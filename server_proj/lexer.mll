@@ -27,7 +27,6 @@ let identifier = identifier_nondigit (identifier_nondigit|digit)*
 
 let whitespace_char_no_newline = [' ' '\t' '\011' '\012' '\r']
 
-(* Integer constants *)
 let nonzero_digit = ['1'-'9']
 let decimal_constant = nonzero_digit digit*
 
