@@ -1,0 +1,12 @@
+(executable
+ (name main)
+ (public_name jovial_parse)
+ (modules ast parser lexer main)
+ (libraries menhirLib))
+
+(menhir
+ (modules parser)
+ (flags --table --explain))
+
+(ocamllex
+ (modules lexer))
