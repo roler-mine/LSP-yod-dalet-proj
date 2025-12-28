@@ -10,7 +10,7 @@ let () =
   lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with pos_fname = filename };
 
   try
-    let ast_loc = parser.compilation_unit lexer.token lexbuf in
+    let ast_loc = Parser.compilation_unit Lexer.token lexbuf in
     let (sp, ep) = ast_loc.Ast.span in
     Printf.printf "OK: parsed. span=%d:%d -> %d:%d\n"
       sp.pos_lnum (sp.pos_cnum - sp.pos_bol + 1)

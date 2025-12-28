@@ -150,8 +150,8 @@
     match Hashtbl.find_opt kw u with
     | Some tok ->
         (match tok with
-         | DEFINE -> dq_state := AfterDefineDQ tok
-         | _ -> tok)
+         | DEFINE -> dq_state := AfterDefineDQ; tok
+         | _ -> tok);
     | None ->
         if String.length u = 1 then LETTER u.[0] else NAME u
 
@@ -383,9 +383,9 @@ let __ocaml_lex_tables = {
    "";
 }
 
-let rec raw_token lexbuf lexbuf =
-   __ocaml_lex_raw_token_rec lexbuf lexbuf 0
-and __ocaml_lex_raw_token_rec lexbuf lexbuf __ocaml_lex_state =
+let rec raw_token lexbuf =
+   __ocaml_lex_raw_token_rec lexbuf 0
+and __ocaml_lex_raw_token_rec lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
 # 201 "server_proj/lexer.mll"
@@ -584,7 +584,7 @@ and
 # 585 "server_proj/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
-      __ocaml_lex_raw_token_rec lexbuf lexbuf __ocaml_lex_state
+      __ocaml_lex_raw_token_rec lexbuf __ocaml_lex_state
 
 and percent_comment startp buf lexbuf =
    __ocaml_lex_percent_comment_rec startp buf lexbuf 47
@@ -809,7 +809,7 @@ let
      Both maintain last_span().
   *)
 
-  let rec token_with_trivia (lexbuf:Lexing.lexbuf) : token =
+  let token_with_trivia (lexbuf:Lexing.lexbuf) : token =
     match dequeue () with
     | Some t -> t
     | None -> raw_token lexbuf

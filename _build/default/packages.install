@@ -1,0 +1,8 @@
+lib: [
+  "_build/install/default/lib/packages/META"
+  "_build/install/default/lib/packages/dune-package"
+  "_build/install/default/lib/packages/opam"
+]
+bin: [
+  "_build/install/default/bin/jovial_parse.exe"
+]

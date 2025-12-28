@@ -1,0 +1,190 @@
+type token =
+    XOR
+  | WORDSIZE
+  | WHILE
+  | UBOUND
+  | TYPE
+  | TRUE
+  | THEN
+  | TERM
+  | TABLE
+  | STOP
+  | STATUS
+  | STATIC
+  | START
+  | STAR
+  | SLASH
+  | SHIFTR
+  | SHIFTL
+  | SGNL
+  | SEMI
+  | RPAREN
+  | RETURN
+  | REP
+  | RENT
+  | REF
+  | REC
+  | REAL of string
+  | RCONV
+  | PROGRAM
+  | PROC
+  | POW
+  | POS
+  | PLUS
+  | PARALLEL
+  | OVERLAY
+  | OR
+  | NULL
+  | NOT
+  | NEXT
+  | NE
+  | NAME of string
+  | MOD
+  | MINUS
+  | LT
+  | LPAREN
+  | LOC
+  | LIKE
+  | LETTER of char
+  | LE
+  | LCONV
+  | LBOUND
+  | LAST
+  | LABEL
+  | ITRACE
+  | ITEM
+  | ISKIP
+  | IREDUCIBLE
+  | IREARRANGE
+  | IORDER
+  | INT of int
+  | INSTANCE
+  | INOLIST
+  | INLINE
+  | ILIST
+  | ILINKAGE
+  | ILEFTRIGHT
+  | IISBASE
+  | IINTERFERENCE
+  | IINITIALIZE
+  | IF
+  | IEND
+  | IEJECT
+  | IDROP
+  | ICOPY
+  | ICOMPOOL
+  | IBEGIN
+  | IBASE
+  | GT
+  | GOTO
+  | GE
+  | FUNCTION
+  | FOR
+  | FIRST
+  | FALSE
+  | FALLTHRU
+  | EXIT
+  | ERROR of string
+  | EQV
+  | EQ
+  | EOF
+  | END
+  | ELSE
+  | DOT
+  | DEFINE_STRING of string
+  | DEFINE
+  | DEFAULT
+  | DEF
+  | CONSTANT
+  | COMPOOL
+  | COMMENT of string
+  | COMMA
+  | COLON
+  | CHARLIT of string
+  | CASE
+  | BYTESIZE
+  | BY
+  | BLOCK
+  | BITSIZE
+  | BITLIT of (int * string)
+  | BIT
+  | BEGIN
+  | AT
+  | AS
+  | AND
+  | ABORT
+val loc0 : Lexing.position -> Lexing.position -> 'a -> 'a Ast.located
+val menhir_begin_marker : int
+val xv_while_stmt_semi : Ast.stmt_node Ast.located
+val xv_while_stmt_colon : Ast.stmt_node Ast.located
+val xv_while_opt : Ast.expr option
+val xv_type_desc : Ast.type_desc
+val xv_type_decl : Ast.decl_node Ast.located
+val xv_type_class_letter : char
+val xv_table_dims : Ast.dim list
+val xv_table_decl : Ast.decl_node Ast.located
+val xv_subroutine_def : Ast.subroutine Ast.located
+val xv_stmt_terminated : Ast.stmt
+val xv_stmt_semi : Ast.stmt
+val xv_stmt_list : Ast.stmt list
+val xv_stmt_core : Ast.stmt
+val xv_stmt_colon : Ast.stmt
+val xv_status_select : string
+val xv_status_list : string list
+val xv_status_entry : string
+val xv_status_const : string
+val xv_selectors : Ast.selector list
+val xv_selector : Ast.selector
+val xv_ret_type_opt : Ast.type_desc option
+val xv_ref_list : Ast.lvalue Ast.located list
+val xv_ref : Ast.lvalue Ast.located
+val xv_param_type_opt : Ast.type_desc option
+val xv_opt_stmt_term : unit
+val xv_module_kind : Ast.module_kind
+val xv_maybe_int : int option
+val xv_loop_step_opt : Ast.loop_step option
+val xv_loop_control : Ast.loop_control
+val xv_item_decl : Ast.decl_node Ast.located
+val xv_interlude_item :
+  [ `Def of Ast.define Ast.located | `Dir of Ast.directive Ast.located ]
+val xv_interlude :
+  Ast.directive Ast.located list * Ast.define Ast.located list
+val xv_init_opt : Ast.expr option
+val xv_index_letter : char
+val xv_if_stmt_semi : Ast.stmt
+val xv_if_stmt_colon : Ast.stmt
+val xv_ident : string
+val xv_formals_opt : Ast.param list
+val xv_formals : Ast.param list
+val xv_formal : Ast.param
+val xv_for_stmt_semi : Ast.stmt
+val xv_for_stmt_colon : Ast.stmt
+val xv_expr_list_opt : Ast.expr list
+val xv_expr_list : Ast.expr list
+val xv_expr : Ast.expr
+val xv_directive_stmt : Ast.directive Ast.located
+val xv_directive_kind : Ast.directive_kind
+val xv_dir_args_opt : Ast.dir_arg list
+val xv_dir_arg_list_opt : Ast.dir_arg list
+val xv_dir_arg_list : Ast.dir_arg list
+val xv_dir_arg : Ast.dir_arg
+val xv_dim_list : Ast.dim list
+val xv_dim : Ast.dim
+val xv_defn : Ast.subroutine Ast.located
+val xv_define_stmt : Ast.define Ast.located
+val xv_def_section_opt : Ast.subroutine Ast.located list
+val xv_decls_opt : Ast.decl list
+val xv_decl : Ast.decl
+val xv_const_item_decl : Ast.decl
+val xv_compilation_unit : Ast.compilation_unit Ast.located
+val xv_case_stmt_semi : Ast.stmt
+val xv_case_stmt_colon : Ast.stmt
+val xv_case_labels : Ast.case_label list
+val xv_case_label : Ast.case_label
+val xv_case_default_opt : Ast.stmt option
+val xv_case_alts : (Ast.case_label list * Ast.stmt) list
+val xv_case_alt : Ast.case_label list * Ast.stmt
+val xv_block_decl : Ast.decl
+val xv_block : Ast.stmt list
+val xv_atom : Ast.expr
+val menhir_end_marker : int

@@ -149,8 +149,8 @@
     match Hashtbl.find_opt kw u with
     | Some tok ->
         (match tok with
-         | DEFINE -> dq_state := AfterDefineDQ tok
-         | _ -> tok)
+         | DEFINE -> dq_state := AfterDefineDQ; tok
+         | _ -> tok);
     | None ->
         if String.length u = 1 then LETTER u.[0] else NAME u
 
@@ -196,7 +196,7 @@ let real_lit =
 let bit_size = ['1'-'5']
 let bit_digits = ['0'-'3']+
 
-rule raw_token lexbuf =
+rule raw_token =
   parse
   | wsp+         { raw_token lexbuf }
   | nl           { Lexing.new_line lexbuf; raw_token lexbuf }
@@ -412,7 +412,7 @@ and char_literal startp buf =
      Both maintain last_span().
   *)
 
-  let rec token_with_trivia (lexbuf:Lexing.lexbuf) : token =
+  let token_with_trivia (lexbuf:Lexing.lexbuf) : token =
     match dequeue () with
     | Some t -> t
     | None -> raw_token lexbuf
