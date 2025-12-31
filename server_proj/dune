@@ -2,7 +2,7 @@
  (name main)
  (public_name jovial_parse)
  (modules ast parser lexer main)
- (libraries menhirLib))
+ (libraries menhirLib yojson unix))
 
 (menhir
  (modules parser)
