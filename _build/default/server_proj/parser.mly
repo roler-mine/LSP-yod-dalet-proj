@@ -196,7 +196,7 @@ decl:
   | d=block_decl { d }
   | LABEL n=ident SEMI { loc0 $startpos $endpos (DLabel n) }
   | INLINE n=ident SEMI { loc0 $startpos $endpos (DInline n) }
-  | error SEMI { loc0 $startpos $endpos (DUnknownDecl "<parse-error-decl>") }
+ // | error SEMI { loc0 $startpos $endpos (DUnknownDecl "<parse-error-decl>") }
 
 type_decl:
   | TYPE name=ident td=type_desc SEMI
@@ -266,12 +266,12 @@ def_section_opt:
 
 defn:
   | DEF s=subroutine_def { s }
-  | error SEMI
+ /* | error SEMI
       {
         loc0 $startpos $endpos
           { kind=Proc; name="<bad-subroutine>"; params=[]; ret=None; decls=[];
             body=[loc0 $startpos $endpos (SError (Some "bad subroutine"))] }
-      }
+      }*/
 
 subroutine_def:
   | PROC name=ident params=formals_opt SEMI decls=decls_opt body=block
@@ -325,7 +325,7 @@ stmt_semi:
   | s=for_stmt_semi { s }
   | s=while_stmt_semi { s }
   | s=case_stmt_semi { s }
-  | error SEMI { loc0 $startpos $endpos (SError None) }
+ // | error SEMI { loc0 $startpos $endpos (SError None) }
 
 stmt_colon:
   | COLON { loc0 $startpos $endpos SNull }
@@ -334,7 +334,7 @@ stmt_colon:
   | s=for_stmt_colon { s }
   | s=while_stmt_colon { s }
   | s=case_stmt_colon { s }
-  | error COLON { loc0 $startpos $endpos (SError None) }
+  //| error COLON { loc0 $startpos $endpos (SError None) }
 
 stmt_core:
   | refs=ref_list MINUS e=expr

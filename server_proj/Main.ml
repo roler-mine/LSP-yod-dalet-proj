@@ -1,4 +1,5 @@
 open Unix
+open Stdlib
 open Yojson.Safe.Util
 
 (* Minimal JSON shell server for VSCode extension over stdio. *)
@@ -103,7 +104,8 @@ let handle_request json =
     let meth = json |> member "method" |> to_string in
     match meth with 
     | "initialize" -> 
-        let caps = `Assoc [] in 
+        (* Advertise that we support text document sync so VS Code keeps us connected *)
+        let caps = `Assoc [("textDocumentSync", `Int 1)] in 
         let result = `Assoc [("capabilities", caps)] in 
         send_lsp_message (make_response ?id:(id_json) result);
         let init_notif = `Assoc [("jsonrpc", `String "2.0"); ("method", `String "initialized");
@@ -111,7 +113,6 @@ let handle_request json =
         send_lsp_message init_notif;
         `Assoc [("action", `String "none")]
     
-    (* NEW: Parse command *)
     | "parse" ->
         let text = json |> member "params" |> member "text" |> to_string in
         let result = do_parse text in
@@ -128,12 +129,22 @@ let handle_request json =
         ] in 
         send_lsp_message (make_response ?id:(id_json) result);
         `Assoc [("action", `String "none")]
+
     | "shutdown" -> 
         send_lsp_message (make_response ?id:(id_json) `Null);
         `Assoc [("action", `String "shutdown-requested")]
+    
     | "exit" -> 
         send_lsp_message (make_response ?id:(id_json) (`String "exiting"));
         exit 0
+
+    | "textDocument/didOpen" 
+    | "textDocument/didChange" 
+    | "textDocument/didClose" 
+    | "textDocument/didSave" 
+    | "initialized" ->
+        `Assoc [("action", `String "none")]
+
     | _ -> 
         let msg = "unknown method: " ^ meth in 
         send_lsp_message (make_error_response ?id:(id_json) msg);
@@ -166,6 +177,6 @@ let rec loop ~shutdown_requested =
        with Yojson.Json_error _ -> loop ~shutdown_requested)
 
 let () = 
-  let ready = `Assoc [("event", `String "ready")] in 
-  send_lsp_message ready;
+  set_binary_mode_in stdin true;
+  set_binary_mode_out stdout true;
   loop ~shutdown_requested:false

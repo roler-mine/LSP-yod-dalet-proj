@@ -1,6 +1,5 @@
 {
  
-
   open Parser
 
   (* === LSP support: spans === *)

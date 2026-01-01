@@ -1,0 +1,30 @@
+{
+    "scopeName": "source.jovial",
+    "patterns": [
+        {
+            "name": "comment.block.jovial",
+            "begin": "\"",
+            "end": "\""
+        },
+        {
+            "name": "comment.line.percentage.jovial",
+            "match": "%.*%"
+        },
+        {
+            "name": "keyword.control.jovial",
+            "match": "\\b(START|TERM|PROGRAM|COMPOOL|PROC|PROCEDURE|FUNCTION|BEGIN|END|IF|THEN|ELSE|FOR|WHILE|CASE|DEFAULT|EXIT|GOTO|RETURN|STOP|ABORT)\\b"
+        },
+        {
+            "name": "storage.type.jovial",
+            "match": "\\b(ITEM|TABLE|BLOCK|TYPE|CONSTANT|BIT|BITSIZE|BYTESIZE|WORDSIZE)\\b"
+        },
+        {
+            "name": "constant.numeric.jovial",
+            "match": "\\b[0-9]+\\b"
+        },
+        {
+            "name": "variable.parameter.jovial",
+            "match": "\\b[a-zA-Z][a-zA-Z0-9]*\\b"
+        }
+    ]
+}

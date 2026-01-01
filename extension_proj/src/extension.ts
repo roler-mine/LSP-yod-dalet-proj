@@ -1,106 +1,114 @@
-// src/extension.ts
+import * as path from 'path';
 import * as vscode from 'vscode';
-import * as net from 'net';
 import {
-  LanguageClient,
-  LanguageClientOptions,
-  ServerOptions,
-  StreamInfo,
-  TransportKind,
-  type DocumentSelector,
+    LanguageClient,
+    LanguageClientOptions,
+    ServerOptions,
+    TransportKind
 } from 'vscode-languageclient/node';
-import { Trace } from 'vscode-jsonrpc';
 
-let client: LanguageClient | undefined;
-let output: vscode.OutputChannel;
+let client: LanguageClient;
+let diagnosticCollection: vscode.DiagnosticCollection;
 
-export async function activate(ctx: vscode.ExtensionContext) {
-  output = vscode.window.createOutputChannel('MyLang Language Server');
-
-  const startClient = async () => {
-    if (client) {
-      await client.stop();
-      client.dispose();
-      client = undefined;
-    }
-
-    const config = vscode.workspace.getConfiguration();
-    const languageId = config.get<string>('lspLang.languageId', 'mylang');
-    const mode = config.get<'stdio' | 'tcp'>('lspLang.server.mode', 'stdio');
-    const tracePref = config.get<'off' | 'messages' | 'verbose'>('lspLang.trace.server', 'off');
-
-    const serverOptions: ServerOptions =
-      mode === 'tcp' ? tcpServerOptions(config) : stdioServerOptions(config);
-
-    const documentSelector: DocumentSelector = [
-      { scheme: 'file', language: languageId },
-      { scheme: 'untitled', language: languageId },
-    ];
-
-    const clientOptions: LanguageClientOptions = {
-      documentSelector,
-      synchronize: {
-        fileEvents: vscode.workspace.createFileSystemWatcher('**/*'),
-      },
-      outputChannel: output,
+export function activate(context: vscode.ExtensionContext) {
+    console.log("!!! JOVIAL EXTENSION ACTIVATING !!!");
+    
+    const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\_build\\default\\server_proj\\main.exe";
+    
+    const serverOptions: ServerOptions = {
+        run: { 
+            command: serverPath, 
+            transport: TransportKind.stdio 
+        },
+        debug: { 
+            command: serverPath, 
+            transport: TransportKind.stdio 
+        }
     };
 
+    const clientOptions: LanguageClientOptions = {
+        documentSelector: [{ scheme: 'file', language: 'jovial' }],
+        synchronize: {
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/.clientrc')
+        }
+    };
+
+    // 2. Start the LSP Client
     client = new LanguageClient(
-      'mylang',
-      'MyLang Language Server',
-      serverOptions,
-      clientOptions
+        'jovialLsp',
+        'Jovial LSP',
+        serverOptions,
+        clientOptions
     );
 
-    // ensure client is disposed with the extension
-    ctx.subscriptions.push(client);
+    // 3. Create a collection for red squiggles (diagnostics)
+    diagnosticCollection = vscode.languages.createDiagnosticCollection('jovial');
+    context.subscriptions.push(diagnosticCollection);
 
-    // start the client then set trace
-    await client.start();
-    const traceMap = { off: Trace.Off, messages: Trace.Messages, verbose: Trace.Verbose } as const;
-    client.setTrace(traceMap[tracePref]);
-  };
+    // 4. Function to send document text to server and process result
+    async function validateTextDocument(textDocument: vscode.TextDocument) {
+        if (textDocument.languageId !== 'jovial') {
+            return;
+        }
 
-  ctx.subscriptions.push(
-    vscode.commands.registerCommand('lspLang.restart', () => startClient()),
-    vscode.commands.registerCommand('lspLang.showServerLog', () => output.show(true))
-  );
+        try {
+            // Send our custom "parse" request
+            const response: any = await client.sendRequest("parse", {
+                text: textDocument.getText()
+            });
 
-  await startClient();
-}
+                console.log("Server Response:", JSON.stringify(response, null, 2));
 
-export async function deactivate(): Promise<void> {
-  if (client) {
-    await client.stop();
-    client.dispose();
-    client = undefined;
-  }
-}
+            const diagnostics: vscode.Diagnostic[] = [];
 
-function stdioServerOptions(config: vscode.WorkspaceConfiguration): ServerOptions {
-  const command = config.get<string>('lspLang.server.command');
-  const args = config.get<string[]>('lspLang.server.args', []);
-  if (!command || command.trim() === '') {
-    void vscode.window.showErrorMessage(
-      'MyLang LSP: Set "lspLang.server.command" to your server executable (or switch to tcp mode).'
-    );
-  }
-  return {
-    run: { command: command ?? '', args, transport: TransportKind.stdio },
-    debug: { command: command ?? '', args, transport: TransportKind.stdio },
-  };
-}
+            if (response.status === "error") {
+                // Parse the error string "Syntax error at line X, column Y"
+                // This regex matches the format generated in Main.ml
+                const match = response.message.match(/line (\d+), column (\d+)/);
+                
+                if (match) {
+                    const line = parseInt(match[1]) - 1; // VSCode is 0-indexed
+                    const col = parseInt(match[2]);
+                    
+                    const range = new vscode.Range(line, col, line, col + 1);
+                    const diagnostic = new vscode.Diagnostic(
+                        range, 
+                        response.message, 
+                        vscode.DiagnosticSeverity.Error
+                    );
+                    diagnostics.push(diagnostic);
+                }
+            }
 
-function tcpServerOptions(config: vscode.WorkspaceConfiguration): ServerOptions {
-  const host = config.get<string>('lspLang.server.tcp.host', '127.0.0.1');
-  const port = config.get<number>('lspLang.server.tcp.port', 2087);
-  return async (): Promise<StreamInfo> =>
-    new Promise((resolve, reject) => {
-      const socket = new net.Socket();
-      socket.connect(port, host, () => resolve({ reader: socket, writer: socket }));
-      socket.on('error', (err) => {
-        void vscode.window.showErrorMessage(`MyLang LSP TCP connection failed: ${err.message}`);
-        reject(err);
-      });
+            // Set the diagnostics (clears old ones if empty)
+            diagnosticCollection.set(textDocument.uri, diagnostics);
+
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    console.log("Attempting to start client with path:", serverPath);
+
+    client.start().then(() => {
+        console.log("CLIENT STARTED SUCCESSFULLY!");
+        
+        // Validate open documents
+        vscode.workspace.textDocuments.forEach(validateTextDocument);
+        
+        // Validate on change
+        vscode.workspace.onDidChangeTextDocument(event => {
+            validateTextDocument(event.document);
+        });
+    }).catch((error) => {
+        // THIS IS THE IMPORTANT PART
+        console.error("CLIENT FAILED TO START:", error);
     });
+}
+
+export function deactivate(): Thenable<void> | undefined {
+    if (!client) {
+        return undefined;
+    }
+    return client.stop();
 }

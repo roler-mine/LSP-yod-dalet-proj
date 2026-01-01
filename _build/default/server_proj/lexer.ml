@@ -1,7 +1,6 @@
 # 1 "server_proj/lexer.mll"
  
  
-
   open Parser
 
   (* === LSP support: spans === *)
@@ -176,7 +175,7 @@
       emit_error sp ep ("bad integer literal: " ^ s)
 
 
-# 180 "server_proj/lexer.ml"
+# 179 "server_proj/lexer.ml"
 let __ocaml_lex_tables = {
   Lexing.lex_base =
    "\000\000\225\255\226\255\087\000\164\000\230\255\186\000\232\255\
@@ -388,25 +387,25 @@ let rec raw_token lexbuf =
 and __ocaml_lex_raw_token_rec lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 201 "server_proj/lexer.mll"
+# 200 "server_proj/lexer.mll"
                  ( raw_token lexbuf )
-# 394 "server_proj/lexer.ml"
+# 393 "server_proj/lexer.ml"
 
   | 1 ->
-# 202 "server_proj/lexer.mll"
+# 201 "server_proj/lexer.mll"
                  ( Lexing.new_line lexbuf; raw_token lexbuf )
-# 399 "server_proj/lexer.ml"
+# 398 "server_proj/lexer.ml"
 
   | 2 ->
-# 204 "server_proj/lexer.mll"
+# 203 "server_proj/lexer.mll"
                  (
                    let startp = Lexing.lexeme_start_p lexbuf in
                    percent_comment startp (Buffer.create 64) lexbuf
                  )
-# 407 "server_proj/lexer.ml"
+# 406 "server_proj/lexer.ml"
 
   | 3 ->
-# 210 "server_proj/lexer.mll"
+# 209 "server_proj/lexer.mll"
                  (
                    let startp = Lexing.lexeme_start_p lexbuf in
                    match !dq_state with
@@ -416,120 +415,120 @@ and __ocaml_lex_raw_token_rec lexbuf __ocaml_lex_state =
                    | NormalDQ ->
                        dq_comment startp (Buffer.create 64) lexbuf
                  )
-# 420 "server_proj/lexer.ml"
+# 419 "server_proj/lexer.ml"
 
   | 4 ->
-# 221 "server_proj/lexer.mll"
+# 220 "server_proj/lexer.mll"
                  ( emit lexbuf LCONV )
-# 425 "server_proj/lexer.ml"
+# 424 "server_proj/lexer.ml"
 
   | 5 ->
-# 222 "server_proj/lexer.mll"
+# 221 "server_proj/lexer.mll"
                  ( emit lexbuf RCONV )
-# 430 "server_proj/lexer.ml"
+# 429 "server_proj/lexer.ml"
 
   | 6 ->
-# 225 "server_proj/lexer.mll"
+# 224 "server_proj/lexer.mll"
                  ( emit lexbuf POW )
-# 435 "server_proj/lexer.ml"
+# 434 "server_proj/lexer.ml"
 
   | 7 ->
-# 228 "server_proj/lexer.mll"
+# 227 "server_proj/lexer.mll"
                  ( emit lexbuf AT )
-# 440 "server_proj/lexer.ml"
+# 439 "server_proj/lexer.ml"
 
   | 8 ->
-# 231 "server_proj/lexer.mll"
+# 230 "server_proj/lexer.mll"
                  ( emit lexbuf LPAREN )
-# 445 "server_proj/lexer.ml"
+# 444 "server_proj/lexer.ml"
 
   | 9 ->
-# 232 "server_proj/lexer.mll"
+# 231 "server_proj/lexer.mll"
                  ( emit lexbuf RPAREN )
-# 450 "server_proj/lexer.ml"
+# 449 "server_proj/lexer.ml"
 
   | 10 ->
-# 233 "server_proj/lexer.mll"
+# 232 "server_proj/lexer.mll"
                  ( emit lexbuf COMMA )
-# 455 "server_proj/lexer.ml"
+# 454 "server_proj/lexer.ml"
 
   | 11 ->
-# 234 "server_proj/lexer.mll"
+# 233 "server_proj/lexer.mll"
                  ( on_stmt_terminator (); emit lexbuf SEMI )
-# 460 "server_proj/lexer.ml"
+# 459 "server_proj/lexer.ml"
 
   | 12 ->
-# 235 "server_proj/lexer.mll"
+# 234 "server_proj/lexer.mll"
                  ( emit lexbuf COLON )
-# 465 "server_proj/lexer.ml"
+# 464 "server_proj/lexer.ml"
 
   | 13 ->
-# 236 "server_proj/lexer.mll"
+# 235 "server_proj/lexer.mll"
                  ( emit lexbuf DOT )
-# 470 "server_proj/lexer.ml"
+# 469 "server_proj/lexer.ml"
 
   | 14 ->
-# 239 "server_proj/lexer.mll"
+# 238 "server_proj/lexer.mll"
                  ( emit lexbuf LE )
-# 475 "server_proj/lexer.ml"
+# 474 "server_proj/lexer.ml"
 
   | 15 ->
-# 240 "server_proj/lexer.mll"
+# 239 "server_proj/lexer.mll"
                  ( emit lexbuf GE )
-# 480 "server_proj/lexer.ml"
+# 479 "server_proj/lexer.ml"
 
   | 16 ->
-# 241 "server_proj/lexer.mll"
+# 240 "server_proj/lexer.mll"
                  ( emit lexbuf NE )
-# 485 "server_proj/lexer.ml"
+# 484 "server_proj/lexer.ml"
 
   | 17 ->
-# 242 "server_proj/lexer.mll"
+# 241 "server_proj/lexer.mll"
                  ( emit lexbuf LT )
-# 490 "server_proj/lexer.ml"
+# 489 "server_proj/lexer.ml"
 
   | 18 ->
-# 243 "server_proj/lexer.mll"
+# 242 "server_proj/lexer.mll"
                  ( emit lexbuf GT )
-# 495 "server_proj/lexer.ml"
+# 494 "server_proj/lexer.ml"
 
   | 19 ->
-# 244 "server_proj/lexer.mll"
+# 243 "server_proj/lexer.mll"
                  ( emit lexbuf EQ )
-# 500 "server_proj/lexer.ml"
+# 499 "server_proj/lexer.ml"
 
   | 20 ->
-# 247 "server_proj/lexer.mll"
+# 246 "server_proj/lexer.mll"
                  ( emit lexbuf PLUS )
-# 505 "server_proj/lexer.ml"
+# 504 "server_proj/lexer.ml"
 
   | 21 ->
-# 248 "server_proj/lexer.mll"
+# 247 "server_proj/lexer.mll"
                  ( emit lexbuf MINUS )
-# 510 "server_proj/lexer.ml"
+# 509 "server_proj/lexer.ml"
 
   | 22 ->
-# 249 "server_proj/lexer.mll"
+# 248 "server_proj/lexer.mll"
                  ( emit lexbuf STAR )
-# 515 "server_proj/lexer.ml"
+# 514 "server_proj/lexer.ml"
 
   | 23 ->
-# 250 "server_proj/lexer.mll"
+# 249 "server_proj/lexer.mll"
                  ( emit lexbuf SLASH )
-# 520 "server_proj/lexer.ml"
+# 519 "server_proj/lexer.ml"
 
   | 24 ->
 let
-# 253 "server_proj/lexer.mll"
+# 252 "server_proj/lexer.mll"
                  sz
-# 526 "server_proj/lexer.ml"
+# 525 "server_proj/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos
 and
-# 253 "server_proj/lexer.mll"
+# 252 "server_proj/lexer.mll"
                                                    bits
-# 531 "server_proj/lexer.ml"
+# 530 "server_proj/lexer.ml"
 = Lexing.sub_lexeme lexbuf (lexbuf.Lexing.lex_start_pos + 3) (lexbuf.Lexing.lex_curr_pos + -1) in
-# 253 "server_proj/lexer.mll"
+# 252 "server_proj/lexer.mll"
                                                               (
       let startp = Lexing.lexeme_start_p lexbuf in
       let endp = Lexing.lexeme_end_p lexbuf in
@@ -537,23 +536,23 @@ and
       let size = (Char.code sz) - (Char.code '0') in
       BITLIT (size, bits)
     )
-# 541 "server_proj/lexer.ml"
+# 540 "server_proj/lexer.ml"
 
   | 25 ->
-# 265 "server_proj/lexer.mll"
+# 264 "server_proj/lexer.mll"
                  (
       let startp = Lexing.lexeme_start_p lexbuf in
       char_literal startp (Buffer.create 32) lexbuf
     )
-# 549 "server_proj/lexer.ml"
+# 548 "server_proj/lexer.ml"
 
   | 26 ->
-# 271 "server_proj/lexer.mll"
+# 270 "server_proj/lexer.mll"
                  ( emit lexbuf (REAL (Lexing.lexeme lexbuf)) )
-# 554 "server_proj/lexer.ml"
+# 553 "server_proj/lexer.ml"
 
   | 27 ->
-# 272 "server_proj/lexer.mll"
+# 271 "server_proj/lexer.mll"
                  (
       let tok = int_of_lexeme lexbuf in
       (* int_of_lexeme may return ERROR; ensure span already set. *)
@@ -561,27 +560,27 @@ and
        | ERROR _ -> tok
        | _ -> emit lexbuf tok)
     )
-# 565 "server_proj/lexer.ml"
+# 564 "server_proj/lexer.ml"
 
   | 28 ->
-# 281 "server_proj/lexer.mll"
+# 280 "server_proj/lexer.mll"
                  ( emit lexbuf (classify_ident (Lexing.lexeme lexbuf)) )
-# 570 "server_proj/lexer.ml"
+# 569 "server_proj/lexer.ml"
 
   | 29 ->
-# 283 "server_proj/lexer.mll"
+# 282 "server_proj/lexer.mll"
                  ( emit lexbuf EOF )
-# 575 "server_proj/lexer.ml"
+# 574 "server_proj/lexer.ml"
 
   | 30 ->
-# 285 "server_proj/lexer.mll"
+# 284 "server_proj/lexer.mll"
                  (
       let startp = Lexing.lexeme_start_p lexbuf in
       let endp = Lexing.lexeme_end_p lexbuf in
       let s = Lexing.lexeme lexbuf in
       emit_error startp endp ("unexpected character: " ^ s)
     )
-# 585 "server_proj/lexer.ml"
+# 584 "server_proj/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_raw_token_rec lexbuf __ocaml_lex_state
@@ -591,44 +590,44 @@ and percent_comment startp buf lexbuf =
 and __ocaml_lex_percent_comment_rec startp buf lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 296 "server_proj/lexer.mll"
+# 295 "server_proj/lexer.mll"
         (
       let endp = Lexing.lexeme_end_p lexbuf in
       set_span startp endp;
       COMMENT (Buffer.contents buf)
     )
-# 601 "server_proj/lexer.ml"
+# 600 "server_proj/lexer.ml"
 
   | 1 ->
-# 301 "server_proj/lexer.mll"
+# 300 "server_proj/lexer.mll"
         (
       Lexing.new_line lexbuf;
       Buffer.add_char buf '\n';
       percent_comment startp buf lexbuf
     )
-# 610 "server_proj/lexer.ml"
+# 609 "server_proj/lexer.ml"
 
   | 2 ->
-# 306 "server_proj/lexer.mll"
+# 305 "server_proj/lexer.mll"
         (
       let endp = Lexing.lexeme_end_p lexbuf in
       enqueue [EOF];
       emit_error startp endp "unterminated %...% comment"
     )
-# 619 "server_proj/lexer.ml"
+# 618 "server_proj/lexer.ml"
 
   | 3 ->
 let
-# 311 "server_proj/lexer.mll"
+# 310 "server_proj/lexer.mll"
          c
-# 625 "server_proj/lexer.ml"
+# 624 "server_proj/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos in
-# 311 "server_proj/lexer.mll"
+# 310 "server_proj/lexer.mll"
            (
       Buffer.add_char buf c;
       percent_comment startp buf lexbuf
     )
-# 632 "server_proj/lexer.ml"
+# 631 "server_proj/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_percent_comment_rec startp buf lexbuf __ocaml_lex_state
@@ -638,17 +637,17 @@ and dq_comment startp buf lexbuf =
 and __ocaml_lex_dq_comment_rec startp buf lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 318 "server_proj/lexer.mll"
+# 317 "server_proj/lexer.mll"
         (
       (* Quote-delimited comment: " ... " *)
       let endp = Lexing.lexeme_end_p lexbuf in
       set_span startp endp;
       COMMENT (Buffer.contents buf)
     )
-# 649 "server_proj/lexer.ml"
+# 648 "server_proj/lexer.ml"
 
   | 1 ->
-# 324 "server_proj/lexer.mll"
+# 323 "server_proj/lexer.mll"
         (
       (* Many JOVIAL codebases use a single '"' to start a line comment.
          Treat newline as a valid terminator too. We do NOT include the newline
@@ -658,29 +657,29 @@ and __ocaml_lex_dq_comment_rec startp buf lexbuf __ocaml_lex_state =
       Lexing.new_line lexbuf;
       COMMENT (Buffer.contents buf)
     )
-# 662 "server_proj/lexer.ml"
+# 661 "server_proj/lexer.ml"
 
   | 2 ->
-# 333 "server_proj/lexer.mll"
+# 332 "server_proj/lexer.mll"
         (
       let endp = Lexing.lexeme_end_p lexbuf in
       set_span startp endp;
       COMMENT (Buffer.contents buf)
     )
-# 671 "server_proj/lexer.ml"
+# 670 "server_proj/lexer.ml"
 
   | 3 ->
 let
-# 338 "server_proj/lexer.mll"
+# 337 "server_proj/lexer.mll"
          c
-# 677 "server_proj/lexer.ml"
+# 676 "server_proj/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos in
-# 338 "server_proj/lexer.mll"
+# 337 "server_proj/lexer.mll"
            (
       Buffer.add_char buf c;
       dq_comment startp buf lexbuf
     )
-# 684 "server_proj/lexer.ml"
+# 683 "server_proj/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_dq_comment_rec startp buf lexbuf __ocaml_lex_state
@@ -690,52 +689,52 @@ and define_string startp buf lexbuf =
 and __ocaml_lex_define_string_rec startp buf lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 350 "server_proj/lexer.mll"
+# 349 "server_proj/lexer.mll"
            (
       Buffer.add_char buf '"';
       define_string startp buf lexbuf
     )
-# 699 "server_proj/lexer.ml"
+# 698 "server_proj/lexer.ml"
 
   | 1 ->
-# 354 "server_proj/lexer.mll"
+# 353 "server_proj/lexer.mll"
         (
       let endp = Lexing.lexeme_end_p lexbuf in
       set_span startp endp;
       DEFINE_STRING (Buffer.contents buf)
     )
-# 708 "server_proj/lexer.ml"
+# 707 "server_proj/lexer.ml"
 
   | 2 ->
-# 359 "server_proj/lexer.mll"
+# 358 "server_proj/lexer.mll"
        (
       Lexing.new_line lexbuf;
       Buffer.add_char buf '\n';
       define_string startp buf lexbuf
     )
-# 717 "server_proj/lexer.ml"
+# 716 "server_proj/lexer.ml"
 
   | 3 ->
-# 364 "server_proj/lexer.mll"
+# 363 "server_proj/lexer.mll"
         (
       let endp = Lexing.lexeme_end_p lexbuf in
       enqueue [EOF];
       emit_error startp endp "unterminated DEFINE string"
     )
-# 726 "server_proj/lexer.ml"
+# 725 "server_proj/lexer.ml"
 
   | 4 ->
 let
-# 369 "server_proj/lexer.mll"
+# 368 "server_proj/lexer.mll"
          c
-# 732 "server_proj/lexer.ml"
+# 731 "server_proj/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos in
-# 369 "server_proj/lexer.mll"
+# 368 "server_proj/lexer.mll"
            (
       Buffer.add_char buf c;
       define_string startp buf lexbuf
     )
-# 739 "server_proj/lexer.ml"
+# 738 "server_proj/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_define_string_rec startp buf lexbuf __ocaml_lex_state
@@ -745,24 +744,24 @@ and char_literal startp buf lexbuf =
 and __ocaml_lex_char_literal_rec startp buf lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 380 "server_proj/lexer.mll"
+# 379 "server_proj/lexer.mll"
          (
       Buffer.add_char buf '\'';
       char_literal startp buf lexbuf
     )
-# 754 "server_proj/lexer.ml"
+# 753 "server_proj/lexer.ml"
 
   | 1 ->
-# 384 "server_proj/lexer.mll"
+# 383 "server_proj/lexer.mll"
          (
       let endp = Lexing.lexeme_end_p lexbuf in
       set_span startp endp;
       CHARLIT (Buffer.contents buf)
     )
-# 763 "server_proj/lexer.ml"
+# 762 "server_proj/lexer.ml"
 
   | 2 ->
-# 389 "server_proj/lexer.mll"
+# 388 "server_proj/lexer.mll"
        (
       (* newline not allowed in character literals *)
       Lexing.new_line lexbuf;
@@ -770,36 +769,36 @@ and __ocaml_lex_char_literal_rec startp buf lexbuf __ocaml_lex_state =
       enqueue [EOF];
       emit_error startp endp "newline in character literal"
     )
-# 774 "server_proj/lexer.ml"
+# 773 "server_proj/lexer.ml"
 
   | 3 ->
-# 396 "server_proj/lexer.mll"
+# 395 "server_proj/lexer.mll"
         (
       let endp = Lexing.lexeme_end_p lexbuf in
       enqueue [EOF];
       emit_error startp endp "unterminated character literal"
     )
-# 783 "server_proj/lexer.ml"
+# 782 "server_proj/lexer.ml"
 
   | 4 ->
 let
-# 401 "server_proj/lexer.mll"
+# 400 "server_proj/lexer.mll"
          c
-# 789 "server_proj/lexer.ml"
+# 788 "server_proj/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos in
-# 401 "server_proj/lexer.mll"
+# 400 "server_proj/lexer.mll"
            (
       Buffer.add_char buf c;
       char_literal startp buf lexbuf
     )
-# 796 "server_proj/lexer.ml"
+# 795 "server_proj/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_char_literal_rec startp buf lexbuf __ocaml_lex_state
 
 ;;
 
-# 406 "server_proj/lexer.mll"
+# 405 "server_proj/lexer.mll"
  
   (* === Public entrypoints ===
 
@@ -840,4 +839,4 @@ let
     tokenize_lexbuf ~with_trivia lexbuf
 
 
-# 844 "server_proj/lexer.ml"
+# 843 "server_proj/lexer.ml"
