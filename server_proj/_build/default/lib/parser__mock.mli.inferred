@@ -1,0 +1,76 @@
+type token =
+    WHILE
+  | THEN
+  | TABLE
+  | STRING of string
+  | STAR
+  | SLASH
+  | SEMI
+  | RPAR
+  | RETURN
+  | REAL of float
+  | PROC
+  | PLUS
+  | NE
+  | MINUS
+  | LT
+  | LPAR
+  | LE
+  | ITEM
+  | INT of int
+  | IF
+  | IDENT of string
+  | GT
+  | GE
+  | EQ
+  | EOF
+  | END
+  | ELSE
+  | DO
+  | COMMA
+  | COLON
+  | CHAR of char
+  | BOOL of bool
+  | ASSIGN
+val loc : Lexing.position -> Lexing.position -> 'a -> 'a Ast.located
+val loc_expr :
+  Lexing.position -> Lexing.position -> Ast.expr -> Ast.expr Ast.located
+val loc_stmt :
+  Lexing.position -> Lexing.position -> Ast.stmt -> Ast.stmt Ast.located
+val loc_decl :
+  Lexing.position -> Lexing.position -> Ast.decl -> Ast.decl Ast.located
+val mk_ident : Lexing.position -> Lexing.position -> string -> Ast.ident
+val scalar_of_name : string -> Ast.scalar_type option
+val menhir_begin_marker : int
+val xv_while_stmt : Ast.stmt Ast.located
+val xv_unary : Ast.expr Ast.located
+val xv_type_expr_l : Ast.type_expr Ast.located
+val xv_table_decl : Ast.decl Ast.located
+val xv_stmt_list : Ast.stmt Ast.located list
+val xv_stmt : Ast.stmt Ast.located
+val xv_return_stmt : Ast.stmt Ast.located
+val xv_proc_decl : Ast.decl Ast.located
+val xv_primary : Ast.expr Ast.located
+val xv_param_list_opt : (Ast.ident * Ast.type_expr Ast.located option) list
+val xv_param_list : (Ast.ident * Ast.type_expr Ast.located option) list
+val xv_param : Ast.ident * Ast.type_expr Ast.located option
+val xv_opt_type : Ast.type_expr Ast.located option
+val xv_opt_size : int option
+val xv_opt_init : Ast.expr Ast.located option
+val xv_mul : Ast.expr Ast.located
+val xv_item_decl : Ast.decl Ast.located
+val xv_if_stmt : Ast.stmt Ast.located
+val xv_ident : Ast.ident
+val xv_expr : Ast.expr Ast.located
+val xv_else_opt : Ast.stmt Ast.located list
+val xv_decl_list : Ast.decl Ast.located list
+val xv_decl : Ast.decl Ast.located
+val xv_compilation_unit : Ast.compilation_unit
+val xv_cmpop : Ast.binop
+val xv_cmp : Ast.expr Ast.located
+val xv_call_stmt : Ast.stmt Ast.located
+val xv_assign_stmt : Ast.stmt Ast.located
+val xv_arg_list_opt : Ast.expr Ast.located list
+val xv_arg_list : Ast.expr Ast.located list
+val xv_add : Ast.expr Ast.located
+val menhir_end_marker : int

@@ -1,0 +1,13 @@
+(library
+ (name jovial_lsp_lib)
+ (libraries
+  lsp
+  jsonrpc
+  yojson
+  logs
+  fmt))
+
+(ocamllex lexer)
+
+(menhir
+ (modules parser))

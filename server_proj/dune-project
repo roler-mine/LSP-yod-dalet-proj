@@ -1,0 +1,21 @@
+(lang dune 3.11)
+
+(using menhir 2.1)
+
+(name jovial-lsp)
+
+(generate_opam_files true)
+
+(package
+ (name jovial-lsp)
+ (synopsis "Language Server Protocol implementation for JOVIAL J73 (OCaml + Menhir)")
+ (description "An LSP server for JOVIAL J73 built with OCaml, ocamllex, and Menhir. Provides diagnostics, symbols, hover, and go-to-definition.")
+ (depends
+  (ocaml (>= 5.0))
+  (dune (>= 3.11))
+  menhir
+  yojson
+  jsonrpc
+  lsp
+  logs
+  fmt))

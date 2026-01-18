@@ -14,7 +14,13 @@
     "languages": [{
       "id": "jovial",
       "aliases": ["Jovial", "jovial"],
-      "extensions": [".j73"]
+      "extensions": [".j73"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "jovial",
+      "scopeName": "source.jovial",
+      "path": "./syntaxes/jovial.tmLanguage.json"
     }]
   },
   "scripts": {
