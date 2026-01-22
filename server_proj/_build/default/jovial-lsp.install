@@ -1,8 +1,0 @@
-lib: [
-  "_build/install/default/lib/jovial-lsp/META"
-  "_build/install/default/lib/jovial-lsp/dune-package"
-  "_build/install/default/lib/jovial-lsp/opam"
-]
-bin: [
-  "_build/install/default/bin/jovial-lsp.exe"
-]

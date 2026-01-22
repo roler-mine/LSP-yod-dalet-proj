@@ -1,76 +1,265 @@
 type token =
-    WHILE
+    XOR
+  | WITH
+  | WHILE
+  | WHEN
+  | TYPEATOM of string
+  | TYPE
+  | TRUE
+  | TO
   | THEN
+  | TERM
   | TABLE
   | STRING of string
+  | STOP
+  | STATUS
+  | STATIC
+  | START
   | STAR
   | SLASH
   | SEMI
-  | RPAR
+  | RPAREN
   | RETURN
-  | REAL of float
+  | REP
+  | RENT
+  | REF
+  | REC
+  | RBRACK
+  | PROGRAM
   | PROC
+  | POS
   | PLUS
-  | NE
+  | PARALLEL
+  | OVERLAY
+  | OTHERWISE
+  | OR
+  | OF
+  | NULL
+  | NQ
+  | NOT
+  | NEQ
+  | MOD
   | MINUS
   | LT
-  | LPAR
+  | LS
+  | LQ
+  | LPAREN
+  | LIKE
   | LE
+  | LBRACK
+  | LABEL
   | ITEM
   | INT of int
+  | INSTANCE
+  | INLINE
   | IF
   | IDENT of string
+  | ICOMPOOL
   | GT
+  | GR
+  | GQ
+  | GOTO
   | GE
+  | FUNCTION
+  | FOR
+  | FLOAT of float
+  | FALSE
+  | FALLTHRU
+  | EXIT
+  | EQV
+  | EQUAL
   | EQ
   | EOF
   | END
+  | ELSIF
   | ELSE
-  | DO
+  | DIRECTIVE_NAME of string
+  | DEFINE
+  | DEFAULT
+  | DEF
+  | CONSTANT
+  | COMPOOL
   | COMMA
   | COLON
-  | CHAR of char
-  | BOOL of bool
-  | ASSIGN
-val loc : Lexing.position -> Lexing.position -> 'a -> 'a Ast.located
-val loc_expr :
-  Lexing.position -> Lexing.position -> Ast.expr -> Ast.expr Ast.located
-val loc_stmt :
-  Lexing.position -> Lexing.position -> Ast.stmt -> Ast.stmt Ast.located
-val loc_decl :
-  Lexing.position -> Lexing.position -> Ast.decl -> Ast.decl Ast.located
-val mk_ident : Lexing.position -> Lexing.position -> string -> Ast.ident
-val scalar_of_name : string -> Ast.scalar_type option
+  | CASE
+  | BYVAL
+  | BYRES
+  | BYREF
+  | BY
+  | BLOCK
+  | BEGIN
+  | BEAD of (int * string)
+  | BANG
+  | AND
+  | ABORT
+type module_kind =
+    KProgram
+  | KCompool
+  | KProcModule
+  | KFunctionModule
+  | KUnknown
+type directive = { d_name : string; d_args : literal list; }
+and literal =
+    LInt of int
+  | LFloat of float
+  | LString of string
+  | LBead of int * string
+  | LNull
+  | LBool of bool
+type use_attr = ARec | ARent | AStatic | AParallel | AInline
+type decl_attr =
+    DStatic
+  | DConstant
+  | DDefault of expr
+  | DLike of string
+  | DPos of expr
+  | DRep of expr
+  | DOverlay of string
+  | DInstance of string
+  | DRec
+  | DRent
+  | DInline
+  | DParallel
+and type_spec = TAtom of string | TNamed of string
+and status_item = SName of string | SVal of string
+and decl =
+    DItem of string list * type_spec option * decl_attr list
+  | DTable of string * dim list * type_spec option * decl_attr list *
+      decl list
+  | DBlock of string * decl_attr list * decl list
+  | DTypeStatus of string * status_item list
+  | DTypeAlias of string * type_spec
+  | DOverlayDecl of string
+  | DDefine of string * define_rhs
+  | DLinkage of linkage_kind * linkage_target
+  | DLabelDecl of string list
+and define_rhs = DefString of string | DefExpr of expr
+and linkage_kind = LDef | LRef
+and linkage_target =
+    LName of string
+  | LProcSig of string * param list
+  | LFunSig of string * param list * type_spec option
+and dim = DimStar | DimInt of int | DimId of string
+and param_mode = ByRef | ByVal | ByRes
+and param = {
+  pmode : param_mode option;
+  pname : string;
+  ptype : type_spec option;
+}
+and lvalue = LVar of string | LIndex of string * expr list
+and stmt =
+    SLabel of string * stmt
+  | SAssign of lvalue * expr
+  | SCall of string * expr list
+  | SIf of expr * stmt * stmt option
+  | SIfElsif of (expr * stmt) list * stmt option
+  | SWhile of expr * stmt
+  | SForTo of string * expr * expr * expr option * stmt
+  | SForWhile of string * expr * expr option * expr * stmt
+  | SCase of expr * (expr list * stmt list) list * stmt list option
+  | SGoto of string
+  | SReturn of expr option
+  | SExit of string option
+  | SStop of expr option
+  | SAbort of expr option
+  | SFallthru
+  | SBlock of stmt list
+  | SNoop
+and expr =
+    EInt of int
+  | EFloat of float
+  | EString of string
+  | EBead of int * string
+  | ENull
+  | EBool of bool
+  | EVar of string
+  | ECall of string * expr list
+  | EUn of string * expr
+  | EBin of string * expr * expr
+  | EParen of expr
+type module_ = {
+  kind : module_kind;
+  name : string option;
+  directives : directive list;
+  attrs : use_attr list;
+  decls : decl list;
+  stmts : stmt list;
+  procs : proc list;
+}
+and proc_kind = PProc | PFunction
+and proc = {
+  pkind : proc_kind;
+  pname : string;
+  params : param list;
+  rettype : type_spec option;
+  pattrs : use_attr list;
+  body : stmt list option;
+}
 val menhir_begin_marker : int
-val xv_while_stmt : Ast.stmt Ast.located
-val xv_unary : Ast.expr Ast.located
-val xv_type_expr_l : Ast.type_expr Ast.located
-val xv_table_decl : Ast.decl Ast.located
-val xv_stmt_list : Ast.stmt Ast.located list
-val xv_stmt : Ast.stmt Ast.located
-val xv_return_stmt : Ast.stmt Ast.located
-val xv_proc_decl : Ast.decl Ast.located
-val xv_primary : Ast.expr Ast.located
-val xv_param_list_opt : (Ast.ident * Ast.type_expr Ast.located option) list
-val xv_param_list : (Ast.ident * Ast.type_expr Ast.located option) list
-val xv_param : Ast.ident * Ast.type_expr Ast.located option
-val xv_opt_type : Ast.type_expr Ast.located option
-val xv_opt_size : int option
-val xv_opt_init : Ast.expr Ast.located option
-val xv_mul : Ast.expr Ast.located
-val xv_item_decl : Ast.decl Ast.located
-val xv_if_stmt : Ast.stmt Ast.located
-val xv_ident : Ast.ident
-val xv_expr : Ast.expr Ast.located
-val xv_else_opt : Ast.stmt Ast.located list
-val xv_decl_list : Ast.decl Ast.located list
-val xv_decl : Ast.decl Ast.located
-val xv_compilation_unit : Ast.compilation_unit
-val xv_cmpop : Ast.binop
-val xv_cmp : Ast.expr Ast.located
-val xv_call_stmt : Ast.stmt Ast.located
-val xv_assign_stmt : Ast.stmt Ast.located
-val xv_arg_list_opt : Ast.expr Ast.located list
-val xv_arg_list : Ast.expr Ast.located list
-val xv_add : Ast.expr Ast.located
+val xv_while_stmt : stmt
+val xv_use_attrs_opt : use_attr list
+val xv_use_attr : use_attr
+val xv_type_spec_opt : type_spec option
+val xv_type_spec : type_spec
+val xv_top_items_opt : decl list * stmt list * proc list
+val xv_top_item : [ `Decl of decl | `Proc of proc | `Stmt of stmt ]
+val xv_table_dims_opt : dim list
+val xv_table_body_opt : decl list
+val xv_stmt_list_opt : stmt list
+val xv_stmt : stmt
+val xv_status_list : status_item list
+val xv_status_item : status_item
+val xv_semis_opt : unit
+val xv_proc_end_name_opt : string option
+val xv_proc_end : unit
+val xv_proc_def : proc
+val xv_proc_body_opt : stmt list option
+val xv_param_mode_opt : param_mode option
+val xv_param_list_opt : param list
+val xv_param_list : param list
+val xv_param : param
+val xv_otherwise_opt : stmt list option
+val xv_module_name_opt : string option
+val xv_module_kind_opt : module_kind
+val xv_module_header :
+  module_kind * string option * directive list * use_attr list
+val xv_module_body : decl list * stmt list * proc list
+val xv_module_ : module_
+val xv_lvalue : lvalue
+val xv_linkage_target : linkage_target
+val xv_linkage_decl : decl
+val xv_if_stmt : stmt
+val xv_ident_list : string list
+val xv_formal_params_opt : param list
+val xv_for_stmt : stmt
+val xv_expr_opt : expr option
+val xv_expr_list_opt : expr list
+val xv_expr_list : expr list
+val xv_expr : expr
+val xv_exit_name_opt : string option
+val xv_elsif_list : (expr * stmt) list
+val xv_else_opt : stmt option
+val xv_directives_opt : directive list
+val xv_directive_args_opt : literal list
+val xv_directive_args : literal list
+val xv_directive_arg : literal
+val xv_directive : directive
+val xv_dim_list : dim list
+val xv_dim : dim
+val xv_define_rhs : define_rhs
+val xv_decl_list_opt : decl list
+val xv_decl_attrs_opt : decl_attr list
+val xv_decl_attr_list : decl_attr list
+val xv_decl_attr : decl_attr
+val xv_decl : decl
+val xv_compool_includes_opt : directive list
+val xv_compilation_unit : module_
+val xv_case_stmt : stmt
+val xv_case_labels : expr list
+val xv_case_clauses : (expr list * stmt list) list
+val xv_case_clause : expr list * stmt list
+val xv_call_stmt : stmt
+val xv_call_args_opt : expr list
+val xv_by_opt : expr option
+val xv_block_decl_body_opt : decl list
 val menhir_end_marker : int

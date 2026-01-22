@@ -1,1 +1,1 @@
-lib/parser.ml: Ast Lexing Printf String
+lib/parser.ml: Printf

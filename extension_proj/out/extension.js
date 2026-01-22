@@ -43,6 +43,7 @@ function activate(context) {
 }
 exports.activate = activate;
 function deactivate() {
+    console.log('Client Crashed/Stopped');
     return client ? client.stop() : undefined;
 }
 exports.deactivate = deactivate;
