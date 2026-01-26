@@ -3,7 +3,7 @@
 module T = Lsp.Types
 
 type t = private
-  { ast : Ast.compilation_unit option
+  { ast : Ast.module_ option
   ; symbols : Symbols.t
   ; diagnostics : T.Diagnostic.t list
   }
@@ -11,7 +11,7 @@ type t = private
 val parse :
   T.DocumentUri.t ->
   string ->
-  (Ast.compilation_unit, T.Diagnostic.t list) result
+  (Ast.module_, T.Diagnostic.t list) result
 
 val analyze :
   uri:T.DocumentUri.t ->

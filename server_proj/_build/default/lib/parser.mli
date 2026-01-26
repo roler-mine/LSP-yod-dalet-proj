@@ -102,4 +102,4 @@ exception Error
 
 (* The monolithic API. *)
 
-val compilation_unit: (Lexing.lexbuf -> token) -> Lexing.lexbuf -> (module_)
+val compilation_unit: (Lexing.lexbuf -> token) -> Lexing.lexbuf -> (Ast.module_)

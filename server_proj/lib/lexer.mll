@@ -131,10 +131,9 @@ let id_char    = alpha | digit | ['$' '_' '\'']
 let ws         = [' ' '\t' '\r']
 let nl         = '\n'
 
-rule token (lexbuf : Lexing.lexbuf) : Parser.token =
-  parse
-  | ws+            { token lexbuf }
-  | nl             { bump_line lexbuf; token lexbuf }
+rule token = parse
+| ws+ { token lexbuf }
+| '\n' { bump_line lexbuf; token lexbuf }
 
   (* Comments:
      - " ... "  (double-quote delimited)
@@ -211,21 +210,21 @@ rule token (lexbuf : Lexing.lexbuf) : Parser.token =
 
   | _ as c         { raise (Lexing_error (Printf.sprintf "Unexpected char: %C" c)) }
 
-and comment_quote (lexbuf : Lexing.lexbuf) =
+and comment_quote =
   parse
   | '"'            { () }
   | nl             { bump_line lexbuf; comment_quote lexbuf }
   | eof            { () }
   | _              { comment_quote lexbuf }
 
-and comment_percent (lexbuf : Lexing.lexbuf) =
+and comment_percent  =
   parse
   | '%'            { () }
   | nl             { bump_line lexbuf; comment_percent lexbuf }
   | eof            { () }
   | _              { comment_percent lexbuf }
 
-and string_lit (lexbuf : Lexing.lexbuf) : string =
+and string_lit  =
   parse
   | '\''           { "" }
   | "''"           { "'" ^ string_lit lexbuf }

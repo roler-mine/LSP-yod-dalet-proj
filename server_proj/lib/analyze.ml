@@ -11,6 +11,17 @@ type t =
 let diag_message (s : string) =
   (`String s : [ `String of string | `MarkupContent of T.MarkupContent.t ])
 
+let position_of_lex (p : Lexing.position) : T.Position.t =
+  let line = max 0 (p.pos_lnum - 1) in
+  let character = max 0 (p.pos_cnum - p.pos_bol) in
+  T.Position.create ~line ~character
+
+let range_of_lex (a : Lexing.position) (b : Lexing.position) : T.Range.t =
+  T.Range.create ~start:(position_of_lex a) ~end_:(position_of_lex b)
+
+let range_of_lexbuf (lexbuf : Lexing.lexbuf) : T.Range.t =
+  range_of_lex lexbuf.lex_start_p lexbuf.lex_curr_p
+
 let mk_diag
     ?(severity = T.DiagnosticSeverity.Error)
     ?(source = "jovial-lsp")
@@ -36,47 +47,33 @@ let lexbuf_init ~(fname : string) (lexbuf : Lexing.lexbuf) : unit =
   lexbuf.lex_curr_p <- p;
   lexbuf.lex_start_p <- p
 
-let string_of_scalar = function
-  | Ast.TyInt -> "INT"
-  | Ast.TyReal -> "REAL"
-  | Ast.TyBool -> "BOOL"
-  | Ast.TyChar -> "CHAR"
-  | Ast.TyString -> "STRING"
-  | Ast.TyUnknown -> "?"
+(* Your current AST nodes do not carry spans yet, but Symbols requires them. *)
+let dummy_span : Ast.span =
+  { startp = Lexing.dummy_pos; endp = Lexing.dummy_pos }
 
-let rec string_of_type_expr (t : Ast.type_expr) : string =
+let string_of_type_spec (t : Ast.type_spec) : string =
   match t with
-  | Ast.Scalar s -> string_of_scalar s
-  | Ast.Named id -> Ast.loc_value id
-  | Ast.Array (inner, size_opt) ->
-      let inner_s = string_of_type_expr (Ast.loc_value inner) in
-      (match size_opt with
-       | None -> Printf.sprintf "ARRAY[%s]" inner_s
-       | Some n -> Printf.sprintf "ARRAY[%s; %d]" inner_s n)
+  | Ast.TAtom a -> a
+  | Ast.TNamed n -> n
 
-let opt_ty_of_type (t : Ast.type_expr Ast.located option) : string option =
-  match t with
-  | None -> None
-  | Some lt -> Some (string_of_type_expr (Ast.loc_value lt))
-
-let dup_diag ~(attempted : Symbols.symbol) ~existing:(_existing : Symbols.symbol) : T.Diagnostic.t =
+let dup_diag ~(attempted : Symbols.symbol) : T.Diagnostic.t =
   let range = Symbols.symbol_name_range attempted in
   let msg =
     Printf.sprintf
       "Duplicate definition of '%s' (already defined earlier)."
-      attempted.name
+      (Symbols.sym_name attempted)
   in
   mk_diag ~range ~message:msg ()
 
 let add_global_or_diag (syms : Symbols.t) (diags : T.Diagnostic.t list ref) (sym : Symbols.symbol) =
   match Symbols.add_global syms sym with
   | Ok () -> ()
-  | Error { existing; attempted } -> diags := dup_diag ~attempted ~existing :: !diags
+  | Error { attempted; _ } -> diags := dup_diag ~attempted :: !diags
 
 let add_proc_or_diag (syms : Symbols.t) (diags : T.Diagnostic.t list ref) (sym : Symbols.symbol) =
   match Symbols.add_proc syms sym with
   | Ok () -> ()
-  | Error { existing; attempted } -> diags := dup_diag ~attempted ~existing :: !diags
+  | Error { attempted; _ } -> diags := dup_diag ~attempted :: !diags
 
 let add_in_proc_or_diag
     (syms : Symbols.t)
@@ -86,74 +83,130 @@ let add_in_proc_or_diag
   =
   match Symbols.add_in_proc syms ~proc_name sym with
   | Ok () -> ()
-  | Error { existing; attempted } -> diags := dup_diag ~attempted ~existing :: !diags
+  | Error { attempted; _ } -> diags := dup_diag ~attempted :: !diags
 
-let index_decl (syms : Symbols.t) (diags : T.Diagnostic.t list ref) (d : Ast.decl Ast.located) =
-  let decl_span = Ast.loc_span d in
-  match Ast.loc_value d with
-  | Ast.Item it ->
-      let sym =
-        Symbols.make
-          ~name:(Ast.loc_value it.name)
-          ~kind:Symbols.Item
-          ~decl_span
-          ~name_span:(Ast.loc_span it.name)
-          ?ty:(opt_ty_of_type it.ty)
-          ()
-      in
-      add_global_or_diag syms diags sym
+let index_decl (syms : Symbols.t) (diags : T.Diagnostic.t list ref) (d : Ast.decl) : unit =
+  match d with
+  | Ast.DItem { names; typ; _ } ->
+      let ty = Option.map string_of_type_spec typ in
+      List.iter
+        (fun name ->
+          let sym =
+            Symbols.make
+              ~name
+              ~kind:Symbols.Item
+              ~decl_span:dummy_span
+              ~name_span:dummy_span
+              ?ty
+              ()
+          in
+          add_global_or_diag syms diags sym)
+        names
 
-  | Ast.Table tb ->
+  | Ast.DTable { name; typ; _ } ->
       let ty =
-        match tb.elem_ty with
+        match typ with
         | None -> Some "TABLE"
-        | Some t -> Some ("TABLE OF " ^ string_of_type_expr (Ast.loc_value t))
+        | Some t -> Some ("TABLE OF " ^ string_of_type_spec t)
       in
       let sym =
         Symbols.make
-          ~name:(Ast.loc_value tb.name)
+          ~name
           ~kind:Symbols.Table
-          ~decl_span
-          ~name_span:(Ast.loc_span tb.name)
+          ~decl_span:dummy_span
+          ~name_span:dummy_span
           ?ty
           ()
       in
       add_global_or_diag syms diags sym
 
-  | Ast.Proc p ->
-      let proc_name = Ast.loc_value p.name in
-      let proc_sym =
+  (* No dedicated symbol kinds for these in symbols.mli; map them to Item for now. *)
+  | Ast.DTypeAlias { name; target } ->
+      let sym =
         Symbols.make
-          ~name:proc_name
-          ~kind:Symbols.Proc
-          ~decl_span
-          ~name_span:(Ast.loc_span p.name)
-          ?ty:(opt_ty_of_type p.returns |> Option.map (fun s -> "RETURNS " ^ s))
+          ~name
+          ~kind:Symbols.Item
+          ~decl_span:dummy_span
+          ~name_span:dummy_span
+          ~ty:(string_of_type_spec target)
           ()
       in
-      add_proc_or_diag syms diags proc_sym;
+      add_global_or_diag syms diags sym
 
+  | Ast.DDefine { name; _ } ->
+      let sym =
+        Symbols.make
+          ~name
+          ~kind:Symbols.Item
+          ~decl_span:dummy_span
+          ~name_span:dummy_span
+          ~ty:"DEFINE"
+          ()
+      in
+      add_global_or_diag syms diags sym
+
+  | Ast.DLabelDecl names ->
       List.iter
-        (fun (param_id, param_ty) ->
-          let pname = Ast.loc_value param_id in
-          let pspan = Ast.loc_span param_id in
+        (fun name ->
           let sym =
             Symbols.make
-              ~name:pname
-              ~kind:Symbols.Param
-              ~decl_span:pspan
-              ~name_span:pspan
-              ?ty:(opt_ty_of_type param_ty)
-              ~container:proc_name
+              ~name
+              ~kind:Symbols.Item
+              ~decl_span:dummy_span
+              ~name_span:dummy_span
+              ~ty:"LABEL"
               ()
           in
-          add_in_proc_or_diag syms diags ~proc_name sym)
-        p.params
+          add_global_or_diag syms diags sym)
+        names
+
+  | Ast.DOverlayDecl _
+  | Ast.DBlock _
+  | Ast.DTypeStatus _
+  | Ast.DLinkage _ ->
+      ()
+
+let index_proc (syms : Symbols.t) (diags : T.Diagnostic.t list ref) (p : Ast.proc) : unit =
+  let proc_name = p.pr_name in
+
+  let proc_ty =
+    match p.rettype with
+    | None -> None
+    | Some t -> Some ("RETURNS " ^ string_of_type_spec t)
+  in
+
+  let proc_sym =
+    Symbols.make
+      ~name:proc_name
+      ~kind:Symbols.Proc
+      ~decl_span:dummy_span
+      ~name_span:dummy_span
+      ?ty:proc_ty
+      ()
+  in
+  add_proc_or_diag syms diags proc_sym;
+
+  List.iter
+    (fun (param : Ast.param) ->
+      let ty = Option.map string_of_type_spec param.ptype in
+      let sym =
+        Symbols.make
+          ~name:param.pname
+          ~kind:Symbols.Param
+          ~decl_span:dummy_span
+          ~name_span:dummy_span
+          ?ty
+          ~container:proc_name
+          ()
+      in
+      add_in_proc_or_diag syms diags ~proc_name sym)
+    p.params
 
 let index_ast (ast : Ast.compilation_unit) : Symbols.t * T.Diagnostic.t list =
   let syms = Symbols.create () in
   let diags = ref [] in
   List.iter (index_decl syms diags) ast.decls;
+  List.iter (index_proc syms diags) ast.procs;
   (syms, List.rev !diags)
 
 let parse (uri : T.DocumentUri.t) (text : string)
@@ -161,23 +214,19 @@ let parse (uri : T.DocumentUri.t) (text : string)
   let lexbuf = Lexing.from_string text in
   lexbuf_init ~fname:(Lsp.Uri.to_string uri) lexbuf;
   try
-    let ast = Parser.compilation_unit Lexer.token lexbuf in
-    Ok ast
+    Ok (Parser.compilation_unit Lexer.token lexbuf)
   with
-  | Lexer.Lexing_error (msg, startp, endp) ->
-      let range = Lsp_convert.range_of_lex startp endp in
-      Error [ mk_diag ~range ~message:("Lexing error: " ^ msg) () ]
   | Parser.Error ->
-      let range = Lsp_convert.range_of_lexbuf lexbuf in
+      let range = range_of_lexbuf lexbuf in
       Error [ mk_diag ~range ~message:"Syntax error." () ]
   | exn ->
-      let range = Lsp_convert.range_of_lexbuf lexbuf in
-      Error [ mk_diag ~range ~message:("Internal parse failure: " ^ Printexc.to_string exn) () ]
+      let range = range_of_lexbuf lexbuf in
+      Error [ mk_diag ~range ~message:("Parse/lex failure: " ^ Printexc.to_string exn) () ]
 
 let analyze ~(uri : T.DocumentUri.t) ~(text : string) : t =
   match parse uri text with
   | Error diags ->
       { ast = None; symbols = Symbols.create (); diagnostics = diags }
   | Ok ast ->
-      let (symbols, sym_diags) = index_ast ast in
-      { ast = Some ast; symbols; diagnostics = sym_diags }
+      let (symbols, diags) = index_ast ast in
+      { ast = Some ast; symbols; diagnostics = diags }

@@ -10,7 +10,19 @@
     "onLanguage:jovial"
   ],
   "main": "./out/extension.js",
-  "contributes": {
+  "contributes": 
+  {
+    "configuration": {
+    "properties": {
+      "<ClientId>.trace.server": {
+        "type": "string",
+        "scope": "window",
+        "enum": ["off", "messages", "verbose"],
+        "default": "off",
+        "description": "Trace LSP communication between client and server."
+      }
+    }
+  },
     "languages": [{
       "id": "jovial",
       "aliases": ["Jovial", "jovial"],

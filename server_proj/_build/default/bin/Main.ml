@@ -251,6 +251,12 @@ let handle_notification (st : state) (oc : out_channel) (n : Jsonrpc.Notificatio
       | _ -> ()
     )
 
+
+let () =
+  Fmt_tty.setup_std_outputs ();
+  Logs.set_reporter (Logs_fmt.reporter ());
+  Logs.set_level (Some Logs.Debug)
+
 (* ---------------- Main loop ---------------- *)
 let rec loop (st : state) (ic : in_channel) (oc : out_channel) : unit =
   match Stdio.read_packet ic with

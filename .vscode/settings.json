@@ -1,4 +1,5 @@
 {
+    "JovialLsp.trace.server": "verbose",
     "ocaml.sandbox": {
         "kind": "global"
     }

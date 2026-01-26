@@ -1,1 +1,1 @@
-lib/analyze.ml: Ast Lexer Lexing List Lsp Lsp_convert Option Parser Printexc Printf Symbols
+lib/analyze.ml: Ast Lexer Lexing List Lsp Option Parser Printexc Printf Symbols

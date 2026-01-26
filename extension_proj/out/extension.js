@@ -14,67 +14,104 @@ const vscode = require("vscode");
 const fs = require("fs");
 const node_1 = require("vscode-languageclient/node");
 let client;
-const diagnosticCollection = vscode.languages.createDiagnosticCollection("jovial");
-function activate(context) {
-    console.log("!!! JOVIAL EXTENSION ACTIVATING !!!");
-    // FIX: Update this path to your specific main.exe location
-    const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\main.exe";
-    if (!fs.existsSync(serverPath)) {
-        vscode.window.showErrorMessage(`CRITICAL: Cannot find server at ${serverPath}`);
-        return;
-    }
-    const serverOptions = {
-        run: { command: serverPath, transport: node_1.TransportKind.stdio },
-        debug: { command: serverPath, transport: node_1.TransportKind.stdio }
-    };
-    const clientOptions = {
-        documentSelector: [{ scheme: 'file', language: 'jovial' }],
-    };
-    client = new node_1.LanguageClient('jovialLsp', 'Jovial LSP', serverOptions, clientOptions);
-    client.start().then(() => {
-        console.log("CLIENT STARTED.");
-        // Validate open documents
-        vscode.workspace.textDocuments.forEach(validateTextDocument);
-        // Validate on change and open
-        context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => validateTextDocument(e.document)));
-        context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(validateTextDocument));
+function getServerPath() {
+    // Read from settings: "jovial.serverPath"
+    const cfg = vscode.workspace.getConfiguration("jovial");
+    const configured = cfg.get("C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\main.exe");
+    if (configured && configured.trim().length > 0)
+        return configured;
+    return undefined;
+}
+function startClient(context) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const output = vscode.window.createOutputChannel("Jovial LSP");
+        const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\main.exe";
+        if (!serverPath) {
+            vscode.window.showErrorMessage("Jovial LSP: Missing server path. Set jovial.serverPath in settings.");
+            output.appendLine("Missing jovial.serverPath setting.");
+            output.show(true);
+            return;
+        }
+        if (!fs.existsSync(serverPath)) {
+            vscode.window.showErrorMessage(`Jovial LSP: Server not found at: ${serverPath}`);
+            output.appendLine(`Server not found: ${serverPath}`);
+            output.show(true);
+            return;
+        }
+        const serverOptions = {
+            run: { command: serverPath, args: [] },
+            debug: { command: serverPath, args: [] },
+        };
+        const clientOptions = {
+            documentSelector: [{ scheme: "file", language: "jovial" }],
+            outputChannel: output,
+            traceOutputChannel: output,
+            // You can also enable protocol trace via VS Code setting:
+            // "jovial.trace.server": "verbose" :contentReference[oaicite:2]{index=2}
+        };
+        client = new node_1.LanguageClient("jovialLsp", "Jovial LSP", serverOptions, clientOptions);
+        // vscode-languageclient start() is Disposable in older versions, Promise in newer versions. :contentReference[oaicite:3]{index=3}
+        const started = client.start();
+        if (started && typeof started.then === "function") {
+            yield started;
+        }
+        else if (started && typeof started.dispose === "function") {
+            context.subscriptions.push(started);
+        }
+        // Always stop on deactivate
+        context.subscriptions.push({ dispose: () => client === null || client === void 0 ? void 0 : client.stop() });
+        output.appendLine("Client started.");
     });
-    context.subscriptions.push(diagnosticCollection);
+}
+function activate(context) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield startClient(context);
+        // Optional: on-demand parse/validate command (does NOT replace standard LSP diagnostics)
+        context.subscriptions.push(vscode.commands.registerCommand("jovial.debugParse", () => __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            if (!client) {
+                vscode.window.showErrorMessage("Jovial LSP: client not running.");
+                return;
+            }
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.document.languageId !== "jovial") {
+                vscode.window.showInformationMessage("Open a Jovial file first.");
+                return;
+            }
+            const uri = editor.document.uri.toString();
+            const text = editor.document.getText();
+            try {
+                const res = yield client.sendRequest("jovial/parse", { uri, text });
+                // Expect: { status: "ok", diagnostics: [...] }
+                const diags = Array.isArray(res === null || res === void 0 ? void 0 : res.diagnostics) ? res.diagnostics : [];
+                if (diags.length === 0) {
+                    vscode.window.showInformationMessage("jovial/parse: no diagnostics.");
+                    return;
+                }
+                // Show a compact summary
+                const lines = diags.slice(0, 50).map((d) => {
+                    var _a, _b;
+                    const msg = (_a = d === null || d === void 0 ? void 0 : d.message) !== null && _a !== void 0 ? _a : "(no message)";
+                    const s = (_b = d === null || d === void 0 ? void 0 : d.range) === null || _b === void 0 ? void 0 : _b.start;
+                    const line = typeof (s === null || s === void 0 ? void 0 : s.line) === "number" ? s.line + 1 : "?";
+                    const col = typeof (s === null || s === void 0 ? void 0 : s.character) === "number" ? s.character + 1 : "?";
+                    return `(${line}:${col}) ${msg}`;
+                });
+                const doc = yield vscode.workspace.openTextDocument({
+                    content: lines.join("\n"),
+                    language: "text",
+                });
+                yield vscode.window.showTextDocument(doc, { preview: true });
+            }
+            catch (e) {
+                vscode.window.showErrorMessage(`jovial/parse failed: ${String((_a = e === null || e === void 0 ? void 0 : e.message) !== null && _a !== void 0 ? _a : e)}`);
+            }
+        })));
+    });
 }
 exports.activate = activate;
 function deactivate() {
-    console.log('Client Crashed/Stopped');
     return client ? client.stop() : undefined;
 }
 exports.deactivate = deactivate;
-function validateTextDocument(textDocument) {
-    return __awaiter(this, void 0, void 0, function* () {
-        if (textDocument.languageId !== 'jovial') {
-            return;
-        }
-        try {
-            const response = yield client.sendRequest("parse", {
-                text: textDocument.getText()
-            });
-            const diagnostics = [];
-            // Main.ml sends { status: "error", errors: [...] }
-            if (response.status === "error" && response.errors && Array.isArray(response.errors)) {
-                for (const err of response.errors) {
-                    // Convert 1-based (OCaml) to 0-based (VS Code)
-                    const line = Math.max(0, err.line - 1);
-                    const col = Math.max(0, err.col);
-                    // Highlight 5 characters or the rest of the word
-                    const range = new vscode.Range(line, col, line, col + 5);
-                    const diagnostic = new vscode.Diagnostic(range, err.message, vscode.DiagnosticSeverity.Error);
-                    diagnostics.push(diagnostic);
-                }
-            }
-            // If status is "success", we set an empty array to clear previous errors
-            diagnosticCollection.set(textDocument.uri, diagnostics);
-        }
-        catch (e) {
-            console.error("Validation failed:", e);
-        }
-    });
-}
 //# sourceMappingURL=extension.js.map

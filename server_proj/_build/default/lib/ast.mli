@@ -1,79 +1,209 @@
-(* server/lib/ast.mli *)
+(* lib/ast.mli *)
 
-type span = private { startp : Lexing.position; endp : Lexing.position }
+type span = {
+  startp : Lexing.position;
+  endp : Lexing.position;
+}
 
-type 'a located = private
-  { value : 'a
-  ; span : span
-  }
+type 'a located = {
+  value : 'a;
+  span : span;
+}
 
-val located : startp:Lexing.position -> endp:Lexing.position -> 'a -> 'a located
-val map_loc : ('a -> 'b) -> 'a located -> 'b located
+type ident = string
+type ident_loc = ident located
 
-val loc_value : 'a located -> 'a
-val loc_span : 'a located -> span
+type module_kind =
+  | Program
+  | Compool
+  | Proc_module
+  | Function_module
+  | Unknown
 
-type ident = string located
-val ident : startp:Lexing.position -> endp:Lexing.position -> string -> ident
+type literal =
+  | LInt of int
+  | LFloat of float
+  | LString of string
+  | LBead of int * string
+  | LNull
+  | LBool of bool
 
-type scalar_type =
-  | TyInt | TyReal | TyBool | TyChar | TyString | TyUnknown
+type directive = {
+  d_name : string;
+  d_args : literal list;
+}
 
-type type_expr =
-  | Scalar of scalar_type
-  | Named of ident
-  | Array of type_expr located * int option
+type use_attr =
+  | ARec
+  | ARent
+  | AStatic
+  | AParallel
+  | AInline
 
-type binop =
-  | Add | Sub | Mul | Div
-  | Eq | Ne | Lt | Le | Gt | Ge
-  | And | Or
+type type_spec =
+  | TAtom of string
+  | TNamed of string
 
-type unop = Neg | Not
+type param_mode =
+  | ByRef
+  | ByVal
+  | ByRes
 
 type expr =
-  | IntLit of int
-  | RealLit of float
-  | StringLit of string
-  | CharLit of char
-  | BoolLit of bool
-  | Var of ident
-  | Call of ident * expr located list
-  | Unary of unop * expr located
-  | Binary of binop * expr located * expr located
+  | EInt of int
+  | EFloat of float
+  | EString of string
+  | EBead of int * string
+  | ENull
+  | EBool of bool
+  | EVar of ident
+  | ECall of ident * expr list
+  | EUn of string * expr
+  | EBin of string * expr * expr
+  | EParen of expr
 
-type stmt =
-  | Assign of ident * expr located
-  | If of expr located * stmt located list * stmt located list
-  | While of expr located * stmt located list
-  | CallStmt of ident * expr located list
-  | Return of expr located option
-  | Block of stmt located list
+type decl_attr =
+  | DStatic
+  | DConstant
+  | DDefault of expr
+  | DLike of ident
+  | DPos of expr
+  | DRep of expr
+  | DOverlay of ident
+  | DInstance of ident
+  | DRec
+  | DRent
+  | DInline
+  | DParallel
 
-type item_decl =
-  { name : ident
-  ; ty : type_expr located option
-  ; init : expr located option
-  }
+type status_item =
+  | SName of ident
+  | SVal of ident
 
-type table_decl =
-  { name : ident
-  ; elem_ty : type_expr located option
-  ; size : int option
-  }
+type linkage_kind =
+  | LDef
+  | LRef
 
-type proc_decl =
-  { name : ident
-  ; params : (ident * type_expr located option) list
-  ; returns : type_expr located option
-  ; body : stmt located list
-  }
+type param = {
+  pmode : param_mode option;
+  pname : ident;
+  ptype : type_spec option;
+}
+
+type dim =
+  | DimStar
+  | DimInt of int
+  | DimId of ident
+
+type define_rhs =
+  | DefString of string
+  | DefExpr of expr
+
+type linkage_target =
+  | LName of ident
+  | LProcSig of ident * param list
+  | LFunSig of ident * param list * type_spec option
 
 type decl =
-  | Item of item_decl
-  | Table of table_decl
-  | Proc of proc_decl
+  | DItem of {
+      names : ident list;
+      typ : type_spec option;
+      attrs : decl_attr list;
+    }
+  | DTable of {
+      name : ident;
+      dims : dim list;
+      typ : type_spec option;
+      attrs : decl_attr list;
+      body : decl list;
+    }
+  | DBlock of {
+      name : ident;
+      attrs : decl_attr list;
+      body : decl list;
+    }
+  | DTypeStatus of {
+      name : ident;
+      items : status_item list;
+    }
+  | DTypeAlias of {
+      name : ident;
+      target : type_spec;
+    }
+  | DOverlayDecl of ident
+  | DDefine of {
+      name : ident;
+      rhs : define_rhs;
+    }
+  | DLinkage of {
+      kind : linkage_kind;
+      target : linkage_target;
+    }
+  | DLabelDecl of ident list
 
-type compilation_unit =
-  { decls : decl located list
-  }
+type lvalue =
+  | LVar of ident
+  | LIndex of ident * expr list
+
+type stmt =
+  | SLabel of ident * stmt
+  | SAssign of lvalue * expr
+  | SCall of ident * expr list
+  | SIf of expr * stmt * stmt option
+  | SIfElsif of (expr * stmt) list * stmt option
+  | SWhile of expr * stmt
+  | SForTo of {
+      var : ident;
+      start_ : expr;
+      stop_ : expr;
+      step : expr option;
+      body : stmt;
+    }
+  | SForWhile of {
+      var : ident;
+      start_ : expr;
+      step : expr option;
+      cond : expr;
+      body : stmt;
+    }
+  | SCase of {
+      expr : expr;
+      clauses : (expr list * stmt list) list;
+      otherwise_ : stmt list option;
+    }
+  | SGoto of ident
+  | SReturn of expr option
+  | SExit of ident option
+  | SStop of expr option
+  | SAbort of expr option
+  | SFallthru
+  | SBlock of stmt list
+  | SNoop
+  | SError
+
+type proc_kind =
+  | PProc
+  | PFunction
+
+type proc = {
+  pkind : proc_kind;
+  pr_name : ident;
+  params : param list;
+  rettype : type_spec option;
+  pattrs : use_attr list;
+  directives : directive list;
+  body : stmt list option;
+}
+
+type module_ = {
+  kind : module_kind;
+  name : ident option;
+  directives : directive list;
+  attrs : use_attr list;
+  decls : decl list;
+  stmts : stmt list;
+  procs : proc list;
+}
+
+(* What the parser returns *)
+type compilation_unit = module_

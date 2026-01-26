@@ -15,7 +15,7 @@ function getServerPath(): string | undefined {
 
 async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel("Jovial LSP");
-  const serverPath = getServerPath();
+  const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\main.exe";
 
   if (!serverPath) {
     vscode.window.showErrorMessage(
@@ -64,6 +64,7 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
 
 export async function activate(context: vscode.ExtensionContext) {
   await startClient(context);
+
 
   // Optional: on-demand parse/validate command (does NOT replace standard LSP diagnostics)
   context.subscriptions.push(
