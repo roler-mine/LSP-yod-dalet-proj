@@ -10,6 +10,10 @@ type 'a located = {
   span : span;
 }
 
+val mk_span : Lexing.position -> Lexing.position -> span
+val mk_loc : 'a -> Lexing.position -> Lexing.position -> 'a located
+val unloc : 'a located -> 'a
+
 type ident = string
 type ident_loc = ident located
 
@@ -86,7 +90,7 @@ type linkage_kind =
 
 type param = {
   pmode : param_mode option;
-  pname : ident;
+  pname : ident_loc;
   ptype : type_spec option;
 }
 
@@ -106,40 +110,40 @@ type linkage_target =
 
 type decl =
   | DItem of {
-      names : ident list;
+      names : ident_loc list;
       typ : type_spec option;
       attrs : decl_attr list;
     }
   | DTable of {
-      name : ident;
+      name : ident_loc;
       dims : dim list;
       typ : type_spec option;
       attrs : decl_attr list;
       body : decl list;
     }
   | DBlock of {
-      name : ident;
+      name : ident_loc;
       attrs : decl_attr list;
       body : decl list;
     }
   | DTypeStatus of {
-      name : ident;
+      name : ident_loc;
       items : status_item list;
     }
   | DTypeAlias of {
-      name : ident;
+      name : ident_loc;
       target : type_spec;
     }
-  | DOverlayDecl of ident
+  | DOverlayDecl of ident_loc
   | DDefine of {
-      name : ident;
+      name : ident_loc;
       rhs : define_rhs;
     }
   | DLinkage of {
       kind : linkage_kind;
       target : linkage_target;
     }
-  | DLabelDecl of ident list
+  | DLabelDecl of ident_loc list
 
 type lvalue =
   | LVar of ident
@@ -187,7 +191,8 @@ type proc_kind =
 
 type proc = {
   pkind : proc_kind;
-  pr_name : ident;
+  pr_name : ident_loc;
+  pr_span : span;
   params : param list;
   rettype : type_spec option;
   pattrs : use_attr list;
@@ -197,7 +202,7 @@ type proc = {
 
 type module_ = {
   kind : module_kind;
-  name : ident option;
+  name : ident_loc option;
   directives : directive list;
   attrs : use_attr list;
   decls : decl list;

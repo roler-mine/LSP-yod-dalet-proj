@@ -2,7 +2,10 @@
 
 %{
   open Ast
+  let mk_span = Ast.mk_span
+  let mk_loc  = Ast.mk_loc
 %}
+
 
 %token START TERM
 %token PROGRAM COMPOOL ICOMPOOL
@@ -53,6 +56,9 @@
 %start <Ast.compilation_unit> compilation_unit
 %type  <Ast.module_> module_
 
+(* Important: proc_end returns a Lexing.position so we can build pr_span cleanly. *)
+%type  <Lexing.position> proc_end
+
 %%
 
 compilation_unit:
@@ -81,7 +87,7 @@ module_kind_opt:
   | /* empty */ { Unknown }
 
 module_name_opt:
-  | IDENT { Some $1 }
+  | IDENT { Some (mk_loc $1 $startpos $endpos) }
   | /* empty */ { None }
 
 use_attrs_opt:
@@ -103,9 +109,23 @@ directive:
   BANG DIRECTIVE_NAME directive_args_opt SEMI
     { { d_name = $2; d_args = $3 } }
 
+directive_payload_opt:
+  | /* empty */ { [] }
+  | LPAREN directive_arg_list_opt RPAREN { $2 }
+  | directive_args { $1 }
+
 directive_args_opt:
   | /* empty */ { [] }
   | directive_args { $1 }
+  | LPAREN directive_arg_list_opt RPAREN { $2 }
+
+directive_arg_list_opt:
+  | /* empty */ { [] }
+  | directive_arg_list { $1 }
+
+directive_arg_list:
+  directive_arg { [$1] }
+| directive_arg_list COMMA directive_arg { $1 @ [$3] }
 
 directive_args:
   directive_arg { [$1] }
@@ -150,6 +170,7 @@ top_item:
   | proc_def { `Proc $1 }
   | stmt { `Stmt $1 }
   | SEMI { `Stmt SNoop }
+  | error SEMI { `Stmt (SError (mk_span $startpos $endpos)) }
 
 (* ---------- Declarations ---------- *)
 
@@ -157,22 +178,25 @@ decl:
   | ITEM ident_list type_spec_opt decl_attrs_opt SEMI
       { DItem { names = $2; typ = $3; attrs = $4 } }
 
-  | TABLE IDENT table_dims_opt type_spec_opt decl_attrs_opt SEMI table_body_opt
+  | TABLE ident_loc table_dims_opt type_spec_opt decl_attrs_opt SEMI table_body_opt
       { DTable { name = $2; dims = $3; typ = $4; attrs = $5; body = $7 } }
 
-  | BLOCK IDENT decl_attrs_opt SEMI block_decl_body_opt
+  | BLOCK ident_loc decl_attrs_opt SEMI block_decl_body_opt
       { DBlock { name = $2; attrs = $3; body = $5 } }
 
-  | TYPE IDENT STATUS LPAREN status_list RPAREN SEMI
+  | TYPE ident_loc STATUS LPAREN status_list RPAREN SEMI
       { DTypeStatus { name = $2; items = $5 } }
 
-  | TYPE IDENT EQUAL type_spec SEMI
+  | TYPE ident_loc EQUAL type_spec SEMI
       { DTypeAlias { name = $2; target = $4 } }
 
-  | OVERLAY IDENT SEMI
+  | OVERLAY ident_loc SEMI
       { DOverlayDecl $2 }
 
-  | DEFINE IDENT EQUAL define_rhs SEMI
+  | DEFINE ident_loc define_rhs SEMI
+    { DDefine { name = $2; rhs = $3 } }
+
+  | DEFINE ident_loc EQUAL define_rhs SEMI
       { DDefine { name = $2; rhs = $4 } }
 
   | linkage_decl { $1 }
@@ -220,12 +244,14 @@ dim:
 
 type_spec_opt:
   | /* empty */ { None }
+  | type_spec { Some $1 }
   | COLON type_spec { Some $2 }
   | TYPE type_spec { Some $2 }
 
 type_spec:
-  | TYPEATOM { TAtom $1 }
-  | IDENT    { TNamed $1 }
+  | TYPEATOM INT { TAtom ($1 ^ " " ^ string_of_int $2) }
+  | TYPEATOM     { TAtom $1 }
+  | IDENT        { TNamed $1 }
 
 decl_attrs_opt:
   | /* empty */ { [] }
@@ -249,9 +275,13 @@ decl_attr:
   | INLINE                 { DInline }
   | PARALLEL               { DParallel }
 
+ident_loc:
+  | IDENT { mk_loc $1 $startpos $endpos }
+
+(* IMPORTANT: ident_list now returns ident_loc list (drop-in for located AST) *)
 ident_list:
-  | IDENT { [$1] }
-  | ident_list COMMA IDENT { $1 @ [$3] }
+  | ident_loc { [$1] }
+  | ident_list COMMA ident_loc { $1 @ [$3] }
 
 status_list:
   status_item { [$1] }
@@ -264,10 +294,12 @@ status_item:
 (* ---------- Procedures ---------- *)
 
 proc_def:
-  | DEF PROC IDENT formal_params_opt use_attrs_opt SEMI proc_body_opt proc_end
+  | DEF PROC ident_loc formal_params_opt use_attrs_opt SEMI proc_body_opt proc_end
       {
+        let endpos = $8 in
         { pkind = PProc
         ; pr_name = $3
+        ; pr_span = mk_span $startpos endpos
         ; params = $4
         ; rettype = None
         ; pattrs = $5
@@ -276,10 +308,12 @@ proc_def:
         }
       }
 
-  | DEF FUNCTION IDENT formal_params_opt type_spec_opt use_attrs_opt SEMI proc_body_opt proc_end
+  | DEF FUNCTION ident_loc formal_params_opt type_spec_opt use_attrs_opt SEMI proc_body_opt proc_end
       {
+        let endpos = $9 in
         { pkind = PFunction
         ; pr_name = $3
+        ; pr_span = mk_span $startpos endpos
         ; params = $4
         ; rettype = $5
         ; pattrs = $6
@@ -301,7 +335,7 @@ param_list:
   | param_list COMMA param { $1 @ [$3] }
 
 param:
-  | param_mode_opt IDENT type_spec_opt
+  | param_mode_opt ident_loc type_spec_opt
       { { pmode = $1; pname = $2; ptype = $3 } }
 
 param_mode_opt:
@@ -314,8 +348,10 @@ proc_body_opt:
   | /* empty */ { None }
   | BEGIN stmt_list_opt END semis_opt { Some $2 }
 
+(* proc_end returns the end-position of the END token (excluding trailing semis). *)
 proc_end:
-  | END proc_end_name_opt semis_opt { () }
+  | e=END proc_end_name_opt semis_opt { ignore e; $endpos(e) }
+
 
 proc_end_name_opt:
   | IDENT { Some $1 }
@@ -341,8 +377,28 @@ stmt:
   | STOP expr_opt SEMI { SStop $2 }
   | ABORT expr_opt SEMI { SAbort $2 }
   | FALLTHRU SEMI { SFallthru }
-  | BEGIN stmt_list_opt END semis_opt { SBlock $2 }
+  | BEGIN block_list_opt END semis_opt { SBlock $2 }
   | SEMI { SNoop }
+  | error SEMI { SError (mk_span $startpos $endpos) }
+
+block_list_opt:
+  | /* empty */ { [] }
+  | block_list { $1 }
+
+block_list:
+  | block_item { (match $1 with None -> [] | Some s -> [s]) }
+  | block_list block_item
+      { $1 @ (match $2 with None -> [] | Some s -> [s]) }
+
+block_items_opt:
+  | /* empty */ { [] }
+  | block_items_opt block_item
+      { match $2 with None -> $1 | Some s -> $1 @ [s] }
+
+block_item:
+  | decl { None }
+  | stmt { Some $1 }
+  | SEMI { Some SNoop }
 
 exit_name_opt:
   | IDENT { Some $1 }
@@ -459,3 +515,4 @@ expr:
   | expr OR expr    { EBin ("OR", $1, $3) }
   | expr XOR expr   { EBin ("XOR", $1, $3) }
   | expr EQV expr   { EBin ("EQV", $1, $3) }
+;

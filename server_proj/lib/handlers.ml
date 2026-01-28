@@ -50,28 +50,33 @@ let range_contains (td : Lsp.Text_document.t) (r : T.Range.t) (pos : T.Position.
   a <= p && p <= b
 
 let is_ident_char = function
-  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '\'' | '$' -> true
   | _ -> false
 
 let identifier_at_position (td : Lsp.Text_document.t) (pos : T.Position.t) : string option =
   let text = Lsp.Text_document.text td in
   let n = String.length text in
-  let p = abs_pos td pos |> min n |> max 0 in
-  let i0 = min (max 0 (p - 1)) (max 0 (n - 1)) in
   if n = 0 then None
-  else if not (is_ident_char text.[i0]) then None
   else (
-    let l = ref i0 in
-    while !l > 0 && is_ident_char text.[!l - 1] do
-      decr l
-    done;
-    let r = ref i0 in
-    while !r + 1 < n && is_ident_char text.[!r + 1] do
-      incr r
-    done;
-    Some (String.sub text !l (!r - !l + 1))
-  )
+    (* absolute_position can point to n (EOF), clamp for indexing *)
+    let p = abs_pos td pos |> max 0 |> min (n - 1) in
 
+    (* try cursor char first; if not ident-char, try previous char *)
+    let i0_opt =
+      if is_ident_char text.[p] then Some p
+      else if p > 0 && is_ident_char text.[p - 1] then Some (p - 1)
+      else None
+    in
+
+    match i0_opt with
+    | None -> None
+    | Some i0 ->
+        let l = ref i0 in
+        while !l > 0 && is_ident_char text.[!l - 1] do decr l done;
+        let r = ref i0 in
+        while !r + 1 < n && is_ident_char text.[!r + 1] do incr r done;
+        Some (String.sub text !l (!r - !l + 1))
+  )
 let proc_name_at (td : Lsp.Text_document.t) (a : Analyze.t) (pos : T.Position.t) : string option =
   Symbols.all a.symbols
   |> List.find_opt (fun s ->

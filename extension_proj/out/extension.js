@@ -25,7 +25,7 @@ function getServerPath() {
 function startClient(context) {
     return __awaiter(this, void 0, void 0, function* () {
         const output = vscode.window.createOutputChannel("Jovial LSP");
-        const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\main.exe";
+        const serverPath = "C:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\Main.exe";
         if (!serverPath) {
             vscode.window.showErrorMessage("Jovial LSP: Missing server path. Set jovial.serverPath in settings.");
             output.appendLine("Missing jovial.serverPath setting.");
