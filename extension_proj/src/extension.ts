@@ -15,7 +15,7 @@ function getServerPath(): string | undefined {
 
 async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel("Jovial LSP");
-  const serverPath = "C:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\Main.exe";
+  const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\Main.exe";
 
   if (!serverPath) {
     vscode.window.showErrorMessage(
