@@ -1,1 +1,1 @@
-lib/handlers.mli: Lsp
+lib/handlers.mli: Lsp Yojson

@@ -1,1 +1,1 @@
-lib/symbols.ml: Ast Hashtbl List Lsp Lsp_convert
+lib/symbols.ml: Ast Hashtbl Lexing List Lsp UriTbl

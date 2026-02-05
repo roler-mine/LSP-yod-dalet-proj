@@ -1,1 +1,1 @@
-lib/lsp_convert.ml: Lexing Lsp
+lib/lsp_convert.ml: Ast Buffer Bytes Char Lexing Lsp String

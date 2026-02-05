@@ -110,7 +110,7 @@ val xv_stmt : Ast.stmt
 val xv_status_list : Ast.status_item list
 val xv_status_item : Ast.status_item
 val xv_semis_opt : unit
-val xv_proc_end_name_opt : string option
+val xv_proc_end_name_opt : Ast.ident_loc option
 val xv_proc_end : Lexing.position
 val xv_proc_def : Ast.proc
 val xv_proc_body_opt : Ast.stmt list option
@@ -138,7 +138,7 @@ val xv_expr_opt : Ast.expr option
 val xv_expr_list_opt : Ast.expr list
 val xv_expr_list : Ast.expr list
 val xv_expr : Ast.expr
-val xv_exit_name_opt : string option
+val xv_exit_name_opt : Ast.ident_loc option
 val xv_elsif_list : (Ast.expr * Ast.stmt) list
 val xv_else_opt : Ast.stmt option
 val xv_directives_opt : Ast.directive list
@@ -165,8 +165,7 @@ val xv_case_clause : Ast.expr list * Ast.stmt list
 val xv_call_stmt : Ast.stmt
 val xv_call_args_opt : Ast.expr list
 val xv_by_opt : Ast.expr option
-val xv_block_list_opt : Ast.stmt list
-val xv_block_list : Ast.stmt list
+val xv_block_items_opt : Ast.stmt list
 val xv_block_item : Ast.stmt option
 val xv_block_decl_body_opt : Ast.decl list
 val menhir_end_marker : int

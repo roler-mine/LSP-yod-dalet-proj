@@ -6,9 +6,6 @@ type t =
   ; diagnostics : T.Diagnostic.t list
   }
 
-let diag_message (s : string) =
-  (`String s : [ `String of string | `MarkupContent of T.MarkupContent.t ])
-
 let mk_diag
     ?(severity = T.DiagnosticSeverity.Error)
     ?(source = "jovial-lsp")
@@ -16,12 +13,14 @@ let mk_diag
     ~(message : string)
     ()
   : T.Diagnostic.t =
+  (* In LSP, Diagnostic.message is a plain string. *)
   T.Diagnostic.create
-    ~message:(diag_message message)
     ~range
+    ~message:(`String message)
     ~severity
     ~source
     ()
+
 
 let lexbuf_init ~(fname : string) (lexbuf : Lexing.lexbuf) : unit =
   let p =
@@ -35,10 +34,10 @@ let lexbuf_init ~(fname : string) (lexbuf : Lexing.lexbuf) : unit =
   lexbuf.lex_start_p <- p
 
 let span_of_lexbuf (lexbuf : Lexing.lexbuf) : Ast.span =
-  { Ast.startp = lexbuf.lex_start_p; endp = lexbuf.lex_curr_p }
+  { Ast.sp_start = lexbuf.lex_start_p; sp_end = lexbuf.lex_curr_p }
 
 let range_of_span (sp : Ast.span) : T.Range.t =
-  Lsp_convert.range_of_lex sp.Ast.startp sp.Ast.endp
+  Lsp_convert.range_of_lex sp.Ast.sp_start sp.Ast.sp_end
 
 (* ---------- Lexer stream ---------- *)
 
@@ -299,17 +298,17 @@ let index_item_decl
   let item_span =
     match sc_next sc with
     | Some t -> tok_span t
-    | None -> { Ast.startp = Lexing.dummy_pos; endp = Lexing.dummy_pos }
+    | None -> { Ast.sp_start = Lexing.dummy_pos; sp_end = Lexing.dummy_pos }
   in
   let names = parse_ident_list sc in
   let ty_opt = parse_type_spec sc in
   let last_span_opt = skip_until_semi sc in
-  let endp =
+  let sp_end =
     match last_span_opt with
-    | Some sp -> sp.Ast.endp
-    | None -> item_span.Ast.endp
+    | Some sp -> sp.Ast.sp_end
+    | None -> item_span.Ast.sp_end
   in
-  let decl_span = { Ast.startp = item_span.Ast.startp; endp } in
+  let decl_span = { Ast.sp_start = item_span.Ast.sp_start; sp_end } in
   let mk (nm, nm_span) (kind : Symbols.kind) =
     make_symbol
       ~name:nm
@@ -383,7 +382,7 @@ let parse_def_like
   let def_span =
     match sc_next sc with
     | Some t -> tok_span t
-    | None -> { Ast.startp = Lexing.dummy_pos; endp = Lexing.dummy_pos }
+    | None -> { Ast.sp_start = Lexing.dummy_pos; sp_end = Lexing.dummy_pos }
   in
 
   let kind_is_fun =
@@ -432,16 +431,16 @@ let parse_def_like
     | _ -> None
   in
 
-  let decl_endp =
+  let decl_sp_end =
     match end_span_opt with
-    | Some sp -> sp.Ast.endp
+    | Some sp -> sp.Ast.sp_end
     | None -> (
         match semi_span_opt with
-        | Some sp -> sp.Ast.endp
-        | None -> name_span.Ast.endp)
+        | Some sp -> sp.Ast.sp_end
+        | None -> name_span.Ast.sp_end)
   in
 
-  let decl_span = { Ast.startp = def_span.Ast.startp; endp = decl_endp } in
+  let decl_span = { Ast.sp_start = def_span.Ast.sp_start; sp_end = decl_sp_end } in
 
   let sig_params =
     match params with
@@ -490,7 +489,7 @@ let parse_ref_like (pending : pending_ref list ref) (sc : scanner) : unit =
   let ref_span =
     match sc_next sc with
     | Some t -> tok_span t
-    | None -> { Ast.startp = Lexing.dummy_pos; endp = Lexing.dummy_pos }
+    | None -> { Ast.sp_start = Lexing.dummy_pos; sp_end = Lexing.dummy_pos }
   in
 
   let kind_is_fun =
@@ -515,12 +514,12 @@ let parse_ref_like (pending : pending_ref list ref) (sc : scanner) : unit =
   skip_use_attrs sc;
 
   let last_span_opt = skip_until_semi sc in
-  let endp =
+  let sp_end =
     match last_span_opt with
-    | Some sp -> sp.Ast.endp
-    | None -> name_span.Ast.endp
+    | Some sp -> sp.Ast.sp_end
+    | None -> name_span.Ast.sp_end
   in
-  let decl_span = { Ast.startp = ref_span.Ast.startp; endp } in
+  let decl_span = { Ast.sp_start = ref_span.Ast.sp_start; sp_end } in
 
   let sig_params =
     match params with
@@ -600,7 +599,7 @@ let build_symbols (toks : tok array) : Symbols.t * T.Diagnostic.t list =
             let defsp =
               match sc_next sc with
               | Some x -> tok_span x
-              | None -> { Ast.startp = Lexing.dummy_pos; endp = Lexing.dummy_pos }
+              | None -> { Ast.sp_start = Lexing.dummy_pos; sp_end = Lexing.dummy_pos }
             in
             let name_opt =
               match sc_peek sc with
@@ -616,12 +615,12 @@ let build_symbols (toks : tok array) : Symbols.t * T.Diagnostic.t list =
             (match name_opt with
              | None -> ()
              | Some (nm, nm_span) ->
-                 let endp =
+                 let sp_end =
                    match last_span_opt with
-                   | Some sp -> sp.Ast.endp
-                   | None -> nm_span.Ast.endp
+                   | Some sp -> sp.Ast.sp_end
+                   | None -> nm_span.Ast.sp_end
                  in
-                 let decl_span = { Ast.startp = defsp.Ast.startp; endp } in
+                 let decl_span = { Ast.sp_start = defsp.Ast.sp_start; sp_end } in
                  let sym =
                    make_symbol
                      ~name:nm

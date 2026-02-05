@@ -1,1 +1,1 @@
-lib/handlers.ml: Analyze Hashtbl List Lsp Option String Symbols
+lib/handlers.ml: Analyze Array Buffer Char Filename Hashtbl List Lsp Option String Symbols Sys Yojson

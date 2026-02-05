@@ -1,12 +1,10 @@
-# 1 "lib/lexer.mll"
+# 3 "lib/lexer.mll"
  
-  (* lexer.mll — JOVIAL J73-ish lexer for Menhir *)
-
   open Parser
 
   exception Lexing_error of string
 
-  (* After a '!' we treat the next identifier as a directive name. *)
+  (* After a directive introducer (@ or !) we treat the next identifier as a directive name. *)
   let in_directive : bool ref = ref false
 
   (* Keyword table (case-insensitive). *)
@@ -73,7 +71,7 @@
     add "CONSTANT" CONSTANT;
     add "PARALLEL" PARALLEL;
 
-    (* explicit parameter binding (often dialect/impl-specific) *)
+    (* explicit parameter binding *)
     add "BYREF" BYREF;
     add "BYVAL" BYVAL;
     add "BYRES" BYRES;
@@ -100,8 +98,7 @@
     add "GQ" GQ
 
   let is_type_atom (u : string) : bool =
-    (* JOVIAL type atoms are commonly single-letter codes.
-       NOTE: this will tokenize a variable named "S" as TYPEATOM "S". *)
+    (* Heuristic: single-letter type atoms. *)
     String.length u = 1 &&
     match u.[0] with
     | 'U' | 'S' | 'F' | 'A' | 'B' | 'C' | 'P' | 'V' -> true
@@ -109,32 +106,17 @@
 
   let bump_line (lexbuf : Lexing.lexbuf) = Lexing.new_line lexbuf
 
-  (* Strings: '...' with doubled '' => ' *)
-  let unescape_jovial_string (s : string) : string =
-    let b = Buffer.create (String.length s) in
-    let rec go i =
-      if i >= String.length s then ()
-      else if s.[i] = '\'' && i + 1 < String.length s && s.[i+1] = '\'' then (
-        Buffer.add_char b '\'';
-        go (i + 2)
-      ) else (
-        Buffer.add_char b s.[i];
-        go (i + 1)
-      )
-    in
-    go 0; Buffer.contents b
-
-# 128 "lib/lexer.ml"
+# 110 "lib/lexer.ml"
 let __ocaml_lex_tables = {
   Lexing.lex_base =
    "\000\000\225\255\226\255\087\000\228\255\229\255\230\255\231\255\
     \232\255\002\000\033\000\238\255\239\255\240\255\241\255\242\255\
     \243\255\244\255\245\255\162\000\174\000\196\000\251\255\252\255\
-    \253\255\254\255\003\000\228\000\250\000\025\000\004\001\053\000\
+    \253\255\254\255\003\000\228\000\250\000\053\000\004\001\057\000\
     \250\255\080\001\184\000\090\001\100\001\110\001\120\001\142\001\
     \152\001\162\001\235\255\237\255\236\255\004\000\252\255\253\255\
     \254\255\255\255\249\000\252\255\253\255\254\255\255\255\248\000\
-    \251\255\252\255\253\255\057\000\254\255";
+    \251\255\252\255\253\255\085\000\254\255";
   Lexing.lex_backtrk =
    "\255\255\255\255\255\255\028\000\255\255\255\255\255\255\255\255\
     \255\255\022\000\021\000\255\255\255\255\255\255\255\255\255\255\
@@ -162,14 +144,14 @@ let __ocaml_lex_tables = {
     \017\000\016\000\005\000\007\000\013\000\006\000\019\000\004\000\
     \020\000\021\000\021\000\021\000\021\000\021\000\020\000\020\000\
     \020\000\020\000\011\000\012\000\010\000\008\000\009\000\044\000\
-    \030\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
+    \022\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
     \003\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
     \003\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
-    \003\000\003\000\003\000\015\000\032\000\014\000\043\000\042\000\
-    \060\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
+    \003\000\003\000\003\000\015\000\030\000\014\000\043\000\042\000\
+    \032\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
     \003\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
     \003\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
-    \003\000\003\000\003\000\003\000\000\000\000\000\003\000\000\000\
+    \003\000\003\000\003\000\003\000\060\000\000\000\003\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\003\000\
     \003\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
     \003\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
@@ -248,14 +230,14 @@ let __ocaml_lex_tables = {
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\009\000\
-    \029\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
-    \000\000\000\000\000\000\000\000\031\000\000\000\010\000\010\000\
-    \059\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
+    \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
+    \000\000\000\000\000\000\000\000\029\000\000\000\010\000\010\000\
+    \031\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
     \000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\
-    \000\000\000\000\000\000\003\000\255\255\255\255\003\000\255\255\
+    \000\000\000\000\000\000\003\000\059\000\255\255\003\000\255\255\
     \255\255\255\255\255\255\255\255\255\255\255\255\255\255\003\000\
     \003\000\003\000\003\000\003\000\003\000\003\000\003\000\003\000\
     \003\000\255\255\255\255\255\255\255\255\255\255\255\255\255\255\
@@ -344,216 +326,216 @@ let rec token lexbuf =
 and __ocaml_lex_token_rec lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 135 "lib/lexer.mll"
+# 119 "lib/lexer.mll"
       ( token lexbuf )
-# 350 "lib/lexer.ml"
+# 332 "lib/lexer.ml"
 
   | 1 ->
-# 136 "lib/lexer.mll"
+# 120 "lib/lexer.mll"
        ( bump_line lexbuf; token lexbuf )
-# 355 "lib/lexer.ml"
+# 337 "lib/lexer.ml"
 
   | 2 ->
-# 141 "lib/lexer.mll"
-                   ( comment_quote lexbuf; token lexbuf )
-# 360 "lib/lexer.ml"
+# 123 "lib/lexer.mll"
+      ( comment_quote lexbuf; token lexbuf )
+# 342 "lib/lexer.ml"
 
   | 3 ->
-# 142 "lib/lexer.mll"
-                   ( comment_percent lexbuf; token lexbuf )
-# 365 "lib/lexer.ml"
+# 124 "lib/lexer.mll"
+      ( comment_percent lexbuf; token lexbuf )
+# 347 "lib/lexer.ml"
 
   | 4 ->
-# 145 "lib/lexer.mll"
-                   ( in_directive := true; BANG )
-# 370 "lib/lexer.ml"
+# 127 "lib/lexer.mll"
+              ( in_directive := true; BANG )
+# 352 "lib/lexer.ml"
 
   | 5 ->
 let
-# 148 "lib/lexer.mll"
-                  n
-# 376 "lib/lexer.ml"
+# 130 "lib/lexer.mll"
+                n
+# 358 "lib/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos
 and
-# 148 "lib/lexer.mll"
-                                                                  v
-# 381 "lib/lexer.ml"
+# 130 "lib/lexer.mll"
+                                                                v
+# 363 "lib/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf (lexbuf.Lexing.lex_start_pos + 3) in
-# 149 "lib/lexer.mll"
-      (
-        let bits = (Char.code n) - (Char.code '0') in
-        let c =
-          if v >= 'a' && v <= 'v' then Char.chr (Char.code v - 32) else v
-        in
-        BEAD (bits, String.make 1 c)
-      )
-# 391 "lib/lexer.ml"
+# 131 "lib/lexer.mll"
+    (
+      let bits = (Char.code n) - (Char.code '0') in
+      let c =
+        if v >= 'a' && v <= 'v' then Char.chr (Char.code v - 32) else v
+      in
+      BEAD (bits, String.make 1 c)
+    )
+# 373 "lib/lexer.ml"
 
   | 6 ->
 let
-# 158 "lib/lexer.mll"
-                                                      f
-# 397 "lib/lexer.ml"
+# 140 "lib/lexer.mll"
+                                                    f
+# 379 "lib/lexer.ml"
 = Lexing.sub_lexeme lexbuf lexbuf.Lexing.lex_start_pos lexbuf.Lexing.lex_curr_pos in
-# 159 "lib/lexer.mll"
-      ( FLOAT (float_of_string f) )
-# 401 "lib/lexer.ml"
+# 140 "lib/lexer.mll"
+                                                      ( FLOAT (float_of_string f) )
+# 383 "lib/lexer.ml"
 
   | 7 ->
 let
-# 160 "lib/lexer.mll"
-                                               f
-# 407 "lib/lexer.ml"
+# 141 "lib/lexer.mll"
+                                             f
+# 389 "lib/lexer.ml"
 = Lexing.sub_lexeme lexbuf lexbuf.Lexing.lex_start_pos lexbuf.Lexing.lex_curr_pos in
-# 161 "lib/lexer.mll"
-      ( FLOAT (float_of_string f) )
-# 411 "lib/lexer.ml"
+# 141 "lib/lexer.mll"
+                                                       ( FLOAT (float_of_string f) )
+# 393 "lib/lexer.ml"
 
   | 8 ->
 let
-# 162 "lib/lexer.mll"
-                                        f
-# 417 "lib/lexer.ml"
+# 142 "lib/lexer.mll"
+                                      f
+# 399 "lib/lexer.ml"
 = Lexing.sub_lexeme lexbuf lexbuf.Lexing.lex_start_pos lexbuf.Lexing.lex_curr_pos in
-# 163 "lib/lexer.mll"
-      ( FLOAT (float_of_string f) )
-# 421 "lib/lexer.ml"
+# 142 "lib/lexer.mll"
+                                                       ( FLOAT (float_of_string f) )
+# 403 "lib/lexer.ml"
 
   | 9 ->
 let
-# 166 "lib/lexer.mll"
-              i
-# 427 "lib/lexer.ml"
+# 145 "lib/lexer.mll"
+            i
+# 409 "lib/lexer.ml"
 = Lexing.sub_lexeme lexbuf lexbuf.Lexing.lex_start_pos lexbuf.Lexing.lex_curr_pos in
-# 167 "lib/lexer.mll"
-      ( INT (int_of_string i) )
-# 431 "lib/lexer.ml"
+# 145 "lib/lexer.mll"
+              ( INT (int_of_string i) )
+# 413 "lib/lexer.ml"
 
   | 10 ->
-# 170 "lib/lexer.mll"
-                   ( let b = Buffer.create 32 in STRING (string_lit b lexbuf) )
-# 436 "lib/lexer.ml"
+# 148 "lib/lexer.mll"
+       ( let b = Buffer.create 32 in STRING (string_lit b lexbuf) )
+# 418 "lib/lexer.ml"
 
   | 11 ->
-# 173 "lib/lexer.mll"
-                   ( LPAREN )
-# 441 "lib/lexer.ml"
+# 151 "lib/lexer.mll"
+      ( LPAREN )
+# 423 "lib/lexer.ml"
 
   | 12 ->
-# 174 "lib/lexer.mll"
-                   ( RPAREN )
-# 446 "lib/lexer.ml"
+# 152 "lib/lexer.mll"
+      ( RPAREN )
+# 428 "lib/lexer.ml"
 
   | 13 ->
-# 175 "lib/lexer.mll"
-                   ( LBRACK )
-# 451 "lib/lexer.ml"
+# 153 "lib/lexer.mll"
+      ( LBRACK )
+# 433 "lib/lexer.ml"
 
   | 14 ->
-# 176 "lib/lexer.mll"
-                   ( RBRACK )
-# 456 "lib/lexer.ml"
+# 154 "lib/lexer.mll"
+      ( RBRACK )
+# 438 "lib/lexer.ml"
 
   | 15 ->
-# 177 "lib/lexer.mll"
-                   ( COMMA )
-# 461 "lib/lexer.ml"
+# 155 "lib/lexer.mll"
+      ( COMMA )
+# 443 "lib/lexer.ml"
 
   | 16 ->
-# 178 "lib/lexer.mll"
-                   ( SEMI )
-# 466 "lib/lexer.ml"
+# 156 "lib/lexer.mll"
+      ( SEMI )
+# 448 "lib/lexer.ml"
 
   | 17 ->
-# 179 "lib/lexer.mll"
-                   ( COLON )
-# 471 "lib/lexer.ml"
+# 157 "lib/lexer.mll"
+      ( COLON )
+# 453 "lib/lexer.ml"
 
   | 18 ->
-# 182 "lib/lexer.mll"
-                   ( LE )
-# 476 "lib/lexer.ml"
+# 160 "lib/lexer.mll"
+       ( LE )
+# 458 "lib/lexer.ml"
 
   | 19 ->
-# 183 "lib/lexer.mll"
-                   ( GE )
-# 481 "lib/lexer.ml"
+# 161 "lib/lexer.mll"
+       ( GE )
+# 463 "lib/lexer.ml"
 
   | 20 ->
-# 184 "lib/lexer.mll"
-                   ( NEQ )
-# 486 "lib/lexer.ml"
+# 162 "lib/lexer.mll"
+       ( NEQ )
+# 468 "lib/lexer.ml"
 
   | 21 ->
-# 185 "lib/lexer.mll"
-                   ( LT )
-# 491 "lib/lexer.ml"
+# 163 "lib/lexer.mll"
+       ( LT )
+# 473 "lib/lexer.ml"
 
   | 22 ->
-# 186 "lib/lexer.mll"
-                   ( GT )
-# 496 "lib/lexer.ml"
+# 164 "lib/lexer.mll"
+       ( GT )
+# 478 "lib/lexer.ml"
 
   | 23 ->
-# 187 "lib/lexer.mll"
-                   ( EQUAL )
-# 501 "lib/lexer.ml"
+# 165 "lib/lexer.mll"
+       ( EQUAL )
+# 483 "lib/lexer.ml"
 
   | 24 ->
-# 189 "lib/lexer.mll"
-                   ( PLUS )
-# 506 "lib/lexer.ml"
+# 167 "lib/lexer.mll"
+      ( PLUS )
+# 488 "lib/lexer.ml"
 
   | 25 ->
-# 190 "lib/lexer.mll"
-                   ( MINUS )
-# 511 "lib/lexer.ml"
+# 168 "lib/lexer.mll"
+      ( MINUS )
+# 493 "lib/lexer.ml"
 
   | 26 ->
-# 191 "lib/lexer.mll"
-                   ( STAR )
-# 516 "lib/lexer.ml"
+# 169 "lib/lexer.mll"
+      ( STAR )
+# 498 "lib/lexer.ml"
 
   | 27 ->
-# 192 "lib/lexer.mll"
-                   ( SLASH )
-# 521 "lib/lexer.ml"
+# 170 "lib/lexer.mll"
+      ( SLASH )
+# 503 "lib/lexer.ml"
 
   | 28 ->
 let
-# 195 "lib/lexer.mll"
-                         raw
-# 527 "lib/lexer.ml"
+# 173 "lib/lexer.mll"
+                       raw
+# 509 "lib/lexer.ml"
 = Lexing.sub_lexeme lexbuf lexbuf.Lexing.lex_start_pos lexbuf.Lexing.lex_curr_pos in
-# 196 "lib/lexer.mll"
-      (
-        let u = String.uppercase_ascii raw in
-        if !in_directive then (
-          in_directive := false;
-          DIRECTIVE_NAME u
-        ) else if is_type_atom u then
-          TYPEATOM u
-        else
-          match Hashtbl.find_opt kw u with
-          | Some tok -> tok
-          | None -> IDENT raw
-      )
-# 542 "lib/lexer.ml"
+# 174 "lib/lexer.mll"
+    (
+      let u = String.uppercase_ascii raw in
+      if !in_directive then (
+        in_directive := false;
+        DIRECTIVE_NAME u
+      ) else if is_type_atom u then
+        TYPEATOM u
+      else
+        match Hashtbl.find_opt kw u with
+        | Some tok -> tok
+        | None -> IDENT raw
+    )
+# 524 "lib/lexer.ml"
 
   | 29 ->
-# 209 "lib/lexer.mll"
-                   ( EOF )
-# 547 "lib/lexer.ml"
+# 187 "lib/lexer.mll"
+      ( EOF )
+# 529 "lib/lexer.ml"
 
   | 30 ->
 let
-# 211 "lib/lexer.mll"
-         c
-# 553 "lib/lexer.ml"
+# 189 "lib/lexer.mll"
+       c
+# 535 "lib/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos in
-# 211 "lib/lexer.mll"
-                   ( raise (Lexing_error (Printf.sprintf "Unexpected char: %C" c)) )
-# 557 "lib/lexer.ml"
+# 189 "lib/lexer.mll"
+         ( raise (Lexing_error (Printf.sprintf "Unexpected char: %C" c)) )
+# 539 "lib/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_token_rec lexbuf __ocaml_lex_state
@@ -563,24 +545,24 @@ and comment_quote lexbuf =
 and __ocaml_lex_comment_quote_rec lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 215 "lib/lexer.mll"
-                   ( () )
-# 569 "lib/lexer.ml"
+# 192 "lib/lexer.mll"
+       ( () )
+# 551 "lib/lexer.ml"
 
   | 1 ->
-# 216 "lib/lexer.mll"
-                   ( bump_line lexbuf; comment_quote lexbuf )
-# 574 "lib/lexer.ml"
+# 193 "lib/lexer.mll"
+       ( bump_line lexbuf; comment_quote lexbuf )
+# 556 "lib/lexer.ml"
 
   | 2 ->
-# 217 "lib/lexer.mll"
-                   ( () )
-# 579 "lib/lexer.ml"
+# 194 "lib/lexer.mll"
+       ( () )
+# 561 "lib/lexer.ml"
 
   | 3 ->
-# 218 "lib/lexer.mll"
-                   ( comment_quote lexbuf )
-# 584 "lib/lexer.ml"
+# 195 "lib/lexer.mll"
+       ( comment_quote lexbuf )
+# 566 "lib/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_comment_quote_rec lexbuf __ocaml_lex_state
@@ -590,24 +572,24 @@ and comment_percent lexbuf =
 and __ocaml_lex_comment_percent_rec lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 222 "lib/lexer.mll"
-                   ( () )
-# 596 "lib/lexer.ml"
+# 198 "lib/lexer.mll"
+       ( () )
+# 578 "lib/lexer.ml"
 
   | 1 ->
-# 223 "lib/lexer.mll"
-                   ( bump_line lexbuf; comment_percent lexbuf )
-# 601 "lib/lexer.ml"
+# 199 "lib/lexer.mll"
+       ( bump_line lexbuf; comment_percent lexbuf )
+# 583 "lib/lexer.ml"
 
   | 2 ->
-# 224 "lib/lexer.mll"
-                   ( () )
-# 606 "lib/lexer.ml"
+# 200 "lib/lexer.mll"
+       ( () )
+# 588 "lib/lexer.ml"
 
   | 3 ->
-# 225 "lib/lexer.mll"
-                   ( comment_percent lexbuf )
-# 611 "lib/lexer.ml"
+# 201 "lib/lexer.mll"
+       ( comment_percent lexbuf )
+# 593 "lib/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_comment_percent_rec lexbuf __ocaml_lex_state
@@ -617,34 +599,34 @@ and string_lit buf lexbuf =
 and __ocaml_lex_string_lit_rec buf lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
-# 229 "lib/lexer.mll"
-          ( Buffer.contents buf )
-# 623 "lib/lexer.ml"
+# 204 "lib/lexer.mll"
+        ( Buffer.contents buf )
+# 605 "lib/lexer.ml"
 
   | 1 ->
-# 230 "lib/lexer.mll"
-          ( Buffer.add_char buf '\''; string_lit buf lexbuf )
-# 628 "lib/lexer.ml"
+# 205 "lib/lexer.mll"
+        ( Buffer.add_char buf '\''; string_lit buf lexbuf )
+# 610 "lib/lexer.ml"
 
   | 2 ->
-# 231 "lib/lexer.mll"
-          ( bump_line lexbuf; raise (Lexing_error "Unterminated string literal") )
-# 633 "lib/lexer.ml"
+# 206 "lib/lexer.mll"
+        ( bump_line lexbuf; raise (Lexing_error "Unterminated string literal") )
+# 615 "lib/lexer.ml"
 
   | 3 ->
-# 232 "lib/lexer.mll"
-          ( raise (Lexing_error "Unterminated string literal") )
-# 638 "lib/lexer.ml"
+# 207 "lib/lexer.mll"
+        ( raise (Lexing_error "Unterminated string literal") )
+# 620 "lib/lexer.ml"
 
   | 4 ->
 let
-# 233 "lib/lexer.mll"
-         c
-# 644 "lib/lexer.ml"
+# 208 "lib/lexer.mll"
+       c
+# 626 "lib/lexer.ml"
 = Lexing.sub_lexeme_char lexbuf lexbuf.Lexing.lex_start_pos in
-# 233 "lib/lexer.mll"
-           ( Buffer.add_char buf c; string_lit buf lexbuf )
-# 648 "lib/lexer.ml"
+# 208 "lib/lexer.mll"
+         ( Buffer.add_char buf c; string_lit buf lexbuf )
+# 630 "lib/lexer.ml"
 
   | __ocaml_lex_state -> lexbuf.Lexing.refill_buff lexbuf;
       __ocaml_lex_string_lit_rec buf lexbuf __ocaml_lex_state

@@ -8,13 +8,35 @@ type doc =
   ; mutable analysis : Analyze.t
   }
 
+type ws_entry =
+  { uri : T.DocumentUri.t
+  ; path : string option
+  ; analysis : Analyze.t
+  ; refs : (string, T.Range.t list) Hashtbl.t
+  }
+
+type sym_loc =
+  { loc : T.Location.t
+  ; ty  : string option
+  }
+
 type t =
   { docs : (string, doc) Hashtbl.t
   ; position_encoding : position_encoding
+  ; mutable root_uris : string list
+
+  (* workspace index *)
+  ; ws_files : (string, ws_entry) Hashtbl.t            (* key = uri string *)
+  ; def_index : (string, sym_loc list) Hashtbl.t       (* name -> decl locations (+ty) *)
   }
 
 let create ?(position_encoding = `UTF16) () =
-  { docs = Hashtbl.create 16; position_encoding }
+  { docs = Hashtbl.create 16
+  ; position_encoding
+  ; root_uris = []
+  ; ws_files = Hashtbl.create 251
+  ; def_index = Hashtbl.create 251
+  }
 
 let uri_key (uri : T.DocumentUri.t) : string =
   Uri.to_string uri
@@ -27,16 +49,13 @@ let analyze_text ~(uri : T.DocumentUri.t) ~(text : string) : Analyze.t =
   Analyze.analyze ~uri ~text
 
 let analyze_doc (td : Lsp.Text_document.t) : Analyze.t =
-  let uri = Lsp.Text_document.documentUri td in
-  let text = Lsp.Text_document.text td in
-  analyze_text ~uri ~text
+  analyze_text ~uri:(Lsp.Text_document.documentUri td) ~text:(Lsp.Text_document.text td)
 
 let get_doc (st : t) (uri : T.DocumentUri.t) : doc option =
   Hashtbl.find_opt st.docs (uri_key uri)
 
 let set_doc (st : t) (d : doc) : unit =
-  let uri = Lsp.Text_document.documentUri d.td in
-  Hashtbl.replace st.docs (uri_key uri) d
+  Hashtbl.replace st.docs (uri_key (Lsp.Text_document.documentUri d.td)) d
 
 let abs_pos (td : Lsp.Text_document.t) (pos : T.Position.t) : int =
   Lsp.Text_document.absolute_position td pos
@@ -58,16 +77,12 @@ let identifier_at_position (td : Lsp.Text_document.t) (pos : T.Position.t) : str
   let n = String.length text in
   if n = 0 then None
   else (
-    (* absolute_position can point to n (EOF), clamp for indexing *)
     let p = abs_pos td pos |> max 0 |> min (n - 1) in
-
-    (* try cursor char first; if not ident-char, try previous char *)
     let i0_opt =
       if is_ident_char text.[p] then Some p
       else if p > 0 && is_ident_char text.[p - 1] then Some (p - 1)
       else None
     in
-
     match i0_opt with
     | None -> None
     | Some i0 ->
@@ -78,61 +93,13 @@ let identifier_at_position (td : Lsp.Text_document.t) (pos : T.Position.t) : str
         Some (String.sub text !l (!r - !l + 1))
   )
 
-(* Word-ish search for references. This is intentionally lightweight: we avoid
-   re-parsing here so “Find References” can't crash the server if the grammar is
-   mid-flight. *)
-let word_ranges_in_text ~(text : string) ~(word : string) : T.Range.t list =
-  if word = "" then []
-  else
-    let wlen = String.length word in
-    let is_boundary line i_before i_after =
-      let ok_before =
-        i_before < 0 || (i_before < String.length line && not (is_ident_char line.[i_before]))
-      in
-      let ok_after =
-        i_after >= String.length line || (i_after >= 0 && not (is_ident_char line.[i_after]))
-      in
-      ok_before && ok_after
-    in
-    let rec scan_line ~(line_no : int) (line : string) (from : int) (acc : T.Range.t list) =
-      match String.index_from_opt line from word.[0] with
-      | None -> acc
-      | Some i ->
-          let next_from = i + 1 in
-          if i + wlen <= String.length line
-             && String.sub line i wlen = word
-             && is_boundary line (i - 1) (i + wlen)
-          then
-            let r =
-              T.Range.create
-                ~start:(T.Position.create ~line:line_no ~character:i)
-                ~end_:(T.Position.create ~line:line_no ~character:(i + wlen))
-            in
-            scan_line ~line_no line (i + wlen) (r :: acc)
-          else scan_line ~line_no line next_from acc
-    in
-    let lines = String.split_on_char '\n' text in
-    lines
-    |> List.mapi (fun line_no line -> scan_line ~line_no line 0 [])
-    |> List.concat
-    |> List.rev
-
-let ranges_within (td : Lsp.Text_document.t) ~(outer : T.Range.t) (rs : T.Range.t list) : T.Range.t list =
-  let oa, ob = abs_range td outer in
-  let inside r =
-    let a, b = abs_range td r in
-    oa <= a && b <= ob
-  in
-  List.filter inside rs
-
 let proc_name_at (td : Lsp.Text_document.t) (a : Analyze.t) (pos : T.Position.t) : string option =
   Symbols.all a.symbols
   |> List.find_opt (fun s ->
-         match s.Symbols.kind with
-         | Symbols.Proc ->
-             range_contains td (Symbols.symbol_decl_range s) pos
+         match Symbols.sym_kind s with
+         | Symbols.Proc -> range_contains td (Symbols.symbol_decl_range s) pos
          | _ -> false)
-  |> Option.map (fun s -> s.Symbols.name)
+  |> Option.map Symbols.sym_name
 
 let lookup_symbol (a : Analyze.t) ~(proc_name : string option) (name : string) : Symbols.symbol option =
   match proc_name with
@@ -141,40 +108,6 @@ let lookup_symbol (a : Analyze.t) ~(proc_name : string option) (name : string) :
       match Symbols.find ~proc_name:pn a.symbols name with
       | Some s -> Some s
       | None -> Symbols.find a.symbols name)
-
-let definitions_across_open_docs (st : t) ~(name : string) : (T.DocumentUri.t * Symbols.symbol) list =
-  Hashtbl.fold
-    (fun _k d acc ->
-      match Symbols.find d.analysis.symbols name with
-      | None -> acc
-      | Some s -> (Lsp.Text_document.documentUri d.td, s) :: acc)
-    st.docs
-    []
-
-let locations_of_definitions (defs : (T.DocumentUri.t * Symbols.symbol) list) : T.Location.t list =
-  defs
-  |> List.map (fun (uri, s) ->
-         let range = Symbols.symbol_name_range s in
-         T.Location.create ~uri ~range)
-
-let uniq_locations (locs : T.Location.t list) : T.Location.t list =
-  (* stable-ish dedupe by (uri, start line/char, end line/char) *)
-  let key (l : T.Location.t) =
-    let u = Uri.to_string l.uri in
-    let s = l.range.start and e = l.range.end_ in
-    (u, s.line, s.character, e.line, e.character)
-  in
-  let seen : ((string * int * int * int * int), unit) Hashtbl.t = Hashtbl.create 97 in
-  let rec loop acc = function
-    | [] -> List.rev acc
-    | x :: xs ->
-        let k = key x in
-        if Hashtbl.mem seen k then loop acc xs
-        else (
-          Hashtbl.add seen k ();
-          loop (x :: acc) xs)
-  in
-  loop [] locs
 
 let symbol_kind (k : Symbols.kind) : T.SymbolKind.t =
   match k with
@@ -192,11 +125,253 @@ let completion_kind (k : Symbols.kind) : T.CompletionItemKind.t =
   | Symbols.Local -> T.CompletionItemKind.Variable
   | Symbols.Item -> T.CompletionItemKind.Variable
 
+(* ---------------- URI/path helpers ---------------- *)
+
+let hex_value = function
+  | '0'..'9' as c -> Char.code c - Char.code '0'
+  | 'a'..'f' as c -> 10 + (Char.code c - Char.code 'a')
+  | 'A'..'F' as c -> 10 + (Char.code c - Char.code 'A')
+  | _ -> -1
+
+let pct_decode (s:string) : string =
+  let b = Buffer.create (String.length s) in
+  let rec loop i =
+    if i >= String.length s then ()
+    else if s.[i] = '%' && i + 2 < String.length s then
+      let a = hex_value s.[i+1] in
+      let c = hex_value s.[i+2] in
+      if a >= 0 && c >= 0 then (
+        Buffer.add_char b (Char.chr (a * 16 + c));
+        loop (i+3)
+      ) else (
+        Buffer.add_char b s.[i];
+        loop (i+1)
+      )
+    else (
+      Buffer.add_char b s.[i];
+      loop (i+1)
+    )
+  in
+  loop 0;
+  Buffer.contents b
+
+let path_of_file_uri (u:string) : string option =
+  if not (String.length u >= 7 && String.sub u 0 7 = "file://") then None
+  else
+    let rest = String.sub u 7 (String.length u - 7) |> pct_decode in
+    let rest =
+      if String.length rest >= 3 && rest.[0] = '/' && rest.[2] = ':' then
+        String.sub rest 1 (String.length rest - 1)
+      else rest
+    in
+    Some rest
+
+let uri_of_path (path:string) : T.DocumentUri.t =
+  let p = String.map (fun c -> if c = '\\' then '/' else c) path in
+  let p =
+    let b = Buffer.create (String.length p) in
+    String.iter (fun c ->
+      match c with
+      | ' ' -> Buffer.add_string b "%20"
+      | '#' -> Buffer.add_string b "%23"
+      | '%' -> Buffer.add_string b "%25"
+      | _ -> Buffer.add_char b c
+    ) p;
+    Buffer.contents b
+  in
+  let s =
+    if String.length p >= 2 && p.[1] = ':' then "file:///" ^ p else "file://" ^ p
+  in
+  Uri.of_string s
+
+let is_dir (p:string) = try Sys.is_directory p with _ -> false
+
+let has_ext_j73 (p:string) =
+  let p = String.lowercase_ascii p in
+  String.length p >= 4 && String.sub p (String.length p - 4) 4 = ".j73"
+
+let should_skip_dir = function
+  | ".git" | "_build" | "node_modules" | ".vs" | ".vscode" -> true
+  | _ -> false
+
+let rec walk_j73_files (root:string) (acc:string list) : string list =
+  if not (is_dir root) then acc
+  else
+    let items = try Sys.readdir root |> Array.to_list with _ -> [] in
+    List.fold_left
+      (fun acc name ->
+         if should_skip_dir name then acc
+         else
+           let path = Filename.concat root name in
+           if is_dir path then walk_j73_files path acc
+           else if has_ext_j73 path then path :: acc
+           else acc)
+      acc items
+
+let read_file (path:string) : string option =
+  try
+    let ic = open_in_bin path in
+    let len = in_channel_length ic in
+    if len > 15_000_000 then (close_in_noerr ic; None)
+    else
+      let s = really_input_string ic len in
+      close_in_noerr ic;
+      Some s
+  with _ -> None
+
+(* ---------------- reference scanner ---------------- *)
+
+let scan_ident_ranges ~(text:string) : (string, T.Range.t list) Hashtbl.t =
+  let tbl : (string, T.Range.t list) Hashtbl.t = Hashtbl.create 251 in
+  let add name range =
+    let prev = Option.value (Hashtbl.find_opt tbl name) ~default:[] in
+    Hashtbl.replace tbl name (range :: prev)
+  in
+  let n = String.length text in
+  let line = ref 0 in
+  let col  = ref 0 in
+  let i    = ref 0 in
+
+  let bump c =
+    match c with
+    | '\n' -> incr line; col := 0
+    | '\r' -> ()
+    | _ -> incr col
+  in
+
+  let is_ident_no_quote = function
+    | 'a'..'z' | 'A'..'Z' | '0'..'9' | '_' | '$' -> true
+    | _ -> false
+  in
+
+  let rec skip_single_quote_string () =
+    bump '\''; incr i;
+    while !i < n do
+      let c = text.[!i] in
+      bump c; incr i;
+      if c = '\'' then break ()
+    done
+  and break () = () in
+
+  while !i < n do
+    let c = text.[!i] in
+    if c = '\'' then (
+      let prev_ok = (!i > 0 && is_ident_no_quote text.[!i - 1]) in
+      let next_ok = (!i + 1 < n && is_ident_no_quote text.[!i + 1]) in
+      if (not prev_ok) && next_ok then skip_single_quote_string ()
+      else (bump c; incr i)
+    )
+    else if is_ident_char c then (
+      let start_line = !line in
+      let start_col  = !col in
+      let j = ref !i in
+      while !j < n && is_ident_char text.[!j] do
+        bump text.[!j];
+        incr j
+      done;
+      let name = String.sub text !i (!j - !i) in
+      let end_line = !line in
+      let end_col  = !col in
+      let range =
+        T.Range.create
+          ~start:(T.Position.create ~line:start_line ~character:start_col)
+          ~end_:(T.Position.create ~line:end_line ~character:end_col)
+      in
+      add name range;
+      i := !j
+    ) else (
+      bump c;
+      incr i
+    )
+  done;
+
+  Hashtbl.iter (fun k xs -> Hashtbl.replace tbl k (List.rev xs)) tbl;
+  tbl
+
+(* ---------------- workspace indexing ---------------- *)
+
+let rebuild_def_index (st:t) : unit =
+  Hashtbl.clear st.def_index;
+  Hashtbl.iter
+    (fun _ entry ->
+      let syms = Symbols.globals_in_order entry.analysis.symbols in
+      List.iter
+        (fun s ->
+          let name = Symbols.sym_name s in
+          let loc =
+            T.Location.create ~uri:entry.uri ~range:(Symbols.symbol_name_range s)
+          in
+          let item = { loc; ty = Symbols.sym_ty s } in
+          let prev = Option.value (Hashtbl.find_opt st.def_index name) ~default:[] in
+          Hashtbl.replace st.def_index name (item :: prev))
+        syms)
+    st.ws_files
+
+let index_entry (st:t) ~(uri:T.DocumentUri.t) ~(path:string option) ~(text:string) : unit =
+  let analysis = analyze_text ~uri ~text in
+  let refs = scan_ident_ranges ~text in
+  Hashtbl.replace st.ws_files (uri_key uri) { uri; path; analysis; refs }
+
+let reindex_workspace (st:t) : unit =
+  Hashtbl.clear st.ws_files;
+  Hashtbl.clear st.def_index;
+
+  let roots = st.root_uris |> List.filter_map path_of_file_uri in
+  let files = List.fold_left (fun acc r -> walk_j73_files r acc) [] roots in
+
+  List.iter
+    (fun path ->
+      match read_file path with
+      | None -> ()
+      | Some text ->
+          let uri = uri_of_path path in
+          index_entry st ~uri ~path:(Some path) ~text)
+    files;
+
+  (* overlay any open docs *)
+  Hashtbl.iter
+    (fun _ d ->
+      let uri = Lsp.Text_document.documentUri d.td in
+      let text = Lsp.Text_document.text d.td in
+      let path = path_of_file_uri (uri_key uri) in
+      index_entry st ~uri ~path ~text)
+    st.docs;
+
+  rebuild_def_index st
+
+let set_workspace_roots (st:t) (roots:string list) : unit =
+  st.root_uris <- roots;
+  reindex_workspace st
+
+let set_workspace_root (st:t) (root:string) : unit =
+  set_workspace_roots st [root]
+
+(* ---------------- didOpen / didChange / didClose ---------------- *)
+
 let did_open (st : t) (p : T.DidOpenTextDocumentParams.t) : T.PublishDiagnosticsParams.t =
   let td = Lsp.Text_document.make ~position_encoding:st.position_encoding p in
+  let uri = p.textDocument.uri in
   let analysis = analyze_doc td in
+  let diags = analysis.diagnostics in
+
   set_doc st { td; analysis };
-  publish_diagnostics ~uri:p.textDocument.uri ~version:p.textDocument.version analysis.diagnostics
+
+  (* update workspace index for this file *)
+  let path = path_of_file_uri (uri_key uri) in
+  index_entry st ~uri ~path ~text:(Lsp.Text_document.text td);
+  rebuild_def_index st;
+
+  publish_diagnostics ~uri ~version:p.textDocument.version diags
+
+let full_text_from_changes (changes : T.TextDocumentContentChangeEvent.t list) : string option =
+  let rec loop = function
+    | [] -> None
+    | c :: tl ->
+        match c.range with
+        | None -> Some c.text
+        | Some _ -> loop tl
+  in
+  loop changes
 
 let did_change (st : t) (p : T.DidChangeTextDocumentParams.t)
   : T.PublishDiagnosticsParams.t
@@ -204,22 +379,46 @@ let did_change (st : t) (p : T.DidChangeTextDocumentParams.t)
   let uri = p.textDocument.uri in
   match get_doc st uri with
   | None ->
-      (* If we somehow get a change before open, clear diagnostics. *)
       publish_diagnostics ~uri []
   | Some d ->
       let td' =
-        Lsp.Text_document.apply_content_changes
-          ~version:p.textDocument.version
-          d.td
-          p.contentChanges
+        try
+          Lsp.Text_document.apply_content_changes
+            ~version:p.textDocument.version
+            d.td
+            p.contentChanges
+        with _ ->
+          (* Don't crash; attempt full-text replacement if available *)
+          match full_text_from_changes p.contentChanges with
+          | None -> d.td
+          | Some txt ->
+              let open_params =
+                T.DidOpenTextDocumentParams.create
+                  ~textDocument:(T.TextDocumentItem.create
+                                   ~uri
+                                   ~languageId:"jovial"
+                                   ~version:p.textDocument.version
+                                   ~text:txt)
+              in
+              Lsp.Text_document.make ~position_encoding:st.position_encoding open_params
       in
       d.td <- td';
-      d.analysis <- analyze_doc td';
-      publish_diagnostics ~uri ~version:p.textDocument.version d.analysis.diagnostics
+
+      let analysis = analyze_doc td' in
+      d.analysis <- analysis;
+      let diags = analysis.diagnostics in
+
+      let path = path_of_file_uri (uri_key uri) in
+      index_entry st ~uri ~path ~text:(Lsp.Text_document.text td');
+      rebuild_def_index st;
+
+      publish_diagnostics ~uri ~version:p.textDocument.version diags
 
 let did_close (st : t) (p : T.DidCloseTextDocumentParams.t) : T.PublishDiagnosticsParams.t =
   Hashtbl.remove st.docs (uri_key p.textDocument.uri);
   publish_diagnostics ~uri:p.textDocument.uri []
+
+(* ---------------- Hover / Definition / References ---------------- *)
 
 let hover (st : t) (p : T.HoverParams.t) : T.Hover.t option =
   match get_doc st p.textDocument.uri with
@@ -233,12 +432,12 @@ let hover (st : t) (p : T.HoverParams.t) : T.Hover.t option =
           | None -> None
           | Some s ->
               let code =
-                match s.Symbols.ty with
-                | None -> s.Symbols.name
-                | Some ty -> s.Symbols.name ^ " : " ^ ty
+                match Symbols.sym_ty s with
+                | None -> Symbols.sym_name s
+                | Some ty -> Symbols.sym_name s ^ " : " ^ ty
               in
               let body =
-                match s.Symbols.doc with
+                match Symbols.sym_doc s with
                 | None -> "```jovial\n" ^ code ^ "\n```"
                 | Some doc -> "```jovial\n" ^ code ^ "\n```\n\n" ^ doc
               in
@@ -247,7 +446,8 @@ let hover (st : t) (p : T.HoverParams.t) : T.Hover.t option =
                 (T.Hover.create
                    ~contents:(`MarkupContent mc)
                    ~range:(Symbols.symbol_name_range s)
-                   ()))
+                   ())
+    )
 
 let definition (st : t) (p : T.DefinitionParams.t) : T.Locations.t option =
   match get_doc st p.textDocument.uri with
@@ -257,77 +457,42 @@ let definition (st : t) (p : T.DefinitionParams.t) : T.Locations.t option =
       | None -> None
       | Some name ->
           let pn = proc_name_at d.td d.analysis p.position in
-          (* 1) Prefer a local resolution (proc locals/params).
-             2) Fall back to global symbols across *open* docs.
-             3) Return multiple locations if we find multiple definitions. *)
-          let locs =
-            match lookup_symbol d.analysis ~proc_name:pn name with
-            | Some s when s.Symbols.kind = Symbols.Local || s.Symbols.kind = Symbols.Param ->
-                let uri = Lsp.Text_document.documentUri d.td in
-                [ T.Location.create ~uri ~range:(Symbols.symbol_name_range s) ]
-            | Some _ | None ->
-                definitions_across_open_docs st ~name
-                |> locations_of_definitions
-          in
-          let locs = uniq_locations locs in
-          if locs = [] then None else Some (`Location locs))
+          match lookup_symbol d.analysis ~proc_name:pn name with
+          | Some s ->
+              let uri = Lsp.Text_document.documentUri d.td in
+              let loc = T.Location.create ~uri ~range:(Symbols.symbol_name_range s) in
+              Some (`Location [ loc ])
+          | None ->
+              (match Hashtbl.find_opt st.def_index name with
+               | None -> None
+               | Some items ->
+                   Some (`Location (List.rev_map (fun x -> x.loc) items)))
+    )
 
-let references (st : t) (p : T.ReferenceParams.t) : T.Location.t list option =
-  match get_doc st p.textDocument.uri with
-  | None -> None
-  | Some d -> (
-      match identifier_at_position d.td p.position with
-      | None -> None
+let references_at (st:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : T.Location.t list =
+  match get_doc st uri with
+  | None -> []
+  | Some d ->
+      match identifier_at_position d.td pos with
+      | None -> []
       | Some name ->
-          let include_decl = p.context.includeDeclaration in
-          let pn = proc_name_at d.td d.analysis p.position in
-          (* Resolve what kind of symbol this is (local vs global). *)
-          let resolved = lookup_symbol d.analysis ~proc_name:pn name in
-          let is_local =
-            match resolved with
-            | Some s -> s.Symbols.kind = Symbols.Local || s.Symbols.kind = Symbols.Param
-            | None -> false
-          in
+          let acc = ref [] in
+          Hashtbl.iter
+            (fun _ entry ->
+              match Hashtbl.find_opt entry.refs name with
+              | None -> ()
+              | Some ranges ->
+                  List.iter
+                    (fun r ->
+                      acc := T.Location.create ~uri:entry.uri ~range:r :: !acc)
+                    ranges)
+            st.ws_files;
+          List.rev !acc
 
-          let collect_in_doc (doc : doc) : T.Location.t list =
-            let uri = Lsp.Text_document.documentUri doc.td in
-            let text = Lsp.Text_document.text doc.td in
-            let rs = word_ranges_in_text ~text ~word:name in
-            (* If we resolved a local/param, try to restrict to the containing proc. *)
-            let rs =
-              match (resolved, pn) with
-              | Some s, Some _pn when (s.Symbols.kind = Symbols.Local || s.Symbols.kind = Symbols.Param) -> (
-                  match s.Symbols.container with
-                  | None -> rs
-                  | Some container_name -> (
-                      match Symbols.find doc.analysis.symbols container_name with
-                      | Some proc_sym when proc_sym.Symbols.kind = Symbols.Proc ->
-                          ranges_within doc.td ~outer:(Symbols.symbol_decl_range proc_sym) rs
-                      | _ -> rs))
-              | _ -> rs
-            in
-            rs |> List.map (fun range -> T.Location.create ~uri ~range)
-          in
+let references (st:t) (p:T.ReferenceParams.t) : T.Location.t list option =
+  Some (references_at st ~uri:p.textDocument.uri ~pos:p.position)
 
-          let refs =
-            if is_local then
-              (* locals/params: only this document (and preferably within the proc) *)
-              collect_in_doc d
-            else
-              (* globals: search across open docs *)
-              Hashtbl.fold (fun _k doc acc -> collect_in_doc doc @ acc) st.docs []
-          in
-
-          (* Optionally include declaration locations. *)
-          let refs =
-            if include_decl then
-              let defs = definitions_across_open_docs st ~name |> locations_of_definitions in
-              defs @ refs
-            else refs
-          in
-
-          let refs = uniq_locations refs in
-          Some refs)
+(* ---------------- Document symbols / Completion ---------------- *)
 
 let document_symbols (st : t) (p : T.DocumentSymbolParams.t) :
     [ `DocumentSymbol of T.DocumentSymbol.t list
@@ -340,7 +505,7 @@ let document_symbols (st : t) (p : T.DocumentSymbolParams.t) :
       let by_container : (string, Symbols.symbol list) Hashtbl.t = Hashtbl.create 32 in
       List.iter
         (fun s ->
-          match s.Symbols.container with
+          match Symbols.sym_container s with
           | None -> ()
           | Some c ->
               let prev = Option.value (Hashtbl.find_opt by_container c) ~default:[] in
@@ -349,20 +514,20 @@ let document_symbols (st : t) (p : T.DocumentSymbolParams.t) :
 
       let rec build (s : Symbols.symbol) : T.DocumentSymbol.t =
         let children =
-          Hashtbl.find_opt by_container s.Symbols.name
+          Hashtbl.find_opt by_container (Symbols.sym_name s)
           |> Option.map (fun xs -> xs |> List.rev |> List.map build)
         in
         T.DocumentSymbol.create
-          ~name:s.Symbols.name
-          ~kind:(symbol_kind s.Symbols.kind)
+          ~name:(Symbols.sym_name s)
+          ~kind:(symbol_kind (Symbols.sym_kind s))
           ~range:(Symbols.symbol_decl_range s)
           ~selectionRange:(Symbols.symbol_name_range s)
-          ?detail:s.Symbols.ty
+          ?detail:(Symbols.sym_ty s)
           ?children
           ()
       in
 
-      let tops = List.filter (fun s -> s.Symbols.container = None) syms |> List.rev in
+      let tops = List.filter (fun s -> Symbols.sym_container s = None) syms |> List.rev in
       Some (`DocumentSymbol (List.map build tops))
 
 let completion (st : t) (p : T.CompletionParams.t) :
@@ -381,19 +546,24 @@ let completion (st : t) (p : T.CompletionParams.t) :
       in
       let items =
         Symbols.all d.analysis.symbols
-        |> List.filter (fun s -> prefix = "" || starts_with ~prefix s.Symbols.name)
+        |> List.filter (fun s -> prefix = "" || starts_with ~prefix (Symbols.sym_name s))
         |> List.map (fun s ->
                let documentation =
-                 match s.Symbols.doc with
+                 match Symbols.sym_doc s with
                  | None -> None
                  | Some txt -> Some (`String txt)
                in
                T.CompletionItem.create
-                 ~label:s.Symbols.name
-                 ~kind:(completion_kind s.Symbols.kind)
-                 ?detail:s.Symbols.ty
+                 ~label:(Symbols.sym_name s)
+                 ~kind:(completion_kind (Symbols.sym_kind s))
+                 ?detail:(Symbols.sym_ty s)
                  ?documentation
                  ())
       in
       let cl = T.CompletionList.create ~isIncomplete:false ~items () in
       Some (`CompletionList cl)
+
+(* ---------------- Code actions (stub) ---------------- *)
+
+let code_actions_json (_st:t) ~uri:(_uri:T.DocumentUri.t) : Yojson.Safe.t =
+  `List []
