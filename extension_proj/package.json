@@ -1,51 +1,76 @@
 {
   "name": "jovial-lsp-client",
   "displayName": "Jovial Language Support",
-  "description": "Jovial parser integration",
+  "description": "VS Code client for the Jovial OCaml LSP server",
   "version": "0.0.1",
-  "engines": {
-    "vscode": "^1.75.0"
-  },
-  "activationEvents": [
-    "onLanguage:jovial"
+  "publisher": "your-name",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+   "activationEvents": [
+    "onLanguage:jovial",
+    "onCommand:jovial.dumpAstUi",
+    "onCommand:jovial.restartServer"
   ],
   "main": "./out/extension.js",
-  "contributes": 
-  {
+  "contributes": {
+    "languages": [
+      {
+        "id": "jovial",
+        "aliases": ["Jovial", "JOVIAL", "jovial"],
+        "extensions": [".jov", ".j73", ".jvl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jovial",
+        "scopeName": "source.jovial",
+        "path": "./syntaxes/jovial.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      { "command": "jovial.dumpAstUi", "title": "Jovial: Dump AST" },
+      { "command": "jovial.restartServer", "title": "Jovial: Restart Language Server" }
+    ],
     "configuration": {
-    "properties": {
-      "<ClientId>.trace.server": {
-        "type": "string",
-        "scope": "window",
-        "enum": ["off", "messages", "verbose"],
-        "default": "off",
-        "description": "Trace LSP communication between client and server."
+      "title": "Jovial LSP",
+      "properties": {
+        "jovial.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the Jovial LSP server executable (OCaml binary)."
+        },
+        "jovial.server.args": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "description": "Extra command-line args passed to the server."
+        },
+        "jovial.trace": {
+          "type": "string",
+          "default": "off",
+          "enum": ["off", "messages", "verbose"],
+          "description": "Trace LSP traffic in the client output channel."
+        },
+        "jovial.autostart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the language server automatically when a Jovial file is opened."
+        }
       }
     }
   },
-    "languages": [{
-      "id": "jovial",
-      "aliases": ["Jovial", "jovial"],
-      "extensions": [".j73"],
-      "configuration": "./language-configuration.json"
-    }],
-    "grammars": [{
-      "language": "jovial",
-      "scopeName": "source.jovial",
-      "path": "./syntaxes/jovial.tmLanguage.json"
-    }]
-  },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
-  },
-  "devDependencies": {
-    "@types/vscode": "^1.75.0",
-    "@types/node": "^16.x",
-    "typescript": "^4.9.0"
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
-    "vscode-languageclient": "^8.1.0"
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
   }
 }

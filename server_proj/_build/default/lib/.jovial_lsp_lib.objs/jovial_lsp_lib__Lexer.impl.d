@@ -1,1 +1,1 @@
-lib/lexer.ml: Buffer Char Hashtbl Lexing Parser Printf String
+lib/lexer.ml: Buffer Lexing Parser Printf String

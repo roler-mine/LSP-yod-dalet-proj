@@ -1,117 +1,225 @@
 "use strict";
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.deactivate = exports.activate = void 0;
-const vscode = require("vscode");
-const fs = require("fs");
+exports.activate = activate;
+exports.deactivate = deactivate;
+const vscode = __importStar(require("vscode"));
+const cp = __importStar(require("child_process"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
 const node_1 = require("vscode-languageclient/node");
 let client;
-function getServerPath() {
-    // Read from settings: "jovial.serverPath"
+function getConfig() {
     const cfg = vscode.workspace.getConfiguration("jovial");
-    const configured = cfg.get("C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\main.exe");
-    if (configured && configured.trim().length > 0)
-        return configured;
+    return {
+        serverPath: cfg.get("server.path", ""),
+        serverArgs: cfg.get("server.args", []),
+        autostart: cfg.get("autostart", true),
+    };
+}
+function resolveServerPath(context, configured) {
+    const cfg = (configured ?? "").trim();
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (cfg.length > 0) {
+        const expanded = wsRoot ? cfg.replace("${workspaceFolder}", wsRoot) : cfg;
+        if (path.isAbsolute(expanded))
+            return expanded;
+        if (wsRoot)
+            return path.join(wsRoot, expanded);
+        return context.asAbsolutePath(expanded);
+    }
+    const exe = process.platform === "win32" ? "jovial-lsp.exe" : "jovial-lsp";
+    const bundled = context.asAbsolutePath(path.join("server", exe));
+    if (fs.existsSync(bundled))
+        return bundled;
     return undefined;
 }
-function startClient(context) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const output = vscode.window.createOutputChannel("Jovial LSP");
-        const serverPath = "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\server_proj\\_build\\default\\bin\\Main.exe";
-        if (!serverPath) {
-            vscode.window.showErrorMessage("Jovial LSP: Missing server path. Set jovial.serverPath in settings.");
-            output.appendLine("Missing jovial.serverPath setting.");
-            output.show(true);
-            return;
-        }
-        if (!fs.existsSync(serverPath)) {
-            vscode.window.showErrorMessage(`Jovial LSP: Server not found at: ${serverPath}`);
-            output.appendLine(`Server not found: ${serverPath}`);
-            output.show(true);
-            return;
-        }
-        const serverOptions = {
-            run: { command: serverPath, args: [] },
-            debug: { command: serverPath, args: [] },
-        };
-        const clientOptions = {
-            documentSelector: [{ scheme: "file", language: "jovial" }],
-            outputChannel: output,
-            traceOutputChannel: output,
-            // You can also enable protocol trace via VS Code setting:
-            // "jovial.trace.server": "verbose" :contentReference[oaicite:2]{index=2}
-        };
-        client = new node_1.LanguageClient("jovialLsp", "Jovial LSP", serverOptions, clientOptions);
-        // vscode-languageclient start() is Disposable in older versions, Promise in newer versions. :contentReference[oaicite:3]{index=3}
-        const started = client.start();
-        if (started && typeof started.then === "function") {
-            yield started;
-        }
-        else if (started && typeof started.dispose === "function") {
-            context.subscriptions.push(started);
-        }
-        // Always stop on deactivate
-        context.subscriptions.push({ dispose: () => client === null || client === void 0 ? void 0 : client.stop() });
-        output.appendLine("Client started.");
-    });
+function setStatus(status, kind, detail) {
+    switch (kind) {
+        case "starting":
+            status.text = `$(sync~spin) Jovial LSP: starting…`;
+            status.color = "#ffd24d";
+            status.tooltip = detail ?? "Starting Jovial LSP (click to restart)";
+            break;
+        case "running":
+            status.text = `$(check) Jovial LSP: running`;
+            status.color = "#4dff88";
+            status.tooltip = detail ?? "Jovial LSP running (click to restart)";
+            break;
+        case "stopped":
+            status.text = `$(circle-slash) Jovial LSP: stopped`;
+            status.color = "#cccccc";
+            status.tooltip = detail ?? "Jovial LSP stopped (click to start)";
+            break;
+        case "error":
+            status.text = `$(error) Jovial LSP: error`;
+            status.color = "#ff4d4d";
+            status.tooltip = detail ?? "Jovial LSP error (click to restart)";
+            break;
+    }
 }
-function activate(context) {
-    return __awaiter(this, void 0, void 0, function* () {
-        yield startClient(context);
-        // Optional: on-demand parse/validate command (does NOT replace standard LSP diagnostics)
-        context.subscriptions.push(vscode.commands.registerCommand("jovial.debugParse", () => __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            if (!client) {
-                vscode.window.showErrorMessage("Jovial LSP: client not running.");
-                return;
-            }
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document.languageId !== "jovial") {
-                vscode.window.showInformationMessage("Open a Jovial file first.");
-                return;
-            }
-            const uri = editor.document.uri.toString();
-            const text = editor.document.getText();
-            try {
-                const res = yield client.sendRequest("jovial/parse", { uri, text });
-                // Expect: { status: "ok", diagnostics: [...] }
-                const diags = Array.isArray(res === null || res === void 0 ? void 0 : res.diagnostics) ? res.diagnostics : [];
-                if (diags.length === 0) {
-                    vscode.window.showInformationMessage("jovial/parse: no diagnostics.");
-                    return;
-                }
-                // Show a compact summary
-                const lines = diags.slice(0, 50).map((d) => {
-                    var _a, _b;
-                    const msg = (_a = d === null || d === void 0 ? void 0 : d.message) !== null && _a !== void 0 ? _a : "(no message)";
-                    const s = (_b = d === null || d === void 0 ? void 0 : d.range) === null || _b === void 0 ? void 0 : _b.start;
-                    const line = typeof (s === null || s === void 0 ? void 0 : s.line) === "number" ? s.line + 1 : "?";
-                    const col = typeof (s === null || s === void 0 ? void 0 : s.character) === "number" ? s.character + 1 : "?";
-                    return `(${line}:${col}) ${msg}`;
-                });
-                const doc = yield vscode.workspace.openTextDocument({
-                    content: lines.join("\n"),
-                    language: "text",
-                });
-                yield vscode.window.showTextDocument(doc, { preview: true });
-            }
-            catch (e) {
-                vscode.window.showErrorMessage(`jovial/parse failed: ${String((_a = e === null || e === void 0 ? void 0 : e.message) !== null && _a !== void 0 ? _a : e)}`);
-            }
-        })));
-    });
+async function stopClient(status) {
+    if (!client) {
+        setStatus(status, "stopped");
+        return;
+    }
+    const c = client;
+    client = undefined;
+    try {
+        await c.stop();
+    }
+    finally {
+        setStatus(status, "stopped");
+    }
 }
-exports.activate = activate;
-function deactivate() {
-    return client ? client.stop() : undefined;
+async function startClient(context, output, status) {
+    const cfg = getConfig();
+    const serverPath = resolveServerPath(context, cfg.serverPath);
+    output.appendLine(`Resolved server path: ${serverPath ?? "<none>"}`);
+    if (!serverPath || !fs.existsSync(serverPath)) {
+        setStatus(status, "error", "Server executable not found. Set jovial.server.path.");
+        vscode.window.showErrorMessage("Jovial LSP: server executable not found. Set jovial.server.path in Settings (can be relative to workspace).");
+        return;
+    }
+    setStatus(status, "starting", `Starting: ${serverPath}`);
+    if (client) {
+        await stopClient(status);
+    }
+    output.appendLine(`Starting Jovial LSP: ${serverPath}`);
+    const serverOptions = async () => {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const child = cp.spawn(serverPath, cfg.serverArgs, {
+            cwd: workspaceRoot,
+            env: { ...process.env },
+            windowsHide: true,
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => output.appendLine(chunk.toString()));
+        child.on("exit", (code, signal) => {
+            output.appendLine(`Jovial LSP exited: code=${code} signal=${signal}`);
+            setStatus(status, "stopped", `Exited: code=${code} signal=${signal}`);
+        });
+        child.on("error", (err) => {
+            output.appendLine(`Failed to start Jovial LSP: ${String(err)}`);
+            setStatus(status, "error", `Failed to start: ${String(err)}`);
+        });
+        return { reader: child.stdout, writer: child.stdin };
+    };
+    const clientOptions = {
+        documentSelector: [
+            { scheme: "file", language: "jovial" },
+            { scheme: "untitled", language: "jovial" },
+        ],
+        outputChannel: output,
+        errorHandler: {
+            error: (error, message, count) => {
+                output.appendLine(`Client error (${count ?? 0}): ${message ?? ""} ${String(error)}`);
+                return { action: node_1.ErrorAction.Continue };
+            },
+            closed: () => {
+                output.appendLine("Client closed: not restarting automatically.");
+                setStatus(status, "stopped", "Client closed (not restarting automatically).");
+                return { action: node_1.CloseAction.DoNotRestart };
+            },
+        },
+    };
+    // IMPORTANT: keep the client id stable; VS Code uses it for tracing settings keys.
+    client = new node_1.LanguageClient("jovialLsp", "Jovial Language Server", serverOptions, clientOptions);
+    try {
+        await client.start();
+        output.appendLine("Jovial LSP client started.");
+        setStatus(status, "running", `Server: ${serverPath}`);
+    }
+    catch (e) {
+        output.appendLine(`Client failed to start: ${String(e)}`);
+        setStatus(status, "error", `Client failed to start: ${String(e)}`);
+    }
 }
-exports.deactivate = deactivate;
+async function dumpAstUi(output) {
+    if (!client) {
+        vscode.window.showWarningMessage("Jovial LSP is not running.");
+        return;
+    }
+    const editor = vscode.window.activeTextEditor;
+    if (!editor)
+        return;
+    const uri = editor.document.uri.toString();
+    // Call the *server* command name here:
+    const params = {
+        command: "jovial.dumpAst",
+        arguments: [uri],
+    };
+    const res = await client.sendRequest(node_1.ExecuteCommandRequest.type, params);
+    const text = typeof res === "string" ? res : JSON.stringify(res, null, 2);
+    const doc = await vscode.workspace.openTextDocument({ content: text, language: "plaintext" });
+    await vscode.window.showTextDocument(doc, { preview: true });
+}
+async function activate(context) {
+    const output = vscode.window.createOutputChannel("Jovial LSP");
+    context.subscriptions.push(output);
+    const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    status.command = "jovial.restartServer";
+    status.show();
+    context.subscriptions.push(status);
+    setStatus(status, "stopped", "Click to start / restart Jovial LSP");
+    // UI command (renamed) — does NOT collide with languageclient’s auto registration
+    context.subscriptions.push(vscode.commands.registerCommand("jovial.dumpAstUi", async () => {
+        try {
+            await dumpAstUi(output);
+        }
+        catch (e) {
+            output.appendLine(`dumpAstUi failed: ${String(e)}`);
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand("jovial.restartServer", async () => {
+        try {
+            await startClient(context, output, status);
+        }
+        catch (e) {
+            output.appendLine(`restart failed: ${String(e)}`);
+            setStatus(status, "error", `restart failed: ${String(e)}`);
+        }
+    }));
+    context.subscriptions.push({ dispose: () => { void stopClient(status); } });
+    if (getConfig().autostart) {
+        await startClient(context, output, status);
+    }
+}
+async function deactivate() {
+    if (client)
+        await client.stop();
+}
 //# sourceMappingURL=extension.js.map

@@ -1,30 +1,115 @@
 {
-    "scopeName": "source.jovial",
-    "patterns": [
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Jovial",
+  "scopeName": "source.jovial",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#operators" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
         {
-            "name": "comment.block.jovial",
-            "begin": "\"",
-            "end": "\""
+          "name": "comment.line.double-slash.jovial",
+          "begin": "//",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "end": "$\\n?",
+          "patterns": []
         },
         {
-            "name": "comment.line.percentage.jovial",
-            "match": "%.*%"
+          "name": "comment.block.c.jovial",
+          "begin": "/\\*",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "end": "\\*/",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "patterns": []
         },
         {
-            "name": "keyword.control.jovial",
-            "match": "\\b(START|TERM|PROGRAM|COMPOOL|PROC|PROCEDURE|FUNCTION|BEGIN|END|IF|THEN|ELSE|FOR|WHILE|CASE|DEFAULT|EXIT|GOTO|RETURN|STOP|ABORT)\\b"
+          "name": "comment.block.ocaml.jovial",
+          "begin": "\\(\\*",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "end": "\\*\\)",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "patterns": []
         },
         {
-            "name": "storage.type.jovial",
-            "match": "\\b(ITEM|TABLE|BLOCK|TYPE|CONSTANT|BIT|BITSIZE|BYTESIZE|WORDSIZE)\\b"
+          "name": "comment.block.percent.jovial",
+          "begin": "%",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "end": "%",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "patterns": []
         },
         {
-            "name": "constant.numeric.jovial",
-            "match": "\\b[0-9]+\\b"
-        },
-        {
-            "name": "variable.parameter.jovial",
-            "match": "\\b[a-zA-Z][a-zA-Z0-9]*\\b"
+          "name": "comment.block.quote.jovial",
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
+          "patterns": []
         }
-    ]
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.jovial",
+          "begin": "'",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.jovial" } },
+          "end": "'",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.jovial" } },
+          "patterns": [
+            {
+              "name": "constant.character.escape.apostrophe.jovial",
+              "match": "''"
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.float.jovial", "match": "\\b(?:\\d+\\.\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?\\b" },
+        { "name": "constant.numeric.float.jovial", "match": "\\b\\d+(?:[eE][+-]?\\d+)\\b" },
+        { "name": "constant.numeric.integer.jovial", "match": "\\b\\d+\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.jovial",
+          "match": "\\b(?i:(START|TERM|BEGIN|END|IF|ELSE|WHILE|FOR|BY|CASE|DEFAULT|GOTO|RETURN|EXIT|ABORT|STOP))\\b"
+        },
+        {
+          "name": "keyword.declaration.jovial",
+          "match": "\\b(?i:(DEF|REF|PROC|ITEM|TABLE))\\b"
+        },
+        {
+          "name": "constant.language.boolean.jovial",
+          "match": "\\b(?i:(TRUE|FALSE))\\b"
+        },
+        {
+          "name": "keyword.operator.word.jovial",
+          "match": "\\b(?i:(NOT|AND|OR|XOR|EQV|MOD))\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.jovial", "match": "(<>|<=|>=|\\*\\*|=|<|>|\\+|-|\\*|/|\\^|@|\\.|,|;|:|\\(|\\))" }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "variable.other.identifier.jovial",
+          "match": "\\b[A-Za-z_$][A-Za-z0-9_$']*\\b"
+        }
+      ]
+    }
+  }
 }

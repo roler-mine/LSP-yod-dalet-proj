@@ -1,5 +1,4 @@
 {
-    "JovialLsp.trace.server": "verbose",
     "ocaml.sandbox": {
         "kind": "opam",
         "switch": "5.2.0"

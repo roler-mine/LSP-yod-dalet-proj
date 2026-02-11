@@ -1,1 +1,1 @@
-lib/parser.ml: Ast Lexing Printf
+lib/parser.ml: Ast List MenhirLib Obj

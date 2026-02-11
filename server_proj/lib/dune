@@ -2,7 +2,9 @@
  (name jovial_lsp_lib)
  (libraries
   lsp
+  str
   jsonrpc
+  menhirLib
   yojson
   logs
   fmt))
@@ -10,4 +12,5 @@
 (ocamllex lexer)
 
 (menhir
- (modules parser))
+ (modules parser)
+ (flags (--table --inspection --explain)))

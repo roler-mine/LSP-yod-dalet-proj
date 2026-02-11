@@ -1,208 +1,169 @@
-(* lib/lexer.mll — JOVIAL J73-ish lexer for Menhir *)
-
 {
+  (* lib/lexer.mll *)
+
   open Parser
 
-  exception Lexing_error of string
+  exception Lex_error of string * Lexing.position * Lexing.position
 
-  (* After a directive introducer (@ or !) we treat the next identifier as a directive name. *)
-  let in_directive : bool ref = ref false
+  let error lexbuf msg =
+    raise (Lex_error (msg, Lexing.lexeme_start_p lexbuf, Lexing.lexeme_end_p lexbuf))
 
-  (* Keyword table (case-insensitive). *)
-  let kw : (string, Parser.token) Hashtbl.t = Hashtbl.create 256
-  let add k v = Hashtbl.replace kw k v
+  (* Case-insensitive keyword lookup. Keep this list aligned with %token keywords in parser.mly. *)
+  let kw s : Parser.token option =
+    match String.uppercase_ascii s with
+    | "START"   -> Some START
+    | "TERM"    -> Some TERM
+    | "BEGIN"   -> Some BEGIN
+    | "END"     -> Some END
 
-  let () =
-    (* module framing / kinds *)
-    add "START" START;
-    add "TERM" TERM;
-    add "PROGRAM" PROGRAM;
-    add "COMPOOL" COMPOOL;
-    add "ICOMPOOL" ICOMPOOL;
+    | "DEF"     -> Some DEF
+    | "REF"     -> Some REF
+    | "PROC"    -> Some PROC
 
-    (* linkage / subroutines *)
-    add "DEF" DEF;
-    add "REF" REF;
-    add "PROC" PROC;
-    add "FUNCTION" FUNCTION;
+    | "ITEM"    -> Some ITEM
+    | "TABLE"   -> Some TABLE
 
-    (* blocks / declarations *)
-    add "BEGIN" BEGIN;
-    add "END" END;
-    add "ITEM" ITEM;
-    add "TABLE" TABLE;
-    add "STATUS" STATUS;
-    add "TYPE" TYPE;
-    add "BLOCK" BLOCK;
+    | "IF"      -> Some IF
+    | "ELSE"    -> Some ELSE
+    | "WHILE"   -> Some WHILE
+    | "FOR"     -> Some FOR
+    | "BY"      -> Some BY
 
-    (* control flow *)
-    add "IF" IF;
-    add "THEN" THEN;
-    add "ELSE" ELSE;
-    add "ELSIF" ELSIF;
-    add "FOR" FOR;
-    add "BY" BY;
-    add "WHILE" WHILE;
-    add "TO" TO;
-    add "CASE" CASE;
-    add "OF" OF;
-    add "WHEN" WHEN;
-    add "OTHERWISE" OTHERWISE;
-    add "GOTO" GOTO;
-    add "RETURN" RETURN;
-    add "EXIT" EXIT;
-    add "STOP" STOP;
-    add "ABORT" ABORT;
-    add "FALLTHRU" FALLTHRU;
+    | "CASE"    -> Some CASE
+    | "DEFAULT" -> Some DEFAULT
 
-    (* decl attributes / misc *)
-    add "DEFAULT" DEFAULT;
-    add "DEFINE" DEFINE;
-    add "INLINE" INLINE;
-    add "INSTANCE" INSTANCE;
-    add "LABEL" LABEL;
-    add "LIKE" LIKE;
-    add "OVERLAY" OVERLAY;
-    add "POS" POS;
-    add "RENT" RENT;
-    add "REC" REC;
-    add "REP" REP;
-    add "WITH" WITH;
-    add "STATIC" STATIC;
-    add "CONSTANT" CONSTANT;
-    add "PARALLEL" PARALLEL;
+    | "EXIT"    -> Some EXIT
+    | "GOTO"    -> Some GOTO
+    | "RETURN"  -> Some RETURN
+    | "ABORT"   -> Some ABORT
+    | "STOP"    -> Some STOP
 
-    (* explicit parameter binding *)
-    add "BYREF" BYREF;
-    add "BYVAL" BYVAL;
-    add "BYRES" BYRES;
+    | "TRUE"    -> Some TRUE
+    | "FALSE"   -> Some FALSE
 
-    (* literals *)
-    add "NULL" NULL;
-    add "TRUE" TRUE;
-    add "FALSE" FALSE;
+    | "NOT"     -> Some NOT
+    | "AND"     -> Some AND
+    | "OR"      -> Some OR
+    | "XOR"     -> Some XOR
+    | "EQV"     -> Some EQV
 
-    (* boolean / bit ops *)
-    add "AND" AND;
-    add "OR" OR;
-    add "NOT" NOT;
-    add "XOR" XOR;
-    add "EQV" EQV;
-    add "MOD" MOD;
+    | "MOD"     -> Some MOD
+    | _         -> None
 
-    (* word-relops *)
-    add "EQ" EQ;
-    add "NQ" NQ;
-    add "LS" LS;
-    add "LQ" LQ;
-    add "GR" GR;
-    add "GQ" GQ
-
-  let is_type_atom (u : string) : bool =
-    (* Heuristic: single-letter type atoms. *)
-    String.length u = 1 &&
-    match u.[0] with
-    | 'U' | 'S' | 'F' | 'A' | 'B' | 'C' | 'P' | 'V' -> true
-    | _ -> false
-
-  let bump_line (lexbuf : Lexing.lexbuf) = Lexing.new_line lexbuf
+  let mk_id s =
+    match kw s with
+    | Some t -> t
+    | None -> ID s
 }
 
-let digit      = ['0'-'9']
-let alpha      = ['A'-'Z' 'a'-'z']
-let id_start   = alpha | ['$']
-let id_char    = alpha | digit | ['$' '_' '\'']
-let ws         = [' ' '\t' '\r']
-let nl         = '\n'
+let digit = ['0'-'9']
+let alpha = ['A'-'Z''a'-'z']
+
+(* J73-ish names:
+   start: letter or '$' (allow '_' as extension)
+   body : letters digits '$' '_' and PRIME '
+*)
+let name_start = alpha | '$' | '_'
+let name_char  = alpha | digit | '$' | '_' | '\''
+
+let ws = [' ' '\t' '\r']
+let nl = '\n'
+
+let exp = ['e''E'] ['+''-']? digit+
+let float1 = digit+ '.' digit* exp?
+let float2 = '.' digit+ exp?
+let float3 = digit+ exp
 
 rule token = parse
-| ws+ { token lexbuf }
-| '\n' { bump_line lexbuf; token lexbuf }
+  | ws+                 { token lexbuf }
+  | nl                  { Lexing.new_line lexbuf; token lexbuf }
 
-  (* Comments: " ... " and % ... % *)
-| '"' { comment_quote lexbuf; token lexbuf }
-| '%' { comment_percent lexbuf; token lexbuf }
+  (* JOVIAL comment forms *)
+  | '"'                 { dq_comment lexbuf; token lexbuf }
+  | '%'                 { pct_comment lexbuf; token lexbuf }
 
-  (* directives: @NAME ... ;   (also accept !NAME ... ;) *)
-| ('@' | '!') { in_directive := true; BANG }
-
-  (* bead constant: 1B'V' .. 5B'V' *)
-| (['1'-'5'] as n) ('B'|'b') '\'' (['0'-'9' 'A'-'V' 'a'-'v'] as v) '\''
-    {
-      let bits = (Char.code n) - (Char.code '0') in
-      let c =
-        if v >= 'a' && v <= 'v' then Char.chr (Char.code v - 32) else v
-      in
-      BEAD (bits, String.make 1 c)
-    }
-
-  (* floats: 123. , 123.45 , .45 , 1e3 , 1.2e-3 *)
-| digit+ '.' digit* (['E''e'] ['+''-']? digit+)? as f { FLOAT (float_of_string f) }
-| '.' digit+ (['E''e'] ['+''-']? digit+)? as f         { FLOAT (float_of_string f) }
-| digit+ ['E''e'] ['+''-']? digit+ as f                { FLOAT (float_of_string f) }
-
-  (* ints *)
-| digit+ as i { INT (int_of_string i) }
-
-  (* strings: '...' with doubled '' => ' *)
-| '\'' { let b = Buffer.create 32 in STRING (string_lit b lexbuf) }
+  (* extra comment forms *)
+  | "/*"                { c_comment 1 lexbuf; token lexbuf }
+  | "(*"                { p_comment 1 lexbuf; token lexbuf }
+  | "//" [^ '\n']*      { token lexbuf }
 
   (* punctuation *)
-| '(' { LPAREN }
-| ')' { RPAREN }
-| '[' { LBRACK }
-| ']' { RBRACK }
-| ',' { COMMA }
-| ';' { SEMI }
-| ':' { COLON }
+  | '('                 { LPAREN }
+  | ')'                 { RPAREN }
+  | ','                 { COMMA }
+  | ';'                 { SEMI }
+  | ':'                 { COLON }
+  | '.'                 { DOT }
+  | '!'                 { BANG }
+  | '@'                 { AT }
 
-  (* operators / relations *)
-| "<=" { LE }
-| ">=" { GE }
-| "<>" { NEQ }
-| '<'  { LT }
-| '>'  { GT }
-| '='  { EQUAL }
+  (* multi-char ops *)
+  | "<>"                { NE }
+  | "<="                { LE }
+  | ">="                { GE }
+  | "**"                { POW }
 
-| '+' { PLUS }
-| '-' { MINUS }
-| '*' { STAR }
-| '/' { SLASH }
+  (* single-char ops *)
+  | '='                 { EQ }
+  | '<'                 { LT }
+  | '>'                 { GT }
+  | '+'                 { PLUS }
+  | '-'                 { MINUS }
+  | '*'                 { STAR }
+  | '/'                 { SLASH }
+  | '^'                 { POW }
 
-  (* identifiers / keywords *)
-| id_start id_char* as raw
-    {
-      let u = String.uppercase_ascii raw in
-      if !in_directive then (
-        in_directive := false;
-        DIRECTIVE_NAME u
-      ) else if is_type_atom u then
-        TYPEATOM u
-      else
-        match Hashtbl.find_opt kw u with
-        | Some tok -> tok
-        | None -> IDENT raw
-    }
+  (* numbers *)
+  | float1 as s         { FLOATLIT s }
+  | float2 as s         { FLOATLIT s }
+  | float3 as s         { FLOATLIT s }
+  | digit+ as s         { INTLIT s }
 
-| eof { EOF }
+  (* JOVIAL '...' literal:
+     - '' inside becomes '
+     - if length==1 => CHARLIT
+     - else => STRINGLIT
+  *)
+  | '\''                {
+                           let s = read_squoted (Buffer.create 32) lexbuf in
+                           if String.length s = 1 then CHARLIT s.[0] else STRINGLIT s
+                         }
 
-| _ as c { raise (Lexing_error (Printf.sprintf "Unexpected char: %C" c)) }
+  (* identifiers/keywords *)
+  | name_start name_char* as s { mk_id s }
 
-and comment_quote = parse
-| '"'  { () }
-| nl   { bump_line lexbuf; comment_quote lexbuf }
-| eof  { () }
-| _    { comment_quote lexbuf }
+  | eof                 { EOF }
+  | _ as c              { error lexbuf (Printf.sprintf "unexpected character: %C" c) }
 
-and comment_percent = parse
-| '%'  { () }
-| nl   { bump_line lexbuf; comment_percent lexbuf }
-| eof  { () }
-| _    { comment_percent lexbuf }
+and dq_comment = parse
+  | '"'                 { () }
+  | nl                  { Lexing.new_line lexbuf; dq_comment lexbuf }
+  | eof                 { error lexbuf "unterminated \"...\" comment" }
+  | _                   { dq_comment lexbuf }
 
-and string_lit buf = parse
-| '\''  { Buffer.contents buf }
-| "''"  { Buffer.add_char buf '\''; string_lit buf lexbuf }
-| nl    { bump_line lexbuf; raise (Lexing_error "Unterminated string literal") }
-| eof   { raise (Lexing_error "Unterminated string literal") }
-| _ as c { Buffer.add_char buf c; string_lit buf lexbuf }
+and pct_comment = parse
+  | '%'                 { () }
+  | nl                  { Lexing.new_line lexbuf; pct_comment lexbuf }
+  | eof                 { error lexbuf "unterminated %...% comment" }
+  | _                   { pct_comment lexbuf }
+
+and c_comment depth = parse
+  | "/*"                { c_comment (depth + 1) lexbuf }
+  | "*/"                { if depth = 1 then () else c_comment (depth - 1) lexbuf }
+  | nl                  { Lexing.new_line lexbuf; c_comment depth lexbuf }
+  | eof                 { error lexbuf "unterminated /* ... */ comment" }
+  | _                   { c_comment depth lexbuf }
+
+and p_comment depth = parse
+  | "(*"                { p_comment (depth + 1) lexbuf }
+  | "*)"                { if depth = 1 then () else p_comment (depth - 1) lexbuf }
+  | nl                  { Lexing.new_line lexbuf; p_comment depth lexbuf }
+  | eof                 { error lexbuf "unterminated (* ... *) comment" }
+  | _                   { p_comment depth lexbuf }
+
+and read_squoted buf = parse
+  | "''"                { Buffer.add_char buf '\''; read_squoted buf lexbuf }
+  | '\''                { Buffer.contents buf }
+  | nl                  { Lexing.new_line lexbuf; Buffer.add_char buf '\n'; read_squoted buf lexbuf }
+  | eof                 { error lexbuf "unterminated '...' literal" }
+  | _ as c              { Buffer.add_char buf c; read_squoted buf lexbuf }
