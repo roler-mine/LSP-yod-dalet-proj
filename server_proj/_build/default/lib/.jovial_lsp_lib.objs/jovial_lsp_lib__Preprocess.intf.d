@@ -1,1 +1,1 @@
-lib/preprocess.mli: Ast Lsp
+lib/syntax/preprocess.mli: Ast Lsp

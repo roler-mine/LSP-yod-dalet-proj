@@ -1,1 +1,1 @@
-lib/workspace_index.ml: Array Filename Hashtbl List Preprocess String Sys
+lib/workspace/workspace_index.ml: Array Filename Hashtbl List Preprocess String Sys

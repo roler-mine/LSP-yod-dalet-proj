@@ -1,1 +1,1 @@
-lib/lsp_io.ml: String Yojson
+lib/lsp/lsp_io.ml: String Yojson

@@ -1,1 +1,1 @@
-lib/ast.mli: Format Lexing
+lib/syntax/ast.mli: Format Lexing

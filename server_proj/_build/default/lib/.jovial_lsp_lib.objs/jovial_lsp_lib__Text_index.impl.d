@@ -1,1 +1,1 @@
-lib/text_index.ml: Array String
+lib/workspace/text_index.ml: Array String

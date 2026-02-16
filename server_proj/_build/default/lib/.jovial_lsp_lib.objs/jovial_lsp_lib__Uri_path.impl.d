@@ -1,1 +1,1 @@
-lib/uri_path.ml: Buffer Char Lsp String Sys
+lib/workspace/uri_path.ml: Buffer Char Lsp String Sys

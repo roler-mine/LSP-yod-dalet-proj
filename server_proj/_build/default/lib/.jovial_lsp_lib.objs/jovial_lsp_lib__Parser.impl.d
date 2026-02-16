@@ -1,1 +1,1 @@
-lib/parser.ml: Ast List MenhirLib Obj Parse_diags Printf String
+lib/syntax/parser.ml: Ast List MenhirLib Obj Parse_diags Printf String

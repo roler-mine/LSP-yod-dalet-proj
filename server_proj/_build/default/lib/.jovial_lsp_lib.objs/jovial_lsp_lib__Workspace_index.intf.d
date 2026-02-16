@@ -1,1 +1,1 @@
-lib/workspace_index.mli:
+lib/workspace/workspace_index.mli:

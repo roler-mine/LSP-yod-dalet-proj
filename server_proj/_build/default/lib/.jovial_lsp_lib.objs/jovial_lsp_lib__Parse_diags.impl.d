@@ -1,1 +1,1 @@
-lib/parse_diags.ml: Ast List
+lib/syntax/parse_diags.ml: Ast List

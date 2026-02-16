@@ -1,1 +1,1 @@
-lib/parse.mli: Ast Lsp Parser
+lib/syntax/parse.mli: Ast Lsp Parser

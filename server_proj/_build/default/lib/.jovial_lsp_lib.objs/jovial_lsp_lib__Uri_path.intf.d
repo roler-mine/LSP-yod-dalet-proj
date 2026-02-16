@@ -1,1 +1,1 @@
-lib/uri_path.mli: Lsp
+lib/workspace/uri_path.mli: Lsp

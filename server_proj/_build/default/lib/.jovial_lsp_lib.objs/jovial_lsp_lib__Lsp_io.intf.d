@@ -1,1 +1,1 @@
-lib/lsp_io.mli: Yojson
+lib/lsp/lsp_io.mli: Yojson

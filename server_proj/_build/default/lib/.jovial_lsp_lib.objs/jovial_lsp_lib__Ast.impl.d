@@ -1,1 +1,1 @@
-lib/ast.ml: Format Lexing
+lib/syntax/ast.ml: Format Lexing

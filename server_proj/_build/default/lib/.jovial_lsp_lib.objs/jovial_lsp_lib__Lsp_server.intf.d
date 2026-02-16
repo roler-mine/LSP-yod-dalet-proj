@@ -1,1 +1,1 @@
-lib/lsp_server.mli:
+lib/lsp/lsp_server.mli:

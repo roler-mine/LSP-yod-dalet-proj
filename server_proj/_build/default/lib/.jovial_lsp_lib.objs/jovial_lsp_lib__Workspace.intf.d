@@ -1,1 +1,1 @@
-lib/workspace.mli: Lsp Yojson
+lib/workspace/workspace.mli: Lsp Yojson

@@ -1,1 +1,1 @@
-lib/parse_diags.mli: Ast
+lib/syntax/parse_diags.mli: Ast
