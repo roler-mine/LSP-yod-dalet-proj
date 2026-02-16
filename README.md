@@ -95,7 +95,7 @@ Recommended workspace setting (`.vscode/settings.json`):
 
 ```json
 {
-  "jovial.server.path": "${workspaceFolder}\\server_proj\\_build\\default\\bin\\Main.exe",
+  "jovial.server.path": "\\server_proj\\_build\\default\\bin\\Main.exe",
   "jovial.server.args": [],
   "jovial.autostart": true
 }
