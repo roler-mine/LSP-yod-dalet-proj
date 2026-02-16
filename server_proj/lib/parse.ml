@@ -1,3 +1,5 @@
+(* lib/parse.ml *)
+
 module T = Lsp.Types
 module I = Parser.MenhirInterpreter
 
@@ -24,12 +26,18 @@ let attach_file (file : string option) (loc : Ast.Loc.t) : Ast.Loc.t =
   | Some f, None -> { loc with Ast.Loc.file = Some f }
   | _ -> loc
 
-let diag_error (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
+let diag ~sev ~source (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
   Lsp_conv.diagnostic
-    ~severity:T.DiagnosticSeverity.Error
-    ~source:"parse"
+    ~severity:sev
+    ~source
     ~message:msg
     loc
+
+let diag_error (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
+  diag ~sev:T.DiagnosticSeverity.Error ~source:"parse" loc msg
+
+let diag_warn (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
+  diag ~sev:T.DiagnosticSeverity.Warning ~source:"parse" loc msg
 
 module Debug = struct
   let string_of_token (t : Parser.token) : string =
@@ -39,27 +47,30 @@ module Debug = struct
     | Parser.INTLIT _ -> "INTLIT"
     | Parser.FLOATLIT _ -> "FLOATLIT"
     | Parser.STRINGLIT _ -> "STRINGLIT"
+    | Parser.TRUE -> "TRUE"
+    | Parser.FALSE -> "FALSE"
 
     | Parser.START -> "START" | Parser.TERM -> "TERM" | Parser.BEGIN -> "BEGIN" | Parser.END -> "END"
-    | Parser.DEF -> "DEF" | Parser.REF -> "REF" | Parser.PROC -> "PROC" | Parser.ITEM -> "ITEM" | Parser.TABLE -> "TABLE"
-    | Parser.IF -> "IF" | Parser.ELSE -> "ELSE" | Parser.WHILE -> "WHILE" | Parser.FOR -> "FOR" | Parser.BY -> "BY"
+    | Parser.DEF -> "DEF" | Parser.REF -> "REF" | Parser.PROC -> "PROC"
+    | Parser.ITEM -> "ITEM" | Parser.TABLE -> "TABLE"
+    | Parser.IF -> "IF" | Parser.ELSE -> "ELSE" | Parser.WHILE -> "WHILE" | Parser.FOR -> "FOR" | Parser.BY -> "BY" | Parser.THEN -> "THEN"
     | Parser.CASE -> "CASE" | Parser.DEFAULT -> "DEFAULT"
-    | Parser.EXIT -> "EXIT" | Parser.GOTO -> "GOTO" | Parser.RETURN -> "RETURN"
-    | Parser.ABORT -> "ABORT" | Parser.STOP -> "STOP"
-    | Parser.TRUE -> "TRUE" | Parser.FALSE -> "FALSE"
-    | Parser.NOT -> "NOT" | Parser.AND -> "AND" | Parser.OR -> "OR" | Parser.XOR -> "XOR"
-    | Parser.EQV -> "EQV" | Parser.MOD -> "MOD"
+    | Parser.EXIT -> "EXIT" | Parser.GOTO -> "GOTO" | Parser.RETURN -> "RETURN" | Parser.ABORT -> "ABORT" | Parser.STOP -> "STOP"
+    | Parser.PROGRAM -> "PROGRAM" | Parser.COMPOOL -> "COMPOOL" | Parser.ICOMPOOL -> "ICOMPOOL"
+    | Parser.DEFINE -> "DEFINE" | Parser.TYPE -> "TYPE" | Parser.BLOCK -> "BLOCK"
+
+    | Parser.NOT -> "NOT" | Parser.AND -> "AND" | Parser.OR -> "OR" | Parser.XOR -> "XOR" | Parser.EQV -> "EQV"
+    | Parser.MOD -> "MOD"
 
     | Parser.LPAREN -> "(" | Parser.RPAREN -> ")"
     | Parser.COMMA -> "," | Parser.SEMI -> ";" | Parser.COLON -> ":" | Parser.DOT -> "."
     | Parser.BANG -> "!" | Parser.AT -> "@"
+    | Parser.CONV_L -> "(*" | Parser.CONV_R -> "*)"
 
     | Parser.EQ -> "=" | Parser.LT -> "<" | Parser.GT -> ">"
     | Parser.LE -> "<=" | Parser.GE -> ">=" | Parser.NE -> "<>"
     | Parser.PLUS -> "+" | Parser.MINUS -> "-" | Parser.STAR -> "*"
     | Parser.SLASH -> "/" | Parser.POW -> "^"
-
-    | _ -> "<token>"
 end
 
 let take n xs =
@@ -89,20 +100,22 @@ let expected_candidates : Parser.token list =
 
     Parser.START; Parser.TERM; Parser.BEGIN; Parser.END;
     Parser.DEF; Parser.REF; Parser.PROC; Parser.ITEM; Parser.TABLE;
-    Parser.IF; Parser.ELSE; Parser.WHILE; Parser.FOR; Parser.BY;
+    Parser.PROGRAM; Parser.COMPOOL; Parser.ICOMPOOL; Parser.DEFINE; Parser.TYPE; Parser.BLOCK;
+    Parser.IF; Parser.ELSE; Parser.WHILE; Parser.FOR; Parser.BY; Parser.THEN;
     Parser.CASE; Parser.DEFAULT;
     Parser.RETURN; Parser.EXIT; Parser.GOTO; Parser.ABORT; Parser.STOP;
     Parser.TRUE; Parser.FALSE;
     Parser.NOT; Parser.AND; Parser.OR; Parser.XOR; Parser.EQV; Parser.MOD;
 
     Parser.LPAREN; Parser.RPAREN; Parser.COMMA; Parser.SEMI; Parser.COLON; Parser.DOT; Parser.BANG; Parser.AT;
+    Parser.CONV_L; Parser.CONV_R;
     Parser.EQ; Parser.LT; Parser.GT; Parser.LE; Parser.GE; Parser.NE;
     Parser.PLUS; Parser.MINUS; Parser.STAR; Parser.SLASH; Parser.POW;
 
     Parser.EOF;
   ]
 
-(* Menhir signature (table+inspection build):
+(* Menhir (table+inspection):
    acceptable : checkpoint -> token -> position -> bool *)
 let expected_tokens_hint (chk : 'a I.checkpoint) (pos : Lexing.position) : string list =
   expected_candidates
@@ -112,13 +125,13 @@ let expected_tokens_hint (chk : 'a I.checkpoint) (pos : Lexing.position) : strin
   |> uniq_sorted
   |> take 12
 
-let take_recovery_diags (file : string option) : T.Diagnostic.t list =
-  Parser.take_diags ()
-  |> List.map (fun (loc, msg) -> diag_error (attach_file file loc) msg)
+let parse_diags_to_lsp ~(file:string option) : T.Diagnostic.t list =
+  Parse_diags.take ()
+  |> List.map (fun (loc, msg) -> diag_warn (attach_file file loc) msg)
 
 let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
-  (* Clear any stale parser diags from previous runs. *)
-  ignore (Parser.take_diags ());
+  (* Clear stale recovery/warn diags from previous runs *)
+  Parse_diags.clear ();
 
   if String.trim text = "" then
     { ast = None; diags = []; ast_dump = None }
@@ -131,21 +144,35 @@ let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
          let p = lexbuf.lex_curr_p in
          lexbuf.lex_curr_p <- { p with pos_fname = f });
 
+    (* Track the most recent token + span + lexeme so HandlingError can report accurately. *)
     let last_tok : Parser.token option ref = ref None in
     let last_sp  : Lexing.position ref = ref lexbuf.lex_curr_p in
     let last_ep  : Lexing.position ref = ref lexbuf.lex_curr_p in
     let last_lex : string ref = ref "" in
     let last_expected : string list ref = ref [] in
+    let pending_tok : (Parser.token * Lexing.position * Lexing.position * string) option ref = ref None in
+    let parse_errors : T.Diagnostic.t list ref = ref [] in
+    let last_error_span : (int * int) option ref = ref None in
 
-    let next_token () : Parser.token * Lexing.position * Lexing.position =
-      let t = Lexer.token lexbuf in
-      let sp = Lexing.lexeme_start_p lexbuf in
-      let ep = Lexing.lexeme_end_p lexbuf in
+    let remember_token (t : Parser.token) (sp : Lexing.position) (ep : Lexing.position) (lexeme : string) : unit =
       last_tok := Some t;
       last_sp := sp;
       last_ep := ep;
-      last_lex := Lexing.lexeme lexbuf;
-      (t, sp, ep)
+      last_lex := lexeme
+    in
+
+    let next_token () : Parser.token * Lexing.position * Lexing.position =
+      match !pending_tok with
+      | Some (t, sp, ep, lexeme) ->
+          pending_tok := None;
+          remember_token t sp ep lexeme;
+          (t, sp, ep)
+      | None ->
+          let t = Lexer.token lexbuf in
+          let sp = Lexing.lexeme_start_p lexbuf in
+          let ep = Lexing.lexeme_end_p lexbuf in
+          remember_token t sp ep (Lexing.lexeme lexbuf);
+          (t, sp, ep)
     in
 
     let mk_error_diag () : T.Diagnostic.t =
@@ -171,49 +198,106 @@ let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
           diag_error loc (base ^ expected_hint)
     in
 
+    let add_parse_error () : unit =
+      let key = (!last_sp).Lexing.pos_cnum, (!last_ep).Lexing.pos_cnum in
+      if Some key <> !last_error_span then (
+        last_error_span := Some key;
+        parse_errors := (mk_error_diag ()) :: !parse_errors
+      )
+    in
+
+    let is_sync_token = function
+      | Parser.SEMI | Parser.COMMA | Parser.END | Parser.TERM | Parser.EOF -> true
+      | _ -> false
+    in
+
+    let rec resume_to_input_or_done
+      (chk : Ast.program I.checkpoint)
+      (fuel : int)
+      : [ `NeedInput of Ast.program I.checkpoint | `Accepted of Ast.program | `Rejected ] =
+      if fuel <= 0 then `Rejected
+      else
+        match chk with
+        | I.InputNeeded _ -> `NeedInput chk
+        | I.Accepted ast -> `Accepted ast
+        | I.Rejected -> `Rejected
+        | I.Shifting _ | I.AboutToReduce _ | I.HandlingError _ ->
+            resume_to_input_or_done (I.resume chk) (fuel - 1)
+    in
+
+    let rec skip_to_sync (fuel : int) : bool =
+      if fuel <= 0 then false
+      else
+        let t = Lexer.token lexbuf in
+        let sp = Lexing.lexeme_start_p lexbuf in
+        let ep = Lexing.lexeme_end_p lexbuf in
+        let lexeme = Lexing.lexeme lexbuf in
+        if is_sync_token t then (
+          pending_tok := Some (t, sp, ep, lexeme);
+          true
+        ) else
+          skip_to_sync (fuel - 1)
+    in
+
     (* IMPORTANT: adjust if your start symbol is not 'program' *)
     let checkpoint = Parser.Incremental.program lexbuf.lex_curr_p in
 
-    let rec drive (chk : Ast.program I.checkpoint) : (Ast.program, T.Diagnostic.t) result =
+    let rec drive (chk : Ast.program I.checkpoint) : Ast.program option =
       match chk with
       | I.InputNeeded _env ->
-          (* Compute hints *before* consuming the next token. *)
-          last_expected := expected_tokens_hint chk lexbuf.lex_curr_p;
-          let (t, sp, ep) = next_token () in
-          drive (I.offer chk (t, sp, ep))
+        (* Avoid expensive expected-token probing on every token;
+           compute hints only when an error is actually encountered. *)
+        last_expected := [];
+        let (t, sp, ep) = next_token () in
+        drive (I.offer chk (t, sp, ep))
 
       | I.Shifting _ | I.AboutToReduce _ ->
-          drive (I.resume chk)
+        drive (I.resume chk)
 
       | I.Accepted ast ->
-          Ok ast
+        Some ast
 
       | I.HandlingError _env ->
-          Error (mk_error_diag ())
+        last_expected := expected_tokens_hint chk lexbuf.lex_curr_p;
+        add_parse_error ();
+        begin
+          match resume_to_input_or_done chk 1024 with
+          | `Accepted ast -> Some ast
+          | `NeedInput chk' ->
+              if skip_to_sync 4096 then drive chk' else None
+          | `Rejected -> None
+        end
 
       | I.Rejected ->
-          Error (mk_error_diag ())
+        None
     in
 
     try
-      match drive checkpoint with
-      | Ok ast ->
-          let rec_diags = take_recovery_diags file in
+      let ast_opt = drive checkpoint in
+      let extra = parse_diags_to_lsp ~file in
+      let errs = List.rev !parse_errors in
+      match ast_opt with
+      | Some ast ->
           let ast_dump = if dump_ast then Some (Ast.Debug.to_string ast) else None in
-          { ast = Some ast; diags = rec_diags; ast_dump }
-
-      | Error d ->
-          let rec_diags = take_recovery_diags file in
-          { ast = None; diags = rec_diags @ [d]; ast_dump = None }
+          { ast = Some ast; diags = errs @ extra; ast_dump }
+      | None ->
+          let errs =
+            match errs with
+            | [] -> [mk_error_diag ()]
+            | xs -> xs
+          in
+          { ast = None; diags = errs @ extra; ast_dump = None }
 
     with
     | Lexer.Lex_error (msg, sp, ep) ->
-        let rec_diags = take_recovery_diags file in
+        let extra = parse_diags_to_lsp ~file in
+        let errs = List.rev !parse_errors in
         let loc = loc_of_lex file sp ep in
-        { ast = None; diags = rec_diags @ [diag_error loc ("Lex error: " ^ msg)]; ast_dump = None }
+        { ast = None; diags = errs @ extra @ [diag_error loc ("Lex error: " ^ msg)]; ast_dump = None }
 
     | exn ->
-        let rec_diags = take_recovery_diags file in
+        let extra = parse_diags_to_lsp ~file in
+        let errs = List.rev !parse_errors in
         let p = lexbuf.lex_curr_p in
         let loc = loc_of_lex file p p in
-        { ast = None; diags = rec_diags @ [diag_error loc ("Unhandled exception: " ^ Printexc.to_string exn)]; ast_dump = None }
+        { ast = None; diags = errs @ extra @ [diag_error loc ("Unhandled exception: " ^ Printexc.to_string exn)]; ast_dump = None }

@@ -9,6 +9,7 @@ type t = {
 
   pre_text : string;
   imports : Preprocess.import list;
+  compool_def : string option;
 
   pre_diags : T.Diagnostic.t list;
   import_diags : T.Diagnostic.t list;
@@ -29,6 +30,7 @@ let reparse (doc : t) : t =
     { doc with
       pre_text = pre.text;
       imports = pre.imports;
+      compool_def = pre.compool_def;
       pre_diags = pre.diags;
       parse_diags = out.diags;
       ast = out.ast;
@@ -46,6 +48,7 @@ let make ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) : t =
 
       pre_text = text;
       imports = [];
+      compool_def = None;
 
       pre_diags = [];
       import_diags = [];
@@ -68,7 +71,23 @@ let ast_dump (d:t) =
   | Some ast -> Some (Ast.Debug.to_string ast)
 
 let offset_of_pos (idx : Text_index.t) (p : T.Position.t) : int option =
-  Text_index.offset_of_line_col idx ~line:p.line ~col:p.character
+  let clamp lo hi x =
+    if x < lo then lo else if x > hi then hi else x
+  in
+  let line_count = Text_index.line_count idx in
+  if line_count <= 0 then Some 0
+  else
+    let line = clamp 0 (line_count - 1) p.line in
+    match Text_index.line_start_offset idx ~line with
+    | None -> Some 0
+    | Some start ->
+        let line_len =
+          match Text_index.line_length idx ~line with
+          | Some n -> n
+          | None -> 0
+        in
+        let col = clamp 0 line_len p.character in
+        Some (start + col)
 
 let apply_one_change (text : string) (idx : Text_index.t) (c : T.TextDocumentContentChangeEvent.t)
   : (string * Text_index.t) =
@@ -80,16 +99,16 @@ let apply_one_change (text : string) (idx : Text_index.t) (c : T.TextDocumentCon
       let sp = r.start in
       let ep = r.end_ in
       match offset_of_pos idx sp, offset_of_pos idx ep with
-      | Some a, Some b when a <= b ->
+      | Some a, Some b ->
+          let a, b = if a <= b then (a, b) else (b, a) in
           let before = String.sub text 0 a in
           let after_len = String.length text - b in
           let after = if after_len <= 0 then "" else String.sub text b after_len in
           let text' = before ^ c.text ^ after in
           (text', Text_index.of_string text')
       | _ ->
-          (* fallback: treat as full replace *)
-          let text' = c.text in
-          (text', Text_index.of_string text')
+          (* Keep the current text on malformed ranges instead of replacing the whole document. *)
+          (text, idx)
 
 let apply_changes (doc : t) (changes : T.TextDocumentContentChangeEvent.t list) : t =
   let (text, index) =
@@ -101,8 +120,10 @@ let apply_changes (doc : t) (changes : T.TextDocumentContentChangeEvent.t list) 
   { doc with text; index }
 
 let apply_changes_and_reparse ~(changes:T.TextDocumentContentChangeEvent.t list) (doc : t) : t =
-  let doc' = apply_changes doc changes in
-  reparse doc'
+  if changes = [] then doc
+  else
+    let doc' = apply_changes doc changes in
+    reparse doc'
 
 let with_import_diags (import_diags:T.Diagnostic.t list) (d:t) : t =
   recompute_diags { d with import_diags }

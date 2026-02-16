@@ -13,6 +13,9 @@ let sample t n =
   ) t.compools;
   List.rev !acc
 
+let all_paths t =
+  Hashtbl.fold (fun _ path acc -> path :: acc) t.compools []
+
 let is_ignored_dir name =
   name = ".git" || name = "_build" || name = "node_modules" || name = ".vscode"
 
@@ -52,6 +55,21 @@ let rec walk (dir:string) (files:string list ref) =
     with _ -> ()
   ) entries
 
+let normalize_key (s:string) : string =
+  String.uppercase_ascii (String.trim s)
+
+let file_stem_key (path:string) : string =
+  let base = Filename.basename path in
+  let stem =
+    try Filename.chop_extension base
+    with Invalid_argument _ -> base
+  in
+  normalize_key stem
+
+let add_key (tbl : (string, string) Hashtbl.t) ~(name:string) ~(path:string) : unit =
+  let k = normalize_key name in
+  if k <> "" then Hashtbl.replace tbl k path
+
 let build ~(root:string) : t =
   let files = ref [] in
   walk root files;
@@ -64,11 +82,12 @@ let build ~(root:string) : t =
         match Preprocess.scan_compool_def ~text:txt with
         | None -> ()
         | Some name ->
-            let name = String.uppercase_ascii (String.trim name) in
-            if name <> "" then Hashtbl.replace compools name path
+            let def_key = normalize_key name in
+            let stem_key = file_stem_key path in
+            if def_key = stem_key then add_key compools ~name:def_key ~path
   ) !files;
 
   { root; compools }
 
 let find_compool (t:t) ~(name:string) =
-  Hashtbl.find_opt t.compools (String.uppercase_ascii (String.trim name))
+  Hashtbl.find_opt t.compools (normalize_key name)

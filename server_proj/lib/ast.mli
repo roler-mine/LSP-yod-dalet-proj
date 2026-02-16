@@ -100,6 +100,11 @@ and storage =
   | Static
   | External
 
+and proc_use =
+  | UseNormal
+  | UseRec
+  | UseRent
+
 and decl =
   | DVar of {
       name : ident;
@@ -123,6 +128,7 @@ and proc = {
   name : ident;
   params : param node list;
   returns : type_expr node option;
+  use_attr : proc_use;
   locals : decl node list;
   body : stmt node;
 }

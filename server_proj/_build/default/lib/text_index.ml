@@ -30,6 +30,25 @@ let line_start_offset (t : t) ~(line:int) =
   if line < 0 || line >= Array.length t.line_starts then None
   else Some t.line_starts.(line)
 
+let line_length (t : t) ~(line:int) =
+  match line_start_offset t ~line with
+  | None -> None
+  | Some start ->
+      let next_start =
+        if line + 1 < Array.length t.line_starts
+        then t.line_starts.(line + 1)
+        else String.length t.text + 1
+      in
+      let raw = next_start - start in
+      let len =
+        if raw > 0
+           && start + raw - 1 < String.length t.text
+           && t.text.[start + raw - 1] = '\n'
+        then raw - 1
+        else raw
+      in
+      Some (max 0 len)
+
 let offset_of_line_col (t : t) ~(line:int) ~(col:int) =
   if col < 0 then None
   else

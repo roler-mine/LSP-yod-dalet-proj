@@ -42,13 +42,6 @@ let respond_error (oc : out_channel) ~(id:Yojson.Safe.t) ~(code:int) ~(message:s
 let notify (oc : out_channel) ~(method_:string) ~(params:Yojson.Safe.t) : unit =
   Lsp_io.write_message oc (json_obj [ "jsonrpc", `String "2.0"; "method", `String method_; "params", params ])
 
-let docuri_to_string (u:T.DocumentUri.t) : string =
-  try
-    match T.DocumentUri.yojson_of_t u with
-    | `String s -> s
-    | _ -> ""
-  with _ -> ""
-
 let yojson_of_diagnostics (ds : T.Diagnostic.t list) : Yojson.Safe.t =
   `List (List.map T.Diagnostic.yojson_of_t ds)
 
@@ -56,11 +49,31 @@ let publish_diagnostics (oc : out_channel) ~(uri:T.DocumentUri.t) ~(diags:T.Diag
   let params =
     json_obj
       [
-        "uri", `String (docuri_to_string uri);
+        "uri", `String (Uri_path.docuri_to_string uri);
         "diagnostics", yojson_of_diagnostics diags;
       ]
   in
   notify oc ~method_:"textDocument/publishDiagnostics" ~params
+
+let semantic_token_types_legend : Yojson.Safe.t =
+  `List [
+    `String "namespace";
+    `String "type";
+    `String "function";
+    `String "variable";
+    `String "property";
+    `String "keyword";
+    `String "string";
+    `String "number";
+    `String "operator";
+    `String "macro";
+  ]
+
+let semantic_token_modifiers_legend : Yojson.Safe.t =
+  `List [
+    `String "declaration";
+    `String "readonly";
+  ]
 
 let initialize_result_json : Yojson.Safe.t =
   json_obj
@@ -71,32 +84,52 @@ let initialize_result_json : Yojson.Safe.t =
           "textDocumentSync",
           json_obj [ "openClose", `Bool true; "change", `Int 2 (* Incremental *) ];
 
+          "definitionProvider", `Bool true;
+          "implementationProvider", `Bool true;
+          "referencesProvider", `Bool true;
+          "documentSymbolProvider", `Bool true;
+          "hoverProvider", `Bool true;
+          "renameProvider", json_obj [ "prepareProvider", `Bool true ];
+          "inlayHintProvider", `Bool true;
+          "semanticTokensProvider",
+          json_obj [
+            "legend",
+            json_obj [
+              "tokenTypes", semantic_token_types_legend;
+              "tokenModifiers", semantic_token_modifiers_legend;
+            ];
+            "full", `Bool true;
+            "range", `Bool true;
+          ];
+
           "executeCommandProvider",
           json_obj [ "commands",
                      `List [
                        `String "jovial.dumpAst";
+                       `String "jovial.dumpCst";
                        `String "jovial.debugReport";
                        `String "jovial.rescanWorkspace";
-                     ]
-                   ];
+                      ]
+                    ];
+
+          "workspace",
+          json_obj [
+            "didChangeWatchedFiles",
+            json_obj [ "dynamicRegistration", `Bool false ];
+          ];
         ];
     ]
 
 let file_of_uri (u : T.DocumentUri.t) : string option =
-  let s = docuri_to_string u in
-  let prefix = "file://" in
-  if String.length s >= String.length prefix
-     && String.sub s 0 (String.length prefix) = prefix
-  then Some (String.sub s (String.length prefix) (String.length s - String.length prefix))
-  else None
+  Uri_path.file_path_of_uri u
 
 let parse_uri_arg (arg:Yojson.Safe.t) : T.DocumentUri.t option =
   match arg with
   | `String s ->
-      (try Some (T.DocumentUri.t_of_yojson (`String s)) with _ -> None)
+      Uri_path.docuri_of_string s
   | `Assoc xs ->
       (match List.assoc_opt "uri" xs with
-       | Some (`String s) -> (try Some (T.DocumentUri.t_of_yojson (`String s)) with _ -> None)
+       | Some (`String s) -> Uri_path.docuri_of_string s
        | _ -> None)
   | _ -> None
 
@@ -106,13 +139,109 @@ let parse_int_arg (arg:Yojson.Safe.t) : int option =
   | `Intlit s -> (try Some (int_of_string s) with _ -> None)
   | _ -> None
 
+let parse_text_document_uri (params:Yojson.Safe.t) : T.DocumentUri.t option =
+  match get_assoc params with
+  | None -> None
+  | Some xs ->
+      (match find_field "textDocument" xs with
+       | Some (`Assoc tdxs) ->
+           (match find_field "uri" tdxs with
+            | Some (`String s) -> Uri_path.docuri_of_string s
+            | _ -> None)
+       | _ -> None)
+
+let parse_position (params:Yojson.Safe.t) : T.Position.t option =
+  let int_field key xs =
+    match find_field key xs with
+    | Some (`Int n) -> Some n
+    | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+    | _ -> None
+  in
+  match get_assoc params with
+  | None -> None
+  | Some xs ->
+      (match find_field "position" xs with
+       | Some (`Assoc pxs) ->
+           (match int_field "line" pxs, int_field "character" pxs with
+            | Some line, Some character -> Some { T.Position.line; character }
+            | _ -> None)
+       | _ -> None)
+
+let parse_position_obj (j:Yojson.Safe.t) : T.Position.t option =
+  let int_field key xs =
+    match find_field key xs with
+    | Some (`Int n) -> Some n
+    | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+    | _ -> None
+  in
+  match get_assoc j with
+  | None -> None
+  | Some xs ->
+      (match int_field "line" xs, int_field "character" xs with
+       | Some line, Some character -> Some { T.Position.line; character }
+       | _ -> None)
+
+let parse_range (params:Yojson.Safe.t) : T.Range.t option =
+  match get_assoc params with
+  | None -> None
+  | Some xs ->
+      (match find_field "range" xs with
+       | Some (`Assoc rxs) ->
+           (match find_field "start" rxs, find_field "end" rxs with
+            | Some s, Some e ->
+                (match parse_position_obj s, parse_position_obj e with
+                 | Some start, Some end_ -> Some { T.Range.start; end_ }
+                 | _ -> None)
+            | _ -> None)
+       | _ -> None)
+
+let parse_new_name (params:Yojson.Safe.t) : string option =
+  match get_assoc params with
+  | None -> None
+  | Some xs ->
+      (match find_field "newName" xs with
+       | Some (`String s) -> Some s
+       | _ -> None)
+
+let parse_include_declaration (params:Yojson.Safe.t) : bool =
+  match get_assoc params with
+  | None -> true
+  | Some xs ->
+      (match find_field "context" xs with
+       | Some (`Assoc cxs) ->
+           (match find_field "includeDeclaration" cxs with
+            | Some (`Bool b) -> b
+            | _ -> true)
+       | _ -> true)
+
+let parse_root_uri (params:Yojson.Safe.t) : T.DocumentUri.t option =
+  match get_assoc params with
+  | None -> None
+  | Some xs ->
+      (match find_field "rootUri" xs with
+       | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
+       | _ ->
+           (match find_field "workspaceFolders" xs with
+            | Some (`List ((`Assoc f0) :: _)) ->
+                (match find_field "uri" f0 with
+                 | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
+                 | _ -> None)
+            | _ -> None))
+
+let parse_root_path (params:Yojson.Safe.t) : string option =
+  match get_assoc params with
+  | None -> None
+  | Some xs ->
+      (match find_field "rootPath" xs with
+       | Some (`String s) when s <> "" -> Some s
+       | _ -> None)
+
 let handle_initialize (ws:Workspace.t) (oc:out_channel) (id:Yojson.Safe.t) (params:Yojson.Safe.t) =
-  (* set workspace root if provided, then scan *)
-  (try
-     let p = T.InitializeParams.t_of_yojson params in
-     Workspace.set_root_uri ws p.rootUri;
-     Workspace.rescan ws
-   with _ -> ());
+  (* Set workspace root from rootUri/workspaceFolders/rootPath, then scan. *)
+  (match parse_root_uri params with
+   | Some ru -> Workspace.set_root_uri ws (Some ru)
+   | None -> Workspace.set_root_path ws (parse_root_path params));
+  Workspace.rescan ws;
   respond oc ~id ~result:initialize_result_json
 
 let handle_shutdown oc id =
@@ -133,6 +262,20 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
          | None -> respond_error oc ~id ~code:(-32602) ~message:"dumpAst: missing uri argument"
          | Some uri ->
              (match Workspace.ast_dump_for ws ~uri with
+              | None -> respond oc ~id ~result:`Null
+              | Some s -> respond oc ~id ~result:(`String s)))
+
+    | "jovial.dumpCst" ->
+        let uri_opt =
+          match p.arguments with
+          | None -> None
+          | Some (a0 :: _) -> parse_uri_arg a0
+          | Some [] -> None
+        in
+        (match uri_opt with
+         | None -> respond_error oc ~id ~code:(-32602) ~message:"dumpCst: missing uri argument"
+         | Some uri ->
+             (match Workspace.cst_dump_for ws ~uri with
               | None -> respond oc ~id ~result:`Null
               | Some s -> respond oc ~id ~result:(`String s)))
 
@@ -157,8 +300,8 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
         (match uri_opt with
          | None -> respond_error oc ~id ~code:(-32602) ~message:"debugReport: missing uri argument"
          | Some uri ->
-             let j = Workspace.debug_report_for ws ~uri ~max_tokens in
-             respond oc ~id ~result:j)
+              let j = Workspace.debug_report_for ws ~uri ~max_tokens in
+              respond oc ~id ~result:j)
 
     | _ ->
         respond_error oc ~id ~code:(-32601) ~message:"Unknown command"
@@ -191,6 +334,11 @@ let handle_notification (ws : Workspace.t) (oc : out_channel) (method_ : string)
          Workspace.close_doc ws ~uri;
          publish_diagnostics oc ~uri ~diags:[]
        with _ -> ())
+  | "workspace/didChangeWatchedFiles" ->
+      Workspace.rescan ws;
+      Workspace.revalidate_all ws
+      |> List.iter (fun uri ->
+           publish_diagnostics oc ~uri ~diags:(Workspace.diagnostics_for ws ~uri))
   | "exit" -> exit 0
   | _ -> ()
 
@@ -199,6 +347,76 @@ let handle_request (ws : Workspace.t) (oc : out_channel) (method_ : string) (id 
   | "initialize" -> handle_initialize ws oc id params
   | "shutdown" -> handle_shutdown oc id
   | "workspace/executeCommand" -> handle_execute_command ws oc id params
+  | "textDocument/documentSymbol" ->
+      (match parse_text_document_uri params with
+       | None -> respond_error oc ~id ~code:(-32602) ~message:"documentSymbol: missing textDocument.uri"
+       | Some uri ->
+           let j = Workspace.document_symbols_json_for ws ~uri in
+           respond oc ~id ~result:j)
+  | "textDocument/definition" ->
+      (match parse_text_document_uri params, parse_position params with
+       | Some uri, Some pos ->
+           let j = Workspace.definition_json_for ws ~uri ~pos in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"definition: invalid textDocument or position")
+  | "textDocument/implementation" ->
+      (match parse_text_document_uri params, parse_position params with
+       | Some uri, Some pos ->
+           let j = Workspace.implementation_json_for ws ~uri ~pos in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"implementation: invalid textDocument or position")
+  | "textDocument/references" ->
+      (match parse_text_document_uri params, parse_position params with
+       | Some uri, Some pos ->
+           let include_decl = parse_include_declaration params in
+           let j = Workspace.references_json_for ws ~uri ~pos ~include_decl in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"references: invalid textDocument or position")
+  | "textDocument/hover" ->
+      (match parse_text_document_uri params, parse_position params with
+       | Some uri, Some pos ->
+           let j = Workspace.hover_json_for ws ~uri ~pos in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"hover: invalid textDocument or position")
+  | "textDocument/prepareRename" ->
+      (match parse_text_document_uri params, parse_position params with
+       | Some uri, Some pos ->
+           let j = Workspace.prepare_rename_json_for ws ~uri ~pos in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"prepareRename: invalid textDocument or position")
+  | "textDocument/rename" ->
+      (match parse_text_document_uri params, parse_position params, parse_new_name params with
+       | Some uri, Some pos, Some new_name ->
+           let j = Workspace.rename_json_for ws ~uri ~pos ~new_name in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"rename: invalid textDocument, position, or newName")
+  | "textDocument/inlayHint" ->
+      (match parse_text_document_uri params, parse_range params with
+       | Some uri, Some range ->
+           let j = Workspace.inlay_hints_json_for ws ~uri ~range in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"inlayHint: invalid textDocument or range")
+  | "textDocument/semanticTokens/full" ->
+      (match parse_text_document_uri params with
+       | Some uri ->
+           let j = Workspace.semantic_tokens_full_json_for ws ~uri in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"semanticTokens/full: invalid textDocument")
+  | "textDocument/semanticTokens/range" ->
+      (match parse_text_document_uri params, parse_range params with
+       | Some uri, Some range ->
+           let j = Workspace.semantic_tokens_range_json_for ws ~uri ~range in
+           respond oc ~id ~result:j
+       | _ ->
+           respond_error oc ~id ~code:(-32602) ~message:"semanticTokens/range: invalid textDocument or range")
   | _ -> respond_error oc ~id ~code:(-32601) ~message:("Method not found: " ^ method_)
 
 let run (ic : in_channel) (oc : out_channel) : unit =

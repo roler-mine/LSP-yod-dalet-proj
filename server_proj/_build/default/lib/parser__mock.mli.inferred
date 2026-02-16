@@ -1,7 +1,9 @@
 type token =
     XOR
   | WHILE
+  | TYPE
   | TRUE
+  | THEN
   | TERM
   | TABLE
   | STRINGLIT of string
@@ -13,6 +15,7 @@ type token =
   | RPAREN
   | RETURN
   | REF
+  | PROGRAM
   | PROC
   | POW
   | PLUS
@@ -28,6 +31,7 @@ type token =
   | INTLIT of string
   | IF
   | ID of string
+  | ICOMPOOL
   | GT
   | GOTO
   | GE
@@ -41,13 +45,17 @@ type token =
   | END
   | ELSE
   | DOT
+  | DEFINE
   | DEFAULT
   | DEF
+  | CONV_R
+  | CONV_L
+  | COMPOOL
   | COMMA
   | COLON
-  | CHARLIT of char
   | CASE
   | BY
+  | BLOCK
   | BEGIN
   | BANG
   | AT
@@ -60,12 +68,39 @@ val mk_block :
   Lexing.position ->
   Lexing.position -> Ast.stmt Ast.node list -> Ast.stmt Ast.node
 val wrap_labels : Ast.ident list -> Ast.stmt Ast.node -> Ast.stmt Ast.node
+val bad_stmt : Lexing.position -> Lexing.position -> Ast.stmt Ast.node
+val type_to_string : Ast.type_expr Ast.node -> string
+val mk_conv :
+  Lexing.position ->
+  Lexing.position ->
+  Ast.type_expr Ast.node -> Ast.expr Ast.node -> Ast.expr Ast.node
+val mk_preset :
+  Lexing.position ->
+  Lexing.position -> string -> Ast.expr Ast.node list -> Ast.expr Ast.node
+val proc_use_from_flags : bool -> bool -> Ast.proc_use
+val empty_proc_header_info : bool * bool * 'a option
+val merge_proc_header_info :
+  bool * bool * 'a option ->
+  bool * bool * 'a option -> bool * bool * 'a option
+val for_step_stmt :
+  Lexing.position ->
+  Lexing.position ->
+  Ast.expr Ast.node ->
+  Ast.expr Ast.node option * Ast.expr Ast.node option ->
+  Ast.stmt Ast.node option
 val menhir_begin_marker : int
 val xv_while_stmt : Ast.stmt Ast.node
+val xv_while_phrase : Ast.expr Ast.node
 val xv_while_opt : Ast.expr Ast.node option
 val xv_type_spec : Ast.type_expr Ast.node
 val xv_type_sizes_opt : Ast.expr Ast.node list
+val xv_type_size : Ast.expr Ast.node
+val xv_type_decl : Ast.decl Ast.node list
+val xv_terminator_opt : unit
 val xv_terminator : unit
+val xv_table_record_after_term_opt : Ast.field_decl Ast.node list option
+val xv_table_preset_opt : Ast.expr Ast.node option
+val xv_table_elem_type_opt : Ast.type_expr Ast.node option
 val xv_table_dims : Ast.expr Ast.node list
 val xv_stop_stmt : Ast.stmt Ast.node
 val xv_statement : Ast.stmt Ast.node
@@ -73,32 +108,54 @@ val xv_simple_stmt : Ast.stmt Ast.node
 val xv_simple_or_control_stmt : Ast.stmt Ast.node
 val xv_rev_module_items : Ast.toplevel list list
 val xv_rev_field_decl_list : Ast.field_decl Ast.node list
+val xv_rev_directive_args : string Ast.node list
 val xv_rev_decl_section : Ast.decl Ast.node list list
 val xv_return_stmt : Ast.stmt Ast.node
 val xv_record_opt : Ast.field_decl Ast.node list option
 val xv_program : Ast.program
+val xv_proc_header_tail_opt : bool * bool * Ast.type_expr Ast.node option
+val xv_proc_header_tail : bool * bool * Ast.type_expr Ast.node option
+val xv_proc_header_atom : bool * bool * Ast.type_expr Ast.node option
 val xv_proc_decl : Ast.decl Ast.node list
 val xv_proc_body_opt : (Ast.decl Ast.node list * Ast.stmt Ast.node) option
 val xv_primary : Ast.expr Ast.node
+val xv_preset_items_opt : Ast.expr Ast.node list
+val xv_preset_items : Ast.expr Ast.node list
+val xv_preset_item : Ast.expr Ast.node
+val xv_preset_expr : Ast.expr Ast.node
 val xv_postfix_atom : Ast.expr Ast.node
 val xv_postfix : Ast.expr Ast.node
 val xv_outs_opt : Ast.ident list
-val xv_module_items : Ast.program
+val xv_module_items_opt : Ast.toplevel list
+val xv_module_items : Ast.toplevel list
 val xv_module_item : Ast.toplevel list
+val xv_modifier_req : string
 val xv_modifier_opt : string option
 val xv_lvalue_list : Ast.expr Ast.node list
 val xv_lvalue : Ast.expr Ast.node
 val xv_literal : Ast.literal
 val xv_labels_opt : Ast.ident list
 val xv_label : Ast.ident
-val xv_init_opt : Ast.expr Ast.node option
+val xv_jmodules : Ast.toplevel list list
+val xv_jmodule : Ast.toplevel list
+val xv_item_init_opt : Ast.expr Ast.node option
+val xv_item_attrs_opt : unit
+val xv_item_attrs : unit
+val xv_item_attr : unit
 val xv_if_stmt : Ast.stmt Ast.node
 val xv_ident : Ast.ident
 val xv_id_list : Ast.ident list
+val xv_header_items : Ast.toplevel list
+val xv_header_item : Ast.toplevel list
+val xv_group_decl : Ast.decl Ast.node list
 val xv_goto_stmt : Ast.stmt Ast.node
 val xv_formals_opt : Ast.param Ast.node list
 val xv_formal_param_groups_opt : Ast.param Ast.node list
 val xv_formal_param_groups : Ast.param Ast.node list
+val xv_for_update : Ast.expr Ast.node option * Ast.expr Ast.node option
+val xv_for_tail :
+  Ast.expr Ast.node option *
+  (Ast.expr Ast.node option * Ast.expr Ast.node option)
 val xv_for_stmt : Ast.stmt Ast.node
 val xv_field_decl_list : Ast.field_decl Ast.node list
 val xv_field_decl : Ast.field_decl Ast.node
@@ -108,6 +165,7 @@ val xv_expr_list : Ast.expr Ast.node list
 val xv_expr : Ast.expr Ast.node
 val xv_exit_stmt : Ast.stmt Ast.node
 val xv_else_opt : Ast.stmt Ast.node option
+val xv_directive_name : string Ast.node
 val xv_directive_decl : Ast.decl Ast.node
 val xv_directive_args_opt : string Ast.node list
 val xv_directive_args : string Ast.node list
@@ -115,20 +173,30 @@ val xv_directive_arg : string Ast.node
 val xv_dim_list_opt : Ast.expr Ast.node list
 val xv_dim_list : Ast.expr Ast.node list
 val xv_dim : Ast.expr Ast.node
+val xv_define_list_option : Ast.ident
+val xv_define_list_opt : Ast.ident option
+val xv_define_formals_opt : Ast.ident list
+val xv_define_formals : Ast.ident list
+val xv_define_decl : Ast.decl Ast.node list
 val xv_decl_section : Ast.decl Ast.node list
 val xv_decl_item : Ast.decl Ast.node list
 val xv_data_decl : Ast.decl Ast.node list
 val xv_compound_stmt : Ast.stmt Ast.node
+val xv_compool_arg : string Ast.node
 val xv_case_stmt : Ast.stmt Ast.node
 val xv_case_sep : unit
-val xv_case_options : (Ast.expr Ast.node list * Ast.stmt Ast.node) list
-val xv_case_option : Ast.expr Ast.node list * Ast.stmt Ast.node
+val xv_case_options : ('a list * Ast.stmt Ast.node) list
+val xv_case_option : 'a list * Ast.stmt Ast.node
 val xv_case_index_list : Ast.expr Ast.node list
 val xv_case_index : Ast.expr Ast.node
 val xv_call_stmt : Ast.stmt Ast.node
-val xv_by_opt : Ast.expr Ast.node option
 val xv_block_list_opt : Ast.stmt Ast.node list
 val xv_block_list : Ast.stmt Ast.node list
+val xv_block_decl : Ast.decl Ast.node list
+val xv_attr_paren_payload : unit
+val xv_attr_arg_list_opt : unit
+val xv_attr_arg_list : unit
+val xv_attr_arg : unit
 val xv_assign_stmt : Ast.stmt Ast.node
 val xv_actuals_opt : Ast.expr Ast.node list
 val xv_abort_stmt : Ast.stmt Ast.node

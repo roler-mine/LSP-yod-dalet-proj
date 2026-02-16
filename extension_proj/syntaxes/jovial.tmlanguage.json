@@ -3,6 +3,8 @@
   "name": "Jovial",
   "scopeName": "source.jovial",
   "patterns": [
+    { "include": "#defineDeclaration" },
+    { "include": "#compoolDoubleQuoted" },
     { "include": "#comments" },
     { "include": "#strings" },
     { "include": "#numbers" },
@@ -11,6 +13,57 @@
     { "include": "#identifiers" }
   ],
   "repository": {
+    "defineDeclaration": {
+      "patterns": [
+        {
+          "name": "meta.directive.define.jovial",
+          "begin": "(?i)\\b(DEFINE)\\b\\s+([A-Za-z_$][A-Za-z0-9_$']*)(?:\\s*\\(([^)]*)\\))?(?:\\s+(LISTEXP|LISTINV|LISTBOTH))?\\s*(\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.jovial" },
+            "2": { "name": "entity.name.constant.define.jovial" },
+            "3": { "name": "meta.parameter-list.define.jovial" },
+            "4": { "name": "storage.modifier.list-option.jovial" },
+            "5": { "name": "punctuation.definition.string.begin.jovial" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.jovial" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.double-quote.jovial",
+              "match": "\"\""
+            },
+            {
+              "name": "variable.parameter.define.jovial",
+              "match": "!\\s*[A-Za-z]"
+            }
+          ]
+        }
+      ]
+    },
+    "compoolDoubleQuoted": {
+      "patterns": [
+        {
+          "name": "meta.directive.compool.jovial",
+          "begin": "(?i)(!?\\s*\\b(?:COMPOOL|ICOMPOOL)\\b(?:\\s*\\(\\s*)?)(\")",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.jovial" },
+            "2": { "name": "punctuation.definition.string.begin.jovial" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.jovial" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.double-quote.jovial",
+              "match": "\"\""
+            }
+          ]
+        }
+      ]
+    },
     "comments": {
       "patterns": [
         {
@@ -29,14 +82,6 @@
           "patterns": []
         },
         {
-          "name": "comment.block.ocaml.jovial",
-          "begin": "\\(\\*",
-          "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
-          "end": "\\*\\)",
-          "endCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
-          "patterns": []
-        },
-        {
           "name": "comment.block.percent.jovial",
           "begin": "%",
           "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
@@ -50,7 +95,12 @@
           "beginCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
           "end": "\"",
           "endCaptures": { "0": { "name": "punctuation.definition.comment.jovial" } },
-          "patterns": []
+          "patterns": [
+            {
+              "name": "constant.character.escape.double-quote.jovial",
+              "match": "\"\""
+            }
+          ]
         }
       ]
     },
@@ -73,6 +123,7 @@
     },
     "numbers": {
       "patterns": [
+        { "name": "constant.numeric.integer.based.jovial", "match": "\\b\\d+[A-Za-z]'[^'\\n]+'\\b" },
         { "name": "constant.numeric.float.jovial", "match": "\\b(?:\\d+\\.\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?\\b" },
         { "name": "constant.numeric.float.jovial", "match": "\\b\\d+(?:[eE][+-]?\\d+)\\b" },
         { "name": "constant.numeric.integer.jovial", "match": "\\b\\d+\\b" }
@@ -86,7 +137,19 @@
         },
         {
           "name": "keyword.declaration.jovial",
-          "match": "\\b(?i:(DEF|REF|PROC|ITEM|TABLE))\\b"
+          "match": "\\b(?i:(DEF|REF|PROC|ITEM|TABLE|TYPE|BLOCK))\\b"
+        },
+        {
+          "name": "keyword.control.directive.jovial",
+          "match": "\\b(?i:(PROGRAM|COMPOOL|ICOMPOOL|DEFINE|ICOPY|ISKIP|IBEGIN|IEND|ILIST|INOLIST|IEJECT))\\b"
+        },
+        {
+          "name": "storage.modifier.jovial",
+          "match": "\\b(?i:(RENT|REENTRANT|REC|RECURSIVE|LISTEXP|LISTINV|LISTBOTH))\\b"
+        },
+        {
+          "name": "storage.type.builtin.jovial",
+          "match": "\\b(?i:(B|U|S|F|C|P|W|V|STATUS))\\b"
         },
         {
           "name": "constant.language.boolean.jovial",
@@ -100,7 +163,13 @@
     },
     "operators": {
       "patterns": [
-        { "name": "keyword.operator.jovial", "match": "(<>|<=|>=|\\*\\*|=|<|>|\\+|-|\\*|/|\\^|@|\\.|,|;|:|\\(|\\))" }
+        { "name": "punctuation.section.conversion.begin.jovial", "match": "\\(\\*" },
+        { "name": "punctuation.section.conversion.end.jovial", "match": "\\*\\)" },
+        { "name": "keyword.operator.comparison.jovial", "match": "(<>|<=|>=|=|<|>)" },
+        { "name": "keyword.operator.arithmetic.jovial", "match": "(\\*\\*|\\^|\\+|-|\\*|/)" },
+        { "name": "keyword.operator.other.jovial", "match": "[@!]" },
+        { "name": "punctuation.separator.jovial", "match": "[\\.,;:]" },
+        { "name": "punctuation.section.parens.jovial", "match": "[\\(\\)]" }
       ]
     },
     "identifiers": {

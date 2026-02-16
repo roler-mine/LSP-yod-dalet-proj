@@ -6,9 +6,11 @@
   "publisher": "your-name",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Programming Languages"],
-   "activationEvents": [
+  "activationEvents": [
     "onLanguage:jovial",
     "onCommand:jovial.dumpAstUi",
+    "onCommand:jovial.dumpCstUi",
+    "onCommand:jovial.showSyntaxTrees",
     "onCommand:jovial.restartServer"
   ],
   "main": "./out/extension.js",
@@ -25,11 +27,13 @@
       {
         "language": "jovial",
         "scopeName": "source.jovial",
-        "path": "./syntaxes/jovial.tmLanguage.json"
+        "path": "./syntaxes/jovial.tmlanguage.json"
       }
     ],
     "commands": [
       { "command": "jovial.dumpAstUi", "title": "Jovial: Dump AST" },
+      { "command": "jovial.dumpCstUi", "title": "Jovial: Dump CST (Token Stream)" },
+      { "command": "jovial.showSyntaxTrees", "title": "Jovial: Show AST/CST Viewer" },
       { "command": "jovial.restartServer", "title": "Jovial: Restart Language Server" }
     ],
     "configuration": {

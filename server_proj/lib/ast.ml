@@ -114,6 +114,8 @@ and stmt =
 
 and storage = Automatic | Static | External
 
+and proc_use = UseNormal | UseRec | UseRent
+
 and decl =
   | DVar of { name : ident; dtype : type_expr node; init : expr node option; storage : storage }
   | DConst of { name : ident; dtype : type_expr node option; value : expr node }
@@ -125,6 +127,7 @@ and proc = {
   name : ident;
   params : param node list;
   returns : type_expr node option;
+  use_attr : proc_use;
   locals : decl node list;
   body : stmt node;
 }
@@ -363,6 +366,11 @@ module Debug = struct
     | Static -> Format.pp_print_string fmt "Static"
     | External -> Format.pp_print_string fmt "External"
 
+  and pp_proc_use fmt = function
+    | UseNormal -> Format.pp_print_string fmt "Normal"
+    | UseRec -> Format.pp_print_string fmt "REC"
+    | UseRent -> Format.pp_print_string fmt "RENT"
+
   and pp_string_node fmt (s : string node) =
     Format.fprintf fmt "%S" s.v
 
@@ -400,8 +408,9 @@ module Debug = struct
     if not (take_node b) then Format.pp_print_string fmt "<…>"
     else
       let x = p.v in
-      Format.fprintf fmt "@[DProc(name=%a; params=[%a]; returns=%a; locals=[%a]; body=%a)@]%a"
+      Format.fprintf fmt "@[DProc(name=%a; use=%a; params=[%a]; returns=%a; locals=[%a]; body=%a)@]%a"
         pp_ident x.name
+        pp_proc_use x.use_attr
         (pp_list (pp_param opts b (depth + 1))) x.params
         (pp_opt (pp_type_expr opts b (depth + 1))) x.returns
         (pp_list (pp_decl opts b (depth + 1))) x.locals

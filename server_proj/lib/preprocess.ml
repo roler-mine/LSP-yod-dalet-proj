@@ -16,145 +16,166 @@ type result = {
 }
 
 let uppercase = String.uppercase_ascii
+let known_exts = [ ".jov"; ".j73"; ".jvl"; ".j" ]
 
-let contains_substring ~(haystack:string) ~(needle:string) : bool =
-  let n = String.length haystack in
-  let m = String.length needle in
-  if m = 0 then true
-  else if m > n then false
-  else
-    let rec go i =
-      if i + m > n then false
-      else if String.sub haystack i m = needle then true
-      else go (i + 1)
-    in
-    go 0
+let basename_any (s:string) : string =
+  let u = String.map (fun c -> if c = '\\' then '/' else c) s in
+  match String.rindex_opt u '/' with
+  | Some i -> String.sub u (i + 1) (String.length u - i - 1)
+  | None -> u
 
-let normalize_spaces (s:string) : string =
-  s |> String.map (fun c -> if c = '\t' then ' ' else c)
+let strip_known_ext (s:string) : string =
+  let lower = String.lowercase_ascii s in
+  let rec go = function
+    | [] -> s
+    | ext :: tl ->
+        let n = String.length lower in
+        let m = String.length ext in
+        if n >= m && String.sub lower (n - m) m = ext
+        then String.sub s 0 (n - m)
+        else go tl
+  in
+  go known_exts
 
-(* 1-based line numbers in Ast.Loc, columns 0-based; offset unused here *)
-let mk_loc ~(file:string option) ~(line:int) ~(col0:int) ~(col1:int) : Ast.Loc.t =
-  let mkp col : Ast.Loc.pos = { Ast.Loc.line = line; col; offset = 0 } in
-  { Ast.Loc.file = file; start_pos = mkp col0; end_pos = mkp col1 }
+let normalize_compool_name (s:string) : string =
+  s
+  |> String.trim
+  |> basename_any
+  |> strip_known_ext
+  |> String.trim
+  |> uppercase
 
-let extract_quoted (line:string) : (string * (int*int)) list =
-  (* returns list of (contents, (start_col, end_col_exclusive)) for each '...' *)
-  let n = String.length line in
-  let rec loop i acc =
-    if i >= n then List.rev acc
-    else if line.[i] = '\'' then (
-      let j = ref (i + 1) in
-      while !j < n && line.[!j] <> '\'' do incr j done;
-      if !j < n then
-        let contents = String.sub line (i + 1) (!j - (i + 1)) in
-        loop (!j + 1) ((contents, (i, !j + 1)) :: acc)
+let mk_loc_of_lex ~(file:string option) (sp:Lexing.position) (ep:Lexing.position) : Ast.Loc.t =
+  Ast.Loc.of_lexing_positions sp ep ~file
+
+let diag_error (loc:Ast.Loc.t) (msg:string) : T.Diagnostic.t =
+  Lsp_conv.diagnostic
+    ~severity:T.DiagnosticSeverity.Error
+    ~source:"preprocess"
+    ~message:msg
+    loc
+
+type scanned_name = {
+  raw : string;
+  norm : string;
+  sp : Lexing.position;
+  ep : Lexing.position;
+}
+
+let scan_from_tokens ~(file:string option) ~(text:string)
+  : (import list * (string * int * int * int) option) =
+  let lexbuf = Lexing.from_string text in
+  (match file with
+   | None -> ()
+   | Some f ->
+       lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
+  let rec gather acc =
+    try
+      let tok = Lexer.token lexbuf in
+      let sp = Lexing.lexeme_start_p lexbuf in
+      let ep = Lexing.lexeme_end_p lexbuf in
+      let acc = (tok, sp, ep) :: acc in
+      match tok with
+      | Parser.EOF -> List.rev acc
+      | _ -> gather acc
+    with _ ->
+      List.rev acc
+  in
+  let toks = gather [] in
+  let arr = Array.of_list toks in
+  let len = Array.length arr in
+  let tok_at i = let (t, _, _) = arr.(i) in t in
+  let prev_is_bang i =
+    i > 0
+    && match tok_at (i - 1) with
+       | Parser.BANG -> true
+       | _ -> false
+  in
+  let find_name_after start : scanned_name option =
+    let rec go j steps =
+      if j >= len || steps > 12 then None
       else
-        List.rev acc
-    ) else
-      loop (i + 1) acc
+        match arr.(j) with
+        | (Parser.LPAREN | Parser.RPAREN | Parser.COMMA), _, _ ->
+            go (j + 1) (steps + 1)
+        | Parser.ID raw, sp, ep
+        | Parser.STRINGLIT raw, sp, ep ->
+            let norm = normalize_compool_name raw in
+            if norm = "" then go (j + 1) (steps + 1)
+            else Some { raw; norm; sp; ep }
+        | _ ->
+            None
+    in
+    go start 0
   in
-  loop 0 []
-
-let is_ident_char = function
-  | 'A'..'Z' | '0'..'9' | '_' | '$' | '\'' -> true
-  | _ -> false
-
-let uppercase = String.uppercase_ascii
-let normalize_spaces s = String.map (fun c -> if c = '\t' then ' ' else c) s
-
-let take_ident_from (s:string) (i:int) : string option =
-  let n = String.length s in
-  let j = ref i in
-  while !j < n && s.[!j] = ' ' do incr j done;
-  if !j >= n || not (is_ident_char s.[!j]) then None
-  else (
-    let k = ref !j in
-    while !k < n && is_ident_char s.[!k] do incr k done;
-    Some (String.sub s !j (!k - !j))
-  )
-
-let contains_substring ~(haystack:string) ~(needle:string) : bool =
-  let n = String.length haystack and m = String.length needle in
-  let rec go i =
-    if i + m > n then false
-    else if String.sub haystack i m = needle then true
-    else go (i+1)
-  in
-  m = 0 || go 0
+  let imports_rev = ref [] in
+  let compool_hit = ref None in
+  for i = 0 to len - 1 do
+    match tok_at i with
+    | Parser.BANG ->
+        if i + 1 < len then
+          (match tok_at (i + 1) with
+           | Parser.COMPOOL | Parser.ICOMPOOL ->
+               (match find_name_after (i + 2) with
+                | None -> ()
+                | Some nm ->
+                    imports_rev :=
+                      { kind = Compool; name = nm.norm; loc = mk_loc_of_lex ~file nm.sp nm.ep }
+                      :: !imports_rev)
+           | _ -> ())
+    | Parser.ICOMPOOL when not (prev_is_bang i) ->
+        (match find_name_after (i + 1) with
+         | None -> ()
+         | Some nm ->
+             imports_rev :=
+               { kind = Compool; name = nm.norm; loc = mk_loc_of_lex ~file nm.sp nm.ep }
+               :: !imports_rev)
+    | Parser.COMPOOL when not (prev_is_bang i) && !compool_hit = None ->
+        (match find_name_after (i + 1) with
+         | None -> ()
+         | Some nm ->
+             let col0 = nm.sp.pos_cnum - nm.sp.pos_bol in
+             let col1 = nm.ep.pos_cnum - nm.ep.pos_bol in
+             compool_hit := Some (nm.raw, nm.sp.pos_lnum, col0, col1))
+    | _ ->
+        ()
+  done;
+  (List.rev !imports_rev, !compool_hit)
 
 let scan_compool_def ~(text:string) : string option =
-  let lines = String.split_on_char '\n' text in
-  let rec go = function
-    | [] -> None
-    | line :: rest ->
-        let u = uppercase (normalize_spaces line) in
-        (* ignore directive lines/segments *)
-        if contains_substring ~haystack:u ~needle:"!COMPOOL"
-           || contains_substring ~haystack:u ~needle:"ICOMPOOL"
-        then go rest
-        else
-          (* look for "COMPOOL <ident>" *)
-          let rec find_at i =
-            if i + 6 > String.length u then None
-            else if String.sub u i 6 = "COMPOOL" then
-              take_ident_from u (i+6)
-            else find_at (i+1)
-          in
-          match find_at 0 with
-          | Some nm when String.trim nm <> "" -> Some (String.trim nm)
-          | _ -> go rest
-  in
-  go lines
-
+  let _, compool_hit = scan_from_tokens ~file:None ~text in
+  match compool_hit with
+  | None -> None
+  | Some (nm, _, _, _) ->
+      let k = normalize_compool_name nm in
+      if k = "" then None else Some k
 
 let run ~(file:string option) ~(text:string) : result =
-  let lines = String.split_on_char '\n' text in
-  let compool_def = scan_compool_def ~text in
-
-  let imports =
-    lines
-    |> List.mapi (fun idx line -> (idx + 1, line))
-    |> List.fold_left (fun acc (line_no, line) ->
-         let u = uppercase (normalize_spaces line) in
-         if contains_substring ~haystack:u ~needle:"ICOMPOOL" then (
-           (* Priority 1: quoted imports ICOMPOOL 'NAME'; or ICOMPOOL ('A','B'); *)
-           let qs = extract_quoted line in
-           let from_quotes =
-             qs
-             |> List.map (fun (nm, (c0, c1)) ->
-                  let name = uppercase (String.trim nm) in
-                  let loc = mk_loc ~file ~line:line_no ~col0:c0 ~col1:c1 in
-                  { kind = Compool; name; loc })
-           in
-           if from_quotes <> [] then from_quotes @ acc
-           else (
-             (* Priority 2: unquoted variant: ICOMPOOL NAME; *)
-             match
-               let i =
-                 (* find start index of ICOMPOOL to look after it *)
-                 let needle = "ICOMPOOL" in
-                 let rec scan j =
-                   if j + String.length needle > String.length u then None
-                   else if String.sub u j (String.length needle) = needle then Some (j + String.length needle)
-                   else scan (j + 1)
-                 in
-                 scan 0
-               in
-               match i with
-               | None -> None
-               | Some j -> take_ident_from u j
-             with
-             | None -> acc
-             | Some nm ->
-                 let name = uppercase (String.trim nm) in
-                 let c0 = 0 and c1 = min (String.length line) (String.length line) in
-                 let loc = mk_loc ~file ~line:line_no ~col0:c0 ~col1:c1 in
-                 { kind = Compool; name; loc } :: acc
-           )
-         ) else acc
-       ) []
-    |> List.rev
+  let imports, compool_hit = scan_from_tokens ~file ~text in
+  let compool_def =
+    match compool_hit with
+    | None -> None
+    | Some (nm, _, _, _) ->
+        let k = normalize_compool_name nm in
+        if k = "" then None else Some k
   in
 
-  { text; imports; compool_def; diags = [] }
+  let mismatch_diags =
+    match file, compool_hit with
+    | Some path, Some (def_raw, line_no, c0, c1) ->
+        let expected = normalize_compool_name (Filename.basename path) in
+        let found = normalize_compool_name def_raw in
+        if expected <> "" && found <> "" && expected <> found then
+          let sp : Ast.Loc.pos = { line = line_no; col = c0; offset = 0 } in
+          let ep : Ast.Loc.pos = { line = line_no; col = c1; offset = 0 } in
+          let loc = Ast.Loc.make ~file:(Some path) ~start_pos:sp ~end_pos:ep in
+          [diag_error loc
+             (Printf.sprintf
+                "COMPOOL name %S must match file name %S (extension omitted)."
+                found expected)]
+        else
+          []
+    | _ -> []
+  in
+
+  { text; imports; compool_def; diags = mismatch_diags }

@@ -1,1 +1,1 @@
-lib/lsp_server.ml: List Lsp Lsp_io String Sys Workspace Yojson
+lib/lsp_server.ml: List Lsp Lsp_io Sys Uri_path Workspace Yojson

@@ -10,7 +10,7 @@ type import = {
 
 type result = {
   text : string;                 (* for now: identical to input *)
-  imports : import list;         (* ICOMPOOL extracted *)
+  imports : import list;         (* COMPOOL/ICOMPOOL/!COMPOOL extracted *)
   compool_def : string option;   (* START COMPOOL NAME; found in file *)
   diags : T.Diagnostic.t list;   (* preprocess diagnostics only *)
 }

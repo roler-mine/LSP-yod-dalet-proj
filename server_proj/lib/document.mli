@@ -9,6 +9,7 @@ type t = private {
 
   pre_text : string;
   imports : Preprocess.import list;
+  compool_def : string option;
 
   pre_diags : T.Diagnostic.t list;
   import_diags : T.Diagnostic.t list;

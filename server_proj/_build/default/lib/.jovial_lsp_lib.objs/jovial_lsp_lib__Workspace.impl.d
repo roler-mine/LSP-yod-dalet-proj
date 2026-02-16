@@ -1,1 +1,1 @@
-lib/workspace.ml: Ast Document Hashtbl Lexer Lexing List Lsp Lsp_conv Parse Parser Preprocess String Workspace_index Yojson
+lib/workspace.ml: Array Ast Buffer Document Filename Hashtbl Lexer Lexing List Lsp Lsp_conv Option Parse Parser Preprocess Printexc Printf String Sys Text_index Uri_path Workspace_index Yojson
