@@ -68,7 +68,9 @@ let text (d:t) = d.text
 let ast_dump (d:t) =
   match d.ast with
   | None -> None
-  | Some ast -> Some (Ast.Debug.to_string ast)
+  | Some ast ->
+      let opts = { Ast.Debug.default_opts with show_locs = true } in
+      Some (Ast.Debug.to_string ~opts ast)
 
 let offset_of_pos (idx : Text_index.t) (p : T.Position.t) : int option =
   let clamp lo hi x =

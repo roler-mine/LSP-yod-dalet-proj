@@ -1,0 +1,77 @@
+# -----------------------------
+# OS / generic temp files
+# -----------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.log
+
+# -----------------------------
+# Editor / IDE local files
+# -----------------------------
+.idea/
+.vs/
+**/.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+*~
+
+# Keep shared workspace settings if you want them tracked,
+# but ignore local VS Code runtime data.
+.vscode/*.log
+.vscode/*.db
+.vscode/*.cache
+.vscode-test/
+
+# -----------------------------
+# VS Code extension (TypeScript)
+# -----------------------------
+extension_proj/node_modules/
+extension_proj/out/
+extension_proj/.eslintcache
+extension_proj/*.vsix
+extension_proj/npm-debug.log*
+extension_proj/yarn-debug.log*
+extension_proj/yarn-error.log*
+extension_proj/pnpm-debug.log*
+*.tsbuildinfo
+
+# -----------------------------
+# OCaml / Dune / opam artifacts
+# -----------------------------
+**/_build/
+**/_opam/
+**/.merlin
+**/.ocamlinit
+
+# Keep only the prebuilt LSP server binary in repo.
+!server_proj/_build/
+server_proj/_build/*
+!server_proj/_build/default/
+server_proj/_build/default/*
+!server_proj/_build/default/bin/
+server_proj/_build/default/bin/*
+!server_proj/_build/default/bin/Main
+!server_proj/_build/default/bin/Main.exe
+!server_proj/_build/install/
+server_proj/_build/install/*
+!server_proj/_build/install/default/
+server_proj/_build/install/default/*
+!server_proj/_build/install/default/bin/
+server_proj/_build/install/default/bin/*
+!server_proj/_build/install/default/bin/jovial-lsp
+!server_proj/_build/install/default/bin/jovial-lsp.exe
+
+# -----------------------------
+# Project temporary scratch files
+# -----------------------------
+server_proj/_tmp_*.txt
+server_proj/_tmp_*.ml
+server_proj/_tmp_*.json
+server_proj/_tmp_*.log

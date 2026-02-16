@@ -39,6 +39,7 @@ const vscode = __importStar(require("vscode"));
 const cp = __importStar(require("child_process"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const os = __importStar(require("os"));
 const node_1 = require("vscode-languageclient/node");
 let client;
 let fileWatcher;
@@ -50,22 +51,164 @@ function getConfig() {
         autostart: cfg.get("autostart", true),
     };
 }
-function resolveServerPath(context, configured) {
-    const cfg = (configured ?? "").trim();
-    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (cfg.length > 0) {
-        const expanded = wsRoot ? cfg.replace("${workspaceFolder}", wsRoot) : cfg;
-        if (path.isAbsolute(expanded))
-            return expanded;
-        if (wsRoot)
-            return path.join(wsRoot, expanded);
-        return context.asAbsolutePath(expanded);
+function uniquePaths(xs) {
+    const seen = new Set();
+    const out = [];
+    for (const x of xs) {
+        const norm = path.normalize(x);
+        if (!seen.has(norm)) {
+            seen.add(norm);
+            out.push(norm);
+        }
     }
-    const exe = process.platform === "win32" ? "jovial-lsp.exe" : "jovial-lsp";
-    const bundled = context.asAbsolutePath(path.join("server", exe));
-    if (fs.existsSync(bundled))
-        return bundled;
+    return out;
+}
+function stripWrappingQuotes(s) {
+    if (s.length >= 2) {
+        const a = s[0];
+        const b = s[s.length - 1];
+        if ((a === "\"" && b === "\"") || (a === "'" && b === "'")) {
+            return s.slice(1, -1);
+        }
+    }
+    return s;
+}
+function expandEnvVars(s) {
+    const a = s.replace(/\$\{env:([^}]+)\}/g, (_m, name) => process.env[name] ?? "");
+    return a.replace(/%([^%]+)%/g, (_m, name) => process.env[name] ?? "");
+}
+function expandHomeDir(s) {
+    if (s === "~")
+        return os.homedir();
+    if (s.startsWith("~/") || s.startsWith("~\\")) {
+        return path.join(os.homedir(), s.slice(2));
+    }
+    return s;
+}
+function normalizeServerPathForPlatform(s) {
+    const norm = path.normalize(s);
+    if (process.platform === "win32") {
+        return norm.replace(/\//g, "\\");
+    }
+    return norm;
+}
+function pushCandidate(candidates, p) {
+    if (!p)
+        return;
+    candidates.push(normalizeServerPathForPlatform(p));
+}
+function addRelativeCandidates(candidates, baseDir, relPath, maxParentDepth = 3) {
+    let cur = normalizeServerPathForPlatform(baseDir);
+    for (let i = 0; i <= maxParentDepth; i += 1) {
+        pushCandidate(candidates, path.join(cur, relPath));
+        const parent = path.dirname(cur);
+        if (parent === cur)
+            break;
+        cur = parent;
+    }
+}
+function isRepoRootDir(dir) {
+    const hasGit = fs.existsSync(path.join(dir, ".git"));
+    const hasServer = fs.existsSync(path.join(dir, "server_proj"));
+    const hasExtension = fs.existsSync(path.join(dir, "extension_proj"));
+    return hasGit || (hasServer && hasExtension);
+}
+function findRepoRoot(folders, extensionPath) {
+    const seeds = [
+        ...folders.map((f) => f.uri.fsPath),
+        extensionPath,
+        path.dirname(extensionPath),
+    ];
+    for (const seed of seeds) {
+        let cur = normalizeServerPathForPlatform(seed);
+        for (let i = 0; i < 12; i += 1) {
+            if (isRepoRootDir(cur)) {
+                return normalizeServerPathForPlatform(cur);
+            }
+            const parent = path.dirname(cur);
+            if (parent === cur)
+                break;
+            cur = parent;
+        }
+    }
     return undefined;
+}
+function expandWorkspaceVars(s, folders) {
+    const named = s.replace(/\$\{workspaceFolder:([^}]+)\}/g, (_m, name) => {
+        const hit = folders.find((f) => f.name === name);
+        return hit ? hit.uri.fsPath : "";
+    });
+    if (!named.includes("${workspaceFolder}")) {
+        return [named];
+    }
+    if (folders.length === 0) {
+        return [named.replace(/\$\{workspaceFolder\}/g, "")];
+    }
+    return folders.map((f) => named.replace(/\$\{workspaceFolder\}/g, f.uri.fsPath));
+}
+function resolveServerPath(context, configured) {
+    const cfgRaw = stripWrappingQuotes((configured ?? "").trim());
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const repoRoot = findRepoRoot(folders, context.extensionPath);
+    if (cfgRaw.length > 0) {
+        const expanded = expandWorkspaceVars(expandHomeDir(expandEnvVars(cfgRaw)), folders);
+        const candidates = [];
+        for (const item of expanded) {
+            const rawItem = item.trim();
+            if (!rawItem)
+                continue;
+            if (/^file:\/\//i.test(rawItem)) {
+                try {
+                    candidates.push(normalizeServerPathForPlatform(vscode.Uri.parse(rawItem).fsPath));
+                }
+                catch {
+                    // ignore malformed URI
+                }
+                continue;
+            }
+            const c = normalizeServerPathForPlatform(rawItem);
+            if (!c)
+                continue;
+            if (path.isAbsolute(c)) {
+                pushCandidate(candidates, c);
+                continue;
+            }
+            // Preferred behavior: resolve relative server paths from repo root first.
+            if (repoRoot) {
+                pushCandidate(candidates, path.join(repoRoot, c));
+            }
+            for (const f of folders) {
+                addRelativeCandidates(candidates, f.uri.fsPath, c, 4);
+            }
+            addRelativeCandidates(candidates, context.extensionPath, c, 2);
+            pushCandidate(candidates, context.asAbsolutePath(c));
+            pushCandidate(candidates, path.resolve(c));
+        }
+        const ordered = uniquePaths(candidates);
+        const hit = ordered.find((p) => fs.existsSync(p));
+        return normalizeServerPathForPlatform(hit ?? ordered[0]);
+    }
+    const exes = process.platform === "win32"
+        ? ["Main.exe", "jovial-lsp.exe"]
+        : ["Main", "jovial-lsp"];
+    const relCandidates = [
+        ...exes.map((e) => path.join("server", e)),
+        ...exes.map((e) => path.join("server_proj", "_build", "default", "bin", e)),
+        ...exes.map((e) => path.join("server_proj", "_build", "install", "default", "bin", e)),
+    ];
+    const probe = [];
+    for (const rel of relCandidates) {
+        if (repoRoot) {
+            pushCandidate(probe, path.join(repoRoot, rel));
+        }
+        for (const f of folders) {
+            addRelativeCandidates(probe, f.uri.fsPath, rel, 4);
+        }
+        addRelativeCandidates(probe, context.extensionPath, rel, 2);
+        pushCandidate(probe, context.asAbsolutePath(rel));
+    }
+    const hit = uniquePaths(probe).find((p) => fs.existsSync(p));
+    return hit ? normalizeServerPathForPlatform(hit) : undefined;
 }
 function setStatus(status, kind, detail) {
     switch (kind) {
@@ -318,6 +461,35 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
       color: var(--muted);
       font-size: 11px;
     }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      background: #111922;
+      color: #b8c7d8;
+      font-size: 11px;
+    }
+    .legend.hidden { display: none; }
+    .legendItem {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legendSwatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 3px;
+      border: 1px solid transparent;
+    }
+    .legendSwatch.proc { background: #5a3e26; border-color: #e39f5b; }
+    .legendSwatch.decl { background: #214e45; border-color: #6fd8bf; }
+    .legendSwatch.stmt { background: #5b4e1f; border-color: #f4c26b; }
+    .legendSwatch.expr { background: #233c61; border-color: #7fb0ee; }
+    .legendSwatch.type { background: #4b3f24; border-color: #dfc06d; }
+    .legendSwatch.struct { background: #313744; border-color: #8fa0b7; }
     .graphWrap {
       position: relative;
       min-height: 260px;
@@ -389,7 +561,15 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
     <div class="viewer">
       <div class="bar">
         <span>${escapeHtml(shownTitle)}</span>
-        <span>Node Graph View</span>
+        <span>${astActive ? "Click a node to jump to source" : "Token flow order"}</span>
+      </div>
+      <div class="legend ${astActive ? "" : "hidden"}">
+        <span class="legendItem"><span class="legendSwatch proc"></span>Procedure</span>
+        <span class="legendItem"><span class="legendSwatch decl"></span>Declaration</span>
+        <span class="legendItem"><span class="legendSwatch stmt"></span>Statement</span>
+        <span class="legendItem"><span class="legendSwatch expr"></span>Expression</span>
+        <span class="legendItem"><span class="legendSwatch type"></span>Type</span>
+        <span class="legendItem"><span class="legendSwatch struct"></span>Structure</span>
       </div>
       <div class="graphWrap">
         <svg id="graphSvg" xmlns="http://www.w3.org/2000/svg"></svg>
@@ -405,6 +585,7 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
     const vscode = acquireVsCodeApi();
     const payload = {
       tab: ${JSON.stringify(activeTab)},
+      uri: ${JSON.stringify(uri)},
       ast: ${astPayload},
       cst: ${cstPayload},
     };
@@ -415,6 +596,84 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
     function shorten(s, n) {
       if (s.length <= n) return s;
       return s.slice(0, Math.max(1, n - 3)) + "...";
+    }
+
+    function parseLocationPrefix(text, from) {
+      const m = text.slice(from).match(/^(.+):(\\d+):(\\d+)-(\\d+):(\\d+)/);
+      if (!m) return null;
+      const sl = Number(m[2]);
+      const sc = Number(m[3]);
+      const el = Number(m[4]);
+      const ec = Number(m[5]);
+      if (![sl, sc, el, ec].every((n) => Number.isFinite(n))) return null;
+      return {
+        text: m[0],
+        length: m[0].length,
+        loc: {
+          file: m[1],
+          startLine: Math.trunc(sl),
+          startCol: Math.trunc(sc),
+          endLine: Math.trunc(el),
+          endCol: Math.trunc(ec),
+        },
+      };
+    }
+
+    function parseLocationText(text) {
+      if (!text) return null;
+      const m = String(text).trim().match(/^(.+):(\\d+):(\\d+)-(\\d+):(\\d+)$/);
+      if (!m) return null;
+      const sl = Number(m[2]);
+      const sc = Number(m[3]);
+      const el = Number(m[4]);
+      const ec = Number(m[5]);
+      if (![sl, sc, el, ec].every((n) => Number.isFinite(n))) return null;
+      return {
+        file: m[1],
+        startLine: Math.trunc(sl),
+        startCol: Math.trunc(sc),
+        endLine: Math.trunc(el),
+        endCol: Math.trunc(ec),
+      };
+    }
+
+    function astNodeKind(label) {
+      const headMatch = String(label).match(/^[A-Za-z][A-Za-z0-9_]*/);
+      const head = headMatch ? headMatch[0] : "";
+      if (head === "Program" || head === "TopDecl" || head === "TopStmt" || head === "Param" || head === "Field") {
+        return "struct";
+      }
+      if (head === "DProc") return "proc";
+      if (/^D[A-Za-z]/.test(head)) return "decl";
+      if (/^S[A-Za-z]/.test(head)) return "stmt";
+      if (/^E[A-Za-z]/.test(head)) return "expr";
+      if (/^T[A-Za-z]/.test(head)) return "type";
+      return "other";
+    }
+
+    function nodeColor(node, isFlow) {
+      if (node.id === 0) {
+        return { fill: "#244f3f", stroke: "#53bf78", text: "#dcfee7" };
+      }
+      if (isFlow || node.kind === "token") {
+        return { fill: "#23344a", stroke: "#5f86ad", text: "#dce8f5" };
+      }
+      switch (node.kind) {
+        case "proc":
+          return { fill: "#5a3e26", stroke: "#e39f5b", text: "#ffe8cb" };
+        case "decl":
+          return { fill: "#214e45", stroke: "#6fd8bf", text: "#d7fff4" };
+        case "stmt":
+          return { fill: "#5b4e1f", stroke: "#f4c26b", text: "#fff0c8" };
+        case "expr":
+          return { fill: "#233c61", stroke: "#7fb0ee", text: "#d9ebff" };
+        case "type":
+          return { fill: "#4b3f24", stroke: "#dfc06d", text: "#fff0c8" };
+        case "struct":
+          return { fill: "#313744", stroke: "#8fa0b7", text: "#e3e8ef" };
+        default:
+          return { fill: "#2a3140", stroke: "#67758a", text: "#dce8f5" };
+      }
     }
 
     function showMessage(msg) {
@@ -429,11 +688,12 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
     }
 
     function parseAstGraph(text, maxNodes = 520) {
-      const nodes = [{ id: 0, label: "AST", depth: 0 }];
+      const nodes = [{ id: 0, label: "AST", kind: "root", depth: 0 }];
       const edges = [];
       const stack = [0];
       let pending = "";
       let truncated = false;
+      let recentClosed = null;
 
       const isWordChar = (ch) => /[A-Za-z0-9_'$<>.-]/.test(ch);
       const pushNode = (label) => {
@@ -442,13 +702,32 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
           return null;
         }
         const id = nodes.length;
-        nodes.push({ id, label, depth: stack.length });
+        nodes.push({ id, label, kind: astNodeKind(label), depth: stack.length });
         edges.push({ from: stack[stack.length - 1], to: id });
         return id;
       };
 
       let i = 0;
       while (i < text.length) {
+        if (recentClosed !== null) {
+          let j = i;
+          while (j < text.length && /\\s/.test(text[j])) j += 1;
+          const parsedLoc = parseLocationPrefix(text, j);
+          if (parsedLoc) {
+            const n = nodes[recentClosed];
+            if (n && !n.loc) {
+              n.meta = parsedLoc.text;
+              n.loc = parsedLoc.loc;
+            }
+            i = j + parsedLoc.length;
+            recentClosed = null;
+            continue;
+          }
+          recentClosed = null;
+          i = j;
+          if (i >= text.length) break;
+        }
+
         const ch = text[i];
         if (/\\s/.test(ch)) {
           i += 1;
@@ -489,7 +768,7 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
         }
         if (ch === ")" || ch === "]" || ch === "}") {
           pending = "";
-          if (stack.length > 1) stack.pop();
+          if (stack.length > 1) recentClosed = stack.pop();
           i += 1;
           continue;
         }
@@ -501,7 +780,7 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
     }
 
     function parseCstGraph(text, maxTokens = 260) {
-      const nodes = [{ id: 0, label: "CST", depth: 0 }];
+      const nodes = [{ id: 0, label: "CST", kind: "root", depth: 0 }];
       const edges = [];
       let truncated = false;
       let prev = 0;
@@ -519,8 +798,16 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
         const tok = m[2];
         const lex = m[3];
         const loc = m[4];
+        const parsed = parseLocationText(loc);
         const id = nodes.length;
-        nodes.push({ id, label: tok + "\\n" + lex, meta: loc, depth: 1 });
+        nodes.push({
+          id,
+          label: tok + "\\n" + lex,
+          kind: "token",
+          meta: loc,
+          loc: parsed || undefined,
+          depth: 1,
+        });
         edges.push({ from: prev, to: id });
         prev = id;
       }
@@ -634,19 +921,23 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
         rect.setAttribute("width", String(nodeW));
         rect.setAttribute("height", String(nodeH));
         rect.setAttribute("rx", "11");
-        rect.setAttribute("fill", n.id === 0 ? "#244f3f" : (isFlow ? "#23344a" : "#1f2e40"));
-        rect.setAttribute("stroke", n.id === 0 ? "#53bf78" : "#40607b");
+        const colors = nodeColor(n, isFlow);
+        rect.setAttribute("fill", colors.fill);
+        rect.setAttribute("stroke", colors.stroke);
         rect.setAttribute("stroke-width", "1.2");
         g.appendChild(rect);
 
         const title = make("title");
         title.textContent = n.meta ? n.label + " @ " + n.meta : n.label;
+        if (n.loc) {
+          title.textContent += " (click to open source)";
+        }
         g.appendChild(title);
 
         const textEl = make("text");
         textEl.setAttribute("x", String(p.x + nodeW / 2));
         textEl.setAttribute("y", String(p.y + 23));
-        textEl.setAttribute("fill", "#dce8f5");
+        textEl.setAttribute("fill", colors.text);
         textEl.setAttribute("font-size", "11");
         textEl.setAttribute("font-family", "Consolas, 'Cascadia Code', monospace");
         textEl.setAttribute("text-anchor", "middle");
@@ -663,6 +954,20 @@ function syntaxTreeHtml(fileLabel, uri, astText, cstText, activeTab) {
           textEl.appendChild(tspan);
         });
         g.appendChild(textEl);
+
+        if (n.loc) {
+          g.style.cursor = "pointer";
+          g.addEventListener("mouseenter", () => rect.setAttribute("stroke-width", "2"));
+          g.addEventListener("mouseleave", () => rect.setAttribute("stroke-width", "1.2"));
+          g.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "goto",
+              uri: payload.uri,
+              loc: n.loc,
+              label: n.label,
+            });
+          });
+        }
         svg.appendChild(g);
       }
 
@@ -707,6 +1012,7 @@ async function showSyntaxTreesUi(output) {
     const editor = vscode.window.activeTextEditor;
     if (!editor)
         return;
+    const sourceUri = editor.document.uri;
     const docUri = editor.document.uri.toString();
     const fileLabel = path.basename(editor.document.fileName || editor.document.uri.path || "document");
     const panel = vscode.window.createWebviewPanel("jovialSyntaxTrees", `Jovial Trees: ${fileLabel}`, vscode.ViewColumn.Beside, { enableScripts: true, retainContextWhenHidden: true });
@@ -733,12 +1039,91 @@ async function showSyntaxTreesUi(output) {
         }
         render();
     };
+    const parseGraphLoc = (value) => {
+        if (!value || typeof value !== "object")
+            return null;
+        const rec = value;
+        const num = (key) => {
+            const raw = rec[key];
+            if (typeof raw !== "number" || !Number.isFinite(raw))
+                return null;
+            return Math.trunc(raw);
+        };
+        const startLine = num("startLine");
+        const startCol = num("startCol");
+        const endLine = num("endLine");
+        const endCol = num("endCol");
+        if (startLine === null || startCol === null || endLine === null || endCol === null)
+            return null;
+        const rawFile = rec["file"];
+        return {
+            file: typeof rawFile === "string" ? rawFile : undefined,
+            startLine,
+            startCol,
+            endLine,
+            endCol,
+        };
+    };
+    const resolveLocUri = (loc) => {
+        const file = (loc.file ?? "").trim();
+        if (!file || file === "<nofile>")
+            return sourceUri;
+        if (/^[A-Za-z]:[\\/]/.test(file) || file.startsWith("\\\\")) {
+            return vscode.Uri.file(file);
+        }
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(file)) {
+            try {
+                return vscode.Uri.parse(file);
+            }
+            catch {
+                // fall through to relative resolution
+            }
+        }
+        const baseDir = sourceUri.fsPath ? path.dirname(sourceUri.fsPath) : "";
+        if (baseDir) {
+            return vscode.Uri.file(path.resolve(baseDir, file));
+        }
+        return sourceUri;
+    };
+    const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+    const docPos = (doc, line1, col0) => {
+        const maxLine = Math.max(0, doc.lineCount - 1);
+        const line = clamp(line1 - 1, 0, maxLine);
+        const lineLen = doc.lineAt(line).text.length;
+        const col = clamp(col0, 0, lineLen);
+        return new vscode.Position(line, col);
+    };
+    const jumpToGraphLoc = async (value) => {
+        const loc = parseGraphLoc(value);
+        if (!loc)
+            return;
+        try {
+            const targetUri = resolveLocUri(loc);
+            const targetDoc = await vscode.workspace.openTextDocument(targetUri);
+            const start = docPos(targetDoc, Math.max(1, loc.startLine), Math.max(0, loc.startCol));
+            let end = docPos(targetDoc, Math.max(1, loc.endLine), Math.max(0, loc.endCol));
+            if (end.isBefore(start))
+                end = start;
+            const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+            const targetEditor = await vscode.window.showTextDocument(targetDoc, { preview: false, viewColumn: column });
+            const range = new vscode.Range(start, end);
+            targetEditor.selection = new vscode.Selection(start, end);
+            targetEditor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+        }
+        catch (e) {
+            output.appendLine(`AST/CST goto failed: ${String(e)}`);
+        }
+    };
     panel.webview.onDidReceiveMessage(async (msg) => {
         if (!msg || typeof msg !== "object")
             return;
         const kind = msg.type;
         if (kind === "refresh") {
             await refresh();
+            return;
+        }
+        if (kind === "goto") {
+            await jumpToGraphLoc(msg.loc);
             return;
         }
         if (kind === "tab") {

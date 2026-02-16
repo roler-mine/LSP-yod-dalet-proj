@@ -87,7 +87,7 @@ Use this if you are working in this repository and want the fastest local setup.
 
 1. Install the extension locally (VSIX or development host).
 2. Set `jovial.server.path` to the checked-in prebuilt server binary:
-   `${workspaceFolder}/server_proj/_build/install/default/bin/jovial-lsp.exe`
+   `${workspaceFolder}\\server_proj\\_build\\default\\bin\\Main.exe`
 3. Run `Jovial: Restart Language Server`.
 4. Open a `.jov`, `.j73`, or `.jvl` file and verify diagnostics and navigation.
 
@@ -95,7 +95,7 @@ Recommended workspace setting (`.vscode/settings.json`):
 
 ```json
 {
-  "jovial.server.path": "${workspaceFolder}/server_proj/_build/install/default/bin/jovial-lsp.exe",
+  "jovial.server.path": "${workspaceFolder}\\server_proj\\_build\\default\\bin\\Main.exe",
   "jovial.server.args": [],
   "jovial.autostart": true
 }
@@ -113,7 +113,7 @@ Example user setting (`Preferences: Open User Settings (JSON)`):
 
 ```json
 {
-  "jovial.server.path": "C:/tools/jovial-lsp/jovial-lsp.exe",
+  "jovial.server.path": "C:\\tools\\jovial-lsp\\jovial-lsp.exe",
   "jovial.server.args": [],
   "jovial.autostart": true
 }
@@ -186,7 +186,7 @@ Extension settings:
 
 The server runs over stdio and can be used by any LSP-capable editor or client:
 
-- Process executable: `jovial-lsp` or `jovial-lsp.exe`
+- Process executable: `Main.exe` (repo local build) or `jovial-lsp` / `jovial-lsp.exe` (installed artifact)
 - Transport: stdio
 - No standalone CLI mode for direct human interaction
 
