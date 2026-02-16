@@ -1,1 +1,1 @@
-lib/parser.mli: Ast Lexing
+lib/syntax/parser.mli: Ast Lexing MenhirLib
