@@ -13,6 +13,7 @@ val compool_count : t -> int
 val open_doc : t -> uri:T.DocumentUri.t -> file:string option -> text:string -> unit
 val change_doc : t -> uri:T.DocumentUri.t -> changes:T.TextDocumentContentChangeEvent.t list -> unit
 val close_doc : t -> uri:T.DocumentUri.t -> unit
+val apply_watched_file_changes : t -> changes:(string * [ `Created | `Changed | `Deleted ]) list -> unit
 
 val diagnostics_for : t -> uri:T.DocumentUri.t -> T.Diagnostic.t list
 val ast_dump_for : t -> uri:T.DocumentUri.t -> string option

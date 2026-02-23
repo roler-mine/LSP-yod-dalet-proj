@@ -46,6 +46,8 @@
     | "PROC"    -> Some PROC
     | "ITEM"    -> Some ITEM
     | "TABLE"   -> Some TABLE
+    | "STATIC"  -> Some STATIC
+    | "CONSTANT"-> Some CONSTANT
 
     | "IF"      -> Some IF
     | "ELSE"    -> Some ELSE
@@ -55,6 +57,7 @@
     | "THEN"    -> Some THEN
     | "CASE"    -> Some CASE
     | "DEFAULT" -> Some DEFAULT
+    | "FALLTHRU"-> Some FALLTHRU
 
     | "EXIT"    -> Some EXIT
     | "GOTO"    -> Some GOTO

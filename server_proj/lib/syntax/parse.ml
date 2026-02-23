@@ -53,8 +53,9 @@ module Debug = struct
     | Parser.START -> "START" | Parser.TERM -> "TERM" | Parser.BEGIN -> "BEGIN" | Parser.END -> "END"
     | Parser.DEF -> "DEF" | Parser.REF -> "REF" | Parser.PROC -> "PROC"
     | Parser.ITEM -> "ITEM" | Parser.TABLE -> "TABLE"
+    | Parser.STATIC -> "STATIC" | Parser.CONSTANT -> "CONSTANT"
     | Parser.IF -> "IF" | Parser.ELSE -> "ELSE" | Parser.WHILE -> "WHILE" | Parser.FOR -> "FOR" | Parser.BY -> "BY" | Parser.THEN -> "THEN"
-    | Parser.CASE -> "CASE" | Parser.DEFAULT -> "DEFAULT"
+    | Parser.CASE -> "CASE" | Parser.DEFAULT -> "DEFAULT" | Parser.FALLTHRU -> "FALLTHRU"
     | Parser.EXIT -> "EXIT" | Parser.GOTO -> "GOTO" | Parser.RETURN -> "RETURN" | Parser.ABORT -> "ABORT" | Parser.STOP -> "STOP"
     | Parser.PROGRAM -> "PROGRAM" | Parser.COMPOOL -> "COMPOOL" | Parser.ICOMPOOL -> "ICOMPOOL"
     | Parser.DEFINE -> "DEFINE" | Parser.TYPE -> "TYPE" | Parser.BLOCK -> "BLOCK"
@@ -99,10 +100,10 @@ let expected_candidates : Parser.token list =
     Parser.STRINGLIT "";
 
     Parser.START; Parser.TERM; Parser.BEGIN; Parser.END;
-    Parser.DEF; Parser.REF; Parser.PROC; Parser.ITEM; Parser.TABLE;
+    Parser.DEF; Parser.REF; Parser.PROC; Parser.ITEM; Parser.TABLE; Parser.STATIC; Parser.CONSTANT;
     Parser.PROGRAM; Parser.COMPOOL; Parser.ICOMPOOL; Parser.DEFINE; Parser.TYPE; Parser.BLOCK;
     Parser.IF; Parser.ELSE; Parser.WHILE; Parser.FOR; Parser.BY; Parser.THEN;
-    Parser.CASE; Parser.DEFAULT;
+    Parser.CASE; Parser.DEFAULT; Parser.FALLTHRU;
     Parser.RETURN; Parser.EXIT; Parser.GOTO; Parser.ABORT; Parser.STOP;
     Parser.TRUE; Parser.FALSE;
     Parser.NOT; Parser.AND; Parser.OR; Parser.XOR; Parser.EQV; Parser.MOD;

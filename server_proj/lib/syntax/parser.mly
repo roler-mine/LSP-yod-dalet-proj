@@ -74,9 +74,9 @@
 /* keywords */
 %token START TERM BEGIN END
 %token DEF REF PROC
-%token ITEM TABLE
+%token ITEM TABLE STATIC CONSTANT
 %token IF ELSE WHILE FOR BY THEN
-%token CASE DEFAULT
+%token CASE DEFAULT FALLTHRU
 %token EXIT GOTO RETURN ABORT STOP
 %token NOT AND OR XOR EQV MOD
 
@@ -301,6 +301,31 @@ type_decl:
       {
         [n $startpos $endpos (Ast.DType { name = nm; defn = ty })]
       }
+  /* TYPE T TABLE [dims] BASETYPE; */
+  | TYPE nm=ident TABLE dims=table_dims_opt base=ident _t=terminator
+      {
+        let defn =
+          match dims with
+          | [] ->
+              n $startpos(base) $endpos(base) (Ast.TName base)
+          | _ ->
+              let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
+              n $startpos $endpos (Ast.TArray { elem; dims })
+        in
+        [n $startpos $endpos (Ast.DType { name = nm; defn })]
+      }
+  /* TYPE T TABLE [dims] [;] BEGIN ... END [;] */
+  | TYPE nm=ident TABLE dims=table_dims_opt _t=terminator_opt BEGIN fs=field_decl_list END _tail=terminator_opt
+      {
+        let entry = n $startpos $endpos (Ast.TRecord fs) in
+        let defn =
+          match dims with
+          | [] -> entry
+          | _ -> n $startpos $endpos (Ast.TArray { elem = entry; dims })
+        in
+        [n $startpos $endpos (Ast.DType { name = nm; defn })]
+      }
+  /* Legacy form used by existing examples: TYPE T TABLE W 1; BEGIN ... END */
   | TYPE nm=ident TABLE _base=ident _sizes=type_sizes_opt _t=terminator BEGIN fs=field_decl_list END
       {
         let defn = n $startpos $endpos (Ast.TRecord fs) in
@@ -365,12 +390,17 @@ group_decl:
 
 /* ITEM name type [ - init ] ; */
 data_decl:
-  | mod_=modifier_opt ITEM nm=ident ty=type_spec init=item_init_opt _attrs=item_attrs_opt _t=terminator
+  | mod_=modifier_opt ITEM nm=ident st=static_opt ty=type_spec init=item_init_opt _attrs=item_attrs_opt _t=terminator
       {
         let storage =
           match mod_ with
           | None -> Ast.Automatic
           | Some _ -> Ast.External
+        in
+        let storage =
+          match storage with
+          | Ast.Automatic when st -> Ast.Static
+          | x -> x
         in
         let var =
           n $startpos $endpos (Ast.DVar { name = nm; dtype = ty; init; storage })
@@ -388,13 +418,51 @@ data_decl:
             [md; var]
       }
 
-  /* TABLE name(dims) [ - preset ] [ , BEGIN fielddecls END ] ; [BEGIN fielddecls END] */
-  | mod_=modifier_opt TABLE nm=ident dims=table_dims elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
+  | mod_=modifier_opt CONSTANT ITEM nm=ident st=static_opt ty=type_spec value=const_item_init _attrs=item_attrs_opt _t=terminator
       {
         let storage =
           match mod_ with
           | None -> Ast.Automatic
           | Some _ -> Ast.External
+        in
+        let storage =
+          match storage with
+          | Ast.Automatic when st -> Ast.Static
+          | x -> x
+        in
+        let c =
+          n $startpos $endpos (Ast.DConst { name = nm; dtype = Some ty; value })
+        in
+        (match storage with
+         | Ast.Static | Ast.External -> ()
+         | Ast.Automatic ->
+             Parse_diags.add (loc $startpos $endpos)
+               "CONSTANT items should have static or external allocation.");
+        match mod_ with
+        | None -> [c]
+        | Some m ->
+            let md =
+              n $startpos(mod_) $endpos(mod_)
+                (Ast.DDirective {
+                  name = nid $startpos(mod_) $endpos(mod_) m;
+                  args = [nid $startpos(nm) $endpos(nm) nm.v];
+                })
+            in
+            [md; c]
+      }
+
+  /* TABLE name [ (dims) ] [elem-type] [ - preset ] [ , BEGIN fielddecls END ] ; [BEGIN fielddecls END] */
+  | mod_=modifier_opt TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
+      {
+        let storage =
+          match mod_ with
+          | None -> Ast.Automatic
+          | Some _ -> Ast.External
+        in
+        let storage =
+          match storage with
+          | Ast.Automatic when st -> Ast.Static
+          | x -> x
         in
         let elem_ty =
           match recopt_after with
@@ -431,6 +499,16 @@ data_decl:
       }
   ;
 
+static_opt:
+  | /* empty */ { false }
+  | STATIC { true }
+  ;
+
+const_item_init:
+  | MINUS e=expr { e }
+  | EQ e=expr { e }
+  ;
+
 item_init_opt:
   | /* empty */ { None }
   | MINUS e=expr { Some e }
@@ -448,6 +526,7 @@ item_attrs:
   ;
 
 item_attr:
+  | STATIC { () }
   | _id=ident { () }
   | _id=ident _p=attr_paren_payload { () }
   | _p=attr_paren_payload { () }
@@ -513,6 +592,11 @@ table_dims:
   | LPAREN ds=dim_list_opt RPAREN { ds }
   ;
 
+table_dims_opt:
+  | /* empty */ { [] }
+  | ds=table_dims { ds }
+  ;
+
 dim_list_opt:
   | /* empty */ { [] }
   | ds=dim_list { ds }
@@ -566,9 +650,13 @@ field_decl:
 type_spec:
   | base=ident sizes=type_sizes_opt
       {
-        match sizes with
-        | [] -> n $startpos $endpos (Ast.TName base)
-        | dims ->
+        match String.uppercase_ascii base.v, sizes with
+        | "P", [{ v = Ast.EName pointed; loc = pointed_loc }] ->
+            let inner = Ast.node ~loc:pointed_loc (Ast.TName pointed) in
+            n $startpos $endpos (Ast.TPointer inner)
+        | _, [] ->
+            n $startpos $endpos (Ast.TName base)
+        | _, dims ->
             let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
             n $startpos $endpos (Ast.TArray { elem; dims })
       }
@@ -652,12 +740,8 @@ proc_header_atom:
 
 formals_opt:
   | /* empty */ { [] }
-  | LPAREN ps=formal_param_groups_opt RPAREN { ps }
-  ;
-
-formal_param_groups_opt:
-  | /* empty */ { [] }
-  | ps=formal_param_groups { ps }
+  | LPAREN RPAREN { [] }
+  | LPAREN ps=formal_param_groups RPAREN { ps }
   ;
 
 formal_param_groups:
@@ -670,6 +754,16 @@ formal_param_groups:
           Ast.node ~loc:id.loc { Ast.pname = id; pmode = mode; ptype = unknown_ty }
         in
         (List.map (mkp Ast.In) ins) @ (List.map (mkp Ast.Out) outs)
+      }
+  | COLON outs=id_list
+      {
+        let unknown_ty =
+          n $startpos $endpos (Ast.TName (nid $startpos $endpos "__implicit__"))
+        in
+        let mkp mode (id : Ast.ident) =
+          Ast.node ~loc:id.loc { Ast.pname = id; pmode = mode; ptype = unknown_ty }
+        in
+        List.map (mkp Ast.Out) outs
       }
   ;
 
@@ -688,6 +782,8 @@ proc_body_opt:
   | /* empty */ { None }
   | BEGIN ds=decl_section ss=block_list_opt END
       { Some (ds, mk_block $startpos $endpos ss) }
+  | s=simple_or_control_stmt
+      { Some ([], s) }
   ;
 
 decl_section:
@@ -814,22 +910,37 @@ abort_stmt:
   ;
 
 stop_stmt:
-  | STOP { n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "STOP"; args = [] }) }
+  | STOP eo=expr_opt
+      {
+        let args = match eo with None -> [] | Some e -> [e] in
+        n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "STOP"; args })
+      }
   ;
 
 call_stmt:
-  | callee=ident args=actuals_opt
+  | callee=ident args=actuals_opt _ab=abort_phrase_opt
       { n $startpos $endpos (Ast.SCallStmt { callee; args }) }
+  ;
+
+abort_phrase_opt:
+  | /* empty */ { None }
+  | ABORT lab=ident { Some lab }
   ;
 
 actuals_opt:
   | /* empty */ { [] }
-  | LPAREN es=expr_list_opt RPAREN { es }
+  | LPAREN RPAREN { [] }
+  | LPAREN es=actual_list RPAREN { es }
   ;
 
-expr_list_opt:
+actual_list:
+  | ins=expr_list outs=actual_outs_opt { ins @ outs }
+  | COLON outs=expr_list { outs }
+  ;
+
+actual_outs_opt:
   | /* empty */ { [] }
-  | es=expr_list { es }
+  | COLON outs=expr_list { outs }
   ;
 
 expr_list:
@@ -900,7 +1011,7 @@ case_options:
   ;
 
 case_option:
-  | LPAREN _idxs=case_index_list RPAREN _sep=case_sep body=simple_or_control_stmt
+  | LPAREN _idxs=case_index_list RPAREN _sep=case_sep body=simple_or_control_stmt _fall=fallthru_opt
       { ([], body) }
   | error _t=terminator
       { ([], bad_stmt $startpos $endpos) }
@@ -909,6 +1020,11 @@ case_option:
 case_sep:
   | COLON { () }
   | BANG  { () }
+  ;
+
+fallthru_opt:
+  | /* empty */ { () }
+  | FALLTHRU _t=terminator_opt { () }
   ;
 
 case_index_list:
@@ -954,7 +1070,7 @@ postfix_atom:
   | p=primary { p }
   | base=postfix_atom DOT fld=ident
       { n $startpos $endpos (Ast.EField { base; field = fld }) }
-  | base=postfix_atom LPAREN args=expr_list_opt RPAREN
+  | base=postfix_atom LPAREN args=postfix_call_args_opt RPAREN
       {
         match base.v with
         | Ast.EName callee -> n $startpos $endpos (Ast.ECall { callee; args })
@@ -962,8 +1078,15 @@ postfix_atom:
       }
   ;
 
+postfix_call_args_opt:
+  | /* empty */ { [] }
+  | es=actual_list { es }
+  ;
+
 postfix:
   | p=postfix_atom { p }
+  | AT ptr=postfix_atom
+      { n $startpos $endpos (Ast.EDeref { ptr }) }
   | field=postfix AT ptr=postfix_atom
       { n $startpos $endpos (Ast.EAt { field; ptr }) }
   ;

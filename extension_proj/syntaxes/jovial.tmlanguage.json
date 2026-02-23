@@ -133,15 +133,15 @@
       "patterns": [
         {
           "name": "keyword.control.jovial",
-          "match": "\\b(?i:(START|TERM|BEGIN|END|IF|ELSE|WHILE|FOR|BY|CASE|DEFAULT|GOTO|RETURN|EXIT|ABORT|STOP))\\b"
+          "match": "\\b(?i:(START|TERM|BEGIN|END|IF|THEN|ELSE|WHILE|FOR|BY|CASE|DEFAULT|FALLTHRU|GOTO|RETURN|EXIT|ABORT|STOP))\\b"
         },
         {
           "name": "keyword.declaration.jovial",
-          "match": "\\b(?i:(DEF|REF|PROC|ITEM|TABLE|TYPE|BLOCK))\\b"
+          "match": "\\b(?i:(DEF|REF|PROC|ITEM|TABLE|TYPE|BLOCK|STATIC|CONSTANT|INLINE|LABEL|LIKE|OVERLAY|PARALLEL|POS|INSTANCE))\\b"
         },
         {
           "name": "keyword.control.directive.jovial",
-          "match": "\\b(?i:(PROGRAM|COMPOOL|ICOMPOOL|DEFINE|ICOPY|ISKIP|IBEGIN|IEND|ILIST|INOLIST|IEJECT))\\b"
+          "match": "\\b(?i:(PROGRAM|COMPOOL|ICOMPOOL|DEFINE|ICOPY|ISKIP|IBEGIN|IEND|ILINKAGE|ITRACE|IINTERFERENCE|IREDUCIBLE|ILIST|INOLIST|IEJECT|IBASE|IISBASE|IDROP|ILEFTRIGHT|IREARRANGE|IINITIALIZE|IORDER))\\b"
         },
         {
           "name": "storage.modifier.jovial",
@@ -149,7 +149,11 @@
         },
         {
           "name": "storage.type.builtin.jovial",
-          "match": "\\b(?i:(B|U|S|F|C|P|W|V|STATUS))\\b"
+          "match": "\\b(?i:(A|B|U|S|F|C|P|W|V|STATUS))\\b"
+        },
+        {
+          "name": "support.function.builtin.jovial",
+          "match": "\\b(?i:(ABS|BIT|BITSIZE|BYTE|BYTESIZE|FIRST|LAST|LBOUND|LOC|NEXT|NWDSEN|REP|SGN|SHIFTL|SHIFTR|UBOUND|V|WORDSIZE))\\b"
         },
         {
           "name": "constant.language.boolean.jovial",

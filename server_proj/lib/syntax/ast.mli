@@ -79,7 +79,8 @@ and expr =
   | ECall of { callee : ident; args : expr node list }
   | EIndex of { base : expr node; index : expr node list }
   | EField of { base : expr node; field : ident }
-  | EAt of { field : expr node; ptr : expr node } 
+  | EAt of { field : expr node; ptr : expr node }
+  | EDeref of { ptr : expr node }
   | EParen of expr node
 
 and stmt =

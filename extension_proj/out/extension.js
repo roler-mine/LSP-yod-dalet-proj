@@ -43,6 +43,117 @@ const os = __importStar(require("os"));
 const node_1 = require("vscode-languageclient/node");
 let client;
 let fileWatcher;
+const WATCH_CHANGE_CREATED = 1;
+const WATCH_CHANGE_CHANGED = 2;
+const WATCH_CHANGE_DELETED = 3;
+const WATCH_FLUSH_DELAY_MS = 150;
+const WATCH_CHUNK_SIZE = 256;
+const WATCH_FORCE_FLUSH_SIZE = 2000;
+let pendingWatchedFileChanges = new Map();
+let pendingWatchedFileFlushTimer;
+let watchedFileFlushInFlight = false;
+function watchPathKey(fsPath) {
+    const norm = path.normalize(fsPath);
+    return process.platform === "win32" ? norm.toLowerCase() : norm;
+}
+function shouldIgnoreWatchedPath(fsPath) {
+    const norm = watchPathKey(fsPath).replace(/\\/g, "/");
+    return (norm.includes("/.git/") ||
+        norm.includes("/_build/") ||
+        norm.includes("/node_modules/") ||
+        norm.includes("/.vscode/"));
+}
+function mergeWatchedChangeType(prev, next) {
+    if (prev === WATCH_CHANGE_CREATED && next === WATCH_CHANGE_DELETED)
+        return null;
+    if (prev === WATCH_CHANGE_DELETED && next === WATCH_CHANGE_CREATED)
+        return WATCH_CHANGE_CHANGED;
+    if (prev === WATCH_CHANGE_CREATED && next === WATCH_CHANGE_CHANGED)
+        return WATCH_CHANGE_CREATED;
+    if (prev === WATCH_CHANGE_CHANGED && next === WATCH_CHANGE_DELETED)
+        return WATCH_CHANGE_DELETED;
+    return next;
+}
+function queueWatchedFileChange(uri, type) {
+    const fsPath = uri.fsPath;
+    if (!fsPath || shouldIgnoreWatchedPath(fsPath))
+        return;
+    const key = watchPathKey(fsPath);
+    const prev = pendingWatchedFileChanges.get(key);
+    if (!prev) {
+        pendingWatchedFileChanges.set(key, { fsPath, type });
+        return;
+    }
+    const merged = mergeWatchedChangeType(prev.type, type);
+    if (merged === null)
+        pendingWatchedFileChanges.delete(key);
+    else
+        pendingWatchedFileChanges.set(key, { fsPath, type: merged });
+}
+function clearWatchedFileFlushTimer() {
+    if (!pendingWatchedFileFlushTimer)
+        return;
+    clearTimeout(pendingWatchedFileFlushTimer);
+    pendingWatchedFileFlushTimer = undefined;
+}
+function resetWatchedFileStreamingState() {
+    clearWatchedFileFlushTimer();
+    pendingWatchedFileChanges.clear();
+    watchedFileFlushInFlight = false;
+}
+function takeWatchedFileBatch(maxItems) {
+    const out = [];
+    for (const [k, v] of pendingWatchedFileChanges) {
+        out.push(v);
+        pendingWatchedFileChanges.delete(k);
+        if (out.length >= maxItems)
+            break;
+    }
+    return out;
+}
+async function flushWatchedFileChanges(output) {
+    clearWatchedFileFlushTimer();
+    if (watchedFileFlushInFlight || pendingWatchedFileChanges.size === 0 || !client)
+        return;
+    watchedFileFlushInFlight = true;
+    try {
+        while (client && pendingWatchedFileChanges.size > 0) {
+            const batch = takeWatchedFileBatch(WATCH_CHUNK_SIZE);
+            if (batch.length === 0)
+                break;
+            const params = {
+                changes: batch.map((c) => ({
+                    uri: vscode.Uri.file(c.fsPath).toString(),
+                    type: c.type,
+                })),
+            };
+            await client.sendNotification("workspace/didChangeWatchedFiles", params);
+        }
+    }
+    catch (e) {
+        output.appendLine(`Watched-file flush failed: ${String(e)}`);
+    }
+    finally {
+        watchedFileFlushInFlight = false;
+        if (pendingWatchedFileChanges.size > 0 && client) {
+            scheduleWatchedFileFlush(output);
+        }
+    }
+}
+function scheduleWatchedFileFlush(output) {
+    if (pendingWatchedFileChanges.size === 0)
+        return;
+    if (pendingWatchedFileChanges.size >= WATCH_FORCE_FLUSH_SIZE) {
+        void flushWatchedFileChanges(output);
+        return;
+    }
+    if (pendingWatchedFileFlushTimer)
+        return;
+    pendingWatchedFileFlushTimer = setTimeout(() => {
+        pendingWatchedFileFlushTimer = undefined;
+        void flushWatchedFileChanges(output);
+    }, WATCH_FLUSH_DELAY_MS);
+}
 function getConfig() {
     const cfg = vscode.workspace.getConfiguration("jovial");
     return {
@@ -235,6 +346,11 @@ function setStatus(status, kind, detail) {
     }
 }
 async function stopClient(status) {
+    if (fileWatcher) {
+        fileWatcher.dispose();
+        fileWatcher = undefined;
+    }
+    resetWatchedFileStreamingState();
     if (!client) {
         setStatus(status, "stopped");
         return;
@@ -266,18 +382,36 @@ async function startClient(context, output, status) {
         fileWatcher.dispose();
         fileWatcher = undefined;
     }
+    resetWatchedFileStreamingState();
     fileWatcher = vscode.workspace.createFileSystemWatcher("**/*.{jov,j73,jvl,j}");
     context.subscriptions.push(fileWatcher);
+    fileWatcher.onDidCreate((uri) => {
+        queueWatchedFileChange(uri, WATCH_CHANGE_CREATED);
+        scheduleWatchedFileFlush(output);
+    });
+    fileWatcher.onDidChange((uri) => {
+        queueWatchedFileChange(uri, WATCH_CHANGE_CHANGED);
+        scheduleWatchedFileFlush(output);
+    });
+    fileWatcher.onDidDelete((uri) => {
+        queueWatchedFileChange(uri, WATCH_CHANGE_DELETED);
+        scheduleWatchedFileFlush(output);
+    });
     const serverOptions = async () => {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const stdioMode = process.platform === "win32"
+            ? ["overlapped", "overlapped", "overlapped"]
+            : ["pipe", "pipe", "pipe"];
         const child = cp.spawn(serverPath, cfg.serverArgs, {
             cwd: workspaceRoot,
             env: { ...process.env },
             windowsHide: true,
-            stdio: ["pipe", "pipe", "pipe"],
+            stdio: stdioMode,
         });
-        child.stderr.setEncoding("utf8");
-        child.stderr.on("data", (chunk) => output.appendLine(chunk.toString()));
+        if (child.stderr) {
+            child.stderr.setEncoding("utf8");
+            child.stderr.on("data", (chunk) => output.appendLine(chunk.toString()));
+        }
         child.on("exit", (code, signal) => {
             output.appendLine(`Jovial LSP exited: code=${code} signal=${signal}`);
             setStatus(status, "stopped", `Exited: code=${code} signal=${signal}`);
@@ -286,16 +420,18 @@ async function startClient(context, output, status) {
             output.appendLine(`Failed to start Jovial LSP: ${String(err)}`);
             setStatus(status, "error", `Failed to start: ${String(err)}`);
         });
-        return { reader: child.stdout, writer: child.stdin };
+        const reader = child.stdout;
+        const writer = child.stdin;
+        if (!reader || !writer) {
+            throw new Error("Failed to initialize LSP stdio streams.");
+        }
+        return { reader, writer };
     };
     const clientOptions = {
         documentSelector: [
             { scheme: "file", language: "jovial" },
             { scheme: "untitled", language: "jovial" },
         ],
-        synchronize: {
-            fileEvents: fileWatcher,
-        },
         outputChannel: output,
         errorHandler: {
             error: (error, message, count) => {
@@ -313,6 +449,7 @@ async function startClient(context, output, status) {
     client = new node_1.LanguageClient("jovialLsp", "Jovial Language Server", serverOptions, clientOptions);
     try {
         await client.start();
+        await flushWatchedFileChanges(output);
         output.appendLine("Jovial LSP client started.");
         setStatus(status, "running", `Server: ${serverPath}`);
     }

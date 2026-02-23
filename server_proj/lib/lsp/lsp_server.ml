@@ -55,6 +55,33 @@ let publish_diagnostics (oc : out_channel) ~(uri:T.DocumentUri.t) ~(diags:T.Diag
   in
   notify oc ~method_:"textDocument/publishDiagnostics" ~params
 
+let diagnostics_digest (diags:T.Diagnostic.t list) : string =
+  Digest.(to_hex (string (Yojson.Safe.to_string (yojson_of_diagnostics diags))))
+
+let publish_diagnostics_if_changed
+    (published_diags:(string, string) Hashtbl.t)
+    (oc:out_channel)
+    ~(uri:T.DocumentUri.t)
+    ~(diags:T.Diagnostic.t list)
+  : unit =
+  let uri_s = Uri_path.docuri_to_string uri in
+  let digest = diagnostics_digest diags in
+  match Hashtbl.find_opt published_diags uri_s with
+  | Some prev when prev = digest -> ()
+  | _ ->
+      Hashtbl.replace published_diags uri_s digest;
+      publish_diagnostics oc ~uri ~diags
+
+let revalidate_and_publish_all_open_docs
+    (ws:Workspace.t)
+    (oc:out_channel)
+    (published_diags:(string, string) Hashtbl.t)
+  : unit =
+  Workspace.revalidate_all ws
+  |> List.iter (fun uri ->
+       publish_diagnostics_if_changed published_diags oc ~uri
+         ~diags:(Workspace.diagnostics_for ws ~uri))
+
 let semantic_token_types_legend : Yojson.Safe.t =
   `List [
     `String "namespace";
@@ -259,6 +286,35 @@ let parse_semantic_tokens_refresh_support (params:Yojson.Safe.t) : bool =
             | _ -> false)
        | _ -> false)
 
+let parse_watched_file_changes
+    (params:Yojson.Safe.t)
+    : (string * [ `Created | `Changed | `Deleted ]) list =
+  let parse_kind = function
+    | `Int 1 | `Intlit "1" -> Some `Created
+    | `Int 2 | `Intlit "2" -> Some `Changed
+    | `Int 3 | `Intlit "3" -> Some `Deleted
+    | _ -> None
+  in
+  match get_assoc params with
+  | None -> []
+  | Some xs ->
+      (match find_field "changes" xs with
+       | Some (`List changes) ->
+           changes
+           |> List.filter_map (function
+                | `Assoc cxs ->
+                    (match find_field "uri" cxs, find_field "type" cxs with
+                     | Some (`String u), Some kind_json ->
+                         (match Uri_path.docuri_of_string u, parse_kind kind_json with
+                          | Some uri, Some kind ->
+                              (match file_of_uri uri with
+                               | Some path -> Some (path, kind)
+                               | None -> None)
+                          | _ -> None)
+                     | _ -> None)
+                | _ -> None)
+       | _ -> [])
+
 let send_request (oc:out_channel) ~(id:Yojson.Safe.t) ~(method_:string) ~(params:Yojson.Safe.t) : unit =
   Lsp_io.write_message oc
     (json_obj [ "jsonrpc", `String "2.0"; "id", id; "method", `String method_; "params", params ])
@@ -356,6 +412,7 @@ let handle_notification
     (ws : Workspace.t)
     ~(semantic_refresh_supported:bool ref)
     ~(next_server_request_id:int ref)
+    ~(published_diags:(string, string) Hashtbl.t)
     (oc : out_channel)
     (method_ : string)
     (params : Yojson.Safe.t) =
@@ -368,7 +425,7 @@ let handle_notification
          let uri = td.uri in
          let file = file_of_uri uri in
          Workspace.open_doc ws ~uri ~file ~text:td.text;
-         publish_diagnostics oc ~uri ~diags:(Workspace.diagnostics_for ws ~uri);
+         revalidate_and_publish_all_open_docs ws oc published_diags;
          request_semantic_tokens_refresh oc
            ~refresh_supported:!semantic_refresh_supported
            next_server_request_id
@@ -378,7 +435,7 @@ let handle_notification
          let p = T.DidChangeTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
          Workspace.change_doc ws ~uri ~changes:p.contentChanges;
-         publish_diagnostics oc ~uri ~diags:(Workspace.diagnostics_for ws ~uri);
+         revalidate_and_publish_all_open_docs ws oc published_diags;
          request_semantic_tokens_refresh oc
            ~refresh_supported:!semantic_refresh_supported
            next_server_request_id
@@ -388,16 +445,17 @@ let handle_notification
          let p = T.DidCloseTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
          Workspace.close_doc ws ~uri;
-         publish_diagnostics oc ~uri ~diags:[];
+         publish_diagnostics_if_changed published_diags oc ~uri ~diags:[];
+         revalidate_and_publish_all_open_docs ws oc published_diags;
          request_semantic_tokens_refresh oc
            ~refresh_supported:!semantic_refresh_supported
            next_server_request_id
        with _ -> ())
   | "workspace/didChangeWatchedFiles" ->
-      Workspace.rescan ws;
-      Workspace.revalidate_all ws
-      |> List.iter (fun uri ->
-           publish_diagnostics oc ~uri ~diags:(Workspace.diagnostics_for ws ~uri));
+      let changes = parse_watched_file_changes params in
+      if changes = [] then Workspace.rescan ws
+      else Workspace.apply_watched_file_changes ws ~changes;
+      revalidate_and_publish_all_open_docs ws oc published_diags;
       request_semantic_tokens_refresh oc
         ~refresh_supported:!semantic_refresh_supported
         next_server_request_id
@@ -511,6 +569,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let ws = Workspace.create () in
   let semantic_refresh_supported = ref false in
   let next_server_request_id = ref 1 in
+  let published_diags : (string, string) Hashtbl.t = Hashtbl.create 128 in
 
   let rec loop () =
     match Lsp_io.read_message ic with
@@ -532,6 +591,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                handle_notification ws
                  ~semantic_refresh_supported
                  ~next_server_request_id
+                 ~published_diags
                  oc
                  m
                  (params_of_msg json));

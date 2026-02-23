@@ -36,15 +36,49 @@ let set_root_path (ws:t) (root:string option) : unit =
 let set_root_uri (ws:t) (root_uri:T.DocumentUri.t option) : unit =
   ws.root_path <- (match root_uri with None -> None | Some u -> Uri_path.file_path_of_uri u)
 
+let index_bootstrap_dirs = 64
+let index_bootstrap_files = 6000
+let index_background_dirs = 4
+let index_background_files = 200
+let index_lookup_dirs = 12
+let index_lookup_files = 600
+
+let ensure_index_started (ws:t) : unit =
+  match ws.root_path, ws.index with
+  | Some root, None ->
+      ws.index <- Some (Workspace_index.start ~root)
+  | _ ->
+      ()
+
+let pump_index (ws:t) ~(max_dirs:int) ~(max_files:int) : unit =
+  ensure_index_started ws;
+  match ws.index with
+  | None -> ()
+  | Some idx ->
+      (try
+         ignore (Workspace_index.scan_step idx ~max_dirs ~max_files)
+       with _ -> ())
+
+let pump_index_background (ws:t) : unit =
+  pump_index ws ~max_dirs:index_background_dirs ~max_files:index_background_files
+
 let rescan (ws:t) : unit =
   Hashtbl.clear ws.files;
   ws.symbol_hints <- None;
   match ws.root_path with
   | None -> ws.index <- None
   | Some root ->
-      ws.index <- Some (Workspace_index.build ~root)
+      let idx = Workspace_index.start ~root in
+      ws.index <- Some idx;
+      (try
+         ignore
+           (Workspace_index.scan_step idx
+              ~max_dirs:index_bootstrap_dirs
+              ~max_files:index_bootstrap_files)
+       with _ -> ())
 
 let compool_count (ws:t) : int =
+  pump_index_background ws;
   match ws.index with None -> 0 | Some idx -> Workspace_index.compool_count idx
 
 let diag_missing_compool (loc:Ast.Loc.t) (name:string) : T.Diagnostic.t =
@@ -144,13 +178,23 @@ let find_open_compool_doc_by_key (ws:t) (key:string) : Document.t option =
   !found
 
 let has_compool_target (ws:t) (name:string) : bool =
+  pump_index ws ~max_dirs:index_lookup_dirs ~max_files:index_lookup_files;
   let key = normalize_name name in
   match find_open_compool_doc_by_key ws key with
   | Some _ -> true
   | None ->
       (match ws.index with
-       | Some idx when Workspace_index.find_compool idx ~name:key <> None -> true
-       | _ ->
+       | Some idx ->
+           (match Workspace_index.find_compool idx ~name:key with
+            | Some _ -> true
+            | None ->
+                if Workspace_index.is_complete idx then
+                  (match find_compool_path_fallback ws ~key with
+                   | Some _ -> true
+                   | None -> false)
+                else
+                  false)
+       | None ->
            (match find_compool_path_fallback ws ~key with
             | Some _ -> true
             | None -> false))
@@ -193,8 +237,43 @@ let diag_missing_import_hint ~(loc:Ast.Loc.t) ~(kind:string) ~(symbol:string) ~(
 
 let is_builtin_type (k:string) : bool =
   match k with
-  | "B" | "U" | "S" | "F" | "C" | "P" | "W" | "V" | "STATUS" -> true
+  | "A" | "B" | "U" | "S" | "F" | "C" | "P" | "W" | "V" | "STATUS" -> true
   | _ -> false
+
+let is_builtin_function_name (name:string) : bool =
+  match normalize_name name with
+  | "LOC" | "NEXT" | "BIT" | "BYTE"
+  | "SHIFTL" | "SHIFTR" | "ABS" | "SGN"
+  | "BITSIZE" | "BYTESIZE" | "WORDSIZE"
+  | "LBOUND" | "UBOUND" | "NWDSEN"
+  | "FIRST" | "LAST" | "REP" | "V" ->
+      true
+  | _ ->
+      false
+
+let is_reserved_keyword (name:string) : bool =
+  match normalize_name name with
+  | "START" | "TERM" | "BEGIN" | "END"
+  | "DEF" | "REF" | "STATIC" | "CONSTANT" | "PROC" | "ITEM" | "TABLE" | "TYPE"
+  | "IF" | "THEN" | "ELSE" | "WHILE" | "FOR" | "BY"
+  | "CASE" | "DEFAULT" | "FALLTHRU"
+  | "EXIT" | "GOTO" | "RETURN" | "ABORT" | "STOP"
+  | "TRUE" | "FALSE"
+  | "NOT" | "AND" | "OR" | "XOR" | "EQV" | "MOD"
+  | "PROGRAM" | "COMPOOL" | "ICOMPOOL" | "DEFINE" | "BLOCK"
+  | "ICOPY" | "ISKIP" | "IBEGIN" | "IEND" | "ILINKAGE" | "ITRACE"
+  | "IINTERFERENCE" | "IREDUCIBLE" | "ILIST" | "INOLIST" | "IEJECT"
+  | "IBASE" | "IISBASE" | "IDROP" | "ILEFTRIGHT" | "IREARRANGE"
+  | "IINITIALIZE" | "IORDER"
+  | "REC" | "RENT"
+  | "LISTEXP" | "LISTINV" | "LISTBOTH"
+  | "INLINE" | "INSTANCE" | "LABEL" | "LIKE"
+  | "OVERLAY" | "PARALLEL" | "POS" | "NULL" ->
+      true
+  | x when is_builtin_function_name x ->
+      true
+  | _ ->
+      false
 
 let extract_compool_import_dirs (doc:Document.t) : compool_import_dir list =
   match doc.Document.ast with
@@ -302,6 +381,7 @@ let read_file_text (path:string) : string option =
   with _ -> None
 
 let resolve_compool_doc_uncached (ws:t) ~(name:string) : Document.t option =
+  pump_index ws ~max_dirs:index_lookup_dirs ~max_files:index_lookup_files;
   let key = normalize_name name in
   match find_open_compool_doc_by_key ws key with
   | Some d -> Some d
@@ -311,7 +391,11 @@ let resolve_compool_doc_uncached (ws:t) ~(name:string) : Document.t option =
         | Some idx ->
             (match Workspace_index.find_compool idx ~name:key with
              | Some p -> Some p
-             | None -> find_compool_path_fallback ws ~key)
+             | None ->
+                 if Workspace_index.is_complete idx then
+                   find_compool_path_fallback ws ~key
+                 else
+                   None)
         | None ->
             find_compool_path_fallback ws ~key
       in
@@ -460,7 +544,7 @@ type sem_ty =
   | TyChar
   | TyString
   | TyStatus
-  | TyPointer
+  | TyPointer of sem_ty option
   | TyArray of sem_ty
   | TyRecord of (string * sem_ty) list
 
@@ -524,7 +608,7 @@ let sem_find_record_field (fields:(string * sem_ty) list) (name:string) : sem_ty
 
 let sem_is_builtin_type (k:string) : bool =
   match k with
-  | "B" | "U" | "S" | "F" | "C" | "P" | "W" | "V" | "STATUS" -> true
+  | "A" | "B" | "U" | "S" | "F" | "C" | "P" | "W" | "V" | "STATUS" -> true
   | _ -> false
 
 let is_single_letter_loop_control (name:string) : bool =
@@ -540,9 +624,9 @@ let rec sem_ty_of_type_expr ?(seen:string list=[]) (types:(string, Ast.type_expr
       (match k with
        | "B" -> TyBit
        | "U" | "S" | "W" -> TyInt
-       | "F" -> TyFloat
+       | "F" | "A" -> TyFloat
        | "C" -> TyChar
-       | "P" -> TyPointer
+       | "P" -> TyPointer None
        | "STATUS" | "V" -> TyStatus
        | "" -> TyUnknown
        | _ ->
@@ -553,8 +637,8 @@ let rec sem_ty_of_type_expr ?(seen:string list=[]) (types:(string, Ast.type_expr
              | Some defn -> sem_ty_of_type_expr ~seen:(k :: seen) types defn)
   | Ast.TArray { elem; _ } ->
       TyArray (sem_ty_of_type_expr ~seen types elem)
-  | Ast.TPointer _ ->
-      TyPointer
+  | Ast.TPointer inner ->
+      TyPointer (Some (sem_ty_of_type_expr ~seen types inner))
   | Ast.TRecord fields ->
       TyRecord
         (fields
@@ -674,10 +758,15 @@ let add_compool_hint
     if not (List.mem compool prev) then
       Hashtbl.replace tbl key (compool :: prev)
 
+let symbol_hint_max_file_count = 1500
+let symbol_hint_max_chars = 20_000_000
+
 let build_symbol_hint_index (ws:t) : (string, string list) Hashtbl.t * (string, string list) Hashtbl.t =
   let values = Hashtbl.create 1024 in
   let types = Hashtbl.create 1024 in
   let seen_paths = Hashtbl.create 512 in
+  let parsed_files = ref 0 in
+  let parsed_chars = ref 0 in
 
   let hint_compool_key_of_doc (doc:Document.t) : string option =
     match doc.Document.compool_def with
@@ -700,45 +789,40 @@ let build_symbol_hint_index (ws:t) : (string, string list) Hashtbl.t * (string, 
     | None -> ()
     | Some compool ->
         let exp = sem_exports_of_doc doc in
-        Hashtbl.iter (fun sym _ -> add_compool_hint values ~symbol_key:sym ~compool_key:compool) exp.values;
+        Hashtbl.iter (fun sym v ->
+          match v with
+          | SVProc _ -> ()
+          | _ -> add_compool_hint values ~symbol_key:sym ~compool_key:compool
+        ) exp.values;
         Hashtbl.iter (fun sym _ -> add_compool_hint types ~symbol_key:sym ~compool_key:compool) exp.types
   in
 
   let add_path_hints (p:string) : unit =
     let pk = normalize_path_key p in
-    if not (Hashtbl.mem seen_paths pk) then (
+    if not (Hashtbl.mem seen_paths pk)
+       && !parsed_files < symbol_hint_max_file_count
+       && !parsed_chars < symbol_hint_max_chars
+    then (
       Hashtbl.replace seen_paths pk true;
       match read_file_text p with
       | None -> ()
       | Some txt ->
-          let uri =
-            match Uri_path.docuri_of_path p with
-            | Some u -> u
-            | None ->
-                (match Uri_path.docuri_of_string (Uri_path.file_uri_of_path p) with
-                 | Some u -> u
-                 | None -> T.DocumentUri.t_of_yojson (`String "file:///"))
-          in
-          let d = Document.make ~uri ~file:(Some p) ~text:txt in
-          add_doc_hints d
+          let txt_len = String.length txt in
+          if !parsed_chars + txt_len <= symbol_hint_max_chars then (
+            incr parsed_files;
+            parsed_chars := !parsed_chars + txt_len;
+            let uri =
+              match Uri_path.docuri_of_path p with
+              | Some u -> u
+              | None ->
+                  (match Uri_path.docuri_of_string (Uri_path.file_uri_of_path p) with
+                   | Some u -> u
+                   | None -> T.DocumentUri.t_of_yojson (`String "file:///"))
+            in
+            let d = Document.make ~uri ~file:(Some p) ~text:txt in
+            add_doc_hints d
+          )
     )
-  in
-
-  let rec walk_source_files_for_hints (dir:string) (out:string list ref) : unit =
-    let entries =
-      try Sys.readdir dir |> Array.to_list
-      with _ -> []
-    in
-    List.iter (fun name ->
-      let full = Filename.concat dir name in
-      try
-        if Sys.is_directory full then (
-          if not (is_ignored_lookup_dir name) then walk_source_files_for_hints full out
-        ) else if has_known_source_ext_name name then (
-          out := full :: !out
-        )
-      with _ -> ()
-    ) entries
   in
 
   Hashtbl.iter (fun _ doc ->
@@ -753,16 +837,10 @@ let build_symbol_hint_index (ws:t) : (string, string list) Hashtbl.t * (string, 
    | Some idx ->
        Workspace_index.all_paths idx |> List.iter add_path_hints);
 
-  (match ws.root_path with
-   | None -> ()
-   | Some root ->
-       let files = ref [] in
-       walk_source_files_for_hints root files;
-       List.iter add_path_hints !files);
-
   (values, types)
 
 let symbol_hint_index (ws:t) : (string, string list) Hashtbl.t * (string, string list) Hashtbl.t =
+  pump_index ws ~max_dirs:index_lookup_dirs ~max_files:index_lookup_files;
   match ws.symbol_hints with
   | Some idx -> idx
   | None ->
@@ -811,12 +889,12 @@ let sem_ty_to_string (t:sem_ty) : string =
   | TyChar -> "character"
   | TyString -> "string"
   | TyStatus -> "status"
-  | TyPointer -> "pointer"
+  | TyPointer _ -> "pointer"
   | TyArray _ -> "table/array"
   | TyRecord _ -> "record"
 
 let rec sem_is_primitive = function
-  | TyUnknown | TyInt | TyFloat | TyBit | TyChar | TyString | TyStatus | TyPointer -> true
+  | TyUnknown | TyInt | TyFloat | TyBit | TyChar | TyString | TyStatus | TyPointer _ -> true
   | TyArray inner -> sem_is_primitive inner
   | TyRecord _ -> false
 
@@ -835,7 +913,7 @@ let rec sem_compatible (lhs:sem_ty) (rhs:sem_ty) : bool =
   | TyChar, TyChar
   | TyString, TyString
   | TyStatus, TyStatus
-  | TyPointer, TyPointer -> true
+  | TyPointer _, TyPointer _ -> true
   | TyInt, TyFloat
   | TyFloat, TyInt -> true
   | TyRecord _, TyRecord _ -> true
@@ -995,7 +1073,8 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
 
       let sem_is_builtin_call (name:string) : bool =
         let k = normalize_name name in
-        k = "V" || k = "__CONV__" || k = "__PRESET__" || k = "__POW__" || k = "__RANGE__"
+        k = "__CONV__" || k = "__PRESET__" || k = "__POW__" || k = "__RANGE__"
+        || is_builtin_function_name k
       in
 
       let rec check_type_import_hints (scp:sem_scope) (t:Ast.type_expr Ast.node) : unit =
@@ -1013,6 +1092,55 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
         | Ast.TFunc { params; returns } ->
             List.iter (fun p -> check_type_import_hints scp p.v.ptype) params;
             (match returns with None -> () | Some r -> check_type_import_hints scp r)
+      in
+
+      let rec sem_subscript_array (ty:sem_ty) (count:int) : sem_ty =
+        if count <= 0 then ty
+        else
+          match ty with
+          | TyArray elem -> sem_subscript_array elem (count - 1)
+          | _ -> TyUnknown
+      in
+
+      let sem_subscript_pointer (ty:sem_ty) (count:int) : sem_ty =
+        match ty with
+        | TyPointer None ->
+            TyPointer None
+        | TyPointer (Some target) ->
+            let inner = sem_subscript_array target count in
+            if inner = TyUnknown then TyUnknown else TyPointer (Some inner)
+        | _ ->
+            TyUnknown
+      in
+
+      let sem_subscript_value (ty:sem_ty) (count:int) : sem_ty =
+        match ty with
+        | TyArray _ -> sem_subscript_array ty count
+        | TyPointer _ -> sem_subscript_pointer ty count
+        | _ -> TyUnknown
+      in
+
+      let sem_deref_target ~(ptr_loc:Ast.Loc.t) (ty:sem_ty) : sem_ty =
+        match ty with
+        | TyPointer (Some inner) ->
+            inner
+        | TyPointer None ->
+            emit ptr_loc "Dereference requires a typed pointer.";
+            TyUnknown
+        | other ->
+            (* Keep existing table-qualified behavior for compatibility. *)
+            other
+      in
+
+      let sem_field_ty_in (field_name:string) (ty:sem_ty) : sem_ty option =
+        match ty with
+        | TyRecord fields -> sem_find_record_field fields field_name
+        | TyArray (TyRecord fields) -> sem_find_record_field fields field_name
+        | TyArray inner -> (
+            match inner with
+            | TyRecord fields -> sem_find_record_field fields field_name
+            | _ -> None)
+        | _ -> None
       in
 
       let rec ty_of_expr (scp:sem_scope) (current_proc:sem_proc_ctx option) ?(status_atom=false) (e:Ast.expr Ast.node) : sem_ty =
@@ -1053,8 +1181,22 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
               List.iter (fun a -> ignore (ty_of_expr scp current_proc ~status_atom:true a)) args;
               TyStatus
             ) else if sem_is_builtin_call callee.v then (
-              List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) args;
-              TyUnknown
+              match ck, args with
+              | "LOC", a0 :: rest ->
+                  let target_ty = ty_of_expr scp current_proc a0 in
+                  List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) rest;
+                  TyPointer (Some target_ty)
+              | "LOC", [] ->
+                  TyPointer None
+              | "NEXT", p0 :: rest ->
+                  let pty = ty_of_expr scp current_proc p0 in
+                  List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) rest;
+                  (match pty with
+                   | TyPointer _ -> pty
+                   | _ -> TyUnknown)
+              | _ ->
+                  List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) args;
+                  TyUnknown
             ) else
               (match sem_lookup_value scp callee.v with
                | Some (SVProc sig_) ->
@@ -1093,23 +1235,29 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
                         in
                         check_pairs pts args);
                    (match sig_.ret_ty with Some rt -> rt | None -> TyUnknown)
-               | Some _ ->
-                   emit callee.loc (Printf.sprintf "%S is not callable." callee.v);
+               | Some (SVVar ty) | Some (SVConst ty) ->
                    List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) args;
-                   TyUnknown
+                   if args = [] then (
+                     emit callee.loc (Printf.sprintf "%S is not callable." callee.v);
+                     TyUnknown
+                   ) else
+                     let out_ty = sem_subscript_value ty (List.length args) in
+                     if out_ty = TyUnknown then (
+                       emit callee.loc (Printf.sprintf "Cannot subscript %S." callee.v);
+                       TyUnknown
+                     ) else out_ty
                | None ->
-                   if has_import_hint ~is_type:false callee.v then
-                     suggest_missing_import ~loc:callee.loc ~kind:"Procedure" ~is_type:false ~symbol:callee.v
-                   else
-                     emit callee.loc (Printf.sprintf "Undefined procedure %S." callee.v);
+                   emit callee.loc
+                     (Printf.sprintf
+                        "Undefined procedure %S. Declare it with REF PROC %S in scope."
+                        callee.v
+                        callee.v);
                    List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) args;
                    TyUnknown)
         | Ast.EIndex { base; index } ->
             let bt = ty_of_expr scp current_proc base in
             List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) index;
-            (match bt with
-             | TyArray elem -> elem
-             | _ -> TyUnknown)
+            sem_subscript_value bt (List.length index)
         | Ast.EField { base; field } ->
             let bt = ty_of_expr scp current_proc base in
             (match bt with
@@ -1128,31 +1276,32 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
              | _ -> TyUnknown)
         | Ast.EAt { field; ptr } ->
             let pt = ty_of_expr scp current_proc ptr in
-            let field_name =
+            let target_ty = sem_deref_target ~ptr_loc:ptr.loc pt in
+            let field_ref =
               match field.v with
-              | Ast.EName id -> Some id
+              | Ast.EName id ->
+                  Some (id, [])
+              | Ast.EIndex { base; index } -> (
+                  match base.v with
+                  | Ast.EName id -> Some (id, index)
+                  | _ -> None)
               | _ ->
                   ignore (ty_of_expr scp current_proc field);
                   None
             in
-            (match field_name with
+            (match field_ref with
              | None -> TyUnknown
-             | Some id ->
-                 let field_ty_in ty =
-                   match ty with
-                   | TyRecord fields -> sem_find_record_field fields id.v
-                   | TyArray (TyRecord fields) -> sem_find_record_field fields id.v
-                   | TyArray inner -> (
-                       match inner with
-                       | TyRecord fields -> sem_find_record_field fields id.v
-                       | _ -> None)
-                   | _ -> None
-                 in
-                 (match field_ty_in pt with
+             | Some (id, indexes) ->
+                 List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) indexes;
+                 let qualified_target = sem_subscript_array target_ty (List.length indexes) in
+                 (match sem_field_ty_in id.v qualified_target with
                   | Some ty -> ty
                   | None ->
                        emit id.loc (Printf.sprintf "Unknown field %S for @ access." id.v);
                        TyUnknown))
+        | Ast.EDeref { ptr } ->
+            let pt = ty_of_expr scp current_proc ptr in
+            sem_deref_target ~ptr_loc:ptr.loc pt
         | Ast.EParen inner ->
             ty_of_expr scp current_proc inner
       in
@@ -1179,7 +1328,7 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
                   else
                     emit id.loc (Printf.sprintf "Undefined item %S." id.v);
                   None)
-        | Ast.EField _ | Ast.EAt _ | Ast.EIndex _ ->
+        | Ast.EField _ | Ast.EAt _ | Ast.EDeref _ | Ast.EIndex _ ->
             Some (ty_of_expr scp current_proc e)
         | _ ->
             ignore (ty_of_expr scp current_proc e);
@@ -1323,6 +1472,7 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
       List.rev !out
 
 let store_doc (ws:t) (uri:T.DocumentUri.t) (doc:Document.t) : unit =
+  let old_doc = Hashtbl.find_opt ws.docs uri in
   let import_diags = validate_imports ws doc in
   let semantic_diags =
     if doc.Document.ast = None || doc.Document.parse_diags <> [] then
@@ -1331,7 +1481,13 @@ let store_doc (ws:t) (uri:T.DocumentUri.t) (doc:Document.t) : unit =
       validate_semantics ws doc
   in
   let doc = Document.with_import_diags (import_diags @ semantic_diags) doc in
-  ws.symbol_hints <- None;
+  let has_compool (d:Document.t) =
+    match d.Document.compool_def with
+    | None -> false
+    | Some name -> normalize_name name <> ""
+  in
+  if has_compool doc || Option.fold ~none:false ~some:has_compool old_doc then
+    ws.symbol_hints <- None;
   Hashtbl.replace ws.docs uri doc;
   match doc.Document.file with
   | None -> ()
@@ -1346,7 +1502,8 @@ let open_doc (ws:t) ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) 
        rescan ws
    | _ -> ());
   let doc = Document.make ~uri ~file ~text in
-  store_doc ws uri doc
+  store_doc ws uri doc;
+  pump_index_background ws
 
 let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChangeEvent.t list) : unit =
   match Hashtbl.find_opt ws.docs uri with
@@ -1354,14 +1511,52 @@ let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChan
       let file = Uri_path.file_path_of_uri uri in
       let base = Document.make ~uri ~file ~text:"" in
       let doc = Document.apply_changes_and_reparse ~changes base in
-      store_doc ws uri doc
+      store_doc ws uri doc;
+      pump_index_background ws
   | Some doc ->
       let doc' = Document.apply_changes_and_reparse ~changes doc in
-      store_doc ws uri doc'
+      store_doc ws uri doc';
+      pump_index_background ws
 
 let close_doc (ws:t) ~(uri:T.DocumentUri.t) : unit =
-  ws.symbol_hints <- None;
-  Hashtbl.remove ws.docs uri
+  (match Hashtbl.find_opt ws.docs uri with
+   | Some d ->
+       (match d.Document.compool_def with
+        | Some name when normalize_name name <> "" -> ws.symbol_hints <- None
+        | _ -> ())
+   | None -> ());
+  Hashtbl.remove ws.docs uri;
+  pump_index_background ws
+
+let apply_watched_file_changes
+    (ws:t)
+    ~(changes:(string * [ `Created | `Changed | `Deleted ]) list)
+    : unit =
+  ensure_index_started ws;
+  let hints_dirty = ref false in
+  (match ws.index with
+   | None -> ()
+   | Some idx ->
+       List.iter (fun (path, kind) ->
+         try
+           let mapped_kind =
+             match kind with
+             | `Created -> Workspace_index.Created
+             | `Changed -> Workspace_index.Changed
+             | `Deleted -> Workspace_index.Deleted
+           in
+           if Workspace_index.apply_file_change idx ~path ~kind:mapped_kind then
+             hints_dirty := true;
+           Hashtbl.remove ws.files (normalize_path_key path)
+         with _ -> ()
+       ) changes;
+       (try
+          ignore
+            (Workspace_index.scan_step idx
+               ~max_dirs:index_background_dirs
+               ~max_files:index_bootstrap_files)
+        with _ -> ()));
+  if !hints_dirty then ws.symbol_hints <- None
 
 let revalidate_all (ws:t) : T.DocumentUri.t list =
   let uris = Hashtbl.fold (fun uri _ acc -> uri :: acc) ws.docs [] in
@@ -1732,6 +1927,12 @@ let word_at_position (doc:Document.t) (pos:T.Position.t) : (string * Ast.Loc.t) 
               let loc = loc_of_offsets ~file:doc.Document.file ~idx:doc.Document.index ~s:!a ~e:!b in
               Some (name, loc)
 
+let nav_word_at_position (doc:Document.t) (pos:T.Position.t) : (string * Ast.Loc.t) option =
+  match word_at_position doc pos with
+  | None -> None
+  | Some (name, _) when is_reserved_keyword name -> None
+  | Some x -> Some x
+
 let location_json ~(uri:T.DocumentUri.t) (loc:Ast.Loc.t) : Yojson.Safe.t =
   T.Location.yojson_of_t (Lsp_conv.location_of_loc ~uri loc)
 
@@ -1788,6 +1989,7 @@ let doc_at_path (ws:t) (path:string) : Document.t option =
   )
 
 let resolve_import_paths (ws:t) (doc:Document.t) : string list =
+  pump_index ws ~max_dirs:index_lookup_dirs ~max_files:index_lookup_files;
   match ws.index with
   | None -> []
   | Some idx ->
@@ -1817,35 +2019,8 @@ let docs_for_lookup (ws:t) (doc:Document.t) : Document.t list =
   |> List.iter (fun p -> match doc_at_path ws p with None -> () | Some d -> add_doc d);
   List.rev !out
 
-let has_source_ext (file:string) : bool =
-  let lower = String.lowercase_ascii file in
-  let ends_with ext =
-    let n = String.length lower in
-    let m = String.length ext in
-    n >= m && String.sub lower (n - m) m = ext
-  in
-  ends_with ".jov" || ends_with ".j73" || ends_with ".jvl" || ends_with ".j"
-
-let is_ignored_dir_name (name:string) : bool =
-  name = ".git" || name = "_build" || name = "node_modules" || name = ".vscode"
-
-let rec walk_source_files (dir:string) (out:string list ref) : unit =
-  let entries =
-    try Sys.readdir dir |> Array.to_list
-    with _ -> []
-  in
-  List.iter (fun name ->
-    let full = Filename.concat dir name in
-    try
-      if Sys.is_directory full then (
-        if not (is_ignored_dir_name name) then walk_source_files full out
-      ) else if has_source_ext name then (
-        out := full :: !out
-      )
-    with _ -> ()
-  ) entries
-
 let docs_for_rename (ws:t) (doc:Document.t) : Document.t list =
+  pump_index ws ~max_dirs:index_lookup_dirs ~max_files:index_lookup_files;
   let seen = Hashtbl.create 64 in
   let out = ref [] in
   let add_doc (d:Document.t) =
@@ -1860,21 +2035,11 @@ let docs_for_rename (ws:t) (doc:Document.t) : Document.t list =
   (match ws.index with
    | None -> ()
    | Some idx ->
-       Workspace_index.all_paths idx
+       Workspace_index.all_source_paths idx
        |> List.iter (fun p ->
             match doc_at_path ws p with
             | None -> ()
             | Some d -> add_doc d));
-  (match ws.root_path with
-   | None -> ()
-   | Some root ->
-       let files = ref [] in
-       walk_source_files root files;
-       List.iter (fun p ->
-         match doc_at_path ws p with
-         | None -> ()
-         | Some d -> add_doc d
-       ) !files);
   List.rev !out
 
 let compare_pos (a:T.Position.t) (b:T.Position.t) : int =
@@ -2197,7 +2362,20 @@ let build_doc_nav (ws:t) (doc:Document.t) : doc_nav =
         walk_expr scope ~container base;
         use_field scope field
     | Ast.EAt { field; ptr } ->
-        walk_expr scope ~container field;
+        (match field.v with
+         | Ast.EName id ->
+             use_field scope id
+         | Ast.EIndex { base; index } ->
+             (match base.v with
+              | Ast.EName id ->
+                  use_field scope id
+              | _ ->
+                  walk_expr scope ~container base);
+             List.iter (walk_expr scope ~container) index
+         | _ ->
+             walk_expr scope ~container field);
+        walk_expr scope ~container ptr
+    | Ast.EDeref { ptr } ->
         walk_expr scope ~container ptr
     | Ast.EParen x ->
         walk_expr scope ~container x
@@ -2289,6 +2467,9 @@ let build_doc_nav (ws:t) (doc:Document.t) : doc_nav =
   in
 
   let bind_imports () =
+    let is_importable_def (d:def) : bool =
+      d.kind <> sym_kind_module && d.kind <> sym_kind_func
+    in
     sem_import_dirs doc
     |> List.iter (fun (imp:compool_import_dir) ->
          match resolve_compool_doc_uncached ws ~name:imp.compool with
@@ -2297,7 +2478,7 @@ let build_doc_nav (ws:t) (doc:Document.t) : doc_nav =
              let defs = exported_defs_for_import_scope target in
              if imp.selected = [] then
                List.iter (fun d ->
-                 if d.kind <> sym_kind_module then bind_external_def root_scope d
+                 if is_importable_def d then bind_external_def root_scope d
                ) defs
              else
                let selected = Hashtbl.create 32 in
@@ -2305,7 +2486,8 @@ let build_doc_nav (ws:t) (doc:Document.t) : doc_nav =
                  Hashtbl.replace selected (normalize_name nm) true
                ) imp.selected;
                List.iter (fun d ->
-                 if Hashtbl.mem selected d.key then bind_external_def root_scope d
+                 if is_importable_def d && Hashtbl.mem selected d.key then
+                   bind_external_def root_scope d
                ) defs)
   in
 
@@ -2423,6 +2605,8 @@ let rec expr_to_compact_string (e:Ast.expr Ast.node) : string =
       expr_to_compact_string base ^ "." ^ field.v
   | Ast.EAt { field; ptr } ->
       expr_to_compact_string field ^ " @ " ^ expr_to_compact_string ptr
+  | Ast.EDeref { ptr } ->
+      "@ " ^ expr_to_compact_string ptr
 
 let rec type_expr_to_compact_string (t:Ast.type_expr Ast.node) : string =
   match t.v with
@@ -2513,6 +2697,7 @@ let proc_signature_for_def (ws:t) (d:def) : string option =
              find_top prog)
 
 let find_compool_target (ws:t) ~(name:string) : Document.t option =
+  pump_index ws ~max_dirs:index_lookup_dirs ~max_files:index_lookup_files;
   let key = normalize_name name in
   match find_open_compool_doc_by_key ws key with
   | Some d -> Some d
@@ -2522,7 +2707,11 @@ let find_compool_target (ws:t) ~(name:string) : Document.t option =
         | Some idx ->
             (match Workspace_index.find_compool idx ~name:key with
              | Some p -> Some p
-             | None -> find_compool_path_fallback ws ~key)
+             | None ->
+                 if Workspace_index.is_complete idx then
+                   find_compool_path_fallback ws ~key
+                 else
+                   None)
         | None ->
             find_compool_path_fallback ws ~key
       in
@@ -2575,7 +2764,7 @@ let defs_for_import_cursor (ws:t) (imp:Preprocess.import) : def list =
         [ { uri = d.Document.uri; name = imp.name; key; loc; kind = sym_kind_module; container = None } ]
 
 let fallback_defs_by_name (ws:t) (doc:Document.t) (key:string) : def list =
-  if key = "" then []
+  if key = "" || is_reserved_keyword key then []
   else
     let collect (docs:Document.t list) : def list =
       docs
@@ -2588,7 +2777,7 @@ let fallback_defs_by_name (ws:t) (doc:Document.t) (key:string) : def list =
     else collect (docs_for_rename ws doc)
 
 let allow_unscoped_fallback (doc:Document.t) : bool =
-  doc.Document.ast <> None || doc.Document.parse_diags <> []
+  doc.Document.ast = None || doc.Document.parse_diags <> []
 
 let is_ref_proc_decl_line (line:string) : bool =
   let toks =
@@ -2607,9 +2796,12 @@ let is_likely_proc_implementation (ws:t) (d:def) : bool =
     | Some line -> not (is_ref_proc_decl_line line)
 
 let proc_defs_by_key (ws:t) (doc:Document.t) ~(key:string) : def list =
-  fallback_defs_by_name ws doc key
-  |> List.filter (fun d -> d.kind = sym_kind_func)
-  |> uniq_defs
+  if key = "" then []
+  else
+    docs_for_rename ws doc
+    |> List.concat_map collect_doc_defs
+    |> List.filter (fun d -> d.kind = sym_kind_func && d.key = key)
+    |> uniq_defs
 
 let proc_impl_defs_by_key (ws:t) (doc:Document.t) ~(key:string) : def list =
   let defs = proc_defs_by_key ws doc ~key in
@@ -2648,10 +2840,19 @@ let definition_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
                in
                `List (List.map def_to_loc_json defs)
            | None ->
-               if not (allow_unscoped_fallback doc) then `Null
+               let proc_by_name =
+                 match nav_word_at_position doc pos with
+                 | None -> []
+                 | Some (nm, _) ->
+                     let key = normalize_name nm in
+                     if key = "" then [] else proc_impl_defs_by_key ws doc ~key
+               in
+               if proc_by_name <> [] then
+                 `List (List.map def_to_loc_json proc_by_name)
+               else if not (allow_unscoped_fallback doc) then `Null
                else
                  let by_name =
-                   match word_at_position doc pos with
+                   match nav_word_at_position doc pos with
                    | None -> []
                    | Some (nm, _) -> fallback_defs_by_name ws doc (normalize_name nm)
                  in
@@ -2689,7 +2890,7 @@ let implementation_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
              match defs with
              | d :: _ when d.key <> "" -> Some d.key
              | _ ->
-                 (match word_at_position doc pos with
+                 (match nav_word_at_position doc pos with
                   | Some (nm, _) ->
                       let key = normalize_name nm in
                       if key = "" then None else Some key
@@ -2882,20 +3083,25 @@ let references_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(incl
                in
                `List json
            | None ->
-               if not (allow_unscoped_fallback doc) then `List []
-               else
-                 (match word_at_position doc pos with
-                  | None -> `List []
-                  | Some (nm, _) ->
-                      let key = normalize_name nm in
-                      if key = "" then `List []
-                      else
-                        let docs = docs_for_rename ws doc in
-                        let defs =
+               (match nav_word_at_position doc pos with
+                | None -> `List []
+                | Some (nm, _) ->
+                    let key = normalize_name nm in
+                    if key = "" then `List []
+                    else
+                      let docs = docs_for_rename ws doc in
+                      let proc_defs = proc_defs_by_key ws doc ~key in
+                      let defs =
+                        if proc_defs <> [] then proc_defs
+                        else if allow_unscoped_fallback doc then
                           docs
                           |> List.concat_map collect_doc_defs
                           |> List.filter (fun d -> d.key = key)
-                        in
+                        else
+                          []
+                      in
+                      if defs = [] then `List []
+                      else
                         let def_keys =
                           let h = Hashtbl.create 32 in
                           List.iter (fun d -> Hashtbl.replace h (loc_key ~uri:d.uri d.loc) true) defs;
@@ -2940,7 +3146,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
       in
       let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
       let nav = nav_for_doc_cached ws cache doc in
-      let word = word_at_position doc pos in
+      let word = nav_word_at_position doc pos in
       let resolved = symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos in
       let defs, hover_loc =
         match resolved with
@@ -2956,7 +3162,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
              | None ->
                  (match word with
                   | None -> ([], Some loc)
-                  | Some (nm, wloc) ->
+                 | Some (nm, wloc) ->
                       let defs0 =
                         if allow_unscoped_fallback doc
                         then fallback_defs_by_name ws doc (normalize_name nm)
@@ -2973,6 +3179,20 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                    else []
                  in
                  (defs0, Some wloc))
+      in
+      let defs =
+        match defs with
+        | d :: _ when d.kind = sym_kind_func && not (is_likely_proc_implementation ws d) ->
+            let impls = proc_impl_defs_by_key ws doc ~key:d.key in
+            if impls = [] then defs else impls
+        | [] ->
+            (match word with
+             | None -> []
+             | Some (nm, _) ->
+                 let key = normalize_name nm in
+                 if key = "" then [] else proc_impl_defs_by_key ws doc ~key)
+        | _ ->
+            defs
       in
       if defs = [] then
         (match import_text with
@@ -3072,7 +3292,7 @@ let prepare_rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
                "placeholder", `String placeholder;
              ]
        | None ->
-           (match word_at_position doc pos with
+           (match nav_word_at_position doc pos with
             | None -> `Null
             | Some (nm, word_loc) ->
                 let key = normalize_name nm in
@@ -3139,7 +3359,7 @@ let rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(new_name
              ) docs;
              apply_changes ()
          | None ->
-             (match word_at_position doc pos with
+             (match nav_word_at_position doc pos with
               | None -> `Null
               | Some (nm, _) ->
                   let key = normalize_name nm in
@@ -3219,34 +3439,94 @@ let completion_keywords : (string * int * string option) list =
     ("WHILE", 14, None);
     ("FOR", 14, None);
     ("BY", 14, None);
+    ("FALLTHRU", 14, None);
     ("RETURN", 14, None);
     ("GOTO", 14, None);
+    ("EXIT", 14, None);
+    ("ABORT", 14, None);
+    ("STOP", 14, None);
     ("CASE", 14, None);
     ("DEFAULT", 14, None);
     ("COMPOOL", 14, Some "compool directive");
     ("ICOMPOOL", 14, Some "import compool directive");
+    ("ICOPY", 14, Some "copy directive");
+    ("ISKIP", 14, Some "skip directive");
+    ("IBEGIN", 14, Some "directive scope begin");
+    ("IEND", 14, Some "directive scope end");
+    ("ILINKAGE", 14, Some "linkage directive");
+    ("ITRACE", 14, Some "trace directive");
+    ("IINTERFERENCE", 14, Some "interference directive");
+    ("IREDUCIBLE", 14, Some "reducible directive");
+    ("ILIST", 14, Some "listing directive");
+    ("INOLIST", 14, Some "listing directive");
+    ("IEJECT", 14, Some "listing directive");
+    ("IBASE", 14, Some "base directive");
+    ("IISBASE", 14, Some "base directive");
+    ("IDROP", 14, Some "drop directive");
+    ("ILEFTRIGHT", 14, Some "layout directive");
+    ("IREARRANGE", 14, Some "rearrange directive");
+    ("IINITIALIZE", 14, Some "initialize directive");
+    ("IORDER", 14, Some "order directive");
     ("DEFINE", 14, Some "macro directive");
     ("PROGRAM", 14, Some "program directive");
     ("BLOCK", 14, Some "block directive");
+    ("REC", 14, Some "recursive subroutine");
+    ("RENT", 14, Some "reentrant subroutine");
+    ("LISTEXP", 14, Some "define list option");
+    ("LISTINV", 14, Some "define list option");
+    ("LISTBOTH", 14, Some "define list option");
+    ("INLINE", 14, Some "inline declaration");
+    ("LABEL", 14, Some "statement-name declaration");
+    ("LIKE", 14, Some "table type option");
+    ("OVERLAY", 14, Some "overlay declaration");
+    ("PARALLEL", 14, Some "table structure option");
+    ("POS", 14, Some "preset positioner");
+    ("INSTANCE", 14, Some "def block instance");
+    ("NULL", 14, Some "pointer literal");
     ("TRUE", 14, None);
     ("FALSE", 14, None);
     ("MOD", 14, None);
     ("AND", 14, None);
     ("OR", 14, None);
     ("NOT", 14, None);
+    ("XOR", 14, None);
+    ("EQV", 14, None);
   ]
 
 let completion_types_builtin : (string * int * string option) list =
   [
+    ("A", 7, Some "fixed type indicator");
     ("B", 7, Some "built-in type");
     ("U", 7, Some "built-in type");
     ("S", 7, Some "built-in type");
     ("F", 7, Some "built-in type");
     ("C", 7, Some "built-in type");
     ("P", 7, Some "built-in type");
-    ("W", 7, Some "built-in type");
-    ("V", 7, Some "built-in type");
+    ("W", 7, Some "compatibility type marker");
+    ("V", 7, Some "compatibility/status marker");
     ("STATUS", 7, Some "built-in type");
+  ]
+
+let completion_functions_builtin : (string * int * string option) list =
+  [
+    ("ABS", 3, Some "built-in function");
+    ("BIT", 3, Some "built-in function");
+    ("BITSIZE", 3, Some "built-in function");
+    ("BYTE", 3, Some "built-in function");
+    ("BYTESIZE", 3, Some "built-in function");
+    ("FIRST", 3, Some "built-in function");
+    ("LAST", 3, Some "built-in function");
+    ("LBOUND", 3, Some "built-in function");
+    ("LOC", 3, Some "built-in function");
+    ("NEXT", 3, Some "built-in function");
+    ("NWDSEN", 3, Some "built-in function");
+    ("REP", 3, Some "built-in function");
+    ("SGN", 3, Some "built-in function");
+    ("SHIFTL", 3, Some "built-in function");
+    ("SHIFTR", 3, Some "built-in function");
+    ("UBOUND", 3, Some "built-in function");
+    ("V", 3, Some "built-in status constructor");
+    ("WORDSIZE", 3, Some "built-in function");
   ]
 
 let completion_snippets : (string * string * int * string option) list =
@@ -3312,6 +3592,19 @@ let completion_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
                ())
       in
 
+      let add_builtin_function (label:string) (kind:int) (detail:string option) : unit =
+        if starts_with_ci ~prefix label then
+          let uniq_key = "fn|" ^ normalize_name label in
+          add_item
+            ~uniq_key
+            (completion_item_json
+               ~label
+               ~kind
+               ?detail
+               ~sort_text:("3_" ^ normalize_name label)
+               ())
+      in
+
       let add_snippet (label:string) (insert_text:string) (kind:int) (detail:string option) : unit =
         if starts_with_ci ~prefix label || starts_with_ci ~prefix insert_text then
           let uniq_key = "snip|" ^ normalize_name label in
@@ -3322,7 +3615,7 @@ let completion_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
                ~kind
                ?detail
                ~insert_text
-               ~sort_text:("3_" ^ normalize_name label)
+               ~sort_text:("4_" ^ normalize_name label)
                ())
       in
 
@@ -3333,6 +3626,7 @@ let completion_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
 
       List.iter (fun (label, kind, detail) -> add_keyword label kind detail) completion_keywords;
       List.iter (fun (label, kind, detail) -> add_keyword label kind detail) completion_types_builtin;
+      List.iter (fun (label, kind, detail) -> add_builtin_function label kind detail) completion_functions_builtin;
       List.iter (fun (label, insert_text, kind, detail) -> add_snippet label insert_text kind detail) completion_snippets;
 
       `List (List.rev !out)
@@ -3507,6 +3801,7 @@ let collect_proc_param_map (doc:Document.t) (out:(string, string list) Hashtbl.t
     | Ast.EIndex { base; index } -> add_expr base; List.iter add_expr index
     | Ast.EField { base; _ } -> add_expr base
     | Ast.EAt { field; ptr } -> add_expr field; add_expr ptr
+    | Ast.EDeref { ptr } -> add_expr ptr
     | Ast.EParen x -> add_expr x
   in
   let rec add_stmt (s:Ast.stmt Ast.node) : unit =
@@ -3602,6 +3897,8 @@ let inlay_hints_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(range:T.Range.t) : Yojs
             walk_expr base
         | Ast.EAt { field; ptr } ->
             walk_expr field;
+            walk_expr ptr
+        | Ast.EDeref { ptr } ->
             walk_expr ptr
         | Ast.EParen x ->
             walk_expr x
@@ -3820,7 +4117,9 @@ let semantic_class_of_lex_token
       let k = normalize_name s in
       if k = "" then None
       else if Hashtbl.mem macro_keys k then Some (sem_tt_macro, 0)
+      else if is_builtin_function_name k then Some (sem_tt_function, 0)
       else if is_builtin_type k then Some (sem_tt_type, 0)
+      else if is_reserved_keyword k then Some (sem_tt_keyword, 0)
       else Some (sem_tt_variable, 0)
 
   | Parser.INTLIT _ | Parser.FLOATLIT _ ->
@@ -3830,8 +4129,9 @@ let semantic_class_of_lex_token
 
   | Parser.START | Parser.TERM | Parser.BEGIN | Parser.END
   | Parser.DEF | Parser.REF | Parser.PROC | Parser.ITEM | Parser.TABLE
+  | Parser.STATIC | Parser.CONSTANT
   | Parser.IF | Parser.ELSE | Parser.WHILE | Parser.FOR | Parser.BY | Parser.THEN
-  | Parser.CASE | Parser.DEFAULT
+  | Parser.CASE | Parser.DEFAULT | Parser.FALLTHRU
   | Parser.EXIT | Parser.GOTO | Parser.RETURN | Parser.ABORT | Parser.STOP
   | Parser.NOT | Parser.AND | Parser.OR | Parser.XOR | Parser.EQV | Parser.MOD
   | Parser.TRUE | Parser.FALSE
@@ -4172,13 +4472,20 @@ let debug_report_for (ws:t) ~(uri:T.DocumentUri.t) ~(max_tokens:int) : Yojson.Sa
 
       let compools =
         match ws.index with
-        | None -> `Assoc [ "count", `Int 0; "sample", `List [] ]
+        | None ->
+            `Assoc [ "count", `Int 0; "sources", `Int 0; "complete", `Bool false; "sample", `List [] ]
         | Some idx ->
+            let sources = Workspace_index.all_source_paths idx in
             let sample =
               Workspace_index.sample idx 10
               |> List.map (fun (k,v) -> `Assoc [ "name", `String k; "path", `String v ])
             in
-            `Assoc [ "count", `Int (Workspace_index.compool_count idx); "sample", `List sample ]
+            `Assoc [
+              "count", `Int (Workspace_index.compool_count idx);
+              "sources", `Int (List.length sources);
+              "complete", `Bool (Workspace_index.is_complete idx);
+              "sample", `List sample;
+            ]
       in
 
       let imports =

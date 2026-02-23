@@ -95,8 +95,9 @@ and expr =
   | EBinop of { op : binop; lhs : expr node; rhs : expr node }
   | ECall of { callee : ident; args : expr node list }
   | EIndex of { base : expr node; index : expr node list }
-  | EField of { base : expr node; field : ident }  
-  | EAt of { field : expr node; ptr : expr node } 
+  | EField of { base : expr node; field : ident }
+  | EAt of { field : expr node; ptr : expr node }
+  | EDeref of { ptr : expr node }
   | EParen of expr node
 
 and stmt =
@@ -209,7 +210,7 @@ module Debug = struct
     | BGe -> Format.pp_print_string fmt "BGe"
 
   let rec pp_type_expr opts b depth fmt (t : type_expr node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else if over_depth opts depth then Format.pp_print_string fmt "<depth-limit>"
     else
       match t.v with
@@ -235,7 +236,7 @@ module Debug = struct
             (pp_loc_if opts) t.loc
 
   and pp_field_decl opts b depth fmt (f : field_decl node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = f.v in
       Format.fprintf fmt "@[Field(%a : %a)@]%a"
@@ -249,7 +250,7 @@ module Debug = struct
     | InOut -> Format.pp_print_string fmt "InOut"
 
   and pp_param opts b depth fmt (p : param node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = p.v in
       Format.fprintf fmt "@[Param(%a %a : %a)@]%a"
@@ -259,7 +260,7 @@ module Debug = struct
         (pp_loc_if opts) p.loc
 
   and pp_expr opts b depth fmt (e : expr node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else if over_depth opts depth then Format.pp_print_string fmt "<depth-limit>"
     else
       match e.v with
@@ -299,13 +300,18 @@ module Debug = struct
             (pp_expr opts b (depth + 1)) ptr
             (pp_loc_if opts) e.loc
 
+      | EDeref { ptr } ->
+          Format.fprintf fmt "@[EDeref(@ %a)@]%a"
+            (pp_expr opts b (depth + 1)) ptr
+            (pp_loc_if opts) e.loc
+
       | EParen inner ->
           Format.fprintf fmt "@[EParen(%a)@]%a"
             (pp_expr opts b (depth + 1)) inner
             (pp_loc_if opts) e.loc
 
   and pp_stmt opts b depth fmt (s : stmt node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else if over_depth opts depth then Format.pp_print_string fmt "<depth-limit>"
     else
       match s.v with
@@ -375,7 +381,7 @@ module Debug = struct
     Format.fprintf fmt "%S" s.v
 
   and pp_decl opts b depth fmt (d : decl node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       match d.v with
       | DVar { name; dtype; init; storage } ->
@@ -405,7 +411,7 @@ module Debug = struct
             (pp_loc_if opts) d.loc
 
   and pp_proc opts b depth fmt (p : proc node) =
-    if not (take_node b) then Format.pp_print_string fmt "<…>"
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = p.v in
       Format.fprintf fmt "@[DProc(name=%a; use=%a; params=[%a]; returns=%a; locals=[%a]; body=%a)@]%a"
