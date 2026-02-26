@@ -1682,6 +1682,16 @@ let sym_kind_func = 12
 let sym_kind_var = 13
 let sym_kind_const = 14
 
+let def_of_preprocess_define (doc:Document.t) (d:Preprocess.define) : def =
+  {
+    uri = doc.Document.uri;
+    name = d.name;
+    key = d.key;
+    loc = d.loc;
+    kind = sym_kind_const;
+    container = None;
+  }
+
 let nth_opt (xs:'a list) (n:int) : 'a option =
   let rec go i = function
     | [] -> None
@@ -1713,6 +1723,7 @@ let classify_fallback_decl ~(line:string) (tokens:(string * int * int) list) : (
     | "ITEM" | "TABLE" -> Some (kw_idx, sym_kind_var)
     | "TYPE" -> Some (kw_idx, sym_kind_type)
     | "PROC" -> Some (kw_idx, sym_kind_func)
+    | "DEFINE" -> Some (kw_idx, sym_kind_const)
     | "BLOCK" -> Some (kw_idx, sym_kind_module)
     | "COMPOOL" ->
         if preceded_by_bang line kw_col then None else Some (kw_idx, sym_kind_module)
@@ -1859,15 +1870,26 @@ let find_compool_loc_in_doc (doc:Document.t) (key:string) : Ast.Loc.t option =
 
 let collect_doc_defs (doc:Document.t) : def list =
   let uri = doc.Document.uri in
-  let defs =
+  let defs0 =
     match doc.Document.ast with
     | None -> []
     | Some prog ->
         List.fold_left (fun acc top ->
           match top with
-           | Ast.TopDecl d -> collect_decl_defs ~uri ~container:None acc d
-           | Ast.TopStmt s -> collect_stmt_defs ~uri ~container:None acc s
+            | Ast.TopDecl d -> collect_decl_defs ~uri ~container:None acc d
+            | Ast.TopStmt s -> collect_stmt_defs ~uri ~container:None acc s
         ) [] prog
+  in
+  let defs =
+    List.fold_left (fun acc (dm:Preprocess.define) ->
+      add_def_raw
+        acc
+        ~uri
+        ~name:dm.name
+        ~loc:dm.loc
+        ~kind:sym_kind_const
+        ~container:None
+    ) defs0 doc.Document.defines
   in
   let use_fallback_scan =
     let broken_or_partial = doc.Document.ast = None || doc.Document.parse_diags <> [] in
@@ -1932,6 +1954,201 @@ let nav_word_at_position (doc:Document.t) (pos:T.Position.t) : (string * Ast.Loc
   | None -> None
   | Some (name, _) when is_reserved_keyword name -> None
   | Some x -> Some x
+
+let has_define_key (doc:Document.t) (key:string) : bool =
+  key <> "" && List.exists (fun (d:Preprocess.define) -> d.key = key) doc.Document.defines
+
+let find_define_key_in_word
+    (doc:Document.t)
+    ~(word:string)
+    ~(word_loc:Ast.Loc.t)
+    ~(cursor_col:int)
+  : string option =
+  let direct = normalize_name word in
+  if has_define_key doc direct then Some direct
+  else
+    let upper_word = String.uppercase_ascii word in
+    let n = String.length upper_word in
+    if n = 0 then None
+    else
+      let rel =
+        let r = cursor_col - word_loc.start_pos.col in
+        if r < 0 then 0 else if r >= n then n - 1 else r
+      in
+      let uniq_keys_tbl = Hashtbl.create 16 in
+      List.iter (fun (d:Preprocess.define) -> Hashtbl.replace uniq_keys_tbl d.key true) doc.Document.defines;
+      let keys = Hashtbl.fold (fun k _ acc -> k :: acc) uniq_keys_tbl [] in
+      let best : (string * int * int) option ref = ref None in
+      let consider key start_idx len =
+        match !best with
+        | None -> best := Some (key, len, start_idx)
+        | Some (_, best_len, best_start) ->
+            if len > best_len || (len = best_len && start_idx >= best_start) then
+              best := Some (key, len, start_idx)
+      in
+      List.iter (fun key ->
+        let m = String.length key in
+        if m > 0 && m <= n then (
+          let rec scan i =
+            if i + m > n then ()
+            else (
+              let rec eq j =
+                j = m || (upper_word.[i + j] = key.[j] && eq (j + 1))
+              in
+              if eq 0 && rel >= i && rel < i + m then consider key i m;
+              scan (i + 1)
+            )
+          in
+          scan 0
+        )
+      ) keys;
+      match !best with
+      | None -> None
+      | Some (key, _, _) -> Some key
+
+let is_ws_char = function
+  | ' ' | '\t' | '\r' | '\n' -> true
+  | _ -> false
+
+let skip_ws_forward (s:string) (i:int) : int =
+  let n = String.length s in
+  let rec go j =
+    if j < n && is_ws_char s.[j] then go (j + 1) else j
+  in
+  go i
+
+let parse_call_arg_count ~(text:string) ~(open_idx:int) : int option =
+  let n = String.length text in
+  if open_idx < 0 || open_idx >= n || text.[open_idx] <> '(' then None
+  else
+    let depth = ref 1 in
+    let in_single = ref false in
+    let in_double = ref false in
+    let comma_count = ref 0 in
+    let seen_non_ws = ref false in
+    let i = ref (open_idx + 1) in
+    let done_ = ref false in
+    while not !done_ && !i < n do
+      let c = text.[!i] in
+      if !in_single then (
+        if c = '\'' then
+          if !i + 1 < n && text.[!i + 1] = '\'' then
+            i := !i + 1
+          else
+            in_single := false
+      ) else if !in_double then (
+        if c = '"' then
+          if !i + 1 < n && text.[!i + 1] = '"' then
+            i := !i + 1
+          else
+            in_double := false
+      ) else (
+        match c with
+        | '\'' ->
+            if !depth = 1 then seen_non_ws := true;
+            in_single := true
+        | '"' ->
+            if !depth = 1 then seen_non_ws := true;
+            in_double := true
+        | '(' ->
+            if !depth = 1 then seen_non_ws := true;
+            incr depth
+        | ')' ->
+            decr depth;
+            if !depth = 0 then done_ := true
+        | ',' when !depth = 1 ->
+            incr comma_count
+        | _ ->
+            if !depth = 1 && not (is_ws_char c) then seen_non_ws := true
+      );
+      incr i
+    done;
+    if !depth <> 0 then None
+    else if not !seen_non_ws then Some 0
+    else Some (!comma_count + 1)
+
+let select_define_decl
+    (doc:Document.t)
+    ~(key:string)
+    ~(call_ctx:bool)
+    ~(arg_count:int option)
+    ~(cursor_off:int option)
+  : Preprocess.define option =
+  let defs0 =
+    doc.Document.defines
+    |> List.filter (fun (d:Preprocess.define) -> d.key = key)
+  in
+  let defs1 =
+    match cursor_off with
+    | None -> defs0
+    | Some off ->
+        let before =
+          defs0
+          |> List.filter (fun (d:Preprocess.define) -> d.decl_start_off <= off)
+        in
+        if before = [] then defs0 else before
+  in
+  let defs2 =
+    let same_call =
+      defs1
+      |> List.filter (fun (d:Preprocess.define) -> d.requires_call = call_ctx)
+    in
+    if same_call = [] then defs1 else same_call
+  in
+  let defs3 =
+    match arg_count with
+    | None -> defs2
+    | Some n ->
+        let same_arity =
+          defs2
+          |> List.filter (fun (d:Preprocess.define) -> List.length d.formals = n)
+        in
+        if same_arity = [] then defs2 else same_arity
+  in
+  defs3
+  |> List.fold_left (fun best (d:Preprocess.define) ->
+       match best with
+       | None -> Some d
+       | Some (cur:Preprocess.define) ->
+           if d.decl_start_off >= cur.decl_start_off then Some d else Some cur
+     ) None
+
+let define_under_cursor (doc:Document.t) (pos:T.Position.t)
+  : (Preprocess.define * Ast.Loc.t) option =
+  match word_at_position doc pos with
+  | None -> None
+  | Some (word, word_loc) ->
+      let key_opt =
+        find_define_key_in_word doc ~word ~word_loc ~cursor_col:pos.character
+      in
+      (match key_opt with
+       | None -> None
+       | Some key ->
+           let cursor_off =
+             Text_index.offset_of_line_col doc.Document.index ~line:pos.line ~col:pos.character
+           in
+           let end_line0 = max 0 (word_loc.end_pos.line - 1) in
+           let after_word_off =
+             Text_index.offset_of_line_col
+               doc.Document.index
+               ~line:end_line0
+               ~col:word_loc.end_pos.col
+           in
+           let call_ctx, arg_count =
+             match after_word_off with
+             | None -> (false, None)
+             | Some off ->
+                 let open_idx = skip_ws_forward doc.Document.text off in
+                 if open_idx < String.length doc.Document.text && doc.Document.text.[open_idx] = '('
+                 then
+                   let argc = parse_call_arg_count ~text:doc.Document.text ~open_idx in
+                   (true, argc)
+                 else
+                   (false, None)
+           in
+           (match select_define_decl doc ~key ~call_ctx ~arg_count ~cursor_off with
+            | None -> None
+            | Some d -> Some (d, word_loc)))
 
 let location_json ~(uri:T.DocumentUri.t) (loc:Ast.Loc.t) : Yojson.Safe.t =
   T.Location.yojson_of_t (Lsp_conv.location_of_loc ~uri loc)
@@ -2488,10 +2705,20 @@ let build_doc_nav (ws:t) (doc:Document.t) : doc_nav =
                List.iter (fun d ->
                  if is_importable_def d && Hashtbl.mem selected d.key then
                    bind_external_def root_scope d
-               ) defs)
+                ) defs)
+  in
+
+  let bind_defines () =
+    List.iter (fun (dm:Preprocess.define) ->
+      let d = def_of_preprocess_define doc dm in
+      match nav_add_decl nav d with
+      | None -> ()
+      | Some b -> nav_bind_value root_scope b
+    ) doc.Document.defines
   in
 
   bind_imports ();
+  bind_defines ();
   (match doc.Document.ast with
    | None -> ()
    | Some prog ->
@@ -2817,6 +3044,11 @@ let definition_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
           let hits = defs_for_import_cursor ws imp in
           if hits = [] then `Null else `List (List.map def_to_loc_json hits)
       | None ->
+          (match define_under_cursor doc pos with
+           | Some (dm, _) ->
+               let d = def_of_preprocess_define doc dm in
+               `List [ def_to_loc_json d ]
+           | None ->
           let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
           let nav = nav_for_doc_cached ws cache doc in
           let docs = docs_for_lookup ws doc in
@@ -2855,9 +3087,9 @@ let definition_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
                    match nav_word_at_position doc pos with
                    | None -> []
                    | Some (nm, _) -> fallback_defs_by_name ws doc (normalize_name nm)
-                 in
-                 if by_name = [] then `Null
-                 else `List (List.map def_to_loc_json by_name))
+                  in
+                  if by_name = [] then `Null
+                  else `List (List.map def_to_loc_json by_name)))
 
 let implementation_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Safe.t =
   match doc_of_uri ws uri with
@@ -3144,6 +3376,47 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                | None -> Printf.sprintf "COMPOOL `%s` (unresolved in workspace index)." imp.name
                | Some p -> Printf.sprintf "COMPOOL `%s` -> `%s`" imp.name (Filename.basename p))
       in
+      (match define_under_cursor doc pos with
+       | Some (dm, word_loc) ->
+           let d = def_of_preprocess_define doc dm in
+           let primary_decl =
+             match source_line_for_def ws d with
+             | Some line when String.trim line <> "" -> line
+             | _ ->
+                 if dm.requires_call then
+                   Printf.sprintf "DEFINE %s(%s) \"%s\";"
+                     dm.name
+                     (String.concat "," dm.formals)
+                     dm.body
+                 else
+                   Printf.sprintf "DEFINE %s \"%s\";" dm.name dm.body
+           in
+           let head =
+             Printf.sprintf "### define `%s`\nDefined at `%s`"
+               d.name
+               (file_line_of_def d)
+           in
+           let decl_block =
+             let line = truncate_text 280 primary_decl in
+             if String.trim line = "" then ""
+             else Printf.sprintf "\n```jovial\n%s\n```" line
+           in
+           let expansion =
+             if dm.formals = [] then
+               Printf.sprintf "\nExpands to: `%s`" (truncate_text 180 dm.body)
+             else
+               Printf.sprintf
+                 "\nFormals: `%s`\nExpansion template: `%s`"
+                 (String.concat ", " dm.formals)
+                 (truncate_text 180 dm.body)
+           in
+           let body = head ^ decl_block ^ expansion in
+           `Assoc [
+             "contents",
+             `Assoc [ "kind", `String "markdown"; "value", `String body ];
+             "range", range_json_of_loc word_loc;
+           ]
+       | None ->
       let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
       let nav = nav_for_doc_cached ws cache doc in
       let word = nav_word_at_position doc pos in
@@ -3258,7 +3531,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
           | None -> base
           | Some loc -> ("range", range_json_of_loc loc) :: base
         in
-        `Assoc with_range
+        `Assoc with_range)
 
 let prepare_rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Safe.t =
   match doc_of_uri ws uri with

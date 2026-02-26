@@ -10,6 +10,7 @@ type t = {
   pre_text : string;
   imports : Preprocess.import list;
   compool_def : string option;
+  defines : Preprocess.define list;
 
   pre_diags : T.Diagnostic.t list;
   import_diags : T.Diagnostic.t list;
@@ -31,6 +32,7 @@ let reparse (doc : t) : t =
       pre_text = pre.text;
       imports = pre.imports;
       compool_def = pre.compool_def;
+      defines = pre.defines;
       pre_diags = pre.diags;
       parse_diags = out.diags;
       ast = out.ast;
@@ -49,6 +51,7 @@ let make ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) : t =
       pre_text = text;
       imports = [];
       compool_def = None;
+      defines = [];
 
       pre_diags = [];
       import_diags = [];

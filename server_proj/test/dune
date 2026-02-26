@@ -1,0 +1,7 @@
+(executable
+ (name define_navigation_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:define_navigation_test.exe})))
