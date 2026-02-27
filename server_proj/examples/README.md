@@ -5,7 +5,7 @@ This folder contains sample `.j73` files used to validate parsing, imports, inde
 Current files:
 
 - `MAINCOMP.j73`
-- `MAINMODULE (1).j73`
+- `MAINMODULE.j73`
 - `MAINSYSCOMP.j73`
 - `TINYCOMP.j73`
 - `UTIL.j73`

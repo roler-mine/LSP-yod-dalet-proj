@@ -126,9 +126,24 @@ let expected_tokens_hint (chk : 'a I.checkpoint) (pos : Lexing.position) : strin
   |> uniq_sorted
   |> take 12
 
+let constant_storage_warning =
+  "CONSTANT items should have static or external allocation."
+
 let parse_diags_to_lsp ~(file:string option) : T.Diagnostic.t list =
+  let seen_const_storage = ref false in
   Parse_diags.take ()
-  |> List.map (fun (loc, msg) -> diag_warn (attach_file file loc) msg)
+  |> List.filter_map (fun (loc, msg) ->
+       if msg = constant_storage_warning then
+         if !seen_const_storage then None
+         else (
+           seen_const_storage := true;
+           Some
+             (diag_warn
+                (attach_file file loc)
+                "CONSTANT item uses automatic allocation; consider STATIC/DEF/REF where required.")
+         )
+       else
+         Some (diag_warn (attach_file file loc) msg))
 
 let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
   (* Clear stale recovery/warn diags from previous runs *)
@@ -259,10 +274,14 @@ let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
         Some ast
 
       | I.HandlingError _env ->
-        last_expected := expected_tokens_hint chk lexbuf.lex_curr_p;
+        let resumed = resume_to_input_or_done chk 1024 in
+        last_expected :=
+          (match resumed with
+           | `NeedInput chk' -> expected_tokens_hint chk' !last_ep
+           | `Accepted _ | `Rejected -> []);
         add_parse_error ();
         begin
-          match resume_to_input_or_done chk 1024 with
+          match resumed with
           | `Accepted ast -> Some ast
           | `NeedInput chk' ->
               if skip_to_sync 4096 then drive chk' else None

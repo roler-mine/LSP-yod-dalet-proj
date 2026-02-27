@@ -42,7 +42,7 @@
         "jovial.server.path": {
           "type": "string",
           "default": "",
-          "description": "Absolute path to the Jovial LSP server executable (OCaml binary)."
+          "description": "Path to Jovial LSP server executable. Leave empty to use bundled server from the VSIX."
         },
         "jovial.server.args": {
           "type": "array",
@@ -56,6 +56,11 @@
           "enum": ["off", "messages", "verbose"],
           "description": "Trace LSP traffic in the client output channel."
         },
+        "jovial.lsif.fastPath": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use LSIF-like workspace index cache for definition/implementation/references when targets are in non-open files."
+        },
         "jovial.autostart": {
           "type": "boolean",
           "default": true,
@@ -65,9 +70,11 @@
     }
   },
   "scripts": {
+    "build:server": "node ./scripts/build-server.js",
     "compile": "tsc -p .",
     "watch": "tsc -p . -w",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run build:server && npm run compile",
+    "package:vsix": "npx @vscode/vsce package"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.0"

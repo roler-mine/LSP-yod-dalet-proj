@@ -82,6 +82,15 @@ let revalidate_and_publish_all_open_docs
        publish_diagnostics_if_changed published_diags oc ~uri
          ~diags:(Workspace.diagnostics_for ws ~uri))
 
+let publish_doc_diagnostics
+    (ws:Workspace.t)
+    (oc:out_channel)
+    (published_diags:(string, string) Hashtbl.t)
+    ~(uri:T.DocumentUri.t)
+  : unit =
+  publish_diagnostics_if_changed published_diags oc ~uri
+    ~diags:(Workspace.diagnostics_for ws ~uri)
+
 let semantic_token_types_legend : Yojson.Safe.t =
   `List [
     `String "namespace";
@@ -140,6 +149,7 @@ let initialize_result_json : Yojson.Safe.t =
                      `List [
                        `String "jovial.dumpAst";
                        `String "jovial.dumpCst";
+                       `String "jovial.dumpLsifIndex";
                        `String "jovial.debugReport";
                        `String "jovial.rescanWorkspace";
                       ]
@@ -155,6 +165,35 @@ let initialize_result_json : Yojson.Safe.t =
 
 let file_of_uri (u : T.DocumentUri.t) : string option =
   Uri_path.file_path_of_uri u
+
+let zero_loc_for_uri (uri:T.DocumentUri.t) : Ast.Loc.t =
+  let z = { Ast.Loc.line = 1; col = 0; offset = 0 } in
+  Ast.Loc.make ~file:(file_of_uri uri) ~start_pos:z ~end_pos:z
+
+let diag_internal_server_failure ~(uri:T.DocumentUri.t) ~(phase:string) (exn:exn) : T.Diagnostic.t =
+  Lsp_conv.diagnostic
+    ~severity:T.DiagnosticSeverity.Error
+    ~source:"server"
+    ~message:(Printf.sprintf
+      "Internal failure during %s: %s. Showing partial diagnostics."
+      phase
+      (Printexc.to_string exn))
+    (zero_loc_for_uri uri)
+
+let publish_partial_diagnostics_on_failure
+    (ws:Workspace.t)
+    (oc:out_channel)
+    (published_diags:(string, string) Hashtbl.t)
+    ~(uri:T.DocumentUri.t)
+    ~(phase:string)
+    ~(exn:exn)
+  : unit =
+  let base =
+    try Workspace.diagnostics_for ws ~uri
+    with _ -> []
+  in
+  let diag = diag_internal_server_failure ~uri ~phase exn in
+  publish_diagnostics_if_changed published_diags oc ~uri ~diags:(base @ [diag])
 
 let parse_uri_arg (arg:Yojson.Safe.t) : T.DocumentUri.t option =
   match arg with
@@ -383,6 +422,9 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
         Workspace.rescan ws;
         respond oc ~id ~result:(`Assoc [ "compoolCount", `Int (Workspace.compool_count ws) ])
 
+    | "jovial.dumpLsifIndex" ->
+        respond oc ~id ~result:(Workspace.lsif_index_json ws)
+
     | "jovial.debugReport" ->
         let uri_opt, max_tokens =
           match p.arguments with
@@ -424,21 +466,29 @@ let handle_notification
          let td = p.textDocument in
          let uri = td.uri in
          let file = file_of_uri uri in
-         Workspace.open_doc ws ~uri ~file ~text:td.text;
-         revalidate_and_publish_all_open_docs ws oc published_diags;
-         request_semantic_tokens_refresh oc
-           ~refresh_supported:!semantic_refresh_supported
-           next_server_request_id
+         (try
+            Workspace.open_doc ws ~uri ~file ~text:td.text;
+            publish_doc_diagnostics ws oc published_diags ~uri;
+            request_semantic_tokens_refresh oc
+              ~refresh_supported:!semantic_refresh_supported
+              next_server_request_id
+          with exn ->
+            publish_partial_diagnostics_on_failure ws oc published_diags
+              ~uri ~phase:"didOpen" ~exn)
        with _ -> ())
   | "textDocument/didChange" ->
       (try
          let p = T.DidChangeTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
-         Workspace.change_doc ws ~uri ~changes:p.contentChanges;
-         revalidate_and_publish_all_open_docs ws oc published_diags;
-         request_semantic_tokens_refresh oc
-           ~refresh_supported:!semantic_refresh_supported
-           next_server_request_id
+         (try
+            Workspace.change_doc ws ~uri ~changes:p.contentChanges;
+            publish_doc_diagnostics ws oc published_diags ~uri;
+            request_semantic_tokens_refresh oc
+              ~refresh_supported:!semantic_refresh_supported
+              next_server_request_id
+          with exn ->
+            publish_partial_diagnostics_on_failure ws oc published_diags
+              ~uri ~phase:"didChange" ~exn)
        with _ -> ())
   | "textDocument/didClose" ->
       (try
@@ -586,15 +636,22 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                (match id_of_msg json with
                 | None -> ()
                 | Some id ->
-                    handle_request ws ~semantic_refresh_supported oc m id (params_of_msg json))
+                    (try
+                       handle_request ws ~semantic_refresh_supported oc m id (params_of_msg json)
+                     with exn ->
+                       respond_error oc ~id ~code:(-32603)
+                         ~message:(Printf.sprintf "%s failed: %s" m (Printexc.to_string exn))))
              else
-               handle_notification ws
-                 ~semantic_refresh_supported
-                 ~next_server_request_id
-                 ~published_diags
-                 oc
-                 m
-                 (params_of_msg json));
+               (try
+                  handle_notification ws
+                    ~semantic_refresh_supported
+                    ~next_server_request_id
+                    ~published_diags
+                    oc
+                    m
+                    (params_of_msg json)
+                with _ -> ()));
+        flush oc;
         loop ()
   in
   loop ()
