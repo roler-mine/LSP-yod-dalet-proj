@@ -1,0 +1,119 @@
+{
+  "name": "jovial-lsp-client",
+  "displayName": "Jovial Language Support",
+  "description": "VS Code client for the Jovial OCaml LSP server",
+  "version": "0.0.5",
+  "publisher": "your-name",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": [
+    "onLanguage:jovial",
+    "onCommand:jovial.dumpAstUi",
+    "onCommand:jovial.dumpCstUi",
+    "onCommand:jovial.showSyntaxTrees",
+    "onCommand:jovial.restartServer",
+    "onCommand:jovial.refreshLsifCache"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "jovial",
+        "aliases": ["Jovial", "JOVIAL", "jovial"],
+        "extensions": [".jov", ".j73", ".jvl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jovial",
+        "scopeName": "source.jovial",
+        "path": "./syntaxes/jovial.tmlanguage.json"
+      }
+    ],
+    "commands": [
+      { "command": "jovial.dumpAstUi", "title": "Jovial: Dump AST" },
+      { "command": "jovial.dumpCstUi", "title": "Jovial: Dump CST (Token Stream)" },
+      { "command": "jovial.showSyntaxTrees", "title": "Jovial: Show AST/CST Viewer" },
+      { "command": "jovial.restartServer", "title": "Jovial: Restart Language Server" },
+      { "command": "jovial.refreshLsifCache", "title": "Jovial: Refresh LSIF Cache" }
+    ],
+    "configuration": {
+      "title": "Jovial LSP",
+      "properties": {
+        "jovial.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Jovial LSP server executable. Leave empty to use bundled server from the VSIX."
+        },
+        "jovial.server.preferBundled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prefer bundled server binaries over jovial.server.path when bundled binaries are available."
+        },
+        "jovial.server.args": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "description": "Extra command-line args passed to the server."
+        },
+        "jovial.trace": {
+          "type": "string",
+          "default": "off",
+          "enum": ["off", "messages", "verbose"],
+          "description": "Trace LSP traffic in the client output channel."
+        },
+        "jovial.lsif.fastPath": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable LSIF cache as a fallback for definition/implementation/references/hover when the server has no result yet. Disabled by default."
+        },
+        "jovial.workspaceDiagnostics.mode": {
+          "type": "string",
+          "default": "errors",
+          "enum": ["off", "errors", "all"],
+          "description": "Background diagnostics for unopened files: off, errors-only, or all diagnostics."
+        },
+        "jovial.background.indexBudgetMs": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "description": "Server idle background work budget in milliseconds per tick."
+        },
+        "jovial.background.diagBatchSize": {
+          "type": "number",
+          "default": 64,
+          "minimum": 1,
+          "description": "Maximum number of background diagnostic updates published per idle batch."
+        },
+        "jovial.autostart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the language server automatically when a Jovial file is opened."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:server:host": "node ../../tools/scripts/build-server.js",
+    "build:server:win-x64": "node ../../tools/scripts/build-server.js --target win32-x64 --out runtime/server/win32-x64/jovial-lsp.exe",
+    "build:server:win-arm64": "node ../../tools/scripts/build-server.js --target win32-arm64 --out runtime/server/win32-arm64/jovial-lsp.exe",
+    "verify:runtime": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64",
+    "verify:runtime:host": "node ../../tools/scripts/verify-runtime-binaries.js --targets host",
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "vscode:prepublish": "npm run compile",
+    "package:vsix:dev": "npm run build:server:host && npx @vscode/vsce package",
+    "package:vsix:host": "npm run build:server:host && npm run verify:runtime:host && npx @vscode/vsce package",
+    "package:vsix:release": "npm run verify:runtime && npx @vscode/vsce package",
+    "package:vsix": "npm run package:vsix:dev"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  }
+}

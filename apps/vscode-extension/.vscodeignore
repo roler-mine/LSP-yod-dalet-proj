@@ -1,0 +1,6 @@
+.vs/**
+src/**
+tsconfig.json
+runtime/server/**/.gitkeep
+runtime/server/**/*.pending-*
+server/**

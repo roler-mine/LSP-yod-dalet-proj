@@ -1,0 +1,103 @@
+(executable
+ (name define_navigation_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:define_navigation_test.exe})))
+
+(executable
+ (name scope_navigation_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:scope_navigation_test.exe})))
+
+(executable
+ (name semantic_store_navigation_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:semantic_store_navigation_test.exe})))
+
+(executable
+ (name semantic_store_rename_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:semantic_store_rename_test.exe})))
+
+(executable
+ (name semantic_tokens_cache_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:semantic_tokens_cache_test.exe})))
+
+(executable
+ (name lsif_delta_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsif_delta_test.exe})))
+
+(executable
+ (name watched_file_invalidation_test)
+ (libraries jovial_lsp_lib yojson unix))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:watched_file_invalidation_test.exe})))
+
+(executable
+ (name lsp_responsiveness_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_responsiveness_test.exe} %{exe:../bin/Main.exe})))
+
+(executable
+ (name lsp_restart_stability_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_restart_stability_test.exe} %{exe:../bin/Main.exe})))
+
+(executable
+ (name lsp_didchange_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_didchange_latency_test.exe} %{exe:../bin/Main.exe})))
+
+(executable
+ (name lsp_crossfile_goto_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_crossfile_goto_latency_test.exe} %{exe:../bin/Main.exe})))
+
+(executable
+ (name lsp_startup_openfile_nav_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_startup_openfile_nav_latency_test.exe} %{exe:../bin/Main.exe})))
+
+(executable
+ (name lsp_workspace_diagnostics_background_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_workspace_diagnostics_background_test.exe} %{exe:../bin/Main.exe})))

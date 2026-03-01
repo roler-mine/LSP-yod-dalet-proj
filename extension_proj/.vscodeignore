@@ -1,7 +1,0 @@
-.vs/**
-src/**
-scripts/**
-tsconfig.json
-server/.gitkeep
-server/jovial-lsp
-server/jovial-lsp.exe

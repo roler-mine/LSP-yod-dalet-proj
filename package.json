@@ -1,0 +1,13 @@
+{
+  "name": "jovial-monorepo",
+  "private": true,
+  "scripts": {
+    "build:server:win-x64": "node ./tools/scripts/build-server.js --target win32-x64",
+    "build:server:win-arm64": "node ./tools/scripts/build-server.js --target win32-arm64",
+    "test:server": "opam exec -- dune runtest --root ./apps/lsp-server",
+    "build:extension": "npm --prefix ./apps/vscode-extension run compile",
+    "package:vsix:dev": "npm --prefix ./apps/vscode-extension run package:vsix:dev",
+    "package:vsix:release": "npm --prefix ./apps/vscode-extension run package:vsix:release",
+    "clean": "powershell -ExecutionPolicy Bypass -File ./tools/scripts/clean-generated.ps1"
+  }
+}

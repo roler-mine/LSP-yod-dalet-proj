@@ -1,0 +1,14 @@
+(executable
+ (name Main)
+ (public_name jovial-lsp)
+ (libraries
+  jovial_lsp_lib
+  lsp
+  jsonrpc
+  yojson
+  threads
+  fmt
+  fmt.tty
+  logs
+  logs.fmt))
+

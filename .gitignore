@@ -29,6 +29,15 @@ Desktop.ini
 # Node / TypeScript artifacts
 **/node_modules/
 *.tsbuildinfo
+apps/vscode-extension/out/
+apps/vscode-extension/.eslintcache
+apps/vscode-extension/*.vsix
+apps/vscode-extension/runtime/server/**/*.exe
+apps/vscode-extension/server/jovial-lsp*
+apps/vscode-extension/npm-debug.log*
+apps/vscode-extension/yarn-debug.log*
+apps/vscode-extension/yarn-error.log*
+apps/vscode-extension/pnpm-debug.log*
 extension_proj/out/
 extension_proj/.eslintcache
 extension_proj/*.vsix
@@ -47,10 +56,15 @@ extension_proj/pnpm-debug.log*
 # Workspace index + scratch files
 .jovial-lsp-index-checkpoint.json
 .jovial-lsp-index-resume.txt
+apps/lsp-server/_tmp_*.txt
+apps/lsp-server/_tmp_*.ml
+apps/lsp-server/_tmp_*.json
+apps/lsp-server/_tmp_*.log
 server_proj/_tmp_*.txt
 server_proj/_tmp_*.ml
 server_proj/_tmp_*.json
 server_proj/_tmp_*.log
 
 # Local packaged archives
+apps/vscode-extension.zip
 extension_proj.zip

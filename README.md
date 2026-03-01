@@ -4,12 +4,12 @@ Monorepo for a VS Code client extension and an OCaml LSP server for JOVIAL J73.
 
 ## Repository At A Glance
 
-- `extension_proj/`: VS Code extension (TypeScript)
-- `server_proj/`: language server (OCaml + dune + menhir)
+- `apps/vscode-extension/`: VS Code extension (TypeScript)
+- `apps/lsp-server/`: language server (OCaml + dune + menhir)
 - `docs/`: repository and contributor docs
-- `scripts/`: local maintenance utilities
+- `tools/scripts/`: local build and maintenance utilities
 
-Detailed layout: [`docs/REPO_STRUCTURE.md`](docs/REPO_STRUCTURE.md)
+Detailed layout: [`docs/repo/structure.md`](docs/repo/structure.md)
 
 ## Quick Start (Development)
 
@@ -19,36 +19,60 @@ Prerequisites:
 - OCaml toolchain (`opam`, `dune`)
 - VS Code
 
-Build server:
+Install extension dependencies:
 
 ```powershell
-cd server_proj
-opam exec -- dune build @install
+cd apps/vscode-extension
+npm ci
+```
+
+Build and test server:
+
+```powershell
+cd ..\lsp-server
+opam exec -- dune runtest
 ```
 
 Build extension:
 
 ```powershell
-cd extension_proj
-npm ci
+cd ..\vscode-extension
 npm run compile
 ```
 
-Run extension in VS Code:
+Run extension in VS Code (development):
 
-1. Open `extension_proj` in VS Code.
+1. Open `apps/vscode-extension` in VS Code.
 2. Press `F5` to launch Extension Development Host.
 
-## Package VSIX (Bundled Server)
+## Package VSIX
 
+Developer loop (bundles host-arch server binary, then packages):
 ```powershell
-cd extension_proj
-npm ci
-npm run package:vsix
-code --install-extension .\jovial-lsp-client-0.0.1.vsix
+cd apps/vscode-extension
+npm run package:vsix:dev
 ```
 
-`package:vsix` builds the OCaml server, bundles it into `extension_proj/server/`, compiles the extension, and packages the VSIX.
+Release/universal packaging (requires both runtime binaries present):
+```powershell
+cd C:\path\to\repo
+npm run build:server:win-x64
+npm run build:server:win-arm64
+npm run package:vsix:release
+```
+
+Notes:
+- `build:server:win-arm64` must run on a Windows ARM64 host/runner to produce a real ARM64 binary.
+- `package:vsix:release` validates binary architecture and will fail if `win32-arm64` is actually x64.
+
+Bundled runtime locations:
+- `apps/vscode-extension/runtime/server/win32-x64/jovial-lsp.exe`
+- `apps/vscode-extension/runtime/server/win32-arm64/jovial-lsp.exe`
+
+Install packaged VSIX:
+```powershell
+code --install-extension .\apps\vscode-extension\jovial-lsp-client-0.0.1.vsix
+```
 
 ## Implemented LSP Features
 
@@ -68,10 +92,12 @@ code --install-extension .\jovial-lsp-client-0.0.1.vsix
 ## Configuration
 
 - `jovial.server.path`: optional server executable override
+- `jovial.server.preferBundled`: prefer bundled runtime binaries when available
 - `jovial.server.args`: extra CLI args for server process
 - `jovial.autostart`: auto-start server on file open
 - `jovial.trace`: LSP trace level (`off`, `messages`, `verbose`)
-- `jovial.lsif.fastPath`: faster non-open-file navigation via workspace index cache
+- `jovial.lsif.fastPath`: optional LSIF-like cache for non-open-file nav (default: off to avoid indexing stalls)
+- `Jovial: Refresh LSIF Cache`: manual command to rebuild LSIF cache when `jovial.lsif.fastPath` is enabled
 
 ## Repository Hygiene
 
@@ -79,7 +105,5 @@ code --install-extension .\jovial-lsp-client-0.0.1.vsix
 - To clean local generated artifacts:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\clean-generated.ps1
+powershell -ExecutionPolicy Bypass -File .\tools\scripts\clean-generated.ps1
 ```
-
-For contribution flow and project conventions, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
