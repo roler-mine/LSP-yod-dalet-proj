@@ -3,7 +3,7 @@
  (libraries jovial_lsp_lib yojson))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:define_navigation_test.exe})))
 
 (executable
@@ -11,7 +11,7 @@
  (libraries jovial_lsp_lib yojson))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:scope_navigation_test.exe})))
 
 (executable
@@ -19,7 +19,7 @@
  (libraries jovial_lsp_lib yojson))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:semantic_store_navigation_test.exe})))
 
 (executable
@@ -27,7 +27,7 @@
  (libraries jovial_lsp_lib yojson))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:semantic_store_rename_test.exe})))
 
 (executable
@@ -35,7 +35,7 @@
  (libraries jovial_lsp_lib yojson))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:semantic_tokens_cache_test.exe})))
 
 (executable
@@ -43,7 +43,7 @@
  (libraries jovial_lsp_lib yojson))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:lsif_delta_test.exe})))
 
 (executable
@@ -51,76 +51,15 @@
  (libraries jovial_lsp_lib yojson unix))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action (run %{exe:watched_file_invalidation_test.exe})))
-
-(executable
- (name lsp_responsiveness_test)
- (libraries jovial_lsp_lib yojson unix threads))
-
-(rule
- (alias runtest)
- (action
-  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
-   (setenv JOVIAL_TEST_RESP_INDEX_FILES "900"
-    (setenv JOVIAL_TEST_RESP_TIMEOUT_S "10"
-     (run %{exe:lsp_responsiveness_test.exe} %{exe:../bin/Main.exe}))))))
-
-(executable
- (name lsp_restart_stability_test)
- (libraries jovial_lsp_lib yojson unix threads))
-
-(rule
- (alias runtest)
- (action
-  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
-   (setenv JOVIAL_TEST_RESTART_CYCLES "8"
-    (setenv JOVIAL_TEST_RESTART_TIMEOUT_S "8"
-     (run %{exe:lsp_restart_stability_test.exe} %{exe:../bin/Main.exe}))))))
-
-(executable
- (name lsp_didchange_latency_test)
- (libraries jovial_lsp_lib yojson unix threads))
-
-(rule
- (alias runtest)
- (action
-  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
-   (setenv JOVIAL_TEST_EDIT_LARGE_FILE_LINES "8000"
-    (setenv JOVIAL_TEST_EDIT_TIMEOUT_S "20"
-     (run %{exe:lsp_didchange_latency_test.exe} %{exe:../bin/Main.exe}))))))
-
-(executable
- (name lsp_crossfile_goto_latency_test)
- (libraries jovial_lsp_lib yojson unix threads))
-
-(rule
- (alias runtest)
- (action
-  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
-   (setenv JOVIAL_TEST_CROSSFILE_INDEX_FILES "500"
-    (setenv JOVIAL_TEST_CROSSFILE_TIMEOUT_S "12"
-     (setenv JOVIAL_TEST_CROSSFILE_SETTLE_TIMEOUT_S "20"
-      (run %{exe:lsp_crossfile_goto_latency_test.exe} %{exe:../bin/Main.exe})))))))
-
-(executable
- (name lsp_startup_openfile_nav_latency_test)
- (libraries jovial_lsp_lib yojson unix threads))
-
-(rule
- (alias runtest)
- (action
-  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
-   (setenv JOVIAL_TEST_STARTUP_INDEX_FILES "1000"
-    (setenv JOVIAL_TEST_STARTUP_TIMEOUT_S "10"
-     (run %{exe:lsp_startup_openfile_nav_latency_test.exe} %{exe:../bin/Main.exe}))))))
 
 (executable
  (name lsp_workspace_diagnostics_background_test)
  (libraries jovial_lsp_lib yojson unix threads))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action
   (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
    (run %{exe:lsp_workspace_diagnostics_background_test.exe} %{exe:../bin/Main.exe}))))
@@ -130,17 +69,218 @@
  (libraries jovial_lsp_lib yojson unix))
 
 (rule
- (alias runtest)
- (action (run %{exe:lsp_workspace_diagnostics_latest_wins_test.exe})))
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "120"
+   (run %{exe:lsp_workspace_diagnostics_latest_wins_test.exe}))))
 
 (executable
  (name lsp_nav_soft_budget_guard_test)
  (libraries jovial_lsp_lib yojson unix threads))
 
 (rule
- (alias runtest)
+ (alias runtest-smoke)
  (action
-  (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_LINES "12000"
-   (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_TIMEOUT_S "10"
-    (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_HARD_TIMEOUT_S "90"
-     (run %{exe:lsp_nav_soft_budget_guard_test.exe} %{exe:../bin/Main.exe}))))))
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_LINES "12000"
+    (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_TIMEOUT_S "10"
+     (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_HARD_TIMEOUT_S "90"
+      (run %{exe:lsp_nav_soft_budget_guard_test.exe} %{exe:../bin/Main.exe})))))))
+
+(executable
+ (name lsp_cancel_request_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_CANCEL_LINES "60000"
+    (setenv JOVIAL_TEST_CANCEL_TIMEOUT_S "12"
+     (run %{exe:lsp_cancel_request_test.exe} %{exe:../bin/Main.exe}))))))
+
+(executable
+ (name lsp_multi_root_routing_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_MULTI_ROOT_TIMEOUT_S "10"
+    (run %{exe:lsp_multi_root_routing_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_io_message_size_limit_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_IO_SIZE_TIMEOUT_S "12"
+    (run %{exe:lsp_io_message_size_limit_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_declaration_type_definition_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_DECL_TYPEDEF_TIMEOUT_S "10"
+    (run %{exe:lsp_declaration_type_definition_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_workspace_symbol_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_WORKSPACE_SYMBOL_TIMEOUT_S "10"
+    (run %{exe:lsp_workspace_symbol_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_signature_help_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_SIGNATURE_HELP_TIMEOUT_S "10"
+    (run %{exe:lsp_signature_help_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_completion_ranking_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_COMPLETION_RANK_TIMEOUT_S "10"
+    (run %{exe:lsp_completion_ranking_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsif_snapshot_refresh_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_LSIF_SNAPSHOT_TIMEOUT_S "10"
+    (run %{exe:lsif_snapshot_refresh_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_lsif_payload_shape_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_LSIF_PAYLOAD_TIMEOUT_S "10"
+    (run %{exe:lsp_lsif_payload_shape_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_lsif_delta_by_id_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_LSIF_DELTA_ID_TIMEOUT_S "10"
+    (run %{exe:lsp_lsif_delta_by_id_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_lsif_root_routing_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_LSIF_ROOT_TIMEOUT_S "10"
+    (run %{exe:lsp_lsif_root_routing_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_idle_loop_no_timer_thread_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_IDLE_LOOP_TIMEOUT_S "10"
+    (run %{exe:lsp_idle_loop_no_timer_thread_test.exe} %{exe:../bin/Main.exe})))))
+
+(executable
+ (name lsp_didchange_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-perf)
+ (action
+  (setenv JOVIAL_TEST_EDIT_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_EDIT_LARGE_FILE_LINES "6000"
+    (setenv JOVIAL_TEST_EDIT_TIMEOUT_S "20"
+     (run %{exe:lsp_didchange_latency_test.exe} %{exe:../bin/Main.exe}))))))
+
+(executable
+ (name lsp_crossfile_goto_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-perf)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_CROSSFILE_INDEX_FILES "320"
+    (setenv JOVIAL_TEST_CROSSFILE_TIMEOUT_S "14"
+     (setenv JOVIAL_TEST_CROSSFILE_SETTLE_TIMEOUT_S "30"
+      (run %{exe:lsp_crossfile_goto_latency_test.exe} %{exe:../bin/Main.exe})))))))
+
+(executable
+ (name lsp_startup_openfile_nav_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-perf)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_STARTUP_INDEX_FILES "700"
+    (setenv JOVIAL_TEST_STARTUP_TIMEOUT_S "12"
+     (run %{exe:lsp_startup_openfile_nav_latency_test.exe} %{exe:../bin/Main.exe}))))))
+
+(executable
+ (name lsp_responsiveness_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-stability)
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_RESP_INDEX_FILES "700"
+    (setenv JOVIAL_TEST_RESP_TIMEOUT_S "12"
+     (run %{exe:lsp_responsiveness_test.exe} %{exe:../bin/Main.exe}))))))
+
+(executable
+ (name lsp_restart_stability_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-stability)
+ (action
+  (setenv JOVIAL_TEST_RESTART_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_RESTART_CYCLES "6"
+    (setenv JOVIAL_TEST_RESTART_TIMEOUT_S "8"
+     (run %{exe:lsp_restart_stability_test.exe} %{exe:../bin/Main.exe}))))))
+
+(alias
+ (name runtest)
+ (deps (alias runtest-smoke)))

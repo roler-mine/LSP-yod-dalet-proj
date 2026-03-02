@@ -3,7 +3,7 @@
   "displayName": "Jovial Language Support",
   "description": "VS Code client for the Jovial OCaml LSP server",
   "version": "0.0.5",
-  "publisher": "your-name",
+  "publisher": "roler-mine",
   "engines": {
     "vscode": "^1.85.0"
   },

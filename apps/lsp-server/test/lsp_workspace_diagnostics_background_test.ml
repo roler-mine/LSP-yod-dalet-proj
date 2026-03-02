@@ -54,6 +54,15 @@ let wait_for_uri_diagnostics
     ~(target_uri:string)
     ~(timeout_s:float)
   : int list option =
+  let normalize_uri_for_compare (u:string) : string =
+    match Jovial_lsp_lib.Uri_path.file_path_of_uri_string u with
+    | Some p ->
+        let p = String.map (fun c -> if c = '\\' then '/' else c) p in
+        if Sys.win32 then String.lowercase_ascii p else p
+    | None ->
+        String.lowercase_ascii (String.trim u)
+  in
+  let target_norm = normalize_uri_for_compare target_uri in
   let deadline = Unix.gettimeofday () +. timeout_s in
   let rec loop (last:int list option) =
     let now = Unix.gettimeofday () in
@@ -65,7 +74,8 @@ let wait_for_uri_diagnostics
         try
           let msg = Lsp_test_helpers.wait_for_message srv ~timeout_s:chunk in
           (match parse_publish_diagnostics msg with
-           | Some (uri, severities) when uri = target_uri ->
+           | Some (uri, severities)
+             when normalize_uri_for_compare uri = target_norm ->
                loop (Some severities)
            | _ ->
                loop last)

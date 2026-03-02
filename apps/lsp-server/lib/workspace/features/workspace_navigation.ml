@@ -23,19 +23,33 @@ let request_pos_suffix (pos:T.Position.t) : string =
   Printf.sprintf "@%d:%d" pos.line pos.character
 
 type nav_budget = {
+  ws : t;
   deadline_ms : float;
   mutable exceeded : bool;
+  mutable cancelled : bool;
+  mutable cancel_recorded : bool;
 }
 
-let nav_budget_start () : nav_budget =
+let nav_budget_start (ws:t) : nav_budget =
   {
-    deadline_ms = (Sys.time () *. 1000.0) +. float_of_int nav_soft_budget_ms;
+    ws;
+    deadline_ms = Perf_stats.now_ms () +. float_of_int nav_soft_budget_ms;
     exceeded = false;
+    cancelled = false;
+    cancel_recorded = false;
   }
 
 let nav_budget_check (budget:nav_budget) : bool =
-  if budget.exceeded then true
-  else if (Sys.time () *. 1000.0) > budget.deadline_ms then (
+  if budget.cancelled then true
+  else if request_cancelled budget.ws then (
+    budget.cancelled <- true;
+    if not budget.cancel_recorded then (
+      budget.cancel_recorded <- true;
+      Perf_stats.tick "cancel.applied"
+    );
+    true
+  ) else if budget.exceeded then true
+  else if Perf_stats.now_ms () > budget.deadline_ms then (
     budget.exceeded <- true;
     Perf_stats.tick "nav.soft_budget_exceeded";
     true
@@ -90,7 +104,7 @@ let definition_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
   match doc_of_uri ws uri with
   | None -> `Null
   | Some doc ->
-      let budget = nav_budget_start () in
+      let budget = nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then `Null
         else
@@ -191,7 +205,7 @@ let implementation_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
   match doc_of_uri ws uri with
   | None -> `Null
   | Some doc ->
-      let budget = nav_budget_start () in
+      let budget = nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then `Null
         else
@@ -353,7 +367,7 @@ let references_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(incl
   match doc_of_uri ws uri with
   | None -> `List []
   | Some doc ->
-      let budget = nav_budget_start () in
+      let budget = nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then `List []
         else
@@ -497,7 +511,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
   match doc_of_uri ws uri with
   | None -> `Null
   | Some doc ->
-      let budget = nav_budget_start () in
+      let budget = nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then `Null
         else
@@ -716,7 +730,7 @@ let prepare_rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
   match doc_of_uri ws uri with
   | None -> `Null
   | Some doc ->
-      let budget = nav_budget_start () in
+      let budget = nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then `Null
         else
@@ -778,7 +792,7 @@ let rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(new_name
     match doc_of_uri ws uri with
     | None -> `Null
     | Some doc ->
-        let budget = nav_budget_start () in
+        let budget = nav_budget_start ws in
         let compute () =
           if nav_budget_check budget then `Null
           else
@@ -1016,7 +1030,7 @@ let completion_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
   match doc_of_uri ws uri with
   | None -> `List []
   | Some doc ->
-      let budget = nav_budget_start () in
+      let budget = nav_budget_start ws in
       let compute () =
         let prefix =
           match word_at_position doc pos with
@@ -1120,6 +1134,303 @@ let completion_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
         ) completion_snippets;
 
         `List (List.rev !out)
+      in
+      nav_compute_with_budget budget compute
+
+let declaration_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Safe.t =
+  match doc_of_uri ws uri with
+  | None -> `Null
+  | Some doc ->
+      let budget = nav_budget_start ws in
+      let compute () =
+        if nav_budget_check budget then `Null
+        else
+          match nav_word_at_position doc pos with
+          | Some (nm, _) ->
+              let key = normalize_name nm in
+              if key = "" then definition_json_for ws ~uri ~pos
+              else
+                let decls =
+                  proc_defs_by_key ws doc ~key
+                  |> List.filter (fun d -> not (is_likely_proc_implementation ws d))
+                in
+                if decls = [] then definition_json_for ws ~uri ~pos
+                else `List (List.map def_to_loc_json (uniq_defs decls))
+          | None ->
+              definition_json_for ws ~uri ~pos
+      in
+      nav_compute_with_budget budget compute
+
+let type_definition_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Safe.t =
+  match doc_of_uri ws uri with
+  | None -> `Null
+  | Some doc ->
+      let budget = nav_budget_start ws in
+      let compute () =
+        if nav_budget_check budget then `Null
+        else
+          let key_opt =
+            match nav_word_at_position doc pos with
+            | None -> None
+            | Some (nm, _) ->
+                let key = normalize_name nm in
+                if key = "" then None else Some key
+          in
+          match key_opt with
+          | None -> `Null
+          | Some key ->
+              let docs = docs_for_lookup ws doc in
+              let defs =
+                docs
+                |> List.concat_map collect_doc_defs
+                |> List.filter (fun d -> d.kind = sym_kind_type && d.key = key)
+                |> uniq_defs
+              in
+              if defs = [] then `Null
+              else `List (List.map def_to_loc_json defs)
+      in
+      nav_compute_with_budget budget compute
+
+let doc_sort_key (doc:Document.t) : string =
+  Uri_path.docuri_to_string doc.Document.uri
+
+let workspace_symbols_json_for (ws:t) ~(query:string) : Yojson.Safe.t =
+  let budget = nav_budget_start ws in
+  let max_items = 512 in
+  let prefix = String.trim query in
+  let compute () =
+    if nav_budget_check budget then `List []
+    else
+      let docs_seen = Hashtbl.create 512 in
+      let docs = ref [] in
+      let add_doc (d:Document.t) : unit =
+        if nav_budget_check budget then ()
+        else
+          let k = Uri_path.docuri_to_string d.Document.uri in
+          if not (Hashtbl.mem docs_seen k) then (
+            Hashtbl.replace docs_seen k true;
+            docs := d :: !docs
+          )
+      in
+      Hashtbl.iter (fun _ d -> add_doc d) ws.docs;
+      Hashtbl.iter (fun _ d -> add_doc d) ws.files;
+      let docs =
+        !docs
+        |> List.sort (fun a b -> String.compare (doc_sort_key a) (doc_sort_key b))
+      in
+      let symbol_seen = Hashtbl.create 2048 in
+      let out = ref [] in
+      let count = ref 0 in
+      let add_symbol (d:def) : unit =
+        if nav_budget_check budget || !count >= max_items then ()
+        else if starts_with_ci ~prefix d.name || starts_with_ci ~prefix d.key then
+          let key =
+            Printf.sprintf "%s|%d|%d|%d"
+              (loc_key ~uri:d.uri d.loc)
+              d.kind
+              d.loc.start_pos.line
+              d.loc.start_pos.col
+          in
+          if not (Hashtbl.mem symbol_seen key) then (
+            Hashtbl.replace symbol_seen key true;
+            out := d :: !out;
+            incr count
+          )
+      in
+      List.iter (fun d ->
+        if not (nav_budget_check budget) then
+          collect_doc_defs d |> List.iter add_symbol
+      ) docs;
+      let sorted =
+        List.rev !out
+        |> List.sort (fun a b ->
+             let ka = normalize_name a.name in
+             let kb = normalize_name b.name in
+             let c0 = String.compare ka kb in
+             if c0 <> 0 then c0
+             else
+               let c1 =
+                 String.compare
+                   (Uri_path.docuri_to_string a.uri)
+                   (Uri_path.docuri_to_string b.uri)
+               in
+               if c1 <> 0 then c1
+               else
+                 let c2 = compare a.loc.start_pos.line b.loc.start_pos.line in
+                 if c2 <> 0 then c2
+                 else compare a.loc.start_pos.col b.loc.start_pos.col)
+      in
+      `List (List.map symbol_json sorted)
+  in
+  nav_compute_with_budget budget compute
+
+let split_signature_params (label:string) : string list =
+  match String.index_opt label '(' with
+  | None -> []
+  | Some i0 ->
+      (match String.rindex_opt label ')' with
+       | None -> []
+       | Some i1 when i1 <= i0 -> []
+       | Some i1 ->
+           let inside = String.sub label (i0 + 1) (i1 - i0 - 1) |> String.trim in
+           if inside = "" then []
+           else
+             inside
+             |> String.split_on_char ','
+             |> List.map String.trim
+             |> List.filter (fun s -> s <> ""))
+
+let signature_params_json (label:string) : Yojson.Safe.t =
+  split_signature_params label
+  |> List.map (fun p -> `Assoc [ "label", `String p ])
+  |> fun xs -> `List xs
+
+let call_context_at_position (doc:Document.t) (pos:T.Position.t) : (string * int) option =
+  match Text_index.offset_of_line_col doc.Document.index ~line:pos.line ~col:pos.character with
+  | None -> None
+  | Some raw_cursor ->
+      let text = doc.Document.text in
+      let n = String.length text in
+      let cursor = max 0 (min n raw_cursor) in
+      let stack : int list ref = ref [] in
+      let in_single = ref false in
+      let in_double = ref false in
+      let i = ref 0 in
+      while !i < cursor do
+        let c = text.[!i] in
+        if !in_single then (
+          if c = '\'' then
+            if !i + 1 < cursor && text.[!i + 1] = '\'' then
+              i := !i + 1
+            else
+              in_single := false
+        ) else if !in_double then (
+          if c = '"' then
+            if !i + 1 < cursor && text.[!i + 1] = '"' then
+              i := !i + 1
+            else
+              in_double := false
+        ) else (
+          match c with
+          | '\'' -> in_single := true
+          | '"' -> in_double := true
+          | '(' -> stack := !i :: !stack
+          | ')' ->
+              (match !stack with
+               | _ :: tl -> stack := tl
+               | [] -> ())
+          | _ -> ()
+        );
+        incr i
+      done;
+      match !stack with
+      | [] -> None
+      | open_idx :: _ ->
+          let rec skip_ws_left j =
+            if j < 0 then -1
+            else
+              match text.[j] with
+              | ' ' | '\t' | '\r' | '\n' -> skip_ws_left (j - 1)
+              | _ -> j
+          in
+          let j0 = skip_ws_left (open_idx - 1) in
+          if j0 < 0 then None
+          else
+            let rec start_ident j =
+              if j >= 0 && is_ident_char text.[j] then start_ident (j - 1) else j + 1
+            in
+            let start = start_ident j0 in
+            if start > j0 then None
+            else
+              let name = String.sub text start (j0 - start + 1) in
+              let key = normalize_name name in
+              if key = "" then None
+              else
+                let depth = ref 1 in
+                let in_single = ref false in
+                let in_double = ref false in
+                let commas = ref 0 in
+                let k = ref (open_idx + 1) in
+                while !k < cursor do
+                  let c = text.[!k] in
+                  if !in_single then (
+                    if c = '\'' then
+                      if !k + 1 < cursor && text.[!k + 1] = '\'' then
+                        k := !k + 1
+                      else
+                        in_single := false
+                  ) else if !in_double then (
+                    if c = '"' then
+                      if !k + 1 < cursor && text.[!k + 1] = '"' then
+                        k := !k + 1
+                      else
+                        in_double := false
+                  ) else (
+                    match c with
+                    | '\'' -> in_single := true
+                    | '"' -> in_double := true
+                    | '(' -> incr depth
+                    | ')' -> if !depth > 0 then decr depth
+                    | ',' when !depth = 1 -> incr commas
+                    | _ -> ()
+                  );
+                  incr k
+                done;
+                Some (key, max 0 !commas)
+
+let signature_help_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Safe.t =
+  match doc_of_uri ws uri with
+  | None -> `Null
+  | Some doc ->
+      let budget = nav_budget_start ws in
+      let compute () =
+        if nav_budget_check budget then `Null
+        else
+          match call_context_at_position doc pos with
+          | None -> `Null
+          | Some (key, active_param) ->
+              let defs =
+                if nav_budget_check budget then []
+                else
+                  let docs = docs_for_lookup ws doc in
+                  let from_docs =
+                    docs
+                    |> List.concat_map collect_doc_defs
+                    |> List.filter (fun d -> d.kind = sym_kind_func && d.key = key)
+                    |> uniq_defs
+                  in
+                  if from_docs <> [] then from_docs
+                  else if allow_unscoped_fallback doc then proc_defs_by_key ws doc ~key
+                  else []
+              in
+              if defs = [] then `Null
+              else
+                let signatures =
+                  defs
+                  |> List.filter_map (fun d ->
+                       if nav_budget_check budget then None
+                       else
+                         match proc_signature_for_def ws d with
+                         | Some label ->
+                             Some
+                               (`Assoc [
+                                  "label", `String label;
+                                  "parameters", signature_params_json label;
+                                ])
+                         | None ->
+                             Some
+                               (`Assoc [
+                                  "label", `String d.name;
+                                  "parameters", `List [];
+                                ]))
+                in
+                if signatures = [] then `Null
+                else
+                  `Assoc [
+                    "signatures", `List signatures;
+                    "activeSignature", `Int 0;
+                    "activeParameter", `Int active_param;
+                  ]
       in
       nav_compute_with_budget budget compute
 
@@ -1440,4 +1751,3 @@ let inlay_hints_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(range:T.Range.t) : Yojs
              | Ast.TopStmt s -> walk_stmt s
             ) prog);
       `List (List.rev !hints)
-

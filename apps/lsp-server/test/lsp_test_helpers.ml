@@ -56,6 +56,10 @@ type server_proc = {
   pid : int;
   stdin_w : out_channel;
   stdout_r : in_channel;
+  msg_q : Yojson.Safe.t Queue.t;
+  msg_mtx : Mutex.t;
+  mutable msg_error : string option;
+  mutable msg_reader_done : bool;
 }
 
 let env_with_overrides (overrides:(string * string) list) : string array =
@@ -76,7 +80,16 @@ let start_server ~(server_path:string) ~(env:(string * string) list) : server_pr
   let child_stdin_r, child_stdin_w = Unix.pipe () in
   let child_stdout_r, child_stdout_w = Unix.pipe () in
   let null_path = if Sys.win32 then "NUL" else "/dev/null" in
-  let child_stderr_w = Unix.openfile null_path [Unix.O_WRONLY] 0o666 in
+  let inherit_stderr =
+    match Sys.getenv_opt "JOVIAL_TEST_SERVER_STDERR" with
+    | Some "1" | Some "true" | Some "TRUE" -> true
+    | _ -> false
+  in
+  let parent_stderr = Unix.descr_of_out_channel stderr in
+  let child_stderr_w =
+    if inherit_stderr then parent_stderr
+    else Unix.openfile null_path [Unix.O_WRONLY] 0o666
+  in
   let argv = [| server_path |] in
   let envp = env_with_overrides env in
   let pid =
@@ -90,14 +103,55 @@ let start_server ~(server_path:string) ~(env:(string * string) list) : server_pr
   in
   Unix.close child_stdin_r;
   Unix.close child_stdout_w;
-  Unix.close child_stderr_w;
+  if child_stderr_w <> parent_stderr then Unix.close child_stderr_w;
   let stdin_w = Unix.out_channel_of_descr child_stdin_w in
   let stdout_r = Unix.in_channel_of_descr child_stdout_r in
   if Sys.win32 then (
     set_binary_mode_out stdin_w true;
     set_binary_mode_in stdout_r true
   );
-  { pid; stdin_w; stdout_r }
+  let msg_q : Yojson.Safe.t Queue.t = Queue.create () in
+  let msg_mtx = Mutex.create () in
+  let srv =
+    {
+      pid;
+      stdin_w;
+      stdout_r;
+      msg_q;
+      msg_mtx;
+      msg_error = None;
+      msg_reader_done = false;
+    }
+  in
+  ignore (Thread.create (fun () ->
+    let set_error msg =
+      Mutex.lock srv.msg_mtx;
+      if srv.msg_error = None then srv.msg_error <- Some msg;
+      srv.msg_reader_done <- true;
+      Mutex.unlock srv.msg_mtx
+    in
+    let rec loop () =
+      match Lib.Lsp_io.read_message srv.stdout_r with
+      | None ->
+          set_error "server closed stdout while waiting for LSP message"
+      | Some txt ->
+          (match
+             try Ok (Yojson.Safe.from_string txt)
+             with exn ->
+               Error (Printf.sprintf "invalid LSP JSON payload: %s" (Printexc.to_string exn))
+           with
+           | Ok msg ->
+               Mutex.lock srv.msg_mtx;
+               Queue.add msg srv.msg_q;
+               Mutex.unlock srv.msg_mtx;
+               loop ()
+           | Error msg ->
+               set_error msg)
+    in
+    (try loop () with exn ->
+       set_error (Printf.sprintf "failed reading LSP message: %s" (Printexc.to_string exn)))
+  ) ());
+  srv
 
 let send_json (srv:server_proc) (j:Yojson.Safe.t) : unit =
   Lib.Lsp_io.write_message srv.stdin_w j;
@@ -121,44 +175,29 @@ let send_notification (srv:server_proc) ~(method_:string) ~(params:Yojson.Safe.t
     ])
 
 let wait_for_message (srv:server_proc) ~(timeout_s:float) : Yojson.Safe.t =
-  let lock = Mutex.create () in
-  let result : (Yojson.Safe.t, string) result option ref = ref None in
-  let _reader_thread =
-    Thread.create (fun () ->
-      let parsed =
-        try
-          match Lib.Lsp_io.read_message srv.stdout_r with
-          | None ->
-              Error "server closed stdout while waiting for LSP message"
-          | Some txt ->
-              (try Ok (Yojson.Safe.from_string txt)
-               with exn ->
-                 Error (Printf.sprintf "invalid LSP JSON payload: %s" (Printexc.to_string exn)))
-        with exn ->
-          Error (Printf.sprintf "failed reading LSP message: %s" (Printexc.to_string exn))
-      in
-      Mutex.lock lock;
-      result := Some parsed;
-      Mutex.unlock lock
-    ) ()
-  in
   let deadline = Unix.gettimeofday () +. timeout_s in
-  let rec wait_loop () =
-    Mutex.lock lock;
-    let current = !result in
-    Mutex.unlock lock;
-    match current with
-    | Some (Ok j) ->
-        j
-    | Some (Error msg) ->
-        failf "%s" msg
+  let rec loop () =
+    Mutex.lock srv.msg_mtx;
+    let next_msg =
+      if Queue.is_empty srv.msg_q then None else Some (Queue.pop srv.msg_q)
+    in
+    let err = srv.msg_error in
+    let done_ = srv.msg_reader_done in
+    Mutex.unlock srv.msg_mtx;
+    match next_msg with
+    | Some msg -> msg
     | None ->
-        if Unix.gettimeofday () >= deadline then
-          failf "timed out waiting for LSP message";
-        Thread.delay 0.01;
-        wait_loop ()
+        (match err with
+         | Some msg -> failf "%s" msg
+         | None ->
+             if done_ then failf "server closed stdout while waiting for LSP message"
+             else if Unix.gettimeofday () >= deadline then
+               failf "timed out waiting for LSP message"
+             else (
+               Thread.delay 0.01;
+               loop ()))
   in
-  wait_loop ()
+  loop ()
 
 let int_of_json_id (j:Yojson.Safe.t) : int option =
   match j with

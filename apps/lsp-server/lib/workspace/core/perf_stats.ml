@@ -30,7 +30,7 @@ let observe_ms (name:string) (elapsed_ms:float) : unit =
   if elapsed_ms > m.max_ms then m.max_ms <- elapsed_ms
 
 let now_ms () : float =
-  Sys.time () *. 1000.0
+  Unix.gettimeofday () *. 1000.0
 
 let time (name:string) (f:unit -> 'a) : 'a =
   let t0 = now_ms () in

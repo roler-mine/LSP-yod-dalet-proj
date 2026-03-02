@@ -692,14 +692,18 @@ type lsif_ref = {
 }
 
 type lsif_symbol_bucket = {
+  sb_id : string;
+  mutable sb_key : string;
   mutable sb_kind : int;
   sb_defs : (string, (T.DocumentUri.t * Ast.Loc.t)) Hashtbl.t;
   sb_impls : (string, (T.DocumentUri.t * Ast.Loc.t)) Hashtbl.t;
   sb_refs : (string, lsif_ref) Hashtbl.t;
 }
 
-let lsif_symbol_bucket_create (kind:int) : lsif_symbol_bucket =
+let lsif_symbol_bucket_create ~(id:string) ~(key:string) (kind:int) : lsif_symbol_bucket =
   {
+    sb_id = id;
+    sb_key = key;
     sb_kind = kind;
     sb_defs = Hashtbl.create 8;
     sb_impls = Hashtbl.create 8;
@@ -708,17 +712,38 @@ let lsif_symbol_bucket_create (kind:int) : lsif_symbol_bucket =
 
 let lsif_bucket_for
     (tbl:(string, lsif_symbol_bucket) Hashtbl.t)
+    ~(sym_id:string)
     ~(key:string)
     ~(kind:int)
   : lsif_symbol_bucket =
-  match Hashtbl.find_opt tbl key with
+  match Hashtbl.find_opt tbl sym_id with
   | Some b ->
+      if b.sb_key = "" then b.sb_key <- key;
       if b.sb_kind <= 0 then b.sb_kind <- kind;
       b
   | None ->
-      let b = lsif_symbol_bucket_create kind in
-      Hashtbl.add tbl key b;
+      let b = lsif_symbol_bucket_create ~id:sym_id ~key kind in
+      Hashtbl.add tbl sym_id b;
       b
+
+let lsif_add_key_index
+    (tbl:(string, (string, bool) Hashtbl.t) Hashtbl.t)
+    ~(key:string)
+    ~(sym_id:string)
+  : unit =
+  let set =
+    match Hashtbl.find_opt tbl key with
+    | Some s -> s
+    | None ->
+        let s = Hashtbl.create 4 in
+        Hashtbl.add tbl key s;
+        s
+  in
+  Hashtbl.replace set sym_id true
+
+let sorted_set_keys (set:(string, bool) Hashtbl.t) : string list =
+  Hashtbl.fold (fun k _ acc -> k :: acc) set []
+  |> List.sort String.compare
 
 let lsif_add_loc
     (tbl:(string, (T.DocumentUri.t * Ast.Loc.t)) Hashtbl.t)
@@ -782,10 +807,12 @@ let lsif_index_payload
   let docs = docs_for_lsif ws in
   let nav_cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 128 in
   let symbols : (string, lsif_symbol_bucket) Hashtbl.t = Hashtbl.create 2048 in
+  let key_index : (string, (string, bool) Hashtbl.t) Hashtbl.t = Hashtbl.create 2048 in
 
-  let add_definition (d:def) : unit =
+  let add_definition (sym_id:string) (d:def) : unit =
     if d.key <> "" then (
-      let bucket = lsif_bucket_for symbols ~key:d.key ~kind:d.kind in
+      let bucket = lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind in
+      lsif_add_key_index key_index ~key:d.key ~sym_id;
       lsif_add_loc bucket.sb_defs ~uri:d.uri ~loc:d.loc;
       if d.kind = sym_kind_func && is_likely_proc_implementation ws d then
         lsif_add_loc bucket.sb_impls ~uri:d.uri ~loc:d.loc
@@ -794,13 +821,14 @@ let lsif_index_payload
 
   List.iter (fun doc ->
     let nav = nav_for_doc_cached ws nav_cache doc in
-    Hashtbl.iter (fun _ d -> add_definition d) nav.defs_by_id;
+    Hashtbl.iter (fun sym_id d -> add_definition sym_id d) nav.defs_by_id;
     Hashtbl.iter (fun sym_id occs ->
       match Hashtbl.find_opt nav.defs_by_id sym_id with
       | None -> ()
       | Some d ->
           if d.key <> "" then (
-            let bucket = lsif_bucket_for symbols ~key:d.key ~kind:d.kind in
+            let bucket = lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind in
+            lsif_add_key_index key_index ~key:d.key ~sym_id;
             let decl_key = loc_key ~uri:d.uri d.loc in
             List.iter (fun (occ_uri, occ_loc) ->
               let occ_key = loc_key ~uri:occ_uri occ_loc in
@@ -816,7 +844,7 @@ let lsif_index_payload
   let symbols_table : (string, Yojson.Safe.t) Hashtbl.t = Hashtbl.create 2048 in
   let symbols_json =
     sorted_assoc_values symbols
-    |> List.map (fun (key, bucket) ->
+    |> List.map (fun (_sym_id, bucket) ->
          let defs_json =
            sorted_assoc_values bucket.sb_defs
            |> List.map (fun (_k, (uri, loc)) -> location_json ~uri loc)
@@ -835,15 +863,24 @@ let lsif_index_payload
          in
          let item =
            `Assoc [
-           "key", `String key;
+           "id", `String bucket.sb_id;
+           "key", `String bucket.sb_key;
            "kind", `Int bucket.sb_kind;
            "definitions", `List defs_json;
            "implementations", `List impls_json;
            "references", `List refs_json;
            ]
          in
-         Hashtbl.replace symbols_table key item;
+         Hashtbl.replace symbols_table bucket.sb_id item;
          item)
+  in
+  let key_index_json =
+    sorted_assoc_values key_index
+    |> List.map (fun (key, sym_set) ->
+         `Assoc [
+           "key", `String key;
+           "symbolIds", `List (List.map (fun sym_id -> `String sym_id) (sorted_set_keys sym_set));
+         ])
   in
 
   let revision =
@@ -851,25 +888,49 @@ let lsif_index_payload
   in
   (`Assoc [
     "format", `String "jovial-lsif-lite";
-    "version", `Int 1;
     "revision", `Int revision;
     "docCount", `Int (List.length docs);
     "symbolCount", `Int (List.length symbols_json);
+    "keyIndex", `List key_index_json;
     "symbols", `List symbols_json;
   ],
   symbols_table,
   revision)
 
+let current_lsif_revision (ws:t) : int =
+  if ws.sem_store_enabled then Semantic_store.global_rev ws.semantic_store
+  else ws.lsif_snapshot_revision
+
+let ensure_lsif_snapshot
+    (ws:t)
+  : Yojson.Safe.t * (string, Yojson.Safe.t) Hashtbl.t * int =
+  let current_revision = current_lsif_revision ws in
+  match ws.lsif_snapshot_payload, ws.lsif_snapshot_symbols with
+  | Some payload, Some symbols when ws.lsif_snapshot_revision = current_revision ->
+      Perf_stats.tick "lsif.snapshot_hit";
+      (payload, symbols, current_revision)
+  | _ ->
+      Perf_stats.tick "lsif.snapshot_miss";
+      let payload, symbols, payload_revision =
+        Perf_stats.time "lsif.snapshot_rebuild_ms" (fun () ->
+          lsif_index_payload ws)
+      in
+      let revision =
+        if ws.sem_store_enabled then payload_revision else current_revision
+      in
+      ws.lsif_snapshot_revision <- revision;
+      ws.lsif_snapshot_payload <- Some payload;
+      ws.lsif_snapshot_symbols <- Some symbols;
+      (payload, symbols, revision)
+
 let lsif_index_json (ws:t) : Yojson.Safe.t =
-  let payload, symbols_table, revision = lsif_index_payload ws in
+  let payload, symbols_table, revision = ensure_lsif_snapshot ws in
   if ws.lsif_delta_enabled then
     Lsif_delta.update_full ws.lsif_delta_state ~revision ~symbols:symbols_table;
   payload
 
 let lsif_delta_json (ws:t) ~(base_revision:int) : Yojson.Safe.t =
-  let current_revision =
-    if ws.sem_store_enabled then Semantic_store.global_rev ws.semantic_store else 0
-  in
+  let current_revision = current_lsif_revision ws in
   if not ws.lsif_delta_enabled then
     Lsif_delta.delta_json
       {
@@ -892,7 +953,7 @@ let lsif_delta_json (ws:t) ~(base_revision:int) : Yojson.Safe.t =
         upserts = [];
       }
   else
-    let _payload, symbols_table, revision = lsif_index_payload ws in
+    let _payload, symbols_table, revision = ensure_lsif_snapshot ws in
     let delta =
       Lsif_delta.diff ws.lsif_delta_state
         ~base_revision

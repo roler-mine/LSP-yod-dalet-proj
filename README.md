@@ -30,7 +30,7 @@ Build and test server:
 
 ```powershell
 cd ..\lsp-server
-opam exec -- dune runtest
+opam exec -- dune runtest --force --verbose
 ```
 
 Build extension:

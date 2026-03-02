@@ -36,9 +36,9 @@ let symbols_of_index_json (j:Yojson.Safe.t) : (string, Yojson.Safe.t) Hashtbl.t 
   List.iter (fun item ->
     match item with
     | `Assoc sfields ->
-        (match List.assoc_opt "key" sfields with
-         | Some (`String key) when String.trim key <> "" ->
-             Hashtbl.replace out key item
+        (match List.assoc_opt "id" sfields with
+         | Some (`String sym_id) when String.trim sym_id <> "" ->
+             Hashtbl.replace out sym_id item
          | _ -> ())
     | _ -> ()
   ) symbols;
@@ -89,7 +89,6 @@ let diff
 let delta_json (d:delta) : Yojson.Safe.t =
   `Assoc [
     "format", `String "jovial-lsif-lite";
-    "version", `Int 1;
     "baseRevision", `Int d.base_revision;
     "revision", `Int d.revision;
     "reset", `Bool d.reset;

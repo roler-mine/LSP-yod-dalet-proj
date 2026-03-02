@@ -50,21 +50,36 @@ let serverStopRequested = false;
 let pendingAutoRestartTimer: NodeJS.Timeout | undefined;
 let autoRestartAttempts: number[] = [];
 let startInProgress = false;
-let pendingLsifRefreshTimer: NodeJS.Timeout | undefined;
-let lsifRefreshInFlight = false;
-let lsifLastRefreshMs = 0;
 
 type LsifReference = LsifReferenceData;
 type LsifSymbolEntry = LsifSymbolEntryData;
+type LsifOccurrenceEntry = {
+  symbolId: string;
+  startLine: number;
+  startCharacter: number;
+  endLine: number;
+  endCharacter: number;
+};
 
 type LsifIndexCache = {
-  symbols: Map<string, LsifSymbolEntry>;
+  symbolsById: Map<string, LsifSymbolEntry>;
+  symbolIdsByKey: Map<string, string[]>;
+  occurrenceIndexByDoc: Map<string, Map<number, LsifOccurrenceEntry[]>>;
   symbolCount: number;
   docCount: number;
   revision: number;
 };
 
 type LsifDeltaPayload = ParsedLsifDelta;
+type LsifRootState = {
+  cache: LsifIndexCache | undefined;
+  refreshTimer: NodeJS.Timeout | undefined;
+  refreshInFlight: boolean;
+  refreshPending: boolean;
+  pendingReason: string | undefined;
+  lastRefreshMs: number;
+  lastContextUri: vscode.Uri | undefined;
+};
 
 type LsifWorkerTask = "parseIndex" | "parseDelta";
 type LsifWorkerPendingRequest = {
@@ -72,7 +87,7 @@ type LsifWorkerPendingRequest = {
   reject: (reason?: unknown) => void;
 };
 
-let lsifIndexCache: LsifIndexCache | undefined;
+const lsifRootStates = new Map<string, LsifRootState>();
 let lsifWorker: Worker | undefined;
 let lsifWorkerRequestSeq = 0;
 let lsifWorkerShutdownRequested = false;
@@ -82,6 +97,87 @@ const lsifWorkerPending = new Map<number, LsifWorkerPendingRequest>();
 function watchPathKey(fsPath: string): string {
   const norm = path.normalize(fsPath);
   return process.platform === "win32" ? norm.toLowerCase() : norm;
+}
+
+function pathWithinRoot(pathKey: string, rootKey: string): boolean {
+  if (pathKey === rootKey) return true;
+  if (!pathKey.startsWith(rootKey)) return false;
+  const next = pathKey.charAt(rootKey.length);
+  return next === path.sep || next === "/" || next === "\\";
+}
+
+function rootKeyForFolder(folder: vscode.WorkspaceFolder): string {
+  return `folder:${watchPathKey(folder.uri.fsPath)}`;
+}
+
+function rootKeyForFileUri(uri: vscode.Uri): string {
+  return `file:${watchPathKey(uri.fsPath)}`;
+}
+
+function normalizeLsifDocUri(uriRaw: string): string | undefined {
+  try {
+    return normalizeNavUri(vscode.Uri.parse(uriRaw)).toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function pickBestWorkspaceFolderForUri(uri: vscode.Uri): vscode.WorkspaceFolder | undefined {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) return undefined;
+  const direct = vscode.workspace.getWorkspaceFolder(uri);
+  if (direct) return direct;
+  if (uri.scheme !== "file") return folders[0];
+  const pathKey = watchPathKey(uri.fsPath);
+  let best: vscode.WorkspaceFolder | undefined;
+  let bestLen = -1;
+  for (const folder of folders) {
+    const rootKey = watchPathKey(folder.uri.fsPath);
+    if (!pathWithinRoot(pathKey, rootKey)) continue;
+    if (rootKey.length > bestLen) {
+      best = folder;
+      bestLen = rootKey.length;
+    }
+  }
+  return best ?? folders[0];
+}
+
+function firstPreferredLsifUri(): vscode.Uri | undefined {
+  const active = vscode.window.activeTextEditor?.document;
+  if (active && active.languageId === "jovial" && active.uri.scheme === "file") {
+    return normalizeNavUri(active.uri);
+  }
+  for (const doc of vscode.workspace.textDocuments) {
+    if (doc.languageId === "jovial" && doc.uri.scheme === "file") {
+      return normalizeNavUri(doc.uri);
+    }
+  }
+  const firstFolder = vscode.workspace.workspaceFolders?.[0];
+  if (firstFolder) return normalizeNavUri(firstFolder.uri);
+  return undefined;
+}
+
+type LsifRootContext = {
+  rootKey: string;
+  contextUri: vscode.Uri;
+};
+
+function resolveLsifRootContext(
+  preferredUri?: vscode.Uri,
+  allowFallback = true
+): LsifRootContext | undefined {
+  const uri =
+    preferredUri && preferredUri.scheme === "file"
+      ? normalizeNavUri(preferredUri)
+      : allowFallback
+        ? firstPreferredLsifUri()
+        : undefined;
+  if (!uri || uri.scheme !== "file") return undefined;
+  const folder = pickBestWorkspaceFolderForUri(uri);
+  if (folder) {
+    return { rootKey: rootKeyForFolder(folder), contextUri: normalizeNavUri(uri) };
+  }
+  return { rootKey: rootKeyForFileUri(uri), contextUri: normalizeNavUri(uri) };
 }
 
 function shouldIgnoreWatchedPath(fsPath: string): boolean {
@@ -158,10 +254,12 @@ async function flushWatchedFileChanges(output: vscode.OutputChannel): Promise<vo
 
   watchedFileFlushInFlight = true;
   let sentAny = false;
+  let lastSentUri: vscode.Uri | undefined;
   try {
     while (client && pendingWatchedFileChanges.size > 0) {
       const batch = takeWatchedFileBatch(WATCH_CHUNK_SIZE);
       if (batch.length === 0) break;
+      lastSentUri = vscode.Uri.file(batch[0].fsPath);
       const params = {
         changes: batch.map((c) => ({
           uri: vscode.Uri.file(c.fsPath).toString(),
@@ -177,7 +275,7 @@ async function flushWatchedFileChanges(output: vscode.OutputChannel): Promise<vo
     watchedFileFlushInFlight = false;
     if (sentAny) {
       // Refresh LSIF cache after filesystem-level changes so nav fast path stays current.
-      scheduleLsifRefresh(output, "watched-files");
+      scheduleLsifRefresh(output, "watched-files", lastSentUri);
     }
     if (pendingWatchedFileChanges.size > 0 && client) {
       scheduleWatchedFileFlush(output);
@@ -222,17 +320,39 @@ function getConfig() {
   };
 }
 
-function clearLsifRefreshTimer(): void {
-  if (!pendingLsifRefreshTimer) return;
-  clearTimeout(pendingLsifRefreshTimer);
-  pendingLsifRefreshTimer = undefined;
+function lsifRootStateFor(rootKey: string): LsifRootState {
+  const prev = lsifRootStates.get(rootKey);
+  if (prev) return prev;
+  const state: LsifRootState = {
+    cache: undefined,
+    refreshTimer: undefined,
+    refreshInFlight: false,
+    refreshPending: false,
+    pendingReason: undefined,
+    lastRefreshMs: 0,
+    lastContextUri: undefined,
+  };
+  lsifRootStates.set(rootKey, state);
+  return state;
+}
+
+function clearLsifRootTimer(state: LsifRootState): void {
+  if (!state.refreshTimer) return;
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = undefined;
 }
 
 function resetLsifState(): void {
-  clearLsifRefreshTimer();
-  lsifRefreshInFlight = false;
-  lsifLastRefreshMs = 0;
-  lsifIndexCache = undefined;
+  for (const state of lsifRootStates.values()) {
+    clearLsifRootTimer(state);
+    state.refreshInFlight = false;
+    state.refreshPending = false;
+    state.pendingReason = undefined;
+    state.cache = undefined;
+    state.lastRefreshMs = 0;
+    state.lastContextUri = undefined;
+  }
+  lsifRootStates.clear();
   disposeLsifWorker();
 }
 
@@ -356,12 +476,62 @@ async function runLsifWorkerTask<T>(
 }
 
 function toLsifIndexCache(parsed: ParsedLsifIndex): LsifIndexCache {
-  const symbols = new Map<string, LsifSymbolEntry>();
-  for (const entry of parsed.symbols) {
-    symbols.set(entry.key, entry);
+  const symbolsById = new Map<string, LsifSymbolEntry>();
+  for (const entry of parsed.symbols) symbolsById.set(entry.id, entry);
+
+  const symbolIdsByKey = new Map<string, string[]>();
+  for (const entry of parsed.keyIndex) {
+    const ids = entry.symbolIds.filter((id) => symbolsById.has(id));
+    if (ids.length <= 0) continue;
+    symbolIdsByKey.set(entry.key, Array.from(new Set(ids)).sort((a, b) => a.localeCompare(b)));
+  }
+  for (const sym of symbolsById.values()) {
+    const prev = symbolIdsByKey.get(sym.key) ?? [];
+    if (!prev.includes(sym.id)) prev.push(sym.id);
+    prev.sort((a, b) => a.localeCompare(b));
+    symbolIdsByKey.set(sym.key, prev);
+  }
+
+  const occurrenceIndexByDoc = new Map<string, Map<number, LsifOccurrenceEntry[]>>();
+  const appendOccurrence = (docUri: string, line: number, entry: LsifOccurrenceEntry): void => {
+    let byLine = occurrenceIndexByDoc.get(docUri);
+    if (!byLine) {
+      byLine = new Map<number, LsifOccurrenceEntry[]>();
+      occurrenceIndexByDoc.set(docUri, byLine);
+    }
+    const prev = byLine.get(line) ?? [];
+    prev.push(entry);
+    byLine.set(line, prev);
+  };
+  for (const sym of symbolsById.values()) {
+    for (const ref of sym.references) {
+      const docUri = normalizeLsifDocUri(ref.location.uri);
+      if (!docUri) continue;
+      const startLine = Math.max(0, Math.trunc(ref.location.startLine));
+      const endLine = Math.max(startLine, Math.trunc(ref.location.endLine));
+      const startCharacter = Math.max(0, Math.trunc(ref.location.startCharacter));
+      const endCharacter = Math.max(0, Math.trunc(ref.location.endCharacter));
+      const entry: LsifOccurrenceEntry = {
+        symbolId: sym.id,
+        startLine,
+        startCharacter,
+        endLine,
+        endCharacter,
+      };
+      const lineSpan = endLine - startLine;
+      if (lineSpan > 256) {
+        appendOccurrence(docUri, startLine, entry);
+      } else {
+        for (let line = startLine; line <= endLine; line += 1) {
+          appendOccurrence(docUri, line, entry);
+        }
+      }
+    }
   }
   return {
-    symbols,
+    symbolsById,
+    symbolIdsByKey,
+    occurrenceIndexByDoc,
     symbolCount: parsed.symbolCount,
     docCount: parsed.docCount,
     revision: parsed.revision,
@@ -388,19 +558,25 @@ async function parseLsifDelta(output: vscode.OutputChannel, payload: unknown): P
 }
 
 function applyLsifDelta(cache: LsifIndexCache, delta: LsifDeltaPayload): LsifIndexCache {
-  const symbols = new Map(cache.symbols);
-  for (const key of delta.deletes) {
-    symbols.delete(key);
+  const symbolsById = new Map(cache.symbolsById);
+  for (const symbolId of delta.deletes) {
+    symbolsById.delete(symbolId);
   }
   for (const entry of delta.upserts) {
-    symbols.set(entry.key, entry);
+    symbolsById.set(entry.id, entry);
   }
-  return {
-    symbols,
-    symbolCount: symbols.size,
+  const parsed: ParsedLsifIndex = {
+    symbols: Array.from(symbolsById.values()),
+    keyIndex: [],
+    symbolCount: symbolsById.size,
     docCount: cache.docCount,
     revision: delta.revision,
   };
+  const merged = toLsifIndexCache(parsed);
+  if (merged.symbolCount !== symbolsById.size) {
+    merged.symbolCount = symbolsById.size;
+  }
+  return merged;
 }
 
 function toVscodeLocation(loc: LsifLocationData): vscode.Location | undefined {
@@ -436,45 +612,169 @@ function normalizeSymbolKeyAtPosition(
   return raw.toUpperCase();
 }
 
-function shouldUseLsifFastPath(document: vscode.TextDocument): boolean {
-  if (!getConfig().lsifFastPath) return false;
-  if (!lsifIndexCache) return false;
-  if (document.languageId !== "jovial") return false;
+function isLsifRangeContainingPosition(
+  entry: LsifOccurrenceEntry,
+  pos: vscode.Position
+): boolean {
+  if (pos.line < entry.startLine || pos.line > entry.endLine) return false;
+  if (entry.startLine === entry.endLine) {
+    return pos.character >= entry.startCharacter && pos.character <= entry.endCharacter;
+  }
+  if (pos.line === entry.startLine) return pos.character >= entry.startCharacter;
+  if (pos.line === entry.endLine) return pos.character <= entry.endCharacter;
   return true;
 }
 
-function lsifSymbolAt(
+function lsifOccurrenceSpan(entry: LsifOccurrenceEntry): number {
+  const lineDelta = entry.endLine - entry.startLine;
+  const charDelta = entry.endCharacter - entry.startCharacter;
+  return lineDelta * 100000 + charDelta;
+}
+
+function lsifCacheForDocument(document: vscode.TextDocument): LsifIndexCache | undefined {
+  if (!getConfig().lsifFastPath) return undefined;
+  if (document.languageId !== "jovial") return undefined;
+  const ctx = resolveLsifRootContext(document.uri, false);
+  if (!ctx) return undefined;
+  return lsifRootStates.get(ctx.rootKey)?.cache;
+}
+
+function lsifSymbolIdAtPosition(
+  cache: LsifIndexCache,
+  docUri: string,
+  position: vscode.Position
+): string | undefined {
+  const byLine = cache.occurrenceIndexByDoc.get(docUri);
+  if (!byLine) return undefined;
+  const entries = byLine.get(position.line);
+  if (!entries || entries.length === 0) return undefined;
+  let best: LsifOccurrenceEntry | undefined;
+  for (const entry of entries) {
+    if (!isLsifRangeContainingPosition(entry, position)) continue;
+    if (!best) {
+      best = entry;
+      continue;
+    }
+    const span = lsifOccurrenceSpan(entry);
+    const cur = lsifOccurrenceSpan(best);
+    if (span < cur || (span === cur && entry.symbolId.localeCompare(best.symbolId) < 0)) {
+      best = entry;
+    }
+  }
+  return best?.symbolId;
+}
+
+type LsifResolution = {
+  symbols: LsifSymbolEntry[];
+  key: string | undefined;
+  fromOccurrence: boolean;
+};
+
+function resolveLsifSymbolsAt(
   document: vscode.TextDocument,
   position: vscode.Position
-): LsifSymbolEntry | undefined {
-  if (!shouldUseLsifFastPath(document)) return undefined;
+): LsifResolution | undefined {
+  const cache = lsifCacheForDocument(document);
+  if (!cache) return undefined;
+  const docUri = normalizeNavUri(document.uri).toString();
+  const occSymbolId = lsifSymbolIdAtPosition(cache, docUri, position);
+  if (occSymbolId) {
+    const hit = cache.symbolsById.get(occSymbolId);
+    if (hit) {
+      return { symbols: [hit], key: hit.key, fromOccurrence: true };
+    }
+  }
   const key = normalizeSymbolKeyAtPosition(document, position);
   if (!key) return undefined;
-  return lsifIndexCache?.symbols.get(key);
+  const ids = cache.symbolIdsByKey.get(key);
+  if (!ids || ids.length === 0) return undefined;
+  const symbols: LsifSymbolEntry[] = [];
+  for (const id of ids) {
+    const sym = cache.symbolsById.get(id);
+    if (sym) symbols.push(sym);
+  }
+  if (symbols.length === 0) return undefined;
+  symbols.sort((a, b) => a.id.localeCompare(b.id));
+  return { symbols, key, fromOccurrence: false };
+}
+
+function dedupeLsifLocations(locations: readonly LsifLocationData[]): LsifLocationData[] {
+  const seen = new Set<string>();
+  const out: LsifLocationData[] = [];
+  for (const loc of locations) {
+    const k = `${loc.uri}|${loc.startLine}|${loc.startCharacter}|${loc.endLine}|${loc.endCharacter}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(loc);
+    if (out.length >= LSIF_MAX_FAST_RESULTS) break;
+  }
+  return out;
+}
+
+function collectLsifLocations(
+  symbols: readonly LsifSymbolEntry[],
+  select: (sym: LsifSymbolEntry) => readonly LsifLocationData[]
+): LsifLocationData[] {
+  const merged: LsifLocationData[] = [];
+  for (const sym of symbols) {
+    const next = select(sym);
+    for (const loc of next) {
+      merged.push(loc);
+      if (merged.length >= LSIF_MAX_FAST_RESULTS * 2) break;
+    }
+    if (merged.length >= LSIF_MAX_FAST_RESULTS * 2) break;
+  }
+  return dedupeLsifLocations(merged).slice(0, LSIF_MAX_FAST_RESULTS);
 }
 
 function lsifDefinitionFastPath(
   document: vscode.TextDocument,
   position: vscode.Position
 ): vscode.Location[] | undefined {
-  const sym = lsifSymbolAt(document, position);
-  if (!sym || sym.definitions.length === 0) return undefined;
-  const locations = toVscodeLocations(sym.definitions.slice(0, LSIF_MAX_FAST_RESULTS));
+  const resolved = resolveLsifSymbolsAt(document, position);
+  if (!resolved) return undefined;
+  const defs = collectLsifLocations(resolved.symbols, (sym) => sym.definitions);
+  if (defs.length === 0) return undefined;
+  const locations = toVscodeLocations(defs);
   return locations.length > 0 ? locations : undefined;
+}
+
+function lsifDeclarationFastPath(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): vscode.Location[] | undefined {
+  return lsifDefinitionFastPath(document, position);
 }
 
 function lsifImplementationFastPath(
   document: vscode.TextDocument,
   position: vscode.Position
 ): vscode.Location[] | undefined {
-  const sym = lsifSymbolAt(document, position);
-  if (!sym) return undefined;
-  const impls =
-    sym.implementations.length > 0
-      ? sym.implementations
-      : sym.definitions;
+  const resolved = resolveLsifSymbolsAt(document, position);
+  if (!resolved) return undefined;
+  const impls = collectLsifLocations(resolved.symbols, (sym) =>
+    sym.implementations.length > 0 ? sym.implementations : sym.definitions
+  );
   if (impls.length === 0) return undefined;
-  const locations = toVscodeLocations(impls.slice(0, LSIF_MAX_FAST_RESULTS));
+  const locations = toVscodeLocations(impls);
+  return locations.length > 0 ? locations : undefined;
+}
+
+function isLsifTypeLikeKind(kind: number): boolean {
+  return kind === 5;
+}
+
+function lsifTypeDefinitionFastPath(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): vscode.Location[] | undefined {
+  const resolved = resolveLsifSymbolsAt(document, position);
+  if (!resolved) return undefined;
+  const typeSymbols = resolved.symbols.filter((sym) => isLsifTypeLikeKind(sym.kind));
+  if (typeSymbols.length === 0) return undefined;
+  const defs = collectLsifLocations(typeSymbols, (sym) => sym.definitions);
+  if (defs.length === 0) return undefined;
+  const locations = toVscodeLocations(defs);
   return locations.length > 0 ? locations : undefined;
 }
 
@@ -483,14 +783,17 @@ function lsifReferencesFastPath(
   position: vscode.Position,
   includeDeclaration: boolean
 ): vscode.Location[] | undefined {
-  const sym = lsifSymbolAt(document, position);
-  if (!sym || sym.references.length === 0) return undefined;
-  const refs = includeDeclaration
-    ? sym.references
-    : sym.references.filter((r) => !r.declaration);
-  const locations = refs.map((r) => r.location);
+  const resolved = resolveLsifSymbolsAt(document, position);
+  if (!resolved) return undefined;
+  const locations: LsifLocationData[] = [];
+  for (const sym of resolved.symbols) {
+    for (const ref of sym.references) {
+      if (!includeDeclaration && ref.declaration) continue;
+      locations.push(ref.location);
+    }
+  }
   if (locations.length === 0) return undefined;
-  const parsed = toVscodeLocations(locations.slice(0, LSIF_MAX_FAST_RESULTS));
+  const parsed = toVscodeLocations(dedupeLsifLocations(locations));
   return parsed.length > 0 ? parsed : undefined;
 }
 
@@ -511,8 +814,9 @@ function lsifHoverFastPath(
   document: vscode.TextDocument,
   position: vscode.Position
 ): vscode.Hover | undefined {
-  const sym = lsifSymbolAt(document, position);
-  if (!sym) return undefined;
+  const resolved = resolveLsifSymbolsAt(document, position);
+  if (!resolved || resolved.symbols.length === 0) return undefined;
+  const sym = resolved.symbols[0];
   const defs = sym.definitions.length > 0 ? sym.definitions : sym.implementations;
   if (defs.length === 0) return undefined;
 
@@ -628,72 +932,130 @@ function normalizeNavResult<T>(value: T): T {
   return normalizeOne(value) as T;
 }
 
-async function refreshLsifIndex(output: vscode.OutputChannel, reason: string): Promise<void> {
-  if (!client || lsifRefreshInFlight) return;
-  if (!getConfig().lsifFastPath) return;
+function scheduleLsifRefreshForContext(
+  output: vscode.OutputChannel,
+  reason: string,
+  context: LsifRootContext,
+  delayMs: number
+): void {
+  const state = lsifRootStateFor(context.rootKey);
+  state.refreshPending = true;
+  state.pendingReason = reason;
+  state.lastContextUri = context.contextUri;
+  clearLsifRootTimer(state);
+  state.refreshTimer = setTimeout(() => {
+    state.refreshTimer = undefined;
+    void refreshLsifIndex(output, reason, context.contextUri);
+  }, Math.max(0, Math.trunc(delayMs)));
+}
+
+async function refreshLsifIndex(
+  output: vscode.OutputChannel,
+  reason: string,
+  preferredUri?: vscode.Uri
+): Promise<void> {
+  if (!client || !getConfig().lsifFastPath) return;
+  const context = resolveLsifRootContext(preferredUri, true);
+  if (!context) return;
+  const state = lsifRootStateFor(context.rootKey);
+  state.lastContextUri = context.contextUri;
+
+  if (state.refreshInFlight) {
+    state.refreshPending = true;
+    state.pendingReason = reason;
+    return;
+  }
 
   const now = Date.now();
-  if (now - lsifLastRefreshMs < LSIF_REFRESH_MIN_INTERVAL_MS) return;
+  const elapsed = now - state.lastRefreshMs;
+  if (elapsed < LSIF_REFRESH_MIN_INTERVAL_MS) {
+    state.refreshPending = true;
+    state.pendingReason = reason;
+    scheduleLsifRefreshForContext(
+      output,
+      reason,
+      context,
+      LSIF_REFRESH_MIN_INTERVAL_MS - elapsed
+    );
+    return;
+  }
 
-  lsifRefreshInFlight = true;
+  clearLsifRootTimer(state);
+  state.refreshInFlight = true;
+  state.refreshPending = false;
+  state.pendingReason = undefined;
   try {
-    if (lsifIndexCache && lsifIndexCache.revision > 0) {
+    if (state.cache && state.cache.revision > 0) {
       try {
-        const deltaRaw = await executeServerCommand("jovial.dumpLsifDelta", [lsifIndexCache.revision]);
+        const deltaRaw = await executeServerCommand("jovial.dumpLsifDelta", [
+          context.contextUri.toString(),
+          state.cache.revision,
+        ]);
         const delta = await parseLsifDelta(output, deltaRaw);
         if (
           delta &&
-          delta.baseRevision === lsifIndexCache.revision &&
+          delta.baseRevision === state.cache.revision &&
           !delta.reset
         ) {
-          lsifIndexCache = applyLsifDelta(lsifIndexCache, delta);
-          lsifLastRefreshMs = Date.now();
+          state.cache = applyLsifDelta(state.cache, delta);
+          state.lastRefreshMs = Date.now();
           output.appendLine(
-            `LSIF cache delta refreshed (${reason}): rev ${delta.baseRevision} -> ${delta.revision}, ` +
+            `LSIF cache delta refreshed (${reason}, ${context.rootKey}): rev ${delta.baseRevision} -> ${delta.revision}, ` +
             `${delta.upserts.length} upserts, ${delta.deletes.length} deletes.`
           );
           return;
         }
         if (delta?.reset) {
           output.appendLine(
-            `LSIF delta requested full refresh (${reason}) at base rev ${delta.baseRevision}.`
+            `LSIF delta requested full refresh (${reason}, ${context.rootKey}) at base rev ${delta.baseRevision}.`
           );
         }
       } catch (deltaErr) {
-        output.appendLine(`LSIF delta refresh fallback (${reason}): ${String(deltaErr)}`);
+        output.appendLine(
+          `LSIF delta refresh fallback (${reason}, ${context.rootKey}): ${String(deltaErr)}`
+        );
       }
     }
 
-    const result = await executeServerCommand("jovial.dumpLsifIndex", []);
+    const result = await executeServerCommand("jovial.dumpLsifIndex", [context.contextUri.toString()]);
     const parsed = await parseLsifIndex(output, result);
     if (!parsed) {
       output.appendLine("LSIF cache refresh skipped: invalid server payload.");
       return;
     }
-    lsifIndexCache = parsed;
-    lsifLastRefreshMs = Date.now();
+    state.cache = parsed;
+    state.lastRefreshMs = Date.now();
     output.appendLine(
-      `LSIF cache refreshed (${reason}): rev ${parsed.revision}, ` +
+      `LSIF cache refreshed (${reason}, ${context.rootKey}): rev ${parsed.revision}, ` +
       `${parsed.symbolCount} symbols across ${parsed.docCount} docs.`
     );
   } catch (e) {
-    output.appendLine(`LSIF cache refresh failed (${reason}): ${String(e)}`);
+    output.appendLine(`LSIF cache refresh failed (${reason}, ${context.rootKey}): ${String(e)}`);
   } finally {
-    lsifRefreshInFlight = false;
+    state.refreshInFlight = false;
+    if (state.refreshPending && client && getConfig().lsifFastPath) {
+      const pendingReason = state.pendingReason ?? `${reason}-pending`;
+      state.refreshPending = false;
+      state.pendingReason = undefined;
+      const followUri = state.lastContextUri ?? context.contextUri;
+      const followContext = resolveLsifRootContext(followUri, true);
+      if (followContext) {
+        scheduleLsifRefreshForContext(output, pendingReason, followContext, LSIF_REFRESH_DEBOUNCE_MS);
+      }
+    }
   }
 }
 
 function scheduleLsifRefresh(
   output: vscode.OutputChannel,
   reason: string,
+  preferredUri?: vscode.Uri,
   delayMs = LSIF_REFRESH_DEBOUNCE_MS
 ): void {
   if (!client || !getConfig().lsifFastPath) return;
-  clearLsifRefreshTimer();
-  pendingLsifRefreshTimer = setTimeout(() => {
-    pendingLsifRefreshTimer = undefined;
-    void refreshLsifIndex(output, reason);
-  }, delayMs);
+  const context = resolveLsifRootContext(preferredUri, true);
+  if (!context) return;
+  scheduleLsifRefreshForContext(output, reason, context, delayMs);
 }
 
 function clearAutoRestartTimer(): void {
@@ -1238,7 +1600,34 @@ async function startClient(
             output.appendLine(`Server definition failed; trying LSIF fallback: ${String(e)}`);
           }
           if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
+          if (token.isCancellationRequested) return serverResult;
           const fallback = lsifDefinitionFastPath(document, position);
+          if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
+          return serverResult;
+        },
+        provideDeclaration: async (document, position, token, next) => {
+          let serverResult: Awaited<ReturnType<typeof next>> | undefined;
+          try {
+            serverResult = await next(document, position, token);
+          } catch (e) {
+            output.appendLine(`Server declaration failed; trying LSIF fallback: ${String(e)}`);
+          }
+          if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
+          if (token.isCancellationRequested) return serverResult;
+          const fallback = lsifDeclarationFastPath(document, position);
+          if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
+          return serverResult;
+        },
+        provideTypeDefinition: async (document, position, token, next) => {
+          let serverResult: Awaited<ReturnType<typeof next>> | undefined;
+          try {
+            serverResult = await next(document, position, token);
+          } catch (e) {
+            output.appendLine(`Server typeDefinition failed; trying LSIF fallback: ${String(e)}`);
+          }
+          if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
+          if (token.isCancellationRequested) return serverResult;
+          const fallback = lsifTypeDefinitionFastPath(document, position);
           if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
           return serverResult;
         },
@@ -1250,6 +1639,7 @@ async function startClient(
             output.appendLine(`Server implementation failed; trying LSIF fallback: ${String(e)}`);
           }
           if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
+          if (token.isCancellationRequested) return serverResult;
           const fallback = lsifImplementationFastPath(document, position);
           if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
           return serverResult;
@@ -1262,6 +1652,7 @@ async function startClient(
             output.appendLine(`Server references failed; trying LSIF fallback: ${String(e)}`);
           }
           if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
+          if (token.isCancellationRequested) return serverResult;
           const fallback = lsifReferencesFastPath(document, position, context.includeDeclaration);
           if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
           return serverResult;
@@ -1274,6 +1665,7 @@ async function startClient(
             output.appendLine(`Server hover failed; trying LSIF fallback: ${String(e)}`);
           }
           if (hasProviderResult(serverResult)) return serverResult;
+          if (token.isCancellationRequested) return serverResult;
           const fallback = lsifHoverFastPath(document, position);
           if (fallback) return fallback;
           return serverResult;
@@ -1302,7 +1694,7 @@ async function startClient(
     await client.start();
     applyTraceSetting(output);
     await flushWatchedFileChanges(output);
-    scheduleLsifRefresh(output, "startup", 200);
+    scheduleLsifRefresh(output, "startup", firstPreferredLsifUri(), 200);
     autoRestartAttempts = [];
     output.appendLine("Jovial LSP client started.");
     setStatus(status, "running", `Server: ${serverPath}`);
@@ -2228,7 +2620,7 @@ export async function activate(context: vscode.ExtensionContext) {
           );
           return;
         }
-        await refreshLsifIndex(output, "manual command");
+        await refreshLsifIndex(output, "manual command", firstPreferredLsifUri());
         vscode.window.showInformationMessage("Jovial: LSIF cache refresh completed.");
       } catch (e) {
         output.appendLine(`refreshLsifCache failed: ${String(e)}`);
@@ -2287,7 +2679,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (doc.languageId !== "jovial") return;
       // Refresh on save only; avoid refresh storms during open/edit/navigation.
-      scheduleLsifRefresh(output, "didSave", 1000);
+      scheduleLsifRefresh(output, "didSave", doc.uri, 1000);
     })
   );
 

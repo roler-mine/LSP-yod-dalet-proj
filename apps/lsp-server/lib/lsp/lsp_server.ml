@@ -121,10 +121,18 @@ let initialize_result_json : Yojson.Safe.t =
           json_obj [ "openClose", `Bool true; "change", `Int 2 (* Incremental *) ];
 
           "definitionProvider", `Bool true;
+          "declarationProvider", `Bool true;
+          "typeDefinitionProvider", `Bool true;
           "implementationProvider", `Bool true;
           "referencesProvider", `Bool true;
+          "workspaceSymbolProvider", `Bool true;
           "documentSymbolProvider", `Bool true;
           "hoverProvider", `Bool true;
+          "signatureHelpProvider",
+          json_obj [
+            "triggerCharacters", `List [ `String "("; `String "," ];
+            "retriggerCharacters", `List [ `String "," ];
+          ];
           "renameProvider", json_obj [ "prepareProvider", `Bool true ];
           "completionProvider",
           json_obj [
@@ -288,6 +296,19 @@ let parse_include_declaration (params:Yojson.Safe.t) : bool =
             | _ -> true)
        | _ -> true)
 
+let parse_workspace_symbol_query (params:Yojson.Safe.t) : string =
+  match get_assoc params with
+  | None -> ""
+  | Some xs ->
+      (match find_field "query" xs with
+       | Some (`String s) -> s
+       | _ -> "")
+
+let parse_cancel_request_id (params:Yojson.Safe.t) : Yojson.Safe.t option =
+  match get_assoc params with
+  | None -> None
+  | Some xs -> find_field "id" xs
+
 let parse_root_uri (params:Yojson.Safe.t) : T.DocumentUri.t option =
   match get_assoc params with
   | None -> None
@@ -301,6 +322,29 @@ let parse_root_uri (params:Yojson.Safe.t) : T.DocumentUri.t option =
                  | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
                  | _ -> None)
             | _ -> None))
+
+let parse_workspace_folder_roots (params:Yojson.Safe.t) : T.DocumentUri.t list =
+  match get_assoc params with
+  | None -> []
+  | Some xs ->
+      (match find_field "workspaceFolders" xs with
+       | Some (`List folders) ->
+           folders
+           |> List.filter_map (function
+                | `Assoc fxs ->
+                    (match find_field "uri" fxs with
+                     | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
+                     | _ -> None)
+                | _ -> None)
+       | _ -> [])
+
+let parse_root_uris (params:Yojson.Safe.t) : T.DocumentUri.t list =
+  let roots = parse_workspace_folder_roots params in
+  if roots <> [] then roots
+  else
+    match parse_root_uri params with
+    | Some u -> [ u ]
+    | None -> []
 
 let parse_root_path (params:Yojson.Safe.t) : string option =
   match get_assoc params with
@@ -402,24 +446,133 @@ let request_semantic_tokens_refresh
     send_request oc ~id:(`Int id) ~method_:"workspace/semanticTokens/refresh" ~params:`Null
   )
 
-let handle_initialize
+type root_workspace = {
+  root_path_key : string;
+  ws : Workspace.t;
+}
+
+type roots_state = {
+  default_ws : Workspace.t;
+  mutable roots : root_workspace list;
+}
+
+let normalize_path_key (p:string) : string =
+  let p = String.map (fun c -> if c = '\\' then '/' else c) p in
+  if Sys.win32 then String.lowercase_ascii p else p
+
+let path_within_root ~(path_key:string) ~(root_key:string) : bool =
+  let lp = String.length path_key in
+  let lr = String.length root_key in
+  if lr = 0 || lp < lr then false
+  else if String.sub path_key 0 lr <> root_key then false
+  else if lp = lr then true
+  else
+    match path_key.[lr] with
+    | '/' -> true
+    | _ -> false
+
+let roots_state_create () : roots_state =
+  { default_ws = Workspace.create (); roots = [] }
+
+let all_workspaces (roots_state:roots_state) : Workspace.t list =
+  let seen : (Workspace.t, bool) Hashtbl.t = Hashtbl.create 16 in
+  let out = ref [] in
+  let add (ws:Workspace.t) =
+    if not (Hashtbl.mem seen ws) then (
+      Hashtbl.replace seen ws true;
+      out := ws :: !out
+    )
+  in
+  add roots_state.default_ws;
+  List.iter (fun r -> add r.ws) roots_state.roots;
+  List.rev !out
+
+let ws_for_path (roots_state:roots_state) (path:string) : Workspace.t =
+  let key = normalize_path_key path in
+  let rec pick best_len best_ws = function
+    | [] ->
+        (match best_ws with
+         | Some ws -> ws
+         | None -> roots_state.default_ws)
+    | r :: tl ->
+        if path_within_root ~path_key:key ~root_key:r.root_path_key then
+          let len = String.length r.root_path_key in
+          if len > best_len then pick len (Some r.ws) tl
+          else pick best_len best_ws tl
+        else
+          pick best_len best_ws tl
+  in
+  pick (-1) None roots_state.roots
+
+let ws_for_uri (roots_state:roots_state) (uri:T.DocumentUri.t) : Workspace.t =
+  match file_of_uri uri with
+  | Some path -> ws_for_path roots_state path
+  | None -> roots_state.default_ws
+
+let ws_refresh_counter_get
+    (pending_change_refreshes:(Workspace.t, int) Hashtbl.t)
     (ws:Workspace.t)
+  : int =
+  match Hashtbl.find_opt pending_change_refreshes ws with
+  | Some n -> n
+  | None -> 0
+
+let ws_refresh_counter_set
+    (pending_change_refreshes:(Workspace.t, int) Hashtbl.t)
+    (ws:Workspace.t)
+    (n:int)
+  : unit =
+  Hashtbl.replace pending_change_refreshes ws n
+
+let reset_all_refresh_counters
+    (pending_change_refreshes:(Workspace.t, int) Hashtbl.t)
+    (roots_state:roots_state)
+  : unit =
+  Hashtbl.clear pending_change_refreshes;
+  all_workspaces roots_state
+  |> List.iter (fun ws -> Hashtbl.replace pending_change_refreshes ws 0)
+
+let handle_initialize
+    (roots_state:roots_state)
+    ~(pending_change_refreshes:(Workspace.t, int) Hashtbl.t)
     ~(semantic_refresh_supported:bool ref)
     (oc:out_channel)
     (id:Yojson.Safe.t)
     (params:Yojson.Safe.t) =
-  (* Set workspace root from rootUri/workspaceFolders/rootPath, then scan. *)
   semantic_refresh_supported := parse_semantic_tokens_refresh_support params;
-  (match parse_root_uri params with
-   | Some ru -> Workspace.set_root_uri ws (Some ru)
-   | None -> Workspace.set_root_path ws (parse_root_path params));
-  Workspace.rescan ws;
+  let roots = parse_root_uris params in
+  if roots = [] then (
+    roots_state.roots <- [];
+    (match parse_root_uri params with
+     | Some ru -> Workspace.set_root_uri roots_state.default_ws (Some ru)
+     | None -> Workspace.set_root_path roots_state.default_ws (parse_root_path params));
+    Workspace.rescan roots_state.default_ws
+  ) else (
+    roots_state.roots <-
+      roots
+      |> List.filter_map (fun root_uri ->
+           match file_of_uri root_uri with
+           | None -> None
+           | Some root_path ->
+               let ws = Workspace.create () in
+               Workspace.set_root_uri ws (Some root_uri);
+               Workspace.rescan ws;
+               Some { root_path_key = normalize_path_key root_path; ws });
+    Workspace.set_root_path roots_state.default_ws None;
+    Workspace.rescan roots_state.default_ws
+  );
+  reset_all_refresh_counters pending_change_refreshes roots_state;
   respond oc ~id ~result:initialize_result_json
 
 let handle_shutdown oc id =
   respond oc ~id ~result:`Null
 
-let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Safe.t) (params : Yojson.Safe.t) =
+let handle_execute_command
+    (roots_state:roots_state)
+    ~(all_workspaces:(unit -> Workspace.t list))
+    (oc:out_channel)
+    (id:Yojson.Safe.t)
+    (params:Yojson.Safe.t) =
   try
     let p = T.ExecuteCommandParams.t_of_yojson params in
     match p.command with
@@ -433,6 +586,7 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
         (match uri_opt with
          | None -> respond_error oc ~id ~code:(-32602) ~message:"dumpAst: missing uri argument"
          | Some uri ->
+             let ws = ws_for_uri roots_state uri in
              (match Workspace.ast_dump_for ws ~uri with
               | None -> respond oc ~id ~result:`Null
               | Some s -> respond oc ~id ~result:(`String s)))
@@ -447,28 +601,54 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
         (match uri_opt with
          | None -> respond_error oc ~id ~code:(-32602) ~message:"dumpCst: missing uri argument"
          | Some uri ->
+             let ws = ws_for_uri roots_state uri in
              (match Workspace.cst_dump_for ws ~uri with
               | None -> respond oc ~id ~result:`Null
               | Some s -> respond oc ~id ~result:(`String s)))
 
     | "jovial.rescanWorkspace" ->
-        Workspace.rescan ws;
-        respond oc ~id ~result:(`Assoc [ "compoolCount", `Int (Workspace.compool_count ws) ])
+        let total =
+          all_workspaces ()
+          |> List.fold_left (fun acc ws ->
+               Workspace.rescan ws;
+               acc + Workspace.compool_count ws
+             ) 0
+        in
+        respond oc ~id ~result:(`Assoc [ "compoolCount", `Int total ])
 
     | "jovial.dumpLsifIndex" ->
-        respond oc ~id ~result:(Workspace.lsif_index_json ws)
+        let uri_opt =
+          match p.arguments with
+          | Some (a0 :: _) -> parse_uri_arg a0
+          | _ -> None
+        in
+        (match uri_opt with
+         | None ->
+             respond_error oc ~id ~code:(-32602) ~message:"dumpLsifIndex: missing uri argument"
+         | Some uri ->
+             let ws = ws_for_uri roots_state uri in
+             respond oc ~id ~result:(Workspace.lsif_index_json ws))
 
     | "jovial.dumpLsifDelta" ->
-        let base_revision =
+        let uri_opt, base_revision_opt =
           match p.arguments with
-          | Some (a0 :: _) ->
-              (match parse_int_arg a0 with
-               | Some n when n >= 0 -> n
-               | _ -> 0)
-          | _ ->
-              0
+          | Some (a0 :: a1 :: _) ->
+              let uri = parse_uri_arg a0 in
+              let base =
+                match parse_int_arg a1 with
+                | Some n when n >= 0 -> Some n
+                | _ -> None
+              in
+              (uri, base)
+          | _ -> (None, None)
         in
-        respond oc ~id ~result:(Workspace.lsif_delta_json ws ~base_revision)
+        (match uri_opt, base_revision_opt with
+         | Some uri, Some base_revision ->
+             let ws = ws_for_uri roots_state uri in
+             respond oc ~id ~result:(Workspace.lsif_delta_json ws ~base_revision)
+         | _ ->
+             respond_error oc ~id ~code:(-32602)
+               ~message:"dumpLsifDelta: missing uri/baseRevision arguments")
 
     | "jovial.debugReport" ->
         let uri_opt, max_tokens =
@@ -487,11 +667,12 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
         (match uri_opt with
          | None -> respond_error oc ~id ~code:(-32602) ~message:"debugReport: missing uri argument"
          | Some uri ->
+              let ws = ws_for_uri roots_state uri in
               let j = Workspace.debug_report_for ws ~uri ~max_tokens in
               respond oc ~id ~result:j)
 
     | "jovial.debugPerfStats" ->
-        respond oc ~id ~result:(Workspace.perf_stats_json ws)
+        respond oc ~id ~result:(Workspace.perf_stats_json roots_state.default_ws)
 
     | _ ->
         respond_error oc ~id ~code:(-32601) ~message:"Unknown command"
@@ -499,26 +680,32 @@ let handle_execute_command (ws : Workspace.t) (oc : out_channel) (id : Yojson.Sa
     respond_error oc ~id ~code:(-32602) ~message:"Invalid executeCommand params"
 
 let handle_notification
-    (ws : Workspace.t)
+    (roots_state:roots_state)
     ~(semantic_refresh_supported:bool ref)
     ~(next_server_request_id:int ref)
-    ~(pending_change_refreshes:int ref)
+    ~(pending_change_refreshes:(Workspace.t, int) Hashtbl.t)
     ~(published_diags:(string, string) Hashtbl.t)
-    (oc : out_channel)
+    ~(mark_cancelled:(Yojson.Safe.t -> unit))
+    (oc:out_channel)
     (method_ : string)
     (params : Yojson.Safe.t) =
   match method_ with
   | "initialized" -> ()
+  | "$/cancelRequest" ->
+      (match parse_cancel_request_id params with
+       | Some id -> mark_cancelled id
+       | None -> ())
   | "textDocument/didOpen" ->
       (try
          let p = T.DidOpenTextDocumentParams.t_of_yojson params in
          let td = p.textDocument in
          let uri = td.uri in
          let file = file_of_uri uri in
+         let ws = ws_for_uri roots_state uri in
          (try
             Workspace.open_doc ws ~uri ~file ~text:td.text;
             publish_doc_diagnostics ws oc published_diags ~uri;
-            pending_change_refreshes := 0;
+            ws_refresh_counter_set pending_change_refreshes ws 0;
             request_semantic_tokens_refresh oc
               ~refresh_supported:!semantic_refresh_supported
               next_server_request_id
@@ -530,12 +717,14 @@ let handle_notification
       (try
          let p = T.DidChangeTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
+         let ws = ws_for_uri roots_state uri in
          (try
             Workspace.change_doc ws ~uri ~changes:p.contentChanges;
             publish_doc_diagnostics ws oc published_diags ~uri;
-            pending_change_refreshes := !pending_change_refreshes + 1;
-            if !pending_change_refreshes >= sem_refresh_every_didchange then (
-              pending_change_refreshes := 0;
+            let next = ws_refresh_counter_get pending_change_refreshes ws + 1 in
+            ws_refresh_counter_set pending_change_refreshes ws next;
+            if next >= sem_refresh_every_didchange then (
+              ws_refresh_counter_set pending_change_refreshes ws 0;
               request_semantic_tokens_refresh oc
                 ~refresh_supported:!semantic_refresh_supported
                 next_server_request_id
@@ -548,163 +737,285 @@ let handle_notification
       (try
          let p = T.DidCloseTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
+         let ws = ws_for_uri roots_state uri in
          Workspace.close_doc ws ~uri;
          publish_diagnostics_if_changed published_diags oc ~uri ~diags:[];
          revalidate_and_publish_all_open_docs ws oc published_diags;
-         pending_change_refreshes := 0;
+         ws_refresh_counter_set pending_change_refreshes ws 0;
          request_semantic_tokens_refresh oc
            ~refresh_supported:!semantic_refresh_supported
            next_server_request_id
        with _ -> ())
   | "workspace/didChangeWatchedFiles" ->
       let changes = parse_watched_file_changes params in
-      if changes = [] then Workspace.rescan ws
-      else Workspace.apply_watched_file_changes ws ~changes;
-      revalidate_and_publish_all_open_docs ws oc published_diags;
-      pending_change_refreshes := 0;
+      if changes = [] then
+        all_workspaces roots_state |> List.iter Workspace.rescan
+      else
+        let grouped : (Workspace.t, (string * [ `Created | `Changed | `Deleted ]) list) Hashtbl.t =
+          Hashtbl.create 16
+        in
+        let push_group ws change =
+          let prev =
+            match Hashtbl.find_opt grouped ws with
+            | Some xs -> xs
+            | None -> []
+          in
+          Hashtbl.replace grouped ws (change :: prev)
+        in
+        List.iter (fun ((path, _kind) as change) ->
+          let ws = ws_for_path roots_state path in
+          push_group ws change
+        ) changes;
+        Hashtbl.iter (fun ws ws_changes ->
+          Workspace.apply_watched_file_changes ws ~changes:(List.rev ws_changes);
+          revalidate_and_publish_all_open_docs ws oc published_diags;
+          ws_refresh_counter_set pending_change_refreshes ws 0
+        ) grouped;
       request_semantic_tokens_refresh oc
         ~refresh_supported:!semantic_refresh_supported
         next_server_request_id
   | "exit" -> exit 0
   | _ -> ()
 
+let merge_workspace_symbol_results (results:Yojson.Safe.t list) : Yojson.Safe.t =
+  let seen = Hashtbl.create 2048 in
+  let out = ref [] in
+  let add_item (j:Yojson.Safe.t) =
+    let k = Yojson.Safe.to_string j in
+    if not (Hashtbl.mem seen k) then (
+      Hashtbl.replace seen k true;
+      out := j :: !out
+    )
+  in
+  results
+  |> List.iter (function
+       | `List xs -> List.iter add_item xs
+       | _ -> ());
+  `List (List.rev !out)
+
+let respond_cancelled (oc:out_channel) ~(id:Yojson.Safe.t) : unit =
+  respond_error oc ~id ~code:(-32800) ~message:"Request cancelled"
+
 let handle_request
-    (ws : Workspace.t)
+    (roots_state:roots_state)
+    ~(all_workspaces:(unit -> Workspace.t list))
+    ~(pending_change_refreshes:(Workspace.t, int) Hashtbl.t)
     ~(semantic_refresh_supported:bool ref)
+    ~(is_cancelled:(unit -> bool))
     (oc : out_channel)
     (method_ : string)
     (id : Yojson.Safe.t)
     (params : Yojson.Safe.t) =
-  match method_ with
-  | "initialize" -> handle_initialize ws ~semantic_refresh_supported oc id params
-  | "shutdown" -> handle_shutdown oc id
-  | "workspace/executeCommand" -> handle_execute_command ws oc id params
-  | "textDocument/documentSymbol" ->
-      (match parse_text_document_uri params with
-       | None -> respond_error oc ~id ~code:(-32602) ~message:"documentSymbol: missing textDocument.uri"
-       | Some uri ->
-           let j = Workspace.document_symbols_json_for ws ~uri in
-           respond oc ~id ~result:j)
-  | "textDocument/definition" ->
-      (match parse_text_document_uri params, parse_position params with
-       | Some uri, Some pos ->
-           let j = Workspace.definition_json_for ws ~uri ~pos in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"definition: invalid textDocument or position")
-  | "textDocument/implementation" ->
-      (match parse_text_document_uri params, parse_position params with
-       | Some uri, Some pos ->
-           let j = Workspace.implementation_json_for ws ~uri ~pos in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"implementation: invalid textDocument or position")
-  | "textDocument/references" ->
-      (match parse_text_document_uri params, parse_position params with
-       | Some uri, Some pos ->
-           let include_decl = parse_include_declaration params in
-           let j = Workspace.references_json_for ws ~uri ~pos ~include_decl in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"references: invalid textDocument or position")
-  | "textDocument/hover" ->
-      (match parse_text_document_uri params, parse_position params with
-       | Some uri, Some pos ->
-           let j = Workspace.hover_json_for ws ~uri ~pos in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"hover: invalid textDocument or position")
-  | "textDocument/prepareRename" ->
-      (match parse_text_document_uri params, parse_position params with
-       | Some uri, Some pos ->
-           let j = Workspace.prepare_rename_json_for ws ~uri ~pos in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"prepareRename: invalid textDocument or position")
-  | "textDocument/rename" ->
-      (match parse_text_document_uri params, parse_position params, parse_new_name params with
-       | Some uri, Some pos, Some new_name ->
-           let j = Workspace.rename_json_for ws ~uri ~pos ~new_name in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"rename: invalid textDocument, position, or newName")
-  | "textDocument/completion" ->
-      (match parse_text_document_uri params, parse_position params with
-       | Some uri, Some pos ->
-           let j = Workspace.completion_json_for ws ~uri ~pos in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"completion: invalid textDocument or position")
-  | "textDocument/codeAction" ->
-      (match parse_text_document_uri params, parse_range params with
-       | Some uri, Some range ->
-           let j = Workspace.code_actions_json_for ws ~uri ~range in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"codeAction: invalid textDocument or range")
-  | "textDocument/inlayHint" ->
-      (match parse_text_document_uri params, parse_range params with
-       | Some uri, Some range ->
-           let j = Workspace.inlay_hints_json_for ws ~uri ~range in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"inlayHint: invalid textDocument or range")
-  | "textDocument/semanticTokens/full" ->
-      (match parse_text_document_uri params with
-       | Some uri ->
-           let j = Workspace.semantic_tokens_full_json_for ws ~uri in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"semanticTokens/full: invalid textDocument")
-  | "textDocument/semanticTokens/range" ->
-      (match parse_text_document_uri params, parse_range params with
-       | Some uri, Some range ->
-           let j = Workspace.semantic_tokens_range_json_for ws ~uri ~range in
-           respond oc ~id ~result:j
-       | _ ->
-           respond_error oc ~id ~code:(-32602) ~message:"semanticTokens/range: invalid textDocument or range")
-  | _ -> respond_error oc ~id ~code:(-32601) ~message:("Method not found: " ^ method_)
+  let respond_result (result:Yojson.Safe.t) : unit =
+    if is_cancelled () then respond_cancelled oc ~id
+    else respond oc ~id ~result
+  in
+  let with_cancel_ws (ws:Workspace.t) (f:unit -> Yojson.Safe.t) : Yojson.Safe.t =
+    Workspace.with_request_cancel_checker ws is_cancelled f
+  in
+  if is_cancelled () then respond_cancelled oc ~id
+  else
+    match method_ with
+    | "initialize" ->
+        handle_initialize roots_state
+          ~pending_change_refreshes
+          ~semantic_refresh_supported
+          oc id params
+    | "shutdown" -> handle_shutdown oc id
+    | "workspace/executeCommand" ->
+        handle_execute_command roots_state ~all_workspaces oc id params
+    | "textDocument/documentSymbol" ->
+        (match parse_text_document_uri params with
+         | None -> respond_error oc ~id ~code:(-32602) ~message:"documentSymbol: missing textDocument.uri"
+         | Some uri ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.document_symbols_json_for ws ~uri) in
+             respond_result j)
+    | "textDocument/definition" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.definition_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"definition: invalid textDocument or position")
+    | "textDocument/declaration" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.declaration_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"declaration: invalid textDocument or position")
+    | "textDocument/typeDefinition" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.type_definition_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"typeDefinition: invalid textDocument or position")
+    | "textDocument/implementation" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.implementation_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"implementation: invalid textDocument or position")
+    | "textDocument/references" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let include_decl = parse_include_declaration params in
+             let ws = ws_for_uri roots_state uri in
+             let j =
+               with_cancel_ws ws (fun () ->
+                 Workspace.references_json_for ws ~uri ~pos ~include_decl)
+             in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"references: invalid textDocument or position")
+    | "workspace/symbol" ->
+        let query = parse_workspace_symbol_query params in
+        let merged =
+          all_workspaces ()
+          |> List.map (fun ws ->
+               with_cancel_ws ws (fun () -> Workspace.workspace_symbols_json_for ws ~query))
+          |> merge_workspace_symbol_results
+        in
+        respond_result merged
+    | "textDocument/hover" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.hover_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"hover: invalid textDocument or position")
+    | "textDocument/signatureHelp" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.signature_help_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"signatureHelp: invalid textDocument or position")
+    | "textDocument/prepareRename" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.prepare_rename_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"prepareRename: invalid textDocument or position")
+    | "textDocument/rename" ->
+        (match parse_text_document_uri params, parse_position params, parse_new_name params with
+         | Some uri, Some pos, Some new_name ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.rename_json_for ws ~uri ~pos ~new_name) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"rename: invalid textDocument, position, or newName")
+    | "textDocument/completion" ->
+        (match parse_text_document_uri params, parse_position params with
+         | Some uri, Some pos ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.completion_json_for ws ~uri ~pos) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"completion: invalid textDocument or position")
+    | "textDocument/codeAction" ->
+        (match parse_text_document_uri params, parse_range params with
+         | Some uri, Some range ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.code_actions_json_for ws ~uri ~range) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"codeAction: invalid textDocument or range")
+    | "textDocument/inlayHint" ->
+        (match parse_text_document_uri params, parse_range params with
+         | Some uri, Some range ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.inlay_hints_json_for ws ~uri ~range) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"inlayHint: invalid textDocument or range")
+    | "textDocument/semanticTokens/full" ->
+        (match parse_text_document_uri params with
+         | Some uri ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.semantic_tokens_full_json_for ws ~uri) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"semanticTokens/full: invalid textDocument")
+    | "textDocument/semanticTokens/range" ->
+        (match parse_text_document_uri params, parse_range params with
+         | Some uri, Some range ->
+             let ws = ws_for_uri roots_state uri in
+             let j = with_cancel_ws ws (fun () -> Workspace.semantic_tokens_range_json_for ws ~uri ~range) in
+             respond_result j
+         | _ ->
+             respond_error oc ~id ~code:(-32602) ~message:"semanticTokens/range: invalid textDocument or range")
+    | _ -> respond_error oc ~id ~code:(-32601) ~message:("Method not found: " ^ method_)
 
 type inbox_item =
   | InboxMsg of string
+  | InboxInvalidFrame of string
   | InboxEof
 
 type inbox = {
   q : inbox_item Queue.t;
   mtx : Mutex.t;
-  cv : Condition.t;
 }
 
 let inbox_create () : inbox =
-  { q = Queue.create (); mtx = Mutex.create (); cv = Condition.create () }
+  { q = Queue.create (); mtx = Mutex.create () }
 
 let inbox_push (box:inbox) (item:inbox_item) : unit =
   Mutex.lock box.mtx;
   Queue.add item box.q;
-  Condition.signal box.cv;
   Mutex.unlock box.mtx
 
-type inbox_wait =
-  | InboxReady of inbox_item
-  | InboxTimedOut
-
-let inbox_pop_wait_or_timeout (box:inbox) ~(timeout_s:float) : inbox_wait =
-  let deadline = Unix.gettimeofday () +. timeout_s in
+let inbox_drain (box:inbox) : inbox_item list =
   Mutex.lock box.mtx;
-  let rec loop () =
-    if not (Queue.is_empty box.q) then (
-      let item = Queue.pop box.q in
+  let rec loop acc =
+    if Queue.is_empty box.q then (
       Mutex.unlock box.mtx;
-      InboxReady item
-    ) else if Unix.gettimeofday () >= deadline then (
-      Mutex.unlock box.mtx;
-      InboxTimedOut
-    ) else (
-      Condition.wait box.cv box.mtx;
-      loop ()
-    )
+      List.rev acc
+    ) else
+      loop (Queue.pop box.q :: acc)
   in
-  loop ()
+  loop []
+
+let inbox_is_empty (box:inbox) : bool =
+  Mutex.lock box.mtx;
+  let empty = Queue.is_empty box.q in
+  Mutex.unlock box.mtx;
+  empty
+
+let write_wake_signal (wake_w:Unix.file_descr) : unit =
+  try
+    ignore (Unix.write_substring wake_w "\001" 0 1)
+  with
+  | Unix.Unix_error (Unix.EAGAIN, _, _) -> ()
+  | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) -> ()
+  | _ -> ()
+
+let drain_wake_pipe ~(nonblock:bool) (wake_r:Unix.file_descr) : unit =
+  let buf = Bytes.create 256 in
+  if not nonblock then
+    (try ignore (Unix.read wake_r buf 0 (Bytes.length buf)) with _ -> ())
+  else
+    let rec loop () =
+      try
+        let n = Unix.read wake_r buf 0 (Bytes.length buf) in
+        if n = Bytes.length buf then loop ()
+      with
+      | Unix.Unix_error (Unix.EAGAIN, _, _) -> ()
+      | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) -> ()
+      | _ -> ()
+    in
+    loop ()
 
 let run (ic : in_channel) (oc : out_channel) : unit =
   (* critical on Windows: LSP framing expects binary-accurate reads/writes *)
@@ -713,36 +1024,63 @@ let run (ic : in_channel) (oc : out_channel) : unit =
     set_binary_mode_out oc true;
   );
 
-  let ws = Workspace.create () in
+  let roots_state = roots_state_create () in
   let semantic_refresh_supported = ref false in
   let next_server_request_id = ref 1 in
-  let pending_change_refreshes = ref 0 in
+  let pending_change_refreshes : (Workspace.t, int) Hashtbl.t = Hashtbl.create 16 in
+  reset_all_refresh_counters pending_change_refreshes roots_state;
   let published_diags : (string, string) Hashtbl.t = Hashtbl.create 128 in
+  let cancelled_request_ids : (string, bool) Hashtbl.t = Hashtbl.create 64 in
+  let in_flight_request_ids : (string, bool) Hashtbl.t = Hashtbl.create 64 in
   let box = inbox_create () in
   let reader_done = ref false in
-  let idle_timer_stop = ref false in
+  let max_inbound_msg_bytes = 16 * 1024 * 1024 in
+  let wake_r, wake_w = Unix.pipe () in
+  let wake_nonblock =
+    let ok = ref true in
+    (try Unix.set_nonblock wake_r with _ -> ok := false);
+    (try Unix.set_nonblock wake_w with _ -> ok := false);
+    !ok
+  in
+
+  let request_id_key (id:Yojson.Safe.t) : string =
+    Yojson.Safe.to_string id
+  in
+  let mark_cancelled (id:Yojson.Safe.t) : unit =
+    Perf_stats.tick "cancel.received";
+    Hashtbl.replace cancelled_request_ids (request_id_key id) true
+  in
 
   ignore (Thread.create (fun () ->
     let rec read_loop () =
-      match Lsp_io.read_message ic with
-      | None ->
+      match Lsp_io.read_message_with_limit ic ~max_len:max_inbound_msg_bytes with
+      | `Eof ->
           inbox_push box InboxEof
-      | Some msg ->
+      | `Message msg ->
           inbox_push box (InboxMsg msg);
+          write_wake_signal wake_w;
           read_loop ()
+      | `Oversize len ->
+          Perf_stats.tick "io.oversize_drop";
+          prerr_endline
+            (Printf.sprintf "dropped oversized inbound LSP frame (%d bytes)" len);
+          write_wake_signal wake_w;
+          read_loop ()
+      | `Invalid msg ->
+          inbox_push box (InboxInvalidFrame msg);
+          inbox_push box InboxEof;
+          write_wake_signal wake_w;
+          ()
     in
-    (try read_loop () with _ -> inbox_push box InboxEof)
+    (try
+       read_loop ();
+       write_wake_signal wake_w
+     with _ ->
+       inbox_push box InboxEof;
+       write_wake_signal wake_w)
   ) ());
 
-  ignore (Thread.create (fun () ->
-    let delay_s = float_of_int idle_sleep_ms /. 1000.0 in
-    while not !idle_timer_stop do
-      Thread.delay delay_s;
-      Mutex.lock box.mtx;
-      Condition.signal box.cv;
-      Mutex.unlock box.mtx
-    done
-  ) ());
+  let all_workspaces_now () = all_workspaces roots_state in
 
   let handle_raw_message (msg:string) : unit =
     try
@@ -757,20 +1095,35 @@ let run (ic : in_channel) (oc : out_channel) : unit =
              (match id_of_msg json with
               | None -> ()
               | Some id ->
+                  let req_key = request_id_key id in
+                  Hashtbl.replace in_flight_request_ids req_key true;
+                  let is_cancelled () =
+                    Hashtbl.mem cancelled_request_ids req_key
+                  in
                   (try
                      Perf_stats.time ("req." ^ m) (fun () ->
-                       handle_request ws ~semantic_refresh_supported oc m id (params_of_msg json))
+                       handle_request roots_state
+                         ~all_workspaces:all_workspaces_now
+                         ~pending_change_refreshes
+                         ~semantic_refresh_supported
+                         ~is_cancelled
+                         oc m id (params_of_msg json))
                    with exn ->
-                     respond_error oc ~id ~code:(-32603)
-                       ~message:(Printf.sprintf "%s failed: %s" m (Printexc.to_string exn))))
+                     if is_cancelled () then respond_cancelled oc ~id
+                     else
+                       respond_error oc ~id ~code:(-32603)
+                         ~message:(Printf.sprintf "%s failed: %s" m (Printexc.to_string exn)));
+                  Hashtbl.remove in_flight_request_ids req_key;
+                  Hashtbl.remove cancelled_request_ids req_key)
            else
              (try
                 Perf_stats.time ("notif." ^ m) (fun () ->
-                  handle_notification ws
+                  handle_notification roots_state
                     ~semantic_refresh_supported
                     ~next_server_request_id
                     ~pending_change_refreshes
                     ~published_diags
+                    ~mark_cancelled
                     oc
                     m
                     (params_of_msg json))
@@ -778,33 +1131,84 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                 prerr_endline
                   (Printf.sprintf "notification %s failed: %s"
                      m
-                     (Printexc.to_string exn))));
-      publish_background_diag_updates ws oc published_diags ~max_items:bg_diag_batch_size;
-      flush oc
+                     (Printexc.to_string exn))))
     with exn ->
       prerr_endline
         (Printf.sprintf "server loop recovered from internal failure: %s"
            (Printexc.to_string exn))
   in
 
+  let run_background_tick () : unit =
+    let wss = all_workspaces_now () in
+    let n = max 1 (List.length wss) in
+    let per_ws_budget = max 1 (bg_tick_budget_ms / n) in
+    List.iter (fun ws ->
+      Workspace.background_tick ws ~budget_ms:per_ws_budget
+    ) wss
+  in
+
+  let publish_background_for_all () : unit =
+    all_workspaces_now ()
+    |> List.iter (fun ws ->
+         publish_background_diag_updates ws oc published_diags ~max_items:bg_diag_batch_size)
+  in
+
   let rec loop () =
-    match inbox_pop_wait_or_timeout box ~timeout_s:(float_of_int idle_sleep_ms /. 1000.0) with
-    | InboxReady (InboxMsg msg) ->
-        handle_raw_message msg;
-        loop ()
-    | InboxReady InboxEof ->
-        reader_done := true
-    | InboxTimedOut ->
-        if !reader_done then ()
-        else (
-          Workspace.background_tick ws ~budget_ms:bg_tick_budget_ms;
-          publish_background_diag_updates ws oc published_diags ~max_items:bg_diag_batch_size;
-          flush oc;
-          loop ()
+    if !reader_done && inbox_is_empty box then ()
+    else (
+      let timeout_s = float_of_int idle_sleep_ms /. 1000.0 in
+      let readable, _, _ =
+        Perf_stats.time "idle.select_wait" (fun () ->
+          Unix.select [ wake_r ] [] [] timeout_s)
+      in
+      let items =
+        Perf_stats.time "idle.msg_drain" (fun () ->
+          if readable <> [] then
+            drain_wake_pipe ~nonblock:wake_nonblock wake_r;
+          inbox_drain box)
+      in
+      if items = [] then (
+        if readable = [] then (
+          Perf_stats.tick "idle.bg_tick";
+          run_background_tick ()
         )
+      ) else (
+        let pending = ref [] in
+        List.iter (function
+          | InboxMsg msg ->
+              let cancel_id_opt =
+                try
+                  let j = Yojson.Safe.from_string msg in
+                  match method_of_msg j with
+                  | Some "$/cancelRequest" when not (is_request j) ->
+                      parse_cancel_request_id (params_of_msg j)
+                  | _ -> None
+                with _ ->
+                  None
+              in
+              (match cancel_id_opt with
+               | Some cancel_id ->
+                   mark_cancelled cancel_id
+               | None ->
+                   pending := InboxMsg msg :: !pending)
+          | other ->
+              pending := other :: !pending
+        ) items;
+        List.iter (function
+          | InboxMsg msg -> handle_raw_message msg
+          | InboxInvalidFrame msg ->
+              prerr_endline
+                (Printf.sprintf "invalid LSP frame received; terminating session: %s" msg);
+              reader_done := true
+          | InboxEof ->
+              reader_done := true
+        ) (List.rev !pending)
+      );
+      publish_background_for_all ();
+      flush oc;
+      loop ()
+    )
   in
   loop ();
-  idle_timer_stop := true;
-  Mutex.lock box.mtx;
-  Condition.broadcast box.cv;
-  Mutex.unlock box.mtx
+  (try Unix.close wake_r with _ -> ());
+  (try Unix.close wake_w with _ -> ())

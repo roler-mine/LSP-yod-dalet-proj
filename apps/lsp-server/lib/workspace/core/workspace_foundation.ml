@@ -19,6 +19,9 @@ type t = {
   sem_store_enabled : bool;
   lsif_delta_enabled : bool;
   lsif_delta_state : Lsif_delta.t;
+  mutable lsif_snapshot_revision : int;
+  mutable lsif_snapshot_payload : Yojson.Safe.t option;
+  mutable lsif_snapshot_symbols : (string, Yojson.Safe.t) Hashtbl.t option;
   workspace_diag_mode : workspace_diag_mode;
   bg_high_queue : string Queue.t;
   bg_norm_queue : string Queue.t;
@@ -30,6 +33,7 @@ type t = {
   bg_pending_diag_updates : string Queue.t;
   bg_pending_diag_payloads : (string, (T.DocumentUri.t * T.Diagnostic.t list)) Hashtbl.t;
   bg_pending_diag_set : (string, bool) Hashtbl.t;
+  mutable request_cancel_checker : (unit -> bool) option;
 }
 
 let env_flag (name:string) ~(default:bool) : bool =
@@ -74,6 +78,9 @@ let create () : t =
     sem_store_enabled = env_flag "JOVIAL_SEM_STORE" ~default:true;
     lsif_delta_enabled = env_flag "JOVIAL_LSIF_DELTA" ~default:true;
     lsif_delta_state = Lsif_delta.create ();
+    lsif_snapshot_revision = 0;
+    lsif_snapshot_payload = None;
+    lsif_snapshot_symbols = None;
     workspace_diag_mode = workspace_diag_mode_of_env ();
     bg_high_queue = Queue.create ();
     bg_norm_queue = Queue.create ();
@@ -85,7 +92,13 @@ let create () : t =
     bg_pending_diag_updates = Queue.create ();
     bg_pending_diag_payloads = Hashtbl.create 1024;
     bg_pending_diag_set = Hashtbl.create 1024;
+    request_cancel_checker = None;
   }
+
+let invalidate_lsif_snapshot (ws:t) : unit =
+  ws.lsif_snapshot_revision <- ws.lsif_snapshot_revision + 1;
+  ws.lsif_snapshot_payload <- None;
+  ws.lsif_snapshot_symbols <- None
 
 let normalize_name (s:string) : string =
   String.uppercase_ascii (String.trim s)
@@ -312,6 +325,19 @@ let bg_seed_paths_per_tick =
 let nav_soft_budget_ms =
   max 1 (env_nonneg_int "JOVIAL_NAV_SOFT_BUDGET_MS" ~default:1800)
 
+let request_cancelled (ws:t) : bool =
+  match ws.request_cancel_checker with
+  | None -> false
+  | Some f ->
+      (try f () with _ -> false)
+
+let with_request_cancel_checker (ws:t) (is_cancelled:unit -> bool) (f:unit -> 'a) : 'a =
+  let prev = ws.request_cancel_checker in
+  ws.request_cancel_checker <- Some is_cancelled;
+  Fun.protect
+    ~finally:(fun () -> ws.request_cancel_checker <- prev)
+    f
+
 type semantic_validation_mode =
   | SemanticFull
   | SemanticRangeSemi of T.Range.t
@@ -357,6 +383,8 @@ let pump_index_lookup (ws:t) : unit =
   pump_index ws ~max_dirs ~max_files
 
 let rescan (ws:t) : unit =
+  invalidate_lsif_snapshot ws;
+  ws.lsif_snapshot_revision <- 0;
   Hashtbl.clear ws.files;
   Hashtbl.clear ws.nav_response_cache;
   Hashtbl.clear ws.bg_enqueued;
@@ -2151,6 +2179,7 @@ let background_parse_path (ws:t) (path:string) : unit =
   else
     match find_open_doc_for_path ws ~path with
     | Some open_doc ->
+        invalidate_lsif_snapshot ws;
         Hashtbl.replace ws.files path_key open_doc;
         Hashtbl.replace ws.bg_parsed path_key true;
         (match compool_key_of_doc open_doc with
@@ -2176,6 +2205,7 @@ let background_parse_path (ws:t) (path:string) : unit =
                  with_internal_phase_diag fallback ~phase:"bg-open-doc" ~exn
              in
              let doc = background_doc_with_diags ws doc0 in
+             invalidate_lsif_snapshot ws;
              Hashtbl.replace ws.files path_key doc;
              Hashtbl.replace ws.bg_parsed path_key true;
              (match compool_key_of_doc doc with
@@ -2191,9 +2221,9 @@ let background_tick (ws:t) ~(budget_ms:int) : unit =
     pump_index_background ws;
     seed_bg_paths_from_index ws;
     let budget = float_of_int budget_ms in
-    let deadline = (Sys.time () *. 1000.0) +. budget in
+    let deadline = Perf_stats.now_ms () +. budget in
     let keep = ref true in
-    while !keep && (Sys.time () *. 1000.0) < deadline do
+    while !keep && Perf_stats.now_ms () < deadline do
       match dequeue_bg_path ws with
       | None ->
           keep := false
@@ -2229,6 +2259,7 @@ let drain_pending_diag_updates
     loop max_items []
 
 let open_doc (ws:t) ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) : unit =
+  invalidate_lsif_snapshot ws;
   (* If no workspace root was set, fall back to the first opened file's directory. *)
   (match ws.root_path, file with
    | None, Some f ->
@@ -2254,6 +2285,7 @@ let open_doc (ws:t) ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) 
 let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChangeEvent.t list) : unit =
   if changes = [] then ()
   else
+  invalidate_lsif_snapshot ws;
   let old_doc = Hashtbl.find_opt ws.docs uri in
   let clear_cache_for_full_sync =
     List.exists (fun (ch:T.TextDocumentContentChangeEvent.t) -> ch.range = None) changes
@@ -2314,6 +2346,7 @@ let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChan
       )
 
 let close_doc (ws:t) ~(uri:T.DocumentUri.t) : unit =
+  invalidate_lsif_snapshot ws;
   clear_nav_response_cache_for_uri ws ~uri;
   (match Hashtbl.find_opt ws.docs uri with
    | Some d ->
@@ -2333,6 +2366,7 @@ let apply_watched_file_changes
     (ws:t)
     ~(changes:(string * [ `Created | `Changed | `Deleted ]) list)
   : unit =
+  if changes <> [] then invalidate_lsif_snapshot ws;
   if changes <> [] then Hashtbl.clear ws.nav_response_cache;
   ensure_index_started ws;
   let hints_dirty = ref false in

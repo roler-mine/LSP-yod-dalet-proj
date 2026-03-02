@@ -12,6 +12,7 @@ export type LsifReferenceData = {
 };
 
 export type LsifSymbolEntryData = {
+  id: string;
   key: string;
   kind: number;
   definitions: LsifLocationData[];
@@ -19,8 +20,14 @@ export type LsifSymbolEntryData = {
   references: LsifReferenceData[];
 };
 
+export type LsifKeyIndexEntryData = {
+  key: string;
+  symbolIds: string[];
+};
+
 export type ParsedLsifIndex = {
   symbols: LsifSymbolEntryData[];
+  keyIndex: LsifKeyIndexEntryData[];
   symbolCount: number;
   docCount: number;
   revision: number;
@@ -111,10 +118,12 @@ function parseLocArray(value: unknown): LsifLocationData[] {
 function parseLsifSymbolEntry(v: unknown): LsifSymbolEntryData | undefined {
   const rec = asRecord(v);
   if (!rec) return undefined;
+  const idRaw = rec["id"];
   const keyRaw = rec["key"];
-  if (typeof keyRaw !== "string") return undefined;
+  if (typeof idRaw !== "string" || typeof keyRaw !== "string") return undefined;
+  const id = idRaw.trim();
   const key = keyRaw.trim().toUpperCase();
-  if (!key) return undefined;
+  if (!id || !key) return undefined;
 
   const kind = typeof rec["kind"] === "number" ? Math.trunc(rec["kind"]) : 0;
   const definitions = parseLocArray(rec["definitions"]);
@@ -143,6 +152,7 @@ function parseLsifSymbolEntry(v: unknown): LsifSymbolEntryData | undefined {
   }
 
   return {
+    id,
     key,
     kind,
     definitions,
@@ -151,22 +161,71 @@ function parseLsifSymbolEntry(v: unknown): LsifSymbolEntryData | undefined {
   };
 }
 
+function parseKeyIndex(
+  value: unknown,
+  symbolsById: Map<string, LsifSymbolEntryData>
+): LsifKeyIndexEntryData[] {
+  if (!Array.isArray(value)) return [];
+  const out: LsifKeyIndexEntryData[] = [];
+  const seenKeys = new Set<string>();
+  for (const item of value) {
+    const rec = asRecord(item);
+    if (!rec) continue;
+    const keyRaw = rec["key"];
+    const idsRaw = rec["symbolIds"];
+    if (typeof keyRaw !== "string" || !Array.isArray(idsRaw)) continue;
+    const key = keyRaw.trim().toUpperCase();
+    if (!key || seenKeys.has(key)) continue;
+    const seenIds = new Set<string>();
+    const symbolIds: string[] = [];
+    for (const idRaw of idsRaw) {
+      if (typeof idRaw !== "string") continue;
+      const id = idRaw.trim();
+      if (!id || seenIds.has(id)) continue;
+      if (!symbolsById.has(id)) continue;
+      seenIds.add(id);
+      symbolIds.push(id);
+    }
+    seenKeys.add(key);
+    out.push({ key, symbolIds });
+  }
+  return out;
+}
+
 export function parseLsifIndexPayload(payload: unknown): ParsedLsifIndex | undefined {
   const root = asRecord(payload);
   if (!root) return undefined;
   const symbolsRaw = root["symbols"];
   if (!Array.isArray(symbolsRaw)) return undefined;
 
-  const symbolsByKey = new Map<string, LsifSymbolEntryData>();
+  const symbolsById = new Map<string, LsifSymbolEntryData>();
   for (const rawEntry of symbolsRaw) {
     const parsed = parseLsifSymbolEntry(rawEntry);
     if (!parsed) continue;
-    symbolsByKey.set(parsed.key, parsed);
+    symbolsById.set(parsed.id, parsed);
   }
-  const symbols = Array.from(symbolsByKey.values());
+  const symbols = Array.from(symbolsById.values());
+
+  let keyIndex = parseKeyIndex(root["keyIndex"], symbolsById);
+  if (keyIndex.length === 0) {
+    const tmp = new Map<string, string[]>();
+    for (const sym of symbols) {
+      const prev = tmp.get(sym.key) ?? [];
+      prev.push(sym.id);
+      tmp.set(sym.key, prev);
+    }
+    keyIndex =
+      Array.from(tmp.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, symbolIds]) => ({
+          key,
+          symbolIds: Array.from(new Set(symbolIds)).sort((a, b) => a.localeCompare(b)),
+        }));
+  }
 
   return {
     symbols,
+    keyIndex,
     symbolCount: normalizeCount(root["symbolCount"], symbols.length),
     docCount: normalizeCount(root["docCount"], 0),
     revision: normalizeCount(root["revision"], 0),
@@ -187,21 +246,23 @@ export function parseLsifDeltaPayload(payload: unknown): ParsedLsifDelta | undef
   const deletes: string[] = [];
   const deletesRaw = root["deletes"];
   if (Array.isArray(deletesRaw)) {
+    const seenDeletes = new Set<string>();
     for (const d of deletesRaw) {
       if (typeof d !== "string") continue;
-      const key = d.trim().toUpperCase();
-      if (!key) continue;
-      deletes.push(key);
+      const id = d.trim();
+      if (!id || seenDeletes.has(id)) continue;
+      seenDeletes.add(id);
+      deletes.push(id);
     }
   }
 
-  const upserts: LsifSymbolEntryData[] = [];
+  const upsertsById = new Map<string, LsifSymbolEntryData>();
   const upsertsRaw = root["upserts"];
   if (Array.isArray(upsertsRaw)) {
     for (const u of upsertsRaw) {
       const entry = parseLsifSymbolEntry(u);
       if (!entry) continue;
-      upserts.push(entry);
+      upsertsById.set(entry.id, entry);
     }
   }
 
@@ -210,6 +271,6 @@ export function parseLsifDeltaPayload(payload: unknown): ParsedLsifDelta | undef
     revision: normalizeCount(revRaw, 0),
     reset: resetRaw,
     deletes,
-    upserts,
+    upserts: Array.from(upsertsById.values()),
   };
 }

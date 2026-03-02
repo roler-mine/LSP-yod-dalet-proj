@@ -17,30 +17,71 @@ let parse_content_length_header (line:string) : int option =
         let v = String.sub line (i + 1) (String.length line - i - 1) |> String.trim in
         try Some (int_of_string v) with _ -> None
 
-let read_headers ic : int option =
-  let rec loop (len:int option) =
+type read_result =
+  [ `Eof
+  | `Message of string
+  | `Oversize of int
+  | `Invalid of string
+  ]
+
+type header_result =
+  | HeaderEof
+  | HeaderLength of int
+  | HeaderInvalid of string
+
+let read_headers ic : header_result =
+  let rec loop ~(seen_any:bool) (len:int option) =
     match input_line ic with
-    | exception End_of_file -> None
+    | exception End_of_file ->
+        if seen_any then HeaderInvalid "unexpected EOF while reading LSP headers"
+        else HeaderEof
     | line ->
         let line = strip_cr line in
-        if line = "" then len
+        let parsed_len = parse_content_length_header line in
+        if line = "" then
+          (match len with
+           | Some n when n > 0 -> HeaderLength n
+           | Some n -> HeaderInvalid (Printf.sprintf "invalid Content-Length: %d" n)
+           | None -> HeaderInvalid "missing Content-Length header")
         else
           let len =
-            match parse_content_length_header line with
+            match parsed_len with
             | Some n when n >= 0 -> Some n
             | _ -> len
           in
-          loop len
+          loop ~seen_any:true len
   in
-  loop None
+  loop ~seen_any:false None
+
+let discard_bytes (ic:in_channel) (len:int) : bool =
+  let chunk = Bytes.create 8192 in
+  let remaining = ref len in
+  let ok = ref true in
+  while !remaining > 0 && !ok do
+    let want = min !remaining (Bytes.length chunk) in
+    let got = input ic chunk 0 want in
+    if got <= 0 then ok := false
+    else remaining := !remaining - got
+  done;
+  !ok
+
+let read_message_with_limit (ic:in_channel) ~(max_len:int) : read_result =
+  match read_headers ic with
+  | HeaderEof -> `Eof
+  | HeaderInvalid msg -> `Invalid msg
+  | HeaderLength len ->
+      if len > max_len then
+        if discard_bytes ic len then `Oversize len
+        else `Invalid "unexpected EOF while discarding oversized frame"
+      else
+        (try `Message (really_input_string ic len)
+         with End_of_file ->
+           `Invalid "unexpected EOF while reading LSP body")
 
 let read_message (ic : in_channel) : string option =
-  match read_headers ic with
-  | None -> None
-  | Some len ->
-      if len <= 0 then None
-      else
-        Some (really_input_string ic len)
+  match read_message_with_limit ic ~max_len:max_int with
+  | `Message body -> Some body
+  | `Eof | `Oversize _ | `Invalid _ -> None
 
 let write_message (oc : out_channel) (json : Yojson.Safe.t) : unit =
   let body = Yojson.Safe.to_string json in
