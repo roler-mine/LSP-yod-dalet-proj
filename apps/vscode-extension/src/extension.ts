@@ -405,7 +405,7 @@ function applyLsifDelta(cache: LsifIndexCache, delta: LsifDeltaPayload): LsifInd
 
 function toVscodeLocation(loc: LsifLocationData): vscode.Location | undefined {
   try {
-    const uri = vscode.Uri.parse(loc.uri);
+    const uri = normalizeNavUri(vscode.Uri.parse(loc.uri));
     const start = new vscode.Position(loc.startLine, loc.startCharacter);
     const end = new vscode.Position(loc.endLine, loc.endCharacter);
     return new vscode.Location(uri, new vscode.Range(start, end));
@@ -536,6 +536,96 @@ function hasProviderResult(value: unknown): boolean {
   if (value === null || value === undefined) return false;
   if (Array.isArray(value)) return value.length > 0;
   return true;
+}
+
+function normalizeNavUri(uri: vscode.Uri): vscode.Uri {
+  if (uri.scheme !== "file") return uri;
+  try {
+    return vscode.Uri.file(uri.fsPath);
+  } catch {
+    return uri;
+  }
+}
+
+function toVscodeUri(value: unknown): vscode.Uri | undefined {
+  if (value instanceof vscode.Uri) return value;
+  if (typeof value === "string") {
+    try {
+      return vscode.Uri.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function toVscodeRange(value: unknown): vscode.Range | undefined {
+  if (value instanceof vscode.Range) return value;
+  if (!value || typeof value !== "object") return undefined;
+  const rec = value as Record<string, unknown>;
+  const start = rec["start"];
+  const end = rec["end"];
+  if (!start || typeof start !== "object" || !end || typeof end !== "object") return undefined;
+  const startRec = start as Record<string, unknown>;
+  const endRec = end as Record<string, unknown>;
+  const sl = startRec["line"];
+  const sc = startRec["character"];
+  const el = endRec["line"];
+  const ec = endRec["character"];
+  if (
+    typeof sl !== "number" ||
+    typeof sc !== "number" ||
+    typeof el !== "number" ||
+    typeof ec !== "number"
+  ) {
+    return undefined;
+  }
+  return new vscode.Range(
+    new vscode.Position(Math.max(0, Math.trunc(sl)), Math.max(0, Math.trunc(sc))),
+    new vscode.Position(Math.max(0, Math.trunc(el)), Math.max(0, Math.trunc(ec)))
+  );
+}
+
+function isLocationLinkLike(value: unknown): value is vscode.LocationLink {
+  if (!value || typeof value !== "object") return false;
+  const rec = value as Record<string, unknown>;
+  return (
+    toVscodeUri(rec["targetUri"]) !== undefined &&
+    toVscodeRange(rec["targetRange"]) !== undefined &&
+    toVscodeRange(rec["targetSelectionRange"]) !== undefined
+  );
+}
+
+function normalizeNavResult<T>(value: T): T {
+  const normalizeOne = (item: unknown): unknown => {
+    if (item && typeof item === "object") {
+      const rec = item as Record<string, unknown>;
+      const locUri = toVscodeUri(rec["uri"]);
+      const locRange = toVscodeRange(rec["range"]);
+      if (locUri && locRange) {
+        return new vscode.Location(normalizeNavUri(locUri), locRange);
+      }
+    }
+    if (isLocationLinkLike(item)) {
+      const rec = item as unknown as Record<string, unknown>;
+      const targetUri = toVscodeUri(rec["targetUri"]);
+      const targetRange = toVscodeRange(rec["targetRange"]);
+      const targetSelectionRange = toVscodeRange(rec["targetSelectionRange"]);
+      if (!targetUri || !targetRange || !targetSelectionRange) return item;
+      return {
+        ...(item as unknown as Record<string, unknown>),
+        targetUri: normalizeNavUri(targetUri),
+        targetRange,
+        targetSelectionRange,
+      };
+    }
+    return item;
+  };
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeOne(item)) as T;
+  }
+  return normalizeOne(value) as T;
 }
 
 async function refreshLsifIndex(output: vscode.OutputChannel, reason: string): Promise<void> {
@@ -1147,9 +1237,9 @@ async function startClient(
           } catch (e) {
             output.appendLine(`Server definition failed; trying LSIF fallback: ${String(e)}`);
           }
-          if (hasProviderResult(serverResult)) return serverResult;
+          if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
           const fallback = lsifDefinitionFastPath(document, position);
-          if (fallback && fallback.length > 0) return fallback;
+          if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
           return serverResult;
         },
         provideImplementation: async (document, position, token, next) => {
@@ -1159,9 +1249,9 @@ async function startClient(
           } catch (e) {
             output.appendLine(`Server implementation failed; trying LSIF fallback: ${String(e)}`);
           }
-          if (hasProviderResult(serverResult)) return serverResult;
+          if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
           const fallback = lsifImplementationFastPath(document, position);
-          if (fallback && fallback.length > 0) return fallback;
+          if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
           return serverResult;
         },
         provideReferences: async (document, position, context, token, next) => {
@@ -1171,9 +1261,9 @@ async function startClient(
           } catch (e) {
             output.appendLine(`Server references failed; trying LSIF fallback: ${String(e)}`);
           }
-          if (hasProviderResult(serverResult)) return serverResult;
+          if (hasProviderResult(serverResult)) return normalizeNavResult(serverResult);
           const fallback = lsifReferencesFastPath(document, position, context.includeDeclaration);
-          if (fallback && fallback.length > 0) return fallback;
+          if (fallback && fallback.length > 0) return normalizeNavResult(fallback);
           return serverResult;
         },
         provideHover: async (document, position, token, next) => {

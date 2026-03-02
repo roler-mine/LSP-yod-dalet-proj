@@ -4,8 +4,12 @@
   "description": "VS Code client for the Jovial OCaml LSP server",
   "version": "0.0.5",
   "publisher": "your-name",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
   "activationEvents": [
     "onLanguage:jovial",
     "onCommand:jovial.dumpAstUi",
@@ -19,8 +23,16 @@
     "languages": [
       {
         "id": "jovial",
-        "aliases": ["Jovial", "JOVIAL", "jovial"],
-        "extensions": [".jov", ".j73", ".jvl"],
+        "aliases": [
+          "Jovial",
+          "JOVIAL",
+          "jovial"
+        ],
+        "extensions": [
+          ".jov",
+          ".j73",
+          ".jvl"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -32,11 +44,26 @@
       }
     ],
     "commands": [
-      { "command": "jovial.dumpAstUi", "title": "Jovial: Dump AST" },
-      { "command": "jovial.dumpCstUi", "title": "Jovial: Dump CST (Token Stream)" },
-      { "command": "jovial.showSyntaxTrees", "title": "Jovial: Show AST/CST Viewer" },
-      { "command": "jovial.restartServer", "title": "Jovial: Restart Language Server" },
-      { "command": "jovial.refreshLsifCache", "title": "Jovial: Refresh LSIF Cache" }
+      {
+        "command": "jovial.dumpAstUi",
+        "title": "Jovial: Dump AST"
+      },
+      {
+        "command": "jovial.dumpCstUi",
+        "title": "Jovial: Dump CST (Token Stream)"
+      },
+      {
+        "command": "jovial.showSyntaxTrees",
+        "title": "Jovial: Show AST/CST Viewer"
+      },
+      {
+        "command": "jovial.restartServer",
+        "title": "Jovial: Restart Language Server"
+      },
+      {
+        "command": "jovial.refreshLsifCache",
+        "title": "Jovial: Refresh LSIF Cache"
+      }
     ],
     "configuration": {
       "title": "Jovial LSP",
@@ -54,13 +81,19 @@
         "jovial.server.args": {
           "type": "array",
           "default": [],
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Extra command-line args passed to the server."
         },
         "jovial.trace": {
           "type": "string",
           "default": "off",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "description": "Trace LSP traffic in the client output channel."
         },
         "jovial.lsif.fastPath": {
@@ -71,7 +104,11 @@
         "jovial.workspaceDiagnostics.mode": {
           "type": "string",
           "default": "errors",
-          "enum": ["off", "errors", "all"],
+          "enum": [
+            "off",
+            "errors",
+            "all"
+          ],
           "description": "Background diagnostics for unopened files: off, errors-only, or all diagnostics."
         },
         "jovial.background.indexBudgetMs": {
@@ -112,7 +149,7 @@
     "vscode-languageclient": "^9.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^20.19.35",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.0.0"
   }

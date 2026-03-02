@@ -671,6 +671,7 @@ let debug_report_for (ws:t) ~(uri:T.DocumentUri.t) ~(max_tokens:int) : Yojson.Sa
           "seedTotal", `Int (Array.length ws.bg_seed_paths);
           "closedDiagUris", `Int (Hashtbl.length ws.bg_closed_diags);
           "pendingDiagUpdates", `Int (Queue.length ws.bg_pending_diag_updates);
+          "pendingDiagPayloads", `Int (Hashtbl.length ws.bg_pending_diag_payloads);
           "pendingDiagSet", `Int (Hashtbl.length ws.bg_pending_diag_set);
         ]
       in
@@ -750,16 +751,23 @@ let docs_for_lsif (ws:t) : Document.t list =
       out := doc :: !out
     )
   in
-  Hashtbl.iter (fun _ doc -> add_doc doc) ws.docs;
+  Hashtbl.iter (fun _ doc ->
+    Perf_stats.tick "lsif.docs_from_open";
+    add_doc doc
+  ) ws.docs;
   (match ws.index with
    | None -> ()
    | Some idx ->
        if not (is_network_root ws) then
          Workspace_index.all_source_paths idx
          |> List.iter (fun p ->
-              match doc_at_path ws p with
-              | None -> ()
-              | Some d -> add_doc d));
+              Perf_stats.tick "lsif.docs_path_scan";
+              match Perf_stats.time "lsif.doc_load" (fun () -> doc_at_path ws p) with
+              | None ->
+                  Perf_stats.tick "lsif.doc_load_miss"
+              | Some d ->
+                  Perf_stats.tick "lsif.doc_load_hit";
+                  add_doc d));
   List.rev !out
 
 let sorted_assoc_values

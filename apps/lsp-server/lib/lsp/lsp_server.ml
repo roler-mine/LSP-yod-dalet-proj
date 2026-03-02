@@ -672,24 +672,39 @@ type inbox_item =
 type inbox = {
   q : inbox_item Queue.t;
   mtx : Mutex.t;
+  cv : Condition.t;
 }
 
 let inbox_create () : inbox =
-  { q = Queue.create (); mtx = Mutex.create () }
+  { q = Queue.create (); mtx = Mutex.create (); cv = Condition.create () }
 
 let inbox_push (box:inbox) (item:inbox_item) : unit =
   Mutex.lock box.mtx;
   Queue.add item box.q;
+  Condition.signal box.cv;
   Mutex.unlock box.mtx
 
-let inbox_pop_nowait (box:inbox) : inbox_item option =
+type inbox_wait =
+  | InboxReady of inbox_item
+  | InboxTimedOut
+
+let inbox_pop_wait_or_timeout (box:inbox) ~(timeout_s:float) : inbox_wait =
+  let deadline = Unix.gettimeofday () +. timeout_s in
   Mutex.lock box.mtx;
-  let out =
-    if Queue.is_empty box.q then None
-    else Some (Queue.pop box.q)
+  let rec loop () =
+    if not (Queue.is_empty box.q) then (
+      let item = Queue.pop box.q in
+      Mutex.unlock box.mtx;
+      InboxReady item
+    ) else if Unix.gettimeofday () >= deadline then (
+      Mutex.unlock box.mtx;
+      InboxTimedOut
+    ) else (
+      Condition.wait box.cv box.mtx;
+      loop ()
+    )
   in
-  Mutex.unlock box.mtx;
-  out
+  loop ()
 
 let run (ic : in_channel) (oc : out_channel) : unit =
   (* critical on Windows: LSP framing expects binary-accurate reads/writes *)
@@ -705,6 +720,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let published_diags : (string, string) Hashtbl.t = Hashtbl.create 128 in
   let box = inbox_create () in
   let reader_done = ref false in
+  let idle_timer_stop = ref false in
 
   ignore (Thread.create (fun () ->
     let rec read_loop () =
@@ -716,6 +732,16 @@ let run (ic : in_channel) (oc : out_channel) : unit =
           read_loop ()
     in
     (try read_loop () with _ -> inbox_push box InboxEof)
+  ) ());
+
+  ignore (Thread.create (fun () ->
+    let delay_s = float_of_int idle_sleep_ms /. 1000.0 in
+    while not !idle_timer_stop do
+      Thread.delay delay_s;
+      Mutex.lock box.mtx;
+      Condition.signal box.cv;
+      Mutex.unlock box.mtx
+    done
   ) ());
 
   let handle_raw_message (msg:string) : unit =
@@ -762,20 +788,23 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   in
 
   let rec loop () =
-    match inbox_pop_nowait box with
-    | Some (InboxMsg msg) ->
+    match inbox_pop_wait_or_timeout box ~timeout_s:(float_of_int idle_sleep_ms /. 1000.0) with
+    | InboxReady (InboxMsg msg) ->
         handle_raw_message msg;
         loop ()
-    | Some InboxEof ->
+    | InboxReady InboxEof ->
         reader_done := true
-    | None ->
+    | InboxTimedOut ->
         if !reader_done then ()
         else (
           Workspace.background_tick ws ~budget_ms:bg_tick_budget_ms;
           publish_background_diag_updates ws oc published_diags ~max_items:bg_diag_batch_size;
           flush oc;
-          Thread.delay (float_of_int idle_sleep_ms /. 1000.0);
           loop ()
         )
   in
-  loop ()
+  loop ();
+  idle_timer_stop := true;
+  Mutex.lock box.mtx;
+  Condition.broadcast box.cv;
+  Mutex.unlock box.mtx

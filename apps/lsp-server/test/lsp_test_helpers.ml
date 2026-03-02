@@ -262,6 +262,11 @@ let wait_for_exit (srv:server_proc) ~(timeout_s:float) : Unix.process_status =
   in
   loop ()
 
+let force_kill (srv:server_proc) : unit =
+  (try Unix.kill srv.pid Sys.sigterm with _ -> ());
+  sleep_seconds 0.05;
+  (try Unix.kill srv.pid Sys.sigkill with _ -> ())
+
 let with_server ?(env:(string * string) list = []) ~(server_path:string) (f:server_proc -> 'a) : 'a =
   let srv = start_server ~server_path ~env in
   try
@@ -269,7 +274,9 @@ let with_server ?(env:(string * string) list = []) ~(server_path:string) (f:serv
     out
   with exn ->
     (try close_out_noerr srv.stdin_w with _ -> ());
-    (try ignore (wait_for_exit srv ~timeout_s:1.0) with _ -> ());
+    (try ignore (wait_for_exit srv ~timeout_s:1.0) with _ ->
+       force_kill srv;
+       (try ignore (wait_for_exit srv ~timeout_s:0.5) with _ -> ()));
     (try close_in_noerr srv.stdout_r with _ -> ());
     raise exn
 

@@ -55,6 +55,15 @@ let create_workspace ~(root:string) ~(file_count:int) : string * string * string
   (main_path, main_text, target_path)
 
 let response_has_result_uri (resp:Yojson.Safe.t) ~(uri:string) : bool =
+  let normalize_uri_for_compare (u:string) : string =
+    match Jovial_lsp_lib.Uri_path.file_path_of_uri_string u with
+    | Some p ->
+        let p = String.map (fun c -> if c = '\\' then '/' else c) p in
+        if Sys.win32 then String.lowercase_ascii p else p
+    | None ->
+        String.lowercase_ascii (String.trim u)
+  in
+  let want = normalize_uri_for_compare uri in
   match resp with
   | `Assoc fields ->
       (match List.assoc_opt "result" fields with
@@ -62,7 +71,7 @@ let response_has_result_uri (resp:Yojson.Safe.t) ~(uri:string) : bool =
            List.exists (function
              | `Assoc lf ->
                  (match List.assoc_opt "uri" lf with
-                  | Some (`String u) -> u = uri
+                  | Some (`String u) -> normalize_uri_for_compare u = want
                   | _ -> false)
              | _ -> false
            ) xs

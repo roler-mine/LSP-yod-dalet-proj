@@ -60,7 +60,11 @@
 
 (rule
  (alias runtest)
- (action (run %{exe:lsp_responsiveness_test.exe} %{exe:../bin/Main.exe})))
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_RESP_INDEX_FILES "900"
+    (setenv JOVIAL_TEST_RESP_TIMEOUT_S "10"
+     (run %{exe:lsp_responsiveness_test.exe} %{exe:../bin/Main.exe}))))))
 
 (executable
  (name lsp_restart_stability_test)
@@ -68,7 +72,11 @@
 
 (rule
  (alias runtest)
- (action (run %{exe:lsp_restart_stability_test.exe} %{exe:../bin/Main.exe})))
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_RESTART_CYCLES "8"
+    (setenv JOVIAL_TEST_RESTART_TIMEOUT_S "8"
+     (run %{exe:lsp_restart_stability_test.exe} %{exe:../bin/Main.exe}))))))
 
 (executable
  (name lsp_didchange_latency_test)
@@ -76,7 +84,11 @@
 
 (rule
  (alias runtest)
- (action (run %{exe:lsp_didchange_latency_test.exe} %{exe:../bin/Main.exe})))
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_EDIT_LARGE_FILE_LINES "8000"
+    (setenv JOVIAL_TEST_EDIT_TIMEOUT_S "20"
+     (run %{exe:lsp_didchange_latency_test.exe} %{exe:../bin/Main.exe}))))))
 
 (executable
  (name lsp_crossfile_goto_latency_test)
@@ -84,7 +96,12 @@
 
 (rule
  (alias runtest)
- (action (run %{exe:lsp_crossfile_goto_latency_test.exe} %{exe:../bin/Main.exe})))
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_CROSSFILE_INDEX_FILES "500"
+    (setenv JOVIAL_TEST_CROSSFILE_TIMEOUT_S "12"
+     (setenv JOVIAL_TEST_CROSSFILE_SETTLE_TIMEOUT_S "20"
+      (run %{exe:lsp_crossfile_goto_latency_test.exe} %{exe:../bin/Main.exe})))))))
 
 (executable
  (name lsp_startup_openfile_nav_latency_test)
@@ -92,7 +109,11 @@
 
 (rule
  (alias runtest)
- (action (run %{exe:lsp_startup_openfile_nav_latency_test.exe} %{exe:../bin/Main.exe})))
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (setenv JOVIAL_TEST_STARTUP_INDEX_FILES "1000"
+    (setenv JOVIAL_TEST_STARTUP_TIMEOUT_S "10"
+     (run %{exe:lsp_startup_openfile_nav_latency_test.exe} %{exe:../bin/Main.exe}))))))
 
 (executable
  (name lsp_workspace_diagnostics_background_test)
@@ -100,4 +121,26 @@
 
 (rule
  (alias runtest)
- (action (run %{exe:lsp_workspace_diagnostics_background_test.exe} %{exe:../bin/Main.exe})))
+ (action
+  (setenv JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S "180"
+   (run %{exe:lsp_workspace_diagnostics_background_test.exe} %{exe:../bin/Main.exe}))))
+
+(executable
+ (name lsp_workspace_diagnostics_latest_wins_test)
+ (libraries jovial_lsp_lib yojson unix))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:lsp_workspace_diagnostics_latest_wins_test.exe})))
+
+(executable
+ (name lsp_nav_soft_budget_guard_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest)
+ (action
+  (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_LINES "12000"
+   (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_TIMEOUT_S "10"
+    (setenv JOVIAL_TEST_NAV_SOFT_BUDGET_HARD_TIMEOUT_S "90"
+     (run %{exe:lsp_nav_soft_budget_guard_test.exe} %{exe:../bin/Main.exe}))))))

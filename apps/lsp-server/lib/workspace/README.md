@@ -32,3 +32,12 @@ to keep nav requests responsive while semantic rebuild is deferred to periodic f
 - `JOVIAL_DIDCHANGE_DEFER_MAX_CHANGES` (default `8`)
 - `JOVIAL_DIDCHANGE_DEFER_MAX_INSERTED_CHARS` (default `1800`)
 - `JOVIAL_DIDCHANGE_DEFER_FORCE_FULL_EVERY` (default `24`)
+
+## Background Processing and Workspace Diagnostics
+
+- `JOVIAL_WORKSPACE_DIAGS_MODE` (default `errors`, supported: `off|errors|all`)
+- `JOVIAL_BG_TICK_BUDGET_MS` (default `8`)
+- `JOVIAL_BG_DIAG_BATCH_SIZE` (default `64`)
+- `JOVIAL_BG_IDLE_SLEEP_MS` (default `20`)
+- `JOVIAL_BG_SEED_PATHS_PER_TICK` (default `128`)
+- `JOVIAL_NAV_SOFT_BUDGET_MS` (default `1800`)

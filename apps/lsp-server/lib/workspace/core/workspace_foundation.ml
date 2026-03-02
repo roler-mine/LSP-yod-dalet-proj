@@ -27,7 +27,8 @@ type t = {
   mutable bg_seed_paths : string array;
   mutable bg_seed_cursor : int;
   bg_closed_diags : (string, T.Diagnostic.t list) Hashtbl.t;
-  bg_pending_diag_updates : (T.DocumentUri.t * T.Diagnostic.t list) Queue.t;
+  bg_pending_diag_updates : string Queue.t;
+  bg_pending_diag_payloads : (string, (T.DocumentUri.t * T.Diagnostic.t list)) Hashtbl.t;
   bg_pending_diag_set : (string, bool) Hashtbl.t;
 }
 
@@ -82,6 +83,7 @@ let create () : t =
     bg_seed_cursor = 0;
     bg_closed_diags = Hashtbl.create 1024;
     bg_pending_diag_updates = Queue.create ();
+    bg_pending_diag_payloads = Hashtbl.create 1024;
     bg_pending_diag_set = Hashtbl.create 1024;
   }
 
@@ -185,6 +187,27 @@ let invalidate_nav_response_cache_for_keys
       in
       List.iter (fun k -> Hashtbl.remove ws.nav_response_cache k) stale
 
+let compool_key_of_doc (doc:Document.t) : string option =
+  match doc.Document.compool_def with
+  | None -> None
+  | Some raw ->
+      let key = normalize_name raw in
+      if key = "" then None else Some key
+
+let invalidate_importer_nav_state_for_compool_key
+    (ws:t)
+    ~(compool_key:string)
+  : unit =
+  if not ws.sem_store_enabled then ()
+  else
+    let key = normalize_name compool_key in
+    if key = "" then ()
+    else
+      Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
+      |> List.iter (fun uri ->
+           Semantic_store.remove_uri ws.semantic_store ~uri;
+           clear_nav_response_cache_for_uri ws ~uri)
+
 let normalize_path_key (p:string) : string =
   let p = String.map (fun c -> if c = '\\' then '/' else c) p in
   if Sys.win32 then String.lowercase_ascii p else p
@@ -218,9 +241,12 @@ let enqueue_bg_diag_update
     ~(diags:T.Diagnostic.t list)
   : unit =
   let key = Uri_path.docuri_to_string uri in
+  if Hashtbl.mem ws.bg_pending_diag_payloads key then
+    Perf_stats.tick "bg.diag_pending_overwrite";
+  Hashtbl.replace ws.bg_pending_diag_payloads key (uri, diags);
   if not (Hashtbl.mem ws.bg_pending_diag_set key) then (
     Hashtbl.replace ws.bg_pending_diag_set key true;
-    Queue.add (uri, diags) ws.bg_pending_diag_updates
+    Queue.add key ws.bg_pending_diag_updates
   )
 
 let filter_workspace_diags (ws:t) (diags:T.Diagnostic.t list) : T.Diagnostic.t list =
@@ -336,6 +362,7 @@ let rescan (ws:t) : unit =
   Hashtbl.clear ws.bg_enqueued;
   Hashtbl.clear ws.bg_parsed;
   Hashtbl.clear ws.bg_closed_diags;
+  Hashtbl.clear ws.bg_pending_diag_payloads;
   Hashtbl.clear ws.bg_pending_diag_set;
   while not (Queue.is_empty ws.bg_high_queue) do ignore (Queue.pop ws.bg_high_queue) done;
   while not (Queue.is_empty ws.bg_norm_queue) do ignore (Queue.pop ws.bg_norm_queue) done;
@@ -1984,6 +2011,7 @@ let store_doc
     (doc:Document.t)
   : unit =
   let old_doc = Hashtbl.find_opt ws.docs uri in
+  let old_compool_key = Option.bind old_doc compool_key_of_doc in
   let import_diags =
     try
       validate_imports ~pump_lookup:import_lookup_pump ws doc
@@ -2004,6 +2032,7 @@ let store_doc
            [])
   in
   let doc = Document.with_import_diags (import_diags @ semantic_diags) doc in
+  let new_compool_key = compool_key_of_doc doc in
   let has_compool (d:Document.t) =
     match d.Document.compool_def with
     | None -> false
@@ -2012,8 +2041,15 @@ let store_doc
   if has_compool doc || Option.fold ~none:false ~some:has_compool old_doc then
     ws.symbol_hints <- None;
   Hashtbl.replace ws.docs uri doc;
-  if ws.sem_store_enabled then
+  if ws.sem_store_enabled then (
+    Option.iter
+      (fun key -> invalidate_importer_nav_state_for_compool_key ws ~compool_key:key)
+      old_compool_key;
+    Option.iter
+      (fun key -> invalidate_importer_nav_state_for_compool_key ws ~compool_key:key)
+      new_compool_key;
     Semantic_store.remove_uri ws.semantic_store ~uri;
+  );
   match doc.Document.file with
   | None -> ()
   | Some f ->
@@ -2116,7 +2152,11 @@ let background_parse_path (ws:t) (path:string) : unit =
     match find_open_doc_for_path ws ~path with
     | Some open_doc ->
         Hashtbl.replace ws.files path_key open_doc;
-        Hashtbl.replace ws.bg_parsed path_key true
+        Hashtbl.replace ws.bg_parsed path_key true;
+        (match compool_key_of_doc open_doc with
+         | None -> ()
+         | Some key ->
+             invalidate_importer_nav_state_for_compool_key ws ~compool_key:key)
     | None ->
         (match read_file_text path with
          | None -> ()
@@ -2138,6 +2178,10 @@ let background_parse_path (ws:t) (path:string) : unit =
              let doc = background_doc_with_diags ws doc0 in
              Hashtbl.replace ws.files path_key doc;
              Hashtbl.replace ws.bg_parsed path_key true;
+             (match compool_key_of_doc doc with
+              | None -> ()
+              | Some key ->
+                  invalidate_importer_nav_state_for_compool_key ws ~compool_key:key);
              queue_workspace_diag_update_for_doc ws doc)
 
 let background_tick (ws:t) ~(budget_ms:int) : unit =
@@ -2173,9 +2217,14 @@ let drain_pending_diag_updates
       if n <= 0 || Queue.is_empty ws.bg_pending_diag_updates then
         List.rev acc
       else
-        let (uri, diags) = Queue.pop ws.bg_pending_diag_updates in
-        Hashtbl.remove ws.bg_pending_diag_set (Uri_path.docuri_to_string uri);
-        loop (n - 1) ((uri, diags) :: acc)
+        let key = Queue.pop ws.bg_pending_diag_updates in
+        Hashtbl.remove ws.bg_pending_diag_set key;
+        (match Hashtbl.find_opt ws.bg_pending_diag_payloads key with
+         | None ->
+             loop n acc
+         | Some (uri, diags) ->
+             Hashtbl.remove ws.bg_pending_diag_payloads key;
+             loop (n - 1) ((uri, diags) :: acc))
     in
     loop max_items []
 
@@ -3891,4 +3940,3 @@ let proc_impl_defs_by_key (ws:t) (doc:Document.t) ~(key:string) : def list =
 
 let perf_stats_json (_ws:t) : Yojson.Safe.t =
   Perf_stats.snapshot_json ()
-
