@@ -88,7 +88,7 @@ and stmt =
   | SBlock of stmt node list
   | SDecl of decl node
   | SAssign of { lhs : expr node; rhs : expr node }
-  | SCallStmt of { callee : ident; args : expr node list }
+  | SCallStmt of { callee : ident; args : expr node list; abort_label : ident option }
   | SIf of { cond : expr node; then_ : stmt node; else_ : stmt node option }
   | SWhile of { cond : expr node; body : stmt node }
   | SFor of { init : stmt node option; cond : expr node option; step : stmt node option; body : stmt node }

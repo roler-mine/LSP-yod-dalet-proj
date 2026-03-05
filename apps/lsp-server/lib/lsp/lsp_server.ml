@@ -63,14 +63,15 @@ let publish_diagnostics_if_changed
     (oc:out_channel)
     ~(uri:T.DocumentUri.t)
     ~(diags:T.Diagnostic.t list)
-  : unit =
+  : bool =
   let uri_s = Uri_path.docuri_to_string uri in
   let digest = diagnostics_digest diags in
   match Hashtbl.find_opt published_diags uri_s with
-  | Some prev when prev = digest -> ()
+  | Some prev when prev = digest -> false
   | _ ->
       Hashtbl.replace published_diags uri_s digest;
-      publish_diagnostics oc ~uri ~diags
+      publish_diagnostics oc ~uri ~diags;
+      true
 
 let revalidate_and_publish_all_open_docs
     (ws:Workspace.t)
@@ -79,17 +80,36 @@ let revalidate_and_publish_all_open_docs
   : unit =
   Workspace.revalidate_all ws
   |> List.iter (fun uri ->
-       publish_diagnostics_if_changed published_diags oc ~uri
-         ~diags:(Workspace.diagnostics_for ws ~uri))
+       let diags = Workspace.diagnostics_for ws ~uri in
+       let published = publish_diagnostics_if_changed published_diags oc ~uri ~diags in
+       if published then (
+         Perf_stats.tick "diag.open.publish";
+         if Workspace.open_doc_converged ws ~uri then
+           Perf_stats.tick "diag.open.authoritative_publish"
+         else
+           Perf_stats.tick "diag.open.provisional_publish"
+       );
+       if published && diags = [] then Perf_stats.tick "diag.open.publish_empty")
 
 let publish_doc_diagnostics
     (ws:Workspace.t)
     (oc:out_channel)
     (published_diags:(string, string) Hashtbl.t)
+    ~(provisional:bool)
     ~(uri:T.DocumentUri.t)
   : unit =
-  publish_diagnostics_if_changed published_diags oc ~uri
-    ~diags:(Workspace.diagnostics_for ws ~uri)
+  let diags = Workspace.diagnostics_for ws ~uri in
+  let published =
+    publish_diagnostics_if_changed published_diags oc ~uri ~diags
+  in
+  if published then (
+    Perf_stats.tick "diag.open.publish";
+    if provisional || not (Workspace.open_doc_converged ws ~uri) then
+      Perf_stats.tick "diag.open.provisional_publish"
+    else
+      Perf_stats.tick "diag.open.authoritative_publish"
+  );
+  if published && diags = [] then Perf_stats.tick "diag.open.publish_empty"
 
 let semantic_token_types_legend : Yojson.Safe.t =
   `List [
@@ -203,7 +223,10 @@ let publish_partial_diagnostics_on_failure
     with _ -> []
   in
   let diag = diag_internal_server_failure ~uri ~phase exn in
-  publish_diagnostics_if_changed published_diags oc ~uri ~diags:(base @ [diag])
+  let published =
+    publish_diagnostics_if_changed published_diags oc ~uri ~diags:(base @ [diag])
+  in
+  if published then Perf_stats.tick "diag.open.publish"
 
 let parse_uri_arg (arg:Yojson.Safe.t) : T.DocumentUri.t option =
   match arg with
@@ -373,7 +396,7 @@ let parse_semantic_tokens_refresh_support (params:Yojson.Safe.t) : bool =
 
 let parse_watched_file_changes
     (params:Yojson.Safe.t)
-    : (string * [ `Created | `Changed | `Deleted ]) list =
+    : bool * int * (string * [ `Created | `Changed | `Deleted ]) list =
   let parse_kind = function
     | `Int 1 | `Intlit "1" -> Some `Created
     | `Int 2 | `Intlit "2" -> Some `Changed
@@ -381,24 +404,27 @@ let parse_watched_file_changes
     | _ -> None
   in
   match get_assoc params with
-  | None -> []
+  | None -> (false, 0, [])
   | Some xs ->
       (match find_field "changes" xs with
        | Some (`List changes) ->
-           changes
-           |> List.filter_map (function
-                | `Assoc cxs ->
-                    (match find_field "uri" cxs, find_field "type" cxs with
-                     | Some (`String u), Some kind_json ->
-                         (match Uri_path.docuri_of_string u, parse_kind kind_json with
-                          | Some uri, Some kind ->
-                              (match file_of_uri uri with
-                               | Some path -> Some (path, kind)
-                               | None -> None)
-                          | _ -> None)
-                     | _ -> None)
-                | _ -> None)
-       | _ -> [])
+           let parsed =
+             changes
+             |> List.filter_map (function
+                  | `Assoc cxs ->
+                      (match find_field "uri" cxs, find_field "type" cxs with
+                       | Some (`String u), Some kind_json ->
+                           (match Uri_path.docuri_of_string u, parse_kind kind_json with
+                            | Some uri, Some kind ->
+                                (match file_of_uri uri with
+                                 | Some path -> Some (path, kind)
+                                 | None -> None)
+                            | _ -> None)
+                       | _ -> None)
+                  | _ -> None)
+           in
+           (true, List.length changes, parsed)
+       | _ -> (false, 0, []))
 
 let env_nonneg_int (name:string) ~(default:int) : int =
   match Sys.getenv_opt name with
@@ -418,6 +444,51 @@ let bg_diag_batch_size =
   max 1 (env_nonneg_int "JOVIAL_BG_DIAG_BATCH_SIZE" ~default:64)
 let idle_sleep_ms =
   max 1 (env_nonneg_int "JOVIAL_BG_IDLE_SLEEP_MS" ~default:20)
+let startup_fair_tick_ms =
+  max 0 (env_nonneg_int "JOVIAL_STARTUP_FAIR_TICK_MS" ~default:2)
+let diag_min_fair_tick_ms =
+  max 0 (env_nonneg_int "JOVIAL_DIAG_MIN_FAIR_TICK_MS" ~default:1)
+let bg_large_parse_idle_quiet_ms =
+  max 0 (env_nonneg_int "JOVIAL_BG_LARGE_PARSE_IDLE_QUIET_MS" ~default:150)
+let open_diag_revalidate_batch_size =
+  max 1 (env_nonneg_int "JOVIAL_OPEN_DIAG_REVALIDATE_BATCH_SIZE" ~default:8)
+let watch_coalesce_ttl_ms =
+  max 0 (env_nonneg_int "JOVIAL_WATCH_COALESCE_TTL_MS" ~default:250)
+let inbox_max_items =
+  max 16 (env_nonneg_int "JOVIAL_INBOX_MAX_ITEMS" ~default:2048)
+let inbox_max_depth_watermark = ref 0
+let watch_recent_ms : (string, float) Hashtbl.t = Hashtbl.create 4096
+
+let watcher_change_kind_tag = function
+  | `Created -> "C"
+  | `Changed -> "M"
+  | `Deleted -> "D"
+
+let filter_noisy_watcher_changes
+    (changes:(string * [ `Created | `Changed | `Deleted ]) list)
+  : (string * [ `Created | `Changed | `Deleted ]) list * int =
+  if watch_coalesce_ttl_ms <= 0 then (changes, 0)
+  else
+    let now = Perf_stats.now_ms () in
+    let dropped = ref 0 in
+    let kept_rev =
+      List.fold_left
+        (fun acc ((path, kind) as change) ->
+          let key =
+            String.lowercase_ascii path ^ "|" ^ watcher_change_kind_tag kind
+          in
+          match Hashtbl.find_opt watch_recent_ms key with
+          | Some last_ms
+            when now -. last_ms < float_of_int watch_coalesce_ttl_ms ->
+              incr dropped;
+              acc
+          | _ ->
+              Hashtbl.replace watch_recent_ms key now;
+              change :: acc)
+        []
+        changes
+    in
+    (List.rev kept_rev, !dropped)
 
 let publish_background_diag_updates
     (ws:Workspace.t)
@@ -428,8 +499,24 @@ let publish_background_diag_updates
   let updates = Workspace.drain_pending_diag_updates ws ~max_items in
   if updates <> [] then Perf_stats.tick "bg.diag_publish_batch";
   List.iter (fun (uri, diags) ->
-    publish_diagnostics_if_changed published_diags oc ~uri ~diags
+    ignore (publish_diagnostics_if_changed published_diags oc ~uri ~diags)
   ) updates
+
+let publish_open_diag_revalidate_updates
+    (ws:Workspace.t)
+    (oc:out_channel)
+    (published_diags:(string, string) Hashtbl.t)
+    ~(max_items:int)
+  : unit =
+  if max_items <= 0 then ()
+  else
+    let uris =
+      Perf_stats.time "diag.open.revalidate_batch_ms" (fun () ->
+        Workspace.drain_open_diag_revalidate_uris ws ~max_items)
+    in
+    List.iter
+      (fun uri -> publish_doc_diagnostics ws oc published_diags ~provisional:false ~uri)
+      uris
 
 let send_request (oc:out_channel) ~(id:Yojson.Safe.t) ~(method_:string) ~(params:Yojson.Safe.t) : unit =
   Lsp_io.write_message oc
@@ -669,6 +756,18 @@ let handle_execute_command
          | Some uri ->
               let ws = ws_for_uri roots_state uri in
               let j = Workspace.debug_report_for ws ~uri ~max_tokens in
+              let j =
+                match j with
+                | `Assoc fields ->
+                    `Assoc
+                      (("server",
+                        `Assoc [
+                          "inboxMaxItems", `Int inbox_max_items;
+                          "inboxMaxDepthSeen", `Int !inbox_max_depth_watermark;
+                        ])
+                      :: fields)
+                | _ -> j
+              in
               respond oc ~id ~result:j)
 
     | "jovial.debugPerfStats" ->
@@ -702,25 +801,38 @@ let handle_notification
          let uri = td.uri in
          let file = file_of_uri uri in
          let ws = ws_for_uri roots_state uri in
+         Perf_stats.tick "diag.open.request";
          (try
             Workspace.open_doc ws ~uri ~file ~text:td.text;
-            publish_doc_diagnostics ws oc published_diags ~uri;
+            publish_doc_diagnostics ws oc published_diags ~provisional:true ~uri;
             ws_refresh_counter_set pending_change_refreshes ws 0;
             request_semantic_tokens_refresh oc
               ~refresh_supported:!semantic_refresh_supported
               next_server_request_id
           with exn ->
+            Perf_stats.tick "diag.open.handler_exception";
+            prerr_endline
+              (Printf.sprintf
+                 "notification didOpen failed for %s: %s"
+                 (Uri_path.docuri_to_string uri)
+                 (Printexc.to_string exn));
             publish_partial_diagnostics_on_failure ws oc published_diags
               ~uri ~phase:"didOpen" ~exn)
-       with _ -> ())
+       with exn ->
+         Perf_stats.tick "diag.open.decode_error";
+         prerr_endline
+           (Printf.sprintf
+              "notification didOpen decode failed: %s"
+              (Printexc.to_string exn)))
   | "textDocument/didChange" ->
       (try
          let p = T.DidChangeTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
          let ws = ws_for_uri roots_state uri in
+         Perf_stats.tick "diag.open.request";
          (try
             Workspace.change_doc ws ~uri ~changes:p.contentChanges;
-            publish_doc_diagnostics ws oc published_diags ~uri;
+            publish_doc_diagnostics ws oc published_diags ~provisional:true ~uri;
             let next = ws_refresh_counter_get pending_change_refreshes ws + 1 in
             ws_refresh_counter_set pending_change_refreshes ws next;
             if next >= sem_refresh_every_didchange then (
@@ -730,16 +842,27 @@ let handle_notification
                 next_server_request_id
             )
           with exn ->
+            Perf_stats.tick "diag.open.handler_exception";
+            prerr_endline
+              (Printf.sprintf
+                 "notification didChange failed for %s: %s"
+                 (Uri_path.docuri_to_string uri)
+                 (Printexc.to_string exn));
             publish_partial_diagnostics_on_failure ws oc published_diags
               ~uri ~phase:"didChange" ~exn)
-       with _ -> ())
+       with exn ->
+         Perf_stats.tick "diag.open.decode_error";
+         prerr_endline
+           (Printf.sprintf
+              "notification didChange decode failed: %s"
+              (Printexc.to_string exn)))
   | "textDocument/didClose" ->
       (try
          let p = T.DidCloseTextDocumentParams.t_of_yojson params in
          let uri = p.textDocument.uri in
          let ws = ws_for_uri roots_state uri in
          Workspace.close_doc ws ~uri;
-         publish_diagnostics_if_changed published_diags oc ~uri ~diags:[];
+         ignore (publish_diagnostics_if_changed published_diags oc ~uri ~diags:[]);
          revalidate_and_publish_all_open_docs ws oc published_diags;
          ws_refresh_counter_set pending_change_refreshes ws 0;
          request_semantic_tokens_refresh oc
@@ -747,10 +870,23 @@ let handle_notification
            next_server_request_id
        with _ -> ())
   | "workspace/didChangeWatchedFiles" ->
-      let changes = parse_watched_file_changes params in
-      if changes = [] then
-        all_workspaces roots_state |> List.iter Workspace.rescan
-      else
+      let has_changes_field, raw_changes, changes =
+        parse_watched_file_changes params
+      in
+      let changes, coalesced_ignored =
+        filter_noisy_watcher_changes changes
+      in
+      if coalesced_ignored > 0 then (
+        Perf_stats.tick "watch.filtered_changes_ignored"
+      );
+      let changed_any =
+        if not has_changes_field then (
+          all_workspaces roots_state |> List.iter Workspace.rescan;
+          true
+        ) else if changes = [] then (
+          if raw_changes > 0 then Perf_stats.tick "watch.filtered_changes_ignored";
+          false
+        ) else (
         let grouped : (Workspace.t, (string * [ `Created | `Changed | `Deleted ]) list) Hashtbl.t =
           Hashtbl.create 16
         in
@@ -771,9 +907,12 @@ let handle_notification
           revalidate_and_publish_all_open_docs ws oc published_diags;
           ws_refresh_counter_set pending_change_refreshes ws 0
         ) grouped;
-      request_semantic_tokens_refresh oc
-        ~refresh_supported:!semantic_refresh_supported
-        next_server_request_id
+        true
+      ) in
+      if changed_any then
+        request_semantic_tokens_refresh oc
+          ~refresh_supported:!semantic_refresh_supported
+          next_server_request_id
   | "exit" -> exit 0
   | _ -> ()
 
@@ -966,20 +1105,41 @@ type inbox_item =
 type inbox = {
   q : inbox_item Queue.t;
   mtx : Mutex.t;
+  not_full : Condition.t;
+  max_items : int;
+  mutable max_depth_seen : int;
 }
 
-let inbox_create () : inbox =
-  { q = Queue.create (); mtx = Mutex.create () }
+let inbox_create ~(max_items:int) () : inbox =
+  { q = Queue.create (); mtx = Mutex.create (); not_full = Condition.create (); max_items; max_depth_seen = 0 }
 
 let inbox_push (box:inbox) (item:inbox_item) : unit =
   Mutex.lock box.mtx;
+  let rec wait_not_full () =
+    if Queue.length box.q >= box.max_items then (
+      ignore (Perf_stats.time "inbox.block_wait_ms" (fun () ->
+        Condition.wait box.not_full box.mtx
+      ));
+      wait_not_full ()
+    )
+  in
+  wait_not_full ();
   Queue.add item box.q;
+  let depth = Queue.length box.q in
+  if depth > box.max_depth_seen then (
+    box.max_depth_seen <- depth;
+    if depth > !inbox_max_depth_watermark then
+      inbox_max_depth_watermark := depth;
+    Perf_stats.tick "inbox.max_depth_seen"
+  );
   Mutex.unlock box.mtx
 
 let inbox_drain (box:inbox) : inbox_item list =
   Mutex.lock box.mtx;
+  let had_items = not (Queue.is_empty box.q) in
   let rec loop acc =
     if Queue.is_empty box.q then (
+      if had_items then Condition.broadcast box.not_full;
       Mutex.unlock box.mtx;
       List.rev acc
     ) else
@@ -1032,8 +1192,9 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let published_diags : (string, string) Hashtbl.t = Hashtbl.create 128 in
   let cancelled_request_ids : (string, bool) Hashtbl.t = Hashtbl.create 64 in
   let in_flight_request_ids : (string, bool) Hashtbl.t = Hashtbl.create 64 in
-  let box = inbox_create () in
+  let box = inbox_create ~max_items:inbox_max_items () in
   let reader_done = ref false in
+  let last_message_ms = ref (Perf_stats.now_ms ()) in
   let max_inbound_msg_bytes = 16 * 1024 * 1024 in
   let wake_r, wake_w = Unix.pipe () in
   let wake_nonblock =
@@ -1063,7 +1224,10 @@ let run (ic : in_channel) (oc : out_channel) : unit =
       | `Oversize len ->
           Perf_stats.tick "io.oversize_drop";
           prerr_endline
-            (Printf.sprintf "dropped oversized inbound LSP frame (%d bytes)" len);
+            (Printf.sprintf
+               "dropped oversized inbound LSP frame (%d bytes, cap=%d bytes)"
+               len
+               max_inbound_msg_bytes);
           write_wake_signal wake_w;
           read_loop ()
       | `Invalid msg ->
@@ -1133,24 +1297,144 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                      m
                      (Printexc.to_string exn))))
     with exn ->
-      prerr_endline
-        (Printf.sprintf "server loop recovered from internal failure: %s"
-           (Printexc.to_string exn))
+      (match exn with
+       | Sys_error _
+       | Unix.Unix_error (Unix.EPIPE, _, _)
+       | Unix.Unix_error (Unix.EBADF, _, _)
+       | Unix.Unix_error (Unix.ECONNRESET, _, _) ->
+           Perf_stats.tick "loop.flush_exception";
+           prerr_endline
+             (Printf.sprintf "server outbound channel failure; terminating session: %s"
+                (Printexc.to_string exn));
+           reader_done := true
+       | _ ->
+           prerr_endline
+             (Printf.sprintf "server loop recovered from internal failure: %s"
+                (Printexc.to_string exn)))
   in
 
   let run_background_tick () : unit =
     let wss = all_workspaces_now () in
     let n = max 1 (List.length wss) in
-    let per_ws_budget = max 1 (bg_tick_budget_ms / n) in
+    let base_budget = max 1 (bg_tick_budget_ms / n) in
     List.iter (fun ws ->
-      Workspace.background_tick ws ~budget_ms:per_ws_budget
+      try
+        let startup_budget =
+          Workspace.startup_background_budget_ms ws ~base_budget_ms:base_budget
+        in
+        let per_ws_budget =
+          Workspace.effective_bg_tick_budget_ms ws ~base_budget_ms:startup_budget
+        in
+        Workspace.background_tick ws
+          ~budget_ms:per_ws_budget
+          ~mode:Workspace.BgTickIdle
+          ~idle_quiet_ms:bg_large_parse_idle_quiet_ms
+          ~last_message_ms:!last_message_ms
+      with exn ->
+        Perf_stats.tick "loop.bg_exception";
+        prerr_endline
+           (Printf.sprintf "background tick failed: %s" (Printexc.to_string exn))
     ) wss
+  in
+
+  let run_startup_fair_tick_if_needed () : unit =
+    let pending =
+      all_workspaces_now ()
+      |> List.filter (fun ws -> not (Workspace.startup_is_ready_now ws))
+    in
+    if pending = [] then ()
+    else
+      let diag_pending =
+        List.exists (fun ws -> not (Workspace.startup_diag_hover_ready_now ws)) pending
+      in
+      let total_budget =
+        if diag_pending then max startup_fair_tick_ms diag_min_fair_tick_ms
+        else startup_fair_tick_ms
+      in
+      if total_budget <= 0 then ()
+      else
+        let n = max 1 (List.length pending) in
+        let base_budget = max 1 (total_budget / n) in
+        List.iter
+          (fun ws ->
+            try
+              let startup_budget =
+                Workspace.startup_background_budget_ms ws ~base_budget_ms:base_budget
+              in
+              let per_ws_budget =
+                Workspace.effective_bg_tick_budget_ms ws ~base_budget_ms:startup_budget
+              in
+              Workspace.background_tick ws
+                ~budget_ms:per_ws_budget
+                ~mode:Workspace.BgTickInteractive
+                ~idle_quiet_ms:bg_large_parse_idle_quiet_ms
+                ~last_message_ms:!last_message_ms
+            with exn ->
+              Perf_stats.tick "loop.bg_exception";
+              prerr_endline
+                (Printf.sprintf "startup fair tick failed: %s" (Printexc.to_string exn)))
+          pending
   in
 
   let publish_background_for_all () : unit =
     all_workspaces_now ()
     |> List.iter (fun ws ->
-         publish_background_diag_updates ws oc published_diags ~max_items:bg_diag_batch_size)
+         try
+           publish_open_diag_revalidate_updates ws oc published_diags
+             ~max_items:open_diag_revalidate_batch_size;
+           publish_background_diag_updates ws oc published_diags ~max_items:bg_diag_batch_size;
+         with exn ->
+            Perf_stats.tick "loop.publish_exception";
+            prerr_endline
+              (Printf.sprintf "background publish failed: %s" (Printexc.to_string exn)))
+  in
+
+  let notify_workspace_ready_events () : unit =
+    all_workspaces_now ()
+    |> List.iter (fun ws ->
+         match Workspace.workspace_ready_event_json ws with
+         | None -> ()
+         | Some payload ->
+             (try
+                notify oc ~method_:"jovial/workspaceReady" ~params:payload
+              with exn ->
+                Perf_stats.tick "loop.publish_exception";
+                prerr_endline
+                  (Printf.sprintf
+                     "workspaceReady notification failed: %s"
+                     (Printexc.to_string exn))))
+  in
+
+  let notify_startup_phase_events () : unit =
+    all_workspaces_now ()
+    |> List.iter (fun ws ->
+         match Workspace.startup_phase_event_json ws with
+         | None -> ()
+         | Some payload ->
+             (try
+                notify oc ~method_:"jovial/workspaceStartupPhase" ~params:payload
+              with exn ->
+                Perf_stats.tick "loop.publish_exception";
+                prerr_endline
+                  (Printf.sprintf
+                     "workspaceStartupPhase notification failed: %s"
+                     (Printexc.to_string exn))))
+  in
+
+  let notify_startup_miss_events () : unit =
+    all_workspaces_now ()
+    |> List.iter (fun ws ->
+         match Workspace.startup_miss_event_json ws with
+         | None -> ()
+         | Some payload ->
+             (try
+                notify oc ~method_:"jovial/workspaceStartupMiss" ~params:payload
+              with exn ->
+                Perf_stats.tick "loop.publish_exception";
+                prerr_endline
+                  (Printf.sprintf
+                     "workspaceStartupMiss notification failed: %s"
+                     (Printexc.to_string exn))))
   in
 
   let rec loop () =
@@ -1167,6 +1451,8 @@ let run (ic : in_channel) (oc : out_channel) : unit =
             drain_wake_pipe ~nonblock:wake_nonblock wake_r;
           inbox_drain box)
       in
+      if items <> [] then
+        last_message_ms := Perf_stats.now_ms ();
       if items = [] then (
         if readable = [] then (
           Perf_stats.tick "idle.bg_tick";
@@ -1204,9 +1490,57 @@ let run (ic : in_channel) (oc : out_channel) : unit =
               reader_done := true
         ) (List.rev !pending)
       );
-      publish_background_for_all ();
-      flush oc;
-      loop ()
+      if items <> [] then (
+        try
+          flush oc
+        with exn ->
+          (match exn with
+           | Sys_error _
+           | Unix.Unix_error (Unix.EPIPE, _, _)
+           | Unix.Unix_error (Unix.EBADF, _, _)
+           | Unix.Unix_error (Unix.ECONNRESET, _, _) ->
+               Perf_stats.tick "loop.flush_exception";
+               prerr_endline
+                 (Printf.sprintf
+                    "flush failed after request handling, terminating session: %s"
+                    (Printexc.to_string exn));
+               reader_done := true
+           | _ ->
+               Perf_stats.tick "loop.flush_exception";
+               prerr_endline
+                 (Printf.sprintf
+                    "flush failed after request handling: %s"
+                    (Printexc.to_string exn));
+               reader_done := true)
+      );
+      if not !reader_done then (
+        run_startup_fair_tick_if_needed ();
+        publish_background_for_all ();
+        notify_startup_phase_events ();
+        notify_startup_miss_events ();
+        notify_workspace_ready_events ();
+        let can_continue =
+          try
+            flush oc;
+            true
+          with exn ->
+            (match exn with
+             | Sys_error _
+             | Unix.Unix_error (Unix.EPIPE, _, _)
+             | Unix.Unix_error (Unix.EBADF, _, _)
+             | Unix.Unix_error (Unix.ECONNRESET, _, _) ->
+                 Perf_stats.tick "loop.flush_exception";
+                 prerr_endline
+                   (Printf.sprintf "flush failed, terminating session: %s" (Printexc.to_string exn));
+                 false
+             | _ ->
+                 Perf_stats.tick "loop.flush_exception";
+                 prerr_endline
+                   (Printf.sprintf "flush failed with unexpected error: %s" (Printexc.to_string exn));
+                 false)
+        in
+        if can_continue then loop ()
+      )
     )
   in
   loop ();

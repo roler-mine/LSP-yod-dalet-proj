@@ -2,6 +2,10 @@ module T = Lsp.Types
 
 type t
 
+type bg_tick_mode =
+  | BgTickInteractive
+  | BgTickIdle
+
 val create : unit -> t
 
 val set_root_uri : t -> T.DocumentUri.t option -> unit
@@ -10,12 +14,28 @@ val rescan : t -> unit
 val revalidate_all : t -> T.DocumentUri.t list
 val compool_count : t -> int
 
-val open_doc : t -> uri:T.DocumentUri.t -> file:string option -> text:string -> unit
+val open_doc : ?force_provisional:bool -> t -> uri:T.DocumentUri.t -> file:string option -> text:string -> unit
 val change_doc : t -> uri:T.DocumentUri.t -> changes:T.TextDocumentContentChangeEvent.t list -> unit
 val close_doc : t -> uri:T.DocumentUri.t -> unit
 val apply_watched_file_changes : t -> changes:(string * [ `Created | `Changed | `Deleted ]) list -> unit
-val background_tick : t -> budget_ms:int -> unit
+val background_tick :
+  t ->
+  budget_ms:int ->
+  mode:bg_tick_mode ->
+  idle_quiet_ms:int ->
+  last_message_ms:float ->
+  unit
+val effective_bg_tick_budget_ms : t -> base_budget_ms:int -> int
 val drain_pending_diag_updates : t -> max_items:int -> (T.DocumentUri.t * T.Diagnostic.t list) list
+val drain_open_diag_revalidate_uris : t -> max_items:int -> T.DocumentUri.t list
+val startup_background_budget_ms : t -> base_budget_ms:int -> int
+val startup_diag_hover_ready_now : t -> bool
+val startup_is_ready_now : t -> bool
+val startup_readiness_json_for_report : t -> Yojson.Safe.t
+val workspace_ready_event_json : t -> Yojson.Safe.t option
+val startup_phase_event_json : t -> Yojson.Safe.t option
+val startup_miss_event_json : t -> Yojson.Safe.t option
+val open_doc_converged : t -> uri:T.DocumentUri.t -> bool
 val request_cancelled : t -> bool
 val with_request_cancel_checker : t -> (unit -> bool) -> (unit -> 'a) -> 'a
 

@@ -6,6 +6,7 @@ type metric = {
 }
 
 val now_ms : unit -> float
+val observe_ms : string -> float -> unit
 val time : string -> (unit -> 'a) -> 'a
 val tick : string -> unit
 

@@ -6,6 +6,130 @@ type workspace_diag_mode =
   | WorkspaceDiagsErrors
   | WorkspaceDiagsAll
 
+type pressure_mode =
+  | PressureNormal
+  | PressureSoft
+  | PressureCritical
+
+type startup_phase =
+  | StartupCold
+  | StartupWarming
+  | StartupAggressiveCatchUp
+  | StartupReady
+
+type startup_ready_stage =
+  | StartupStageDiagHoverReady
+  | StartupStageFullyNavigable
+
+type bg_tick_mode =
+  | BgTickInteractive
+  | BgTickIdle
+
+type workspace_profile =
+  | ProfileSmall
+  | ProfileMedium
+  | ProfileLarge
+
+type workspace_profile_mode =
+  | ProfileModeAuto
+  | ProfileModeSmall
+  | ProfileModeMedium
+  | ProfileModeLarge
+
+type root_model =
+  | RootModelAuto
+  | RootModelHeuristic
+  | RootModelManual
+
+type bg_queue_kind =
+  | BgQueueHighSmall
+  | BgQueueNormalSmall
+  | BgQueueRootSmall
+  | BgQueueHighLarge
+  | BgQueueRootLarge
+  | BgQueueNormalLarge
+
+type parse_job_kind =
+  | ParseJobHighLarge
+  | ParseJobRootLarge
+  | ParseJobNormalLarge
+
+type file_class =
+  | FileClassOpen
+  | FileClassEntry
+  | FileClassNormal
+
+type file_size_class =
+  | FileSizeSmall
+  | FileSizeLarge
+
+type parse_quality =
+  | ParseQualityNone
+  | ParseQualitySkeleton
+  | ParseQualityFull
+
+type schedule_lane =
+  | LaneOpen
+  | LaneRoot
+  | LaneSweep
+
+type graph_node = {
+  gn_path : string;
+  gn_path_key : string;
+  mutable gn_import_compools : string list;
+  mutable gn_import_paths : string list;
+  mutable gn_rev_importers : string list;
+  mutable gn_file_class : file_class;
+  mutable gn_size_class : file_size_class;
+  mutable gn_parse_quality : parse_quality;
+  mutable gn_epoch : int;
+}
+
+type parse_job_payload =
+  | ParseJobOpen of {
+      path_key : string;
+      uri : T.DocumentUri.t;
+      file : string option;
+      text : string;
+      generation : int;
+    }
+  | ParseJobPath of {
+      path : string;
+      path_key : string;
+    }
+
+type parse_job = {
+  pj_kind : parse_job_kind;
+  pj_epoch : int;
+  pj_payload : parse_job_payload;
+}
+
+type parse_result =
+  | ParseResultOpen of {
+      pr_kind : parse_job_kind;
+      pr_epoch : int;
+      path_key : string;
+      uri : T.DocumentUri.t;
+      generation : int;
+      doc : Document.t;
+    }
+  | ParseResultPath of {
+      pr_kind : parse_job_kind;
+      pr_epoch : int;
+      path : string;
+      path_key : string;
+      doc_opt : Document.t option;
+    }
+
+type quick_nav_entry = {
+  qn_uri : T.DocumentUri.t;
+  qn_name : string;
+  qn_key : string;
+  qn_loc : Ast.Loc.t;
+  qn_kind : int;
+  qn_container : string option;
+}
+
 type t = {
   docs : (T.DocumentUri.t, Document.t) Hashtbl.t;
   files : (string, Document.t) Hashtbl.t;  (* normalized file path -> parsed document *)
@@ -23,16 +147,97 @@ type t = {
   mutable lsif_snapshot_payload : Yojson.Safe.t option;
   mutable lsif_snapshot_symbols : (string, Yojson.Safe.t) Hashtbl.t option;
   workspace_diag_mode : workspace_diag_mode;
-  bg_high_queue : string Queue.t;
-  bg_norm_queue : string Queue.t;
-  bg_enqueued : (string, bool) Hashtbl.t;
+  bg_high_small_queue : string Queue.t;
+  bg_norm_small_queue : string Queue.t;
+  bg_root_small_queue : string Queue.t;
+  bg_high_large_queue : string Queue.t;
+  bg_root_large_queue : string Queue.t;
+  bg_norm_large_queue : string Queue.t;
+  bg_enqueued : (string, bg_queue_kind) Hashtbl.t;
+  bg_enqueue_recent_ms : (string, float) Hashtbl.t;
   bg_parsed : (string, bool) Hashtbl.t;
   mutable bg_seed_paths : string array;
   mutable bg_seed_cursor : int;
+  mutable graph_root_closure_paths : string array;
+  mutable graph_root_closure_cursor : int;
+  graph_nodes : (string, graph_node) Hashtbl.t;
+  graph_root_reason : (string, string) Hashtbl.t;
+  graph_root_closure_set : (string, bool) Hashtbl.t;
+  mutable graph_needs_refresh : bool;
+  mutable graph_epoch : int;
+  mutable graph_scc_count : int;
   bg_closed_diags : (string, T.Diagnostic.t list) Hashtbl.t;
   bg_pending_diag_updates : string Queue.t;
   bg_pending_diag_payloads : (string, (T.DocumentUri.t * T.Diagnostic.t list)) Hashtbl.t;
   bg_pending_diag_set : (string, bool) Hashtbl.t;
+  mutable bg_seed_needs_refresh : bool;
+  mutable closed_doc_lru_clock : int;
+  closed_doc_last_touch : (string, int) Hashtbl.t;
+  closed_doc_lru_max : int;
+  parse_file_max_bytes : int;
+  bg_large_file_bytes : int;
+  bg_large_parse_idle_quiet_ms : int;
+  pressure_soft_mb : int;
+  pressure_critical_mb : int;
+  mutable pressure_mode : pressure_mode;
+  mutable pressure_live_mb : int;
+  mutable pressure_last_check_ms : float;
+  mutable startup_started_ms : float;
+  startup_diag_hover_target_ms : int;
+  startup_nav_target_ms : int;
+  mutable startup_diag_hover_ready_ms : float option;
+  mutable startup_fully_nav_ready_ms : float option;
+  mutable startup_diag_hover_notified : bool;
+  mutable startup_fully_nav_notified : bool;
+  mutable startup_diag_hover_miss_notified : bool;
+  mutable startup_nav_miss_notified : bool;
+  mutable startup_diag_hover_miss_emitted : bool;
+  mutable startup_nav_miss_emitted : bool;
+  mutable startup_ready_ms : float option;
+  mutable startup_ready_notified : bool;
+  mutable startup_miss_notified : bool;
+  mutable startup_miss_emitted : bool;
+  mutable startup_phase : startup_phase;
+  mutable startup_phase_notified : startup_phase option;
+  startup_target_ms : int;
+  startup_aggressive_window_ms : int;
+  startup_aggressive_bg_budget_ms : int;
+  open_diag_revalidate_updates : string Queue.t;
+  open_diag_revalidate_payloads : (string, (T.DocumentUri.t * string)) Hashtbl.t;
+  open_diag_revalidate_set : (string, bool) Hashtbl.t;
+  mutable index_reconcile_escalate_last_ms : float;
+  mutable index_reconcile_escalations : int;
+  open_parse_generation : (string, int) Hashtbl.t;
+  open_provisional_since_ms : (string, float) Hashtbl.t;
+  mutable xmodule_diag_ready_prev : bool;
+  mutable source_bytes_estimate : int option;
+  mutable source_bytes_estimate_count : int;
+  workspace_profile_mode : workspace_profile_mode;
+  root_model : root_model;
+  root_heuristic_fallback : bool;
+  root_manual_files : string list;
+  graph_requeue_cooldown_ms : int;
+  root_closure_max_depth : int;
+  root_closure_target_files : int;
+  skeleton_prefix_bytes : int;
+  sched_open_doc_min_share_pct : int;
+  quick_nav_index : (string, quick_nav_entry list) Hashtbl.t;
+  quick_nav_pending_paths : string Queue.t;
+  quick_nav_pending_set : (string, bool) Hashtbl.t;
+  quick_nav_done_set : (string, bool) Hashtbl.t;
+  nav_quick_scan_offset_by_path : (string, int) Hashtbl.t;
+  mutable quick_nav_index_done : int;
+  mutable quick_nav_index_total : int;
+  parse_worker_jobs : parse_job Queue.t;
+  parse_worker_results : parse_result Queue.t;
+  parse_worker_mtx : Mutex.t;
+  parse_worker_cv : Condition.t;
+  parse_worker_inflight : (string, parse_job_kind) Hashtbl.t;
+  parse_worker_max_inflight : int;
+  mutable parse_worker_started : bool;
+  mutable parse_worker_stop : bool;
+  bg_high_large_budget_ms : int;
+  mutable parse_epoch : int;
   mutable request_cancel_checker : (unit -> bool) option;
 }
 
@@ -66,7 +271,104 @@ let workspace_diag_mode_of_env () : workspace_diag_mode =
        | "errors" | "" -> WorkspaceDiagsErrors
        | _ -> WorkspaceDiagsErrors)
 
+let pressure_soft_mb_default = 512
+let pressure_critical_mb_default = 768
+let startup_target_ms_default = 15000
+let startup_diag_hover_target_ms_default = 15000
+let startup_nav_target_ms_default = 30000
+let startup_aggressive_window_ms_default = 3000
+let startup_aggressive_bg_budget_ms_default = 20
+let profile_small_max_bytes = 10 * 1024 * 1024
+let profile_medium_max_bytes = 40 * 1024 * 1024
+
+let workspace_profile_mode_of_env () : workspace_profile_mode =
+  match Sys.getenv_opt "JOVIAL_WORKSPACE_PROFILE_MODE" with
+  | None -> ProfileModeAuto
+  | Some raw ->
+      (match String.lowercase_ascii (String.trim raw) with
+       | "small" -> ProfileModeSmall
+       | "medium" -> ProfileModeMedium
+       | "large" -> ProfileModeLarge
+       | _ -> ProfileModeAuto)
+
+let root_model_of_env () : root_model =
+  match Sys.getenv_opt "JOVIAL_ROOT_MODEL" with
+  | None -> RootModelAuto
+  | Some raw ->
+      (match String.lowercase_ascii (String.trim raw) with
+       | "heuristic" -> RootModelHeuristic
+       | "manual" -> RootModelManual
+       | _ -> RootModelAuto)
+
+let parse_manual_root_files_env () : string list =
+  match Sys.getenv_opt "JOVIAL_ROOT_MANUAL_FILES" with
+  | None -> []
+  | Some raw ->
+      raw
+      |> String.split_on_char ';'
+      |> List.concat_map (fun s -> String.split_on_char ',' s)
+      |> List.map String.trim
+      |> List.filter (fun s -> s <> "")
+
 let create () : t =
+  let startup_target_ms =
+    max 1000 (env_nonneg_int "JOVIAL_STARTUP_TARGET_MS" ~default:startup_target_ms_default)
+  in
+  let startup_diag_hover_target_ms =
+    max 1000
+      (env_nonneg_int
+         "JOVIAL_STARTUP_DIAG_HOVER_TARGET_MS"
+         ~default:startup_diag_hover_target_ms_default)
+  in
+  let startup_nav_target_ms =
+    max startup_diag_hover_target_ms
+      (env_nonneg_int
+         "JOVIAL_STARTUP_NAV_TARGET_MS"
+         ~default:startup_nav_target_ms_default)
+  in
+  let startup_aggressive_window_ms =
+    max 250
+      (env_nonneg_int
+         "JOVIAL_STARTUP_AGGRESSIVE_WINDOW_MS"
+         ~default:startup_aggressive_window_ms_default)
+  in
+  let startup_aggressive_bg_budget_ms =
+    max 1
+      (env_nonneg_int
+         "JOVIAL_STARTUP_AGGRESSIVE_BG_BUDGET_MS"
+         ~default:startup_aggressive_bg_budget_ms_default)
+  in
+  let parse_worker_max_inflight =
+    max 1
+      (env_nonneg_int
+         "JOVIAL_BG_PARSE_WORKER_MAX_INFLIGHT"
+         ~default:1)
+  in
+  let bg_high_large_budget_ms =
+    max 1 (env_nonneg_int "JOVIAL_BG_HIGH_LARGE_BUDGET_MS" ~default:8)
+  in
+  let root_model = root_model_of_env () in
+  let root_heuristic_fallback =
+    env_flag "JOVIAL_ROOT_HEURISTIC_FALLBACK" ~default:true
+  in
+  let root_manual_files = parse_manual_root_files_env () in
+  let graph_requeue_cooldown_ms =
+    max 0 (env_nonneg_int "JOVIAL_GRAPH_REQUEUE_COOLDOWN_MS" ~default:400)
+  in
+  let root_closure_max_depth =
+    max 1 (env_nonneg_int "JOVIAL_ROOT_CLOSURE_MAX_DEPTH" ~default:4)
+  in
+  let root_closure_target_files =
+    max 8 (env_nonneg_int "JOVIAL_ROOT_CLOSURE_TARGET_FILES" ~default:256)
+  in
+  let skeleton_prefix_bytes =
+    max 1024 (env_nonneg_int "JOVIAL_SKELETON_PREFIX_BYTES" ~default:262144)
+  in
+  let sched_open_doc_min_share_pct =
+    let n = env_nonneg_int "JOVIAL_SCHED_OPEN_DOC_MIN_SHARE_PCT" ~default:50 in
+    min 100 (max 0 n)
+  in
+  let now = Perf_stats.now_ms () in
   {
     docs = Hashtbl.create 32;
     files = Hashtbl.create 64;
@@ -82,26 +384,144 @@ let create () : t =
     lsif_snapshot_payload = None;
     lsif_snapshot_symbols = None;
     workspace_diag_mode = workspace_diag_mode_of_env ();
-    bg_high_queue = Queue.create ();
-    bg_norm_queue = Queue.create ();
+    bg_high_small_queue = Queue.create ();
+    bg_norm_small_queue = Queue.create ();
+    bg_root_small_queue = Queue.create ();
+    bg_high_large_queue = Queue.create ();
+    bg_root_large_queue = Queue.create ();
+    bg_norm_large_queue = Queue.create ();
     bg_enqueued = Hashtbl.create 4096;
+    bg_enqueue_recent_ms = Hashtbl.create 8192;
     bg_parsed = Hashtbl.create 4096;
     bg_seed_paths = [||];
     bg_seed_cursor = 0;
+    graph_root_closure_paths = [||];
+    graph_root_closure_cursor = 0;
+    graph_nodes = Hashtbl.create 4096;
+    graph_root_reason = Hashtbl.create 256;
+    graph_root_closure_set = Hashtbl.create 4096;
+    graph_needs_refresh = true;
+    graph_epoch = 0;
+    graph_scc_count = 0;
     bg_closed_diags = Hashtbl.create 1024;
     bg_pending_diag_updates = Queue.create ();
     bg_pending_diag_payloads = Hashtbl.create 1024;
     bg_pending_diag_set = Hashtbl.create 1024;
+    bg_seed_needs_refresh = true;
+    closed_doc_lru_clock = 0;
+    closed_doc_last_touch = Hashtbl.create 4096;
+    closed_doc_lru_max = max 1 (env_nonneg_int "JOVIAL_CLOSED_DOC_LRU_MAX" ~default:256);
+    parse_file_max_bytes = max 1 (env_nonneg_int "JOVIAL_PARSE_FILE_MAX_BYTES" ~default:16777216);
+    bg_large_file_bytes = max 1 (env_nonneg_int "JOVIAL_BG_LARGE_FILE_BYTES" ~default:800000);
+    bg_large_parse_idle_quiet_ms =
+      max 0 (env_nonneg_int "JOVIAL_BG_LARGE_PARSE_IDLE_QUIET_MS" ~default:150);
+    pressure_soft_mb = max 64 (env_nonneg_int "JOVIAL_PRESSURE_SOFT_MB" ~default:pressure_soft_mb_default);
+    pressure_critical_mb =
+      max 64
+        (env_nonneg_int "JOVIAL_PRESSURE_CRITICAL_MB" ~default:pressure_critical_mb_default);
+    pressure_mode = PressureNormal;
+    pressure_live_mb = 0;
+    pressure_last_check_ms = 0.0;
+    startup_started_ms = now;
+    startup_diag_hover_target_ms;
+    startup_nav_target_ms;
+    startup_diag_hover_ready_ms = None;
+    startup_fully_nav_ready_ms = None;
+    startup_diag_hover_notified = false;
+    startup_fully_nav_notified = false;
+    startup_diag_hover_miss_notified = false;
+    startup_nav_miss_notified = false;
+    startup_diag_hover_miss_emitted = false;
+    startup_nav_miss_emitted = false;
+    startup_ready_ms = None;
+    startup_ready_notified = false;
+    startup_miss_notified = false;
+    startup_miss_emitted = false;
+    startup_phase = StartupCold;
+    startup_phase_notified = None;
+    startup_target_ms;
+    startup_aggressive_window_ms;
+    startup_aggressive_bg_budget_ms;
+    open_diag_revalidate_updates = Queue.create ();
+    open_diag_revalidate_payloads = Hashtbl.create 256;
+    open_diag_revalidate_set = Hashtbl.create 256;
+    index_reconcile_escalate_last_ms = 0.0;
+    index_reconcile_escalations = 0;
+    open_parse_generation = Hashtbl.create 128;
+    open_provisional_since_ms = Hashtbl.create 128;
+    xmodule_diag_ready_prev = false;
+    source_bytes_estimate = None;
+    source_bytes_estimate_count = -1;
+    workspace_profile_mode = workspace_profile_mode_of_env ();
+    root_model;
+    root_heuristic_fallback;
+    root_manual_files;
+    graph_requeue_cooldown_ms;
+    root_closure_max_depth;
+    root_closure_target_files;
+    skeleton_prefix_bytes;
+    sched_open_doc_min_share_pct;
+    quick_nav_index = Hashtbl.create 2048;
+    quick_nav_pending_paths = Queue.create ();
+    quick_nav_pending_set = Hashtbl.create 4096;
+    quick_nav_done_set = Hashtbl.create 4096;
+    nav_quick_scan_offset_by_path = Hashtbl.create 4096;
+    quick_nav_index_done = 0;
+    quick_nav_index_total = 0;
+    parse_worker_jobs = Queue.create ();
+    parse_worker_results = Queue.create ();
+    parse_worker_mtx = Mutex.create ();
+    parse_worker_cv = Condition.create ();
+    parse_worker_inflight = Hashtbl.create 4096;
+    parse_worker_max_inflight;
+    parse_worker_started = false;
+    parse_worker_stop = false;
+    bg_high_large_budget_ms;
+    parse_epoch = 0;
     request_cancel_checker = None;
   }
 
 let invalidate_lsif_snapshot (ws:t) : unit =
-  ws.lsif_snapshot_revision <- ws.lsif_snapshot_revision + 1;
-  ws.lsif_snapshot_payload <- None;
-  ws.lsif_snapshot_symbols <- None
+  ws.lsif_snapshot_revision <- ws.lsif_snapshot_revision + 1
 
 let normalize_name (s:string) : string =
   String.uppercase_ascii (String.trim s)
+
+let lane_of_bg_queue_kind = function
+  | BgQueueHighSmall | BgQueueHighLarge -> LaneOpen
+  | BgQueueRootSmall | BgQueueRootLarge -> LaneRoot
+  | BgQueueNormalSmall | BgQueueNormalLarge -> LaneSweep
+
+let string_of_lane = function
+  | LaneOpen -> "open"
+  | LaneRoot -> "root"
+  | LaneSweep -> "sweep"
+
+let queue_kind_priority = function
+  | BgQueueNormalSmall | BgQueueNormalLarge -> 0
+  | BgQueueRootSmall | BgQueueRootLarge -> 1
+  | BgQueueHighSmall | BgQueueHighLarge -> 2
+
+let size_class_of_path (ws:t) (path:string) : file_size_class =
+  match (try Some (Unix.stat path).Unix.st_size with _ -> None) with
+  | Some n when n >= ws.bg_large_file_bytes -> FileSizeLarge
+  | _ -> FileSizeSmall
+
+let file_class_rank = function
+  | FileClassOpen -> 0
+  | FileClassEntry -> 1
+  | FileClassNormal -> 2
+
+let basename_upper (path:string) : string =
+  Filename.basename path |> String.uppercase_ascii
+
+let is_main_boot_heuristic (path:string) : bool =
+  let b = basename_upper path in
+  String.length b >= 4
+  && (String.sub b 0 4 = "MAIN" || String.sub b 0 4 = "BOOT")
+
+let mark_graph_dirty (ws:t) : unit =
+  ws.graph_needs_refresh <- true
 
 let is_nav_ident_start_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '_' | '$' -> true
@@ -221,6 +641,36 @@ let invalidate_importer_nav_state_for_compool_key
            Semantic_store.remove_uri ws.semantic_store ~uri;
            clear_nav_response_cache_for_uri ws ~uri)
 
+let importer_uris_for_compool_key
+    (ws:t)
+    ~(compool_key:string)
+  : T.DocumentUri.t list =
+  let key = normalize_name compool_key in
+  if key = "" then []
+  else
+    let seen : (string, bool) Hashtbl.t = Hashtbl.create 64 in
+    let out = ref [] in
+    let add_uri (uri:T.DocumentUri.t) =
+      let uri_key = Uri_path.docuri_to_string uri in
+      if not (Hashtbl.mem seen uri_key) then (
+        Hashtbl.replace seen uri_key true;
+        out := uri :: !out
+      )
+    in
+    if ws.sem_store_enabled then
+      Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
+      |> List.iter add_uri;
+    Hashtbl.iter
+      (fun uri doc ->
+        if List.exists
+             (fun (imp:Preprocess.import) ->
+               imp.kind = Preprocess.Compool && normalize_name imp.name = key)
+             (Document.imports doc)
+        then
+          add_uri uri)
+      ws.docs;
+    List.rev !out
+
 let normalize_path_key (p:string) : string =
   let p = String.map (fun c -> if c = '\\' then '/' else c) p in
   if Sys.win32 then String.lowercase_ascii p else p
@@ -228,25 +678,276 @@ let normalize_path_key (p:string) : string =
 let same_path a b =
   normalize_path_key a = normalize_path_key b
 
-let enqueue_bg_path (ws:t) ~(high:bool) (path:string) : unit =
-  let path_key = normalize_path_key path in
-  if path_key <> "" && not (Hashtbl.mem ws.bg_enqueued path_key) then (
-    Hashtbl.replace ws.bg_enqueued path_key true;
-    if high then Queue.add path ws.bg_high_queue
-    else Queue.add path ws.bg_norm_queue
+let file_size_bytes (path:string) : int option =
+  try
+    Some (Unix.(stat path).st_size)
+  with _ ->
+    None
+
+let is_parse_guard_exceeded ~(max_bytes:int) ~(text_len:int) : bool =
+  max_bytes > 0 && text_len > max_bytes
+
+let diag_parse_guard ~(file:string option) ~(max_bytes:int) ~(actual_bytes:int) : T.Diagnostic.t =
+  let z = { Ast.Loc.line = 1; col = 0; offset = 0 } in
+  let loc = Ast.Loc.make ~file ~start_pos:z ~end_pos:z in
+  Lsp_conv.diagnostic
+    ~severity:T.DiagnosticSeverity.Error
+    ~source:"parse"
+    ~message:(Printf.sprintf
+      "File parse skipped (%d bytes exceeds guard %d bytes)."
+      actual_bytes
+      max_bytes)
+    loc
+
+let make_doc_with_parse_guard
+    (ws:t)
+    ~(uri:T.DocumentUri.t)
+    ~(file:string option)
+    ~(text:string)
+    ~(actual_bytes:int)
+  : Document.t =
+  Perf_stats.tick "parse.large_file_guard";
+  Document.make_unparsed
+    ~uri
+    ~file
+    ~text
+    ~parse_diags:[diag_parse_guard ~file ~max_bytes:ws.parse_file_max_bytes ~actual_bytes]
+
+let parse_guarded_document_make
+    (ws:t)
+    ~(uri:T.DocumentUri.t)
+    ~(file:string option)
+    ~(text:string)
+  : Document.t =
+  if is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes ~text_len:(String.length text) then
+    make_doc_with_parse_guard ws ~uri ~file ~text ~actual_bytes:(String.length text)
+  else
+    Document.make ~uri ~file ~text
+
+let has_open_doc_for_path_key (ws:t) ~(path_key:string) : bool =
+  Hashtbl.fold (fun _uri doc acc ->
+    acc
+    ||
+    match doc.Document.file with
+    | None -> false
+    | Some p -> normalize_path_key p = path_key
+  ) ws.docs false
+
+let touch_closed_doc_path (ws:t) ~(path_key:string) : unit =
+  if path_key = "" then ()
+  else if has_open_doc_for_path_key ws ~path_key then
+    Hashtbl.remove ws.closed_doc_last_touch path_key
+  else (
+    ws.closed_doc_lru_clock <- ws.closed_doc_lru_clock + 1;
+    Hashtbl.replace ws.closed_doc_last_touch path_key ws.closed_doc_lru_clock
   )
 
-let dequeue_bg_path (ws:t) : (string * [ `High | `Normal ]) option =
-  if not (Queue.is_empty ws.bg_high_queue) then (
-    let p = Queue.pop ws.bg_high_queue in
-    Hashtbl.remove ws.bg_enqueued (normalize_path_key p);
-    Some (p, `High)
-  ) else if not (Queue.is_empty ws.bg_norm_queue) then (
-    let p = Queue.pop ws.bg_norm_queue in
-    Hashtbl.remove ws.bg_enqueued (normalize_path_key p);
-    Some (p, `Normal)
-  ) else
-    None
+let evict_closed_docs_if_needed (ws:t) : unit =
+  let max_closed = max 1 ws.closed_doc_lru_max in
+  let closed =
+    Hashtbl.fold (fun path_key doc acc ->
+      if has_open_doc_for_path_key ws ~path_key then acc
+      else
+        let touch =
+          match Hashtbl.find_opt ws.closed_doc_last_touch path_key with
+          | Some t -> t
+          | None -> 0
+        in
+        (path_key, touch, doc) :: acc
+    ) ws.files []
+  in
+  Perf_stats.tick "mem.closed_doc_count";
+  let closed_count = List.length closed in
+  if closed_count <= max_closed then ()
+  else
+    let to_drop = closed_count - max_closed in
+    let sorted =
+      List.sort (fun (_, ta, _) (_, tb, _) -> compare ta tb) closed
+    in
+    let rec drop n xs =
+      if n <= 0 then ()
+      else
+        match xs with
+        | [] -> ()
+        | (path_key, _, doc) :: tl ->
+            Hashtbl.remove ws.files path_key;
+            Hashtbl.remove ws.bg_parsed path_key;
+            Hashtbl.remove ws.closed_doc_last_touch path_key;
+            if ws.sem_store_enabled then
+              Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+            Perf_stats.tick "mem.closed_doc_evict";
+            drop (n - 1) tl
+    in
+    drop to_drop sorted
+
+let find_open_doc_for_path (ws:t) ~(path:string) : Document.t option =
+  let found_open = ref None in
+  Hashtbl.iter (fun _uri doc ->
+    match doc.Document.file with
+    | Some p when same_path p path -> found_open := Some doc
+    | _ -> ()
+  ) ws.docs;
+  !found_open
+
+let classify_bg_queue_kind
+    (ws:t)
+    ~(lane:schedule_lane)
+    ~(high:bool)
+    ~(path:string)
+  : bg_queue_kind =
+  let size_opt = file_size_bytes path in
+  let is_large =
+    match size_opt with
+    | Some n -> n >= ws.bg_large_file_bytes
+    | None -> false
+  in
+  match lane, is_large with
+  | LaneOpen, false -> BgQueueHighSmall
+  | LaneOpen, true -> BgQueueHighLarge
+  | LaneRoot, false -> BgQueueRootSmall
+  | LaneRoot, true -> BgQueueRootLarge
+  | LaneSweep, false ->
+      if high then BgQueueHighSmall else BgQueueNormalSmall
+  | LaneSweep, true ->
+      if high then BgQueueHighLarge else BgQueueNormalLarge
+
+let enqueue_bg_path
+    ?(lane:schedule_lane=LaneSweep)
+    ?(reason_group:string="generic")
+    (ws:t)
+    ~(high:bool)
+    (path:string)
+  : unit =
+  let path_key = normalize_path_key path in
+  if path_key <> "" then
+    if Hashtbl.mem ws.parse_worker_inflight path_key then
+      ()
+    else
+      let requested = classify_bg_queue_kind ws ~lane ~high ~path in
+      let doc_generation =
+        match find_open_doc_for_path ws ~path with
+        | Some doc ->
+            (match Hashtbl.find_opt ws.open_parse_generation (Uri_path.docuri_to_string doc.Document.uri) with
+             | Some g -> g
+             | None -> 0)
+        | None -> 0
+      in
+      let work_key =
+        Printf.sprintf "%s|%s|%s|g%d|d%d"
+          path_key
+          (string_of_lane lane)
+          reason_group
+          ws.graph_epoch
+          doc_generation
+      in
+      let now = Perf_stats.now_ms () in
+      let is_cooldown_hit =
+        match Hashtbl.find_opt ws.bg_enqueue_recent_ms work_key with
+        | Some last_ms ->
+            ws.graph_requeue_cooldown_ms > 0
+            && lane <> LaneOpen
+            && now -. last_ms < float_of_int ws.graph_requeue_cooldown_ms
+        | None ->
+            false
+      in
+      if is_cooldown_hit then
+        Perf_stats.tick "sched.requeue_cooldown_hit"
+      else (
+        Hashtbl.replace ws.bg_enqueue_recent_ms work_key now;
+        match Hashtbl.find_opt ws.bg_enqueued path_key with
+        | None ->
+            Hashtbl.replace ws.bg_enqueued path_key requested;
+            (match requested with
+             | BgQueueHighSmall -> Queue.add path ws.bg_high_small_queue
+             | BgQueueRootSmall -> Queue.add path ws.bg_root_small_queue
+             | BgQueueNormalSmall -> Queue.add path ws.bg_norm_small_queue
+             | BgQueueHighLarge -> Queue.add path ws.bg_high_large_queue
+             | BgQueueRootLarge -> Queue.add path ws.bg_root_large_queue
+             | BgQueueNormalLarge -> Queue.add path ws.bg_norm_large_queue)
+        | Some current ->
+            if queue_kind_priority requested > queue_kind_priority current then (
+              Hashtbl.replace ws.bg_enqueued path_key requested;
+              (match requested with
+               | BgQueueHighSmall -> Queue.add path ws.bg_high_small_queue
+               | BgQueueRootSmall -> Queue.add path ws.bg_root_small_queue
+               | BgQueueNormalSmall -> Queue.add path ws.bg_norm_small_queue
+               | BgQueueHighLarge -> Queue.add path ws.bg_high_large_queue
+               | BgQueueRootLarge -> Queue.add path ws.bg_root_large_queue
+               | BgQueueNormalLarge -> Queue.add path ws.bg_norm_large_queue);
+              Perf_stats.tick "bg.queue_promoted"
+            ) else
+              Perf_stats.tick "sched.duplicate_work_dropped"
+      )
+
+let dequeue_bg_path
+    (ws:t)
+    ~(mode:bg_tick_mode)
+    ~(allow_normal_large:bool)
+    ~(allow_root_large:bool)
+    ~(prefer_open:bool)
+  : (string * bg_queue_kind) option =
+  let rec pop_from_queue
+      (q:string Queue.t)
+      ~(expect:bg_queue_kind)
+    : (string * bg_queue_kind) option =
+    if Queue.is_empty q then None
+    else
+      let p = Queue.pop q in
+      let key = normalize_path_key p in
+      match Hashtbl.find_opt ws.bg_enqueued key with
+      | Some kind when kind = expect ->
+          Hashtbl.remove ws.bg_enqueued key;
+          Some (p, kind)
+      | _ ->
+          pop_from_queue q ~expect
+  in
+  let pop_high_small () =
+    pop_from_queue ws.bg_high_small_queue ~expect:BgQueueHighSmall
+  in
+  let pop_high_large () =
+    pop_from_queue ws.bg_high_large_queue ~expect:BgQueueHighLarge
+  in
+  let pop_root_small () =
+    pop_from_queue ws.bg_root_small_queue ~expect:BgQueueRootSmall
+  in
+  let pop_root_large () =
+    if not allow_root_large then None
+    else pop_from_queue ws.bg_root_large_queue ~expect:BgQueueRootLarge
+  in
+  let pop_norm_small () =
+    pop_from_queue ws.bg_norm_small_queue ~expect:BgQueueNormalSmall
+  in
+  let pop_norm_large () =
+    match mode with
+    | BgTickInteractive
+    | BgTickIdle ->
+        if not allow_normal_large then None
+        else pop_from_queue ws.bg_norm_large_queue ~expect:BgQueueNormalLarge
+  in
+  let prioritize_open_large =
+    ws.startup_diag_hover_ready_ms = None
+    && Hashtbl.length ws.open_parse_generation > 0
+  in
+  let pops =
+    if prefer_open then
+      if prioritize_open_large then
+        [ pop_high_large; pop_high_small; pop_root_small; pop_root_large; pop_norm_small; pop_norm_large ]
+      else
+        [ pop_high_small; pop_high_large; pop_root_small; pop_root_large; pop_norm_small; pop_norm_large ]
+    else
+      if prioritize_open_large then
+        [ pop_root_small; pop_root_large; pop_high_large; pop_high_small; pop_norm_small; pop_norm_large ]
+      else
+        [ pop_root_small; pop_root_large; pop_high_small; pop_high_large; pop_norm_small; pop_norm_large ]
+  in
+  let rec pick = function
+    | [] -> None
+    | f :: tl ->
+        (match f () with
+         | Some _ as hit -> hit
+         | None -> pick tl)
+  in
+  pick pops
 
 let enqueue_bg_diag_update
     (ws:t)
@@ -261,6 +962,41 @@ let enqueue_bg_diag_update
     Hashtbl.replace ws.bg_pending_diag_set key true;
     Queue.add key ws.bg_pending_diag_updates
   )
+
+let tick_open_diag_revalidate_reason (reason:string) : unit =
+  match String.lowercase_ascii (String.trim reason) with
+  | "compool" | "compool_change" ->
+      Perf_stats.tick "diag.open.revalidate_reason_compool"
+  | "reconcile" | "index_reconcile" ->
+      Perf_stats.tick "diag.open.revalidate_reason_reconcile"
+  | "hint" | "hint_ready" | "xmodule_ready" ->
+      Perf_stats.tick "diag.open.revalidate_reason_hint_ready"
+  | _ ->
+      ()
+
+let enqueue_open_diag_revalidate
+    (ws:t)
+    ~(uri:T.DocumentUri.t)
+    ~(reason:string)
+  : unit =
+  if Hashtbl.mem ws.docs uri then (
+    let key = Uri_path.docuri_to_string uri in
+    Hashtbl.replace ws.open_diag_revalidate_payloads key (uri, reason);
+    if not (Hashtbl.mem ws.open_diag_revalidate_set key) then (
+      Hashtbl.replace ws.open_diag_revalidate_set key true;
+      Queue.add key ws.open_diag_revalidate_updates
+    );
+    Perf_stats.tick "diag.open.revalidate_enqueued";
+    tick_open_diag_revalidate_reason reason
+  )
+
+let enqueue_all_open_diag_revalidate
+    (ws:t)
+    ~(reason:string)
+  : unit =
+  Hashtbl.iter
+    (fun uri _ -> enqueue_open_diag_revalidate ws ~uri ~reason)
+    ws.docs
 
 let filter_workspace_diags (ws:t) (diags:T.Diagnostic.t list) : T.Diagnostic.t list =
   match ws.workspace_diag_mode with
@@ -280,10 +1016,35 @@ let is_probably_network_path (p:string) : bool =
       || (p.[0] = '/' && p.[1] = '/'))
 
 let set_root_path (ws:t) (root:string option) : unit =
-  ws.root_path <- root
+  if ws.root_path <> root then (
+    mark_graph_dirty ws;
+    ws.root_path <- root;
+    ws.startup_started_ms <- Perf_stats.now_ms ();
+    ws.startup_diag_hover_ready_ms <- None;
+    ws.startup_fully_nav_ready_ms <- None;
+    ws.startup_diag_hover_notified <- false;
+    ws.startup_fully_nav_notified <- false;
+    ws.startup_diag_hover_miss_notified <- false;
+    ws.startup_nav_miss_notified <- false;
+    ws.startup_diag_hover_miss_emitted <- false;
+    ws.startup_nav_miss_emitted <- false;
+    ws.startup_ready_ms <- None;
+    ws.startup_ready_notified <- false;
+    ws.startup_miss_notified <- false;
+    ws.startup_miss_emitted <- false;
+    ws.xmodule_diag_ready_prev <- false;
+    Hashtbl.clear ws.open_diag_revalidate_payloads;
+    Hashtbl.clear ws.open_diag_revalidate_set;
+    while not (Queue.is_empty ws.open_diag_revalidate_updates) do
+      ignore (Queue.pop ws.open_diag_revalidate_updates)
+    done
+  )
 
 let set_root_uri (ws:t) (root_uri:T.DocumentUri.t option) : unit =
-  ws.root_path <- (match root_uri with None -> None | Some u -> Uri_path.file_path_of_uri u)
+  set_root_path ws
+    (match root_uri with
+     | None -> None
+     | Some u -> Uri_path.file_path_of_uri u)
 
 let index_bootstrap_dirs = 64
 let index_bootstrap_files = 6000
@@ -297,10 +1058,17 @@ let index_background_dirs_network = 1
 let index_background_files_network = 64
 let index_lookup_dirs_network = 1
 let index_lookup_files_network = 64
+let index_startup_disable = env_flag "JOVIAL_INDEX_STARTUP_DISABLE" ~default:false
 let index_startup_dirs = env_nonneg_int "JOVIAL_INDEX_STARTUP_DIRS" ~default:0
 let index_startup_files = env_nonneg_int "JOVIAL_INDEX_STARTUP_FILES" ~default:0
 let index_startup_dirs_network = env_nonneg_int "JOVIAL_INDEX_STARTUP_DIRS_NETWORK" ~default:0
 let index_startup_files_network = env_nonneg_int "JOVIAL_INDEX_STARTUP_FILES_NETWORK" ~default:0
+let index_stale_reconcile_min_interval_ms =
+  max 100 (env_nonneg_int "JOVIAL_INDEX_STALE_RECONCILE_MIN_INTERVAL_MS" ~default:900)
+let index_reconcile_escalate_dirs =
+  max 1 (env_nonneg_int "JOVIAL_INDEX_RECONCILE_ESCALATE_DIRS" ~default:24)
+let index_reconcile_escalate_files =
+  max 1 (env_nonneg_int "JOVIAL_INDEX_RECONCILE_ESCALATE_FILES" ~default:3000)
 let didchange_semi_check_enabled = env_flag "JOVIAL_DIDCHANGE_SEMI_CHECK" ~default:true
 let didchange_semi_check_max_changes =
   env_nonneg_int "JOVIAL_DIDCHANGE_SEMI_MAX_CHANGES" ~default:6
@@ -320,10 +1088,142 @@ let didchange_defer_parse_max_inserted_chars =
   env_nonneg_int "JOVIAL_DIDCHANGE_DEFER_MAX_INSERTED_CHARS" ~default:1800
 let didchange_defer_parse_force_full_every =
   max 1 (env_nonneg_int "JOVIAL_DIDCHANGE_DEFER_FORCE_FULL_EVERY" ~default:24)
+let didopen_defer_parse_enabled =
+  env_flag "JOVIAL_DIDOPEN_DEFER_PARSE" ~default:true
+let didopen_defer_parse_min_doc_chars =
+  env_nonneg_int "JOVIAL_DIDOPEN_DEFER_MIN_DOC_CHARS" ~default:120000
+let didopen_always_provisional =
+  env_flag "JOVIAL_DIDOPEN_ALWAYS_PROVISIONAL" ~default:false
+let didopen_disable_foreground_tick =
+  env_flag "JOVIAL_DIDOPEN_DISABLE_FOREGROUND_TICK" ~default:true
+let warmup_suppress_crossmodule_unresolved =
+  env_flag "JOVIAL_DIAG_WARMUP_SUPPRESS_XMODULE" ~default:true
 let bg_seed_paths_per_tick =
   max 1 (env_nonneg_int "JOVIAL_BG_SEED_PATHS_PER_TICK" ~default:128)
 let nav_soft_budget_ms =
   max 1 (env_nonneg_int "JOVIAL_NAV_SOFT_BUDGET_MS" ~default:1800)
+let nav_quick_scan_files =
+  match Sys.getenv_opt "JOVIAL_NAV_QUICK_SCAN_FILES" with
+  | Some _ -> env_nonneg_int "JOVIAL_NAV_QUICK_SCAN_FILES" ~default:48
+  | None -> env_nonneg_int "JOVIAL_NAV_SOURCE_SCAN_FILES" ~default:48
+let nav_quick_scan_total_bytes =
+  env_nonneg_int "JOVIAL_NAV_QUICK_SCAN_TOTAL_BYTES" ~default:(12 * 1024 * 1024)
+let nav_quick_scan_per_file_bytes =
+  env_nonneg_int "JOVIAL_NAV_QUICK_SCAN_PER_FILE_BYTES" ~default:262144
+let nav_miss_import_scan_max_chars =
+  max 4096 (env_nonneg_int "JOVIAL_NAV_MISS_IMPORT_SCAN_MAX_CHARS" ~default:262144)
+let nav_miss_high_enqueue_cap =
+  env_nonneg_int "JOVIAL_NAV_MISS_HIGH_ENQUEUE_CAP" ~default:24
+let pressure_check_interval_ms =
+  max 50 (env_nonneg_int "JOVIAL_PRESSURE_CHECK_INTERVAL_MS" ~default:250)
+let lsif_doc_load_budget_normal =
+  max 1 (env_nonneg_int "JOVIAL_LSIF_DOC_LOAD_BUDGET" ~default:400)
+let lsif_doc_load_budget_soft =
+  max 1 (env_nonneg_int "JOVIAL_LSIF_DOC_LOAD_BUDGET_SOFT" ~default:64)
+
+let startup_scan_budget_for_root ~(network:bool) : int * int =
+  if index_startup_disable then
+    (0, 0)
+  else
+    let default_dirs, default_files, cfg_dirs, cfg_files =
+      if network then
+        ( index_bootstrap_dirs_network,
+          index_bootstrap_files_network,
+          index_startup_dirs_network,
+          index_startup_files_network )
+      else
+        ( index_bootstrap_dirs,
+          index_bootstrap_files,
+          index_startup_dirs,
+          index_startup_files )
+    in
+    let dirs = if cfg_dirs = 0 then default_dirs else cfg_dirs in
+    let files = if cfg_files = 0 then default_files else cfg_files in
+    (max 0 dirs, max 0 files)
+
+let pressure_mode_to_string = function
+  | PressureNormal -> "normal"
+  | PressureSoft -> "soft"
+  | PressureCritical -> "critical"
+
+let startup_phase_to_string = function
+  | StartupCold -> "cold"
+  | StartupWarming -> "warming"
+  | StartupAggressiveCatchUp -> "aggressiveCatchUp"
+  | StartupReady -> "ready"
+
+let word_bytes : int =
+  max 1 (Sys.word_size / 8)
+
+let words_to_mb (words:int) : int =
+  let bytes = max 0 (words * word_bytes) in
+  let mb = 1024 * 1024 in
+  if bytes <= 0 then 0 else (bytes + mb - 1) / mb
+
+let update_pressure_state (ws:t) : unit =
+  let now = Perf_stats.now_ms () in
+  if now -. ws.pressure_last_check_ms >= float_of_int pressure_check_interval_ms then (
+    ws.pressure_last_check_ms <- now;
+    let live_words, spike_words =
+      try
+        let s = Gc.quick_stat () in
+        let live_words = max s.live_words s.heap_words in
+        let spike_words = max live_words s.top_heap_words in
+        (live_words, spike_words)
+      with _ -> (0, 0)
+    in
+    let live_mb = words_to_mb live_words in
+    let spike_mb = words_to_mb spike_words in
+    ws.pressure_live_mb <- live_mb;
+    let soft_mb = max 1 ws.pressure_soft_mb in
+    let critical_mb = max soft_mb ws.pressure_critical_mb in
+    let next_mode =
+      match ws.pressure_mode with
+      | PressureNormal ->
+          if spike_mb >= critical_mb then PressureCritical
+          else if spike_mb >= soft_mb then PressureSoft
+          else PressureNormal
+      | PressureSoft | PressureCritical ->
+          if live_mb >= critical_mb then PressureCritical
+          else if live_mb >= soft_mb then PressureSoft
+          else PressureNormal
+    in
+    if next_mode <> ws.pressure_mode then (
+      (match next_mode with
+       | PressureSoft -> Perf_stats.tick "pressure.enter_soft"; Perf_stats.tick "mem.pressure_soft"
+       | PressureCritical ->
+           Perf_stats.tick "pressure.enter_critical";
+           Perf_stats.tick "mem.pressure_critical"
+       | PressureNormal -> Perf_stats.tick "pressure.exit_to_normal");
+      ws.pressure_mode <- next_mode
+    )
+  )
+
+let workspace_pressure_mode (ws:t) : pressure_mode =
+  update_pressure_state ws;
+  ws.pressure_mode
+
+let workspace_pressure_live_mb (ws:t) : int =
+  update_pressure_state ws;
+  ws.pressure_live_mb
+
+let bg_diag_allowed (ws:t) : bool =
+  match workspace_pressure_mode ws with
+  | PressureCritical ->
+      Perf_stats.tick "bg.diag_paused_critical";
+      false
+  | PressureNormal | PressureSoft ->
+      true
+
+let lsif_doc_load_budget_for_pressure (ws:t) : int =
+  match workspace_pressure_mode ws with
+  | PressureNormal -> lsif_doc_load_budget_normal
+  | PressureSoft ->
+      Perf_stats.tick "lsif.throttle_soft";
+      lsif_doc_load_budget_soft
+  | PressureCritical ->
+      Perf_stats.tick "lsif.defer_critical";
+      0
 
 let request_cancelled (ws:t) : bool =
   match ws.request_cancel_checker with
@@ -337,6 +1237,466 @@ let with_request_cancel_checker (ws:t) (is_cancelled:unit -> bool) (f:unit -> 'a
   Fun.protect
     ~finally:(fun () -> ws.request_cancel_checker <- prev)
     f
+
+let startup_mark_started (ws:t) : unit =
+  ws.startup_started_ms <- Perf_stats.now_ms ();
+  ws.startup_diag_hover_ready_ms <- None;
+  ws.startup_fully_nav_ready_ms <- None;
+  ws.startup_diag_hover_notified <- false;
+  ws.startup_fully_nav_notified <- false;
+  ws.startup_diag_hover_miss_notified <- false;
+  ws.startup_nav_miss_notified <- false;
+  ws.startup_diag_hover_miss_emitted <- false;
+  ws.startup_nav_miss_emitted <- false;
+  ws.startup_ready_ms <- None;
+  ws.startup_ready_notified <- false;
+  ws.startup_miss_notified <- false;
+  ws.startup_miss_emitted <- false;
+  ws.startup_phase <- StartupWarming;
+  ws.startup_phase_notified <- None;
+  Perf_stats.tick "startup.phase_warming";
+  ws.xmodule_diag_ready_prev <- false;
+  Hashtbl.clear ws.open_diag_revalidate_payloads;
+  Hashtbl.clear ws.open_diag_revalidate_set;
+  while not (Queue.is_empty ws.open_diag_revalidate_updates) do
+    ignore (Queue.pop ws.open_diag_revalidate_updates)
+  done;
+  ws.index_reconcile_escalate_last_ms <- 0.0;
+  ws.index_reconcile_escalations <- 0
+
+let startup_open_docs_converged (ws:t) : bool =
+  Hashtbl.fold (fun _ doc acc ->
+    acc && doc.Document.parse_rev = doc.Document.rev
+  ) ws.docs true
+
+let startup_open_docs_pending_count (ws:t) : int =
+  Hashtbl.fold (fun _ doc acc ->
+    if doc.Document.parse_rev = doc.Document.rev then acc else acc + 1
+  ) ws.docs 0
+
+let startup_index_complete (ws:t) : bool =
+  match ws.index with
+  | None -> false
+  | Some idx -> Workspace_index.is_complete idx
+
+let startup_index_reconcile_pending (ws:t) : bool =
+  match ws.index with
+  | None -> false
+  | Some idx -> Workspace_index.reconcile_pending idx
+
+let startup_seed_complete (ws:t) : bool =
+  ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
+  && (not ws.graph_needs_refresh)
+  && (not ws.bg_seed_needs_refresh)
+  && ws.bg_seed_cursor >= Array.length ws.bg_seed_paths
+
+let startup_high_queues_empty (ws:t) : bool =
+  Queue.is_empty ws.bg_high_small_queue
+  && Queue.is_empty ws.bg_high_large_queue
+  && Queue.is_empty ws.bg_root_small_queue
+  && Queue.is_empty ws.bg_root_large_queue
+  && not (Hashtbl.fold (fun _ kind acc ->
+      acc || kind = ParseJobHighLarge || kind = ParseJobRootLarge) ws.parse_worker_inflight false)
+
+let startup_queues_empty (ws:t) : bool =
+  startup_high_queues_empty ws
+  && Queue.is_empty ws.bg_norm_small_queue
+  && Queue.is_empty ws.bg_norm_large_queue
+  && Queue.is_empty ws.bg_pending_diag_updates
+  && Hashtbl.length ws.bg_pending_diag_payloads = 0
+  && Hashtbl.length ws.parse_worker_inflight = 0
+
+let startup_hints_ready (ws:t) : bool =
+  ws.symbol_hints <> None
+  || (
+       match ws.index with
+       | Some idx ->
+           Workspace_index.is_complete idx
+           && Queue.is_empty ws.bg_high_small_queue
+           && Queue.is_empty ws.bg_root_small_queue
+           && Queue.is_empty ws.bg_norm_small_queue
+           && Queue.is_empty ws.bg_high_large_queue
+           && Queue.is_empty ws.bg_root_large_queue
+           && Queue.is_empty ws.bg_norm_large_queue
+       | None -> false
+     )
+
+let quick_nav_index_complete (ws:t) : bool =
+  ws.quick_nav_index_total > 0
+  && ws.quick_nav_index_done >= ws.quick_nav_index_total
+  && Queue.is_empty ws.quick_nav_pending_paths
+  && Hashtbl.length ws.quick_nav_pending_set = 0
+
+let quick_nav_index_ready_for_startup (ws:t) : bool =
+  if quick_nav_index_complete ws then true
+  else if ws.quick_nav_index_total <= 0 then false
+  else
+    let goal = min ws.quick_nav_index_total 64 in
+    ws.quick_nav_index_done >= goal
+
+let startup_nav_prereqs_ready (ws:t) : bool =
+  ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
+  && (startup_hints_ready ws || quick_nav_index_ready_for_startup ws)
+
+let startup_open_docs_authoritative (ws:t) : bool =
+  startup_open_docs_converged ws
+  && Hashtbl.length ws.open_parse_generation = 0
+
+let startup_open_diag_revalidate_empty (ws:t) : bool =
+  Queue.is_empty ws.open_diag_revalidate_updates
+  && Hashtbl.length ws.open_diag_revalidate_payloads = 0
+
+let xmodule_diag_prereqs_ready (ws:t) : bool =
+  startup_index_complete ws
+  && not (startup_index_reconcile_pending ws)
+  && startup_hints_ready ws
+  && startup_open_docs_authoritative ws
+
+let startup_is_diag_hover_ready (ws:t) : bool =
+  xmodule_diag_prereqs_ready ws
+  && startup_open_diag_revalidate_empty ws
+
+let startup_is_fully_navigable (ws:t) : bool =
+  startup_nav_prereqs_ready ws
+  && startup_is_diag_hover_ready ws
+
+let startup_elapsed_ms_float (ws:t) : float =
+  let now = Perf_stats.now_ms () in
+  max 0.0 (now -. ws.startup_started_ms)
+
+let startup_update_phase (ws:t) : unit =
+  let next_phase =
+    match ws.startup_fully_nav_ready_ms with
+    | Some _ ->
+        StartupReady
+    | None ->
+        let elapsed_ms = startup_elapsed_ms_float ws in
+        let warm_window =
+          float_of_int (max 0 (ws.startup_nav_target_ms - ws.startup_aggressive_window_ms))
+        in
+        if elapsed_ms >= warm_window then StartupAggressiveCatchUp
+        else StartupWarming
+  in
+  if ws.startup_phase <> next_phase then (
+    ws.startup_phase <- next_phase;
+    (match next_phase with
+     | StartupWarming -> Perf_stats.tick "startup.phase_warming"
+     | StartupAggressiveCatchUp -> Perf_stats.tick "startup.phase_aggressive"
+     | StartupCold | StartupReady -> ())
+  )
+
+let startup_ready_components (ws:t)
+  : bool * bool * bool * bool * bool * bool * bool * bool * bool * bool * bool * bool =
+  ( startup_index_complete ws,
+    not (startup_index_reconcile_pending ws),
+    startup_seed_complete ws,
+    startup_high_queues_empty ws,
+    startup_queues_empty ws,
+    startup_hints_ready ws,
+    startup_nav_prereqs_ready ws,
+    quick_nav_index_complete ws,
+    startup_open_docs_converged ws,
+    startup_open_docs_authoritative ws,
+    xmodule_diag_prereqs_ready ws,
+    startup_open_diag_revalidate_empty ws )
+
+let startup_is_ready (ws:t) : bool =
+  let index_complete, index_reconcile_clear, seed_complete, _high_queues_empty, queues_empty, hints_ready, nav_prereqs_ready, _quick_nav_index_complete, open_docs_converged, open_docs_authoritative, xmodule_ready, open_diag_revalidate_empty =
+    startup_ready_components ws
+  in
+  index_complete && index_reconcile_clear && seed_complete
+  && queues_empty && hints_ready && nav_prereqs_ready
+  && open_docs_converged && open_docs_authoritative
+  && xmodule_ready && open_diag_revalidate_empty
+
+let startup_elapsed_ms (ws:t) : int =
+  max 0 (int_of_float (startup_elapsed_ms_float ws))
+
+let update_startup_ready_state (ws:t) : unit =
+  let elapsed = startup_elapsed_ms ws in
+  if elapsed > ws.startup_diag_hover_target_ms
+     && not ws.startup_diag_hover_miss_notified
+     && ws.startup_diag_hover_ready_ms = None
+  then (
+    ws.startup_diag_hover_miss_notified <- true;
+    Perf_stats.tick "startup.miss_15s"
+  );
+  if elapsed > ws.startup_nav_target_ms
+     && not ws.startup_nav_miss_notified
+     && ws.startup_fully_nav_ready_ms = None
+  then
+    ws.startup_nav_miss_notified <- true;
+
+  let xmodule_ready_now = xmodule_diag_prereqs_ready ws in
+  if xmodule_ready_now && not ws.xmodule_diag_ready_prev then (
+    ws.xmodule_diag_ready_prev <- true;
+    Perf_stats.tick "diag.xmodule_ready_transition";
+    enqueue_all_open_diag_revalidate ws ~reason:"xmodule_ready"
+  ) else if not xmodule_ready_now then
+    ws.xmodule_diag_ready_prev <- false;
+
+  if startup_is_diag_hover_ready ws then (
+    match ws.startup_diag_hover_ready_ms with
+    | Some _ -> ()
+    | None ->
+        let now = Perf_stats.now_ms () in
+        ws.startup_diag_hover_ready_ms <- Some now
+  ) else (
+    match ws.startup_diag_hover_ready_ms with
+    | None -> ()
+    | Some _ ->
+        ws.startup_diag_hover_ready_ms <- None;
+        ws.startup_diag_hover_notified <- false
+  );
+
+  if startup_is_fully_navigable ws then (
+    match ws.startup_fully_nav_ready_ms with
+    | Some _ -> ()
+    | None ->
+        let now = Perf_stats.now_ms () in
+        ws.startup_fully_nav_ready_ms <- Some now;
+        ws.startup_phase <- StartupReady;
+        Perf_stats.tick "startup.ready";
+        if ws.startup_phase_notified = Some StartupReady then
+          ws.startup_phase_notified <- None
+  ) else (
+    match ws.startup_fully_nav_ready_ms with
+    | None -> ()
+    | Some _ ->
+        ws.startup_fully_nav_ready_ms <- None;
+        ws.startup_fully_nav_notified <- false;
+        ws.startup_ready_notified <- false;
+        ws.startup_phase_notified <- None;
+        Perf_stats.tick "startup.ready_retracted"
+  );
+  ws.startup_ready_ms <- ws.startup_fully_nav_ready_ms;
+  ws.startup_miss_notified <- ws.startup_nav_miss_notified;
+  ws.startup_miss_emitted <- ws.startup_nav_miss_emitted;
+  startup_update_phase ws
+
+let startup_readiness_json (ws:t) : Yojson.Safe.t =
+  let index_complete, index_reconcile_clear, seed_complete, high_queues_empty, queues_empty, hints_ready, nav_prereqs_ready, quick_nav_ready, open_docs_converged, open_docs_authoritative, xmodule_ready, open_diag_revalidate_empty =
+    startup_ready_components ws
+  in
+  let index_reconcile_pending = not index_reconcile_clear in
+  let pending_open_docs = startup_open_docs_pending_count ws in
+  let pending_open_diag_revalidate = Queue.length ws.open_diag_revalidate_updates in
+  let ready_diag_ms =
+    match ws.startup_diag_hover_ready_ms with
+    | Some ready -> max 0 (int_of_float (ready -. ws.startup_started_ms))
+    | None -> startup_elapsed_ms ws
+  in
+  let ready_nav_ms =
+    match ws.startup_fully_nav_ready_ms with
+    | Some ready -> max 0 (int_of_float (ready -. ws.startup_started_ms))
+    | None -> startup_elapsed_ms ws
+  in
+  let elapsed_ms =
+    match ws.startup_fully_nav_ready_ms with
+    | Some ready -> max 0 (int_of_float (ready -. ws.startup_started_ms))
+    | None -> startup_elapsed_ms ws
+  in
+  `Assoc
+    [
+      "startedMs", `Float ws.startup_started_ms;
+      ( "readyMs",
+        match ws.startup_ready_ms with
+        | None -> `Null
+        | Some ts -> `Float ts );
+      "elapsedMs", `Int elapsed_ms;
+      "targetMs", `Int ws.startup_nav_target_ms;
+      "readyWithinTarget", `Bool (elapsed_ms <= ws.startup_nav_target_ms);
+      "isReady", `Bool (ws.startup_ready_ms <> None);
+      "phase", `String (startup_phase_to_string ws.startup_phase);
+      "aggressiveWindowMs", `Int ws.startup_aggressive_window_ms;
+      "aggressiveBudgetMs", `Int ws.startup_aggressive_bg_budget_ms;
+      "missNotified", `Bool ws.startup_nav_miss_notified;
+      ( "stages",
+        `Assoc
+          [
+            ( "diagHoverReady",
+              `Assoc
+                [
+                  "targetMs", `Int ws.startup_diag_hover_target_ms;
+                  "elapsedMs", `Int ready_diag_ms;
+                  "isReady", `Bool (ws.startup_diag_hover_ready_ms <> None);
+                  "readyWithinTarget", `Bool (ready_diag_ms <= ws.startup_diag_hover_target_ms);
+                ] );
+            ( "fullyNavigable",
+              `Assoc
+                [
+                  "targetMs", `Int ws.startup_nav_target_ms;
+                  "elapsedMs", `Int ready_nav_ms;
+                  "isReady", `Bool (ws.startup_fully_nav_ready_ms <> None);
+                  "readyWithinTarget", `Bool (ready_nav_ms <= ws.startup_nav_target_ms);
+                ] );
+          ] );
+      ( "components",
+        `Assoc
+          [
+            "indexComplete", `Bool index_complete;
+            "indexReconcilePending", `Bool index_reconcile_pending;
+            "seedComplete", `Bool seed_complete;
+            "highQueuesEmpty", `Bool high_queues_empty;
+            "queuesEmpty", `Bool queues_empty;
+            "hintsReady", `Bool hints_ready;
+            "navPrereqsReady", `Bool nav_prereqs_ready;
+            "quickNavIndexReady", `Bool quick_nav_ready;
+            "openDocsConverged", `Bool open_docs_converged;
+            "openDocsAuthoritative", `Bool open_docs_authoritative;
+            "openDocsPendingParse", `Int pending_open_docs;
+            "xmoduleDiagReady", `Bool xmodule_ready;
+            "openDiagRevalidateQueueEmpty", `Bool open_diag_revalidate_empty;
+            "openDiagRevalidatePending", `Int pending_open_diag_revalidate;
+          ] );
+    ]
+
+let consume_workspace_ready_event_json (ws:t) : Yojson.Safe.t option =
+  update_startup_ready_state ws;
+  let root_uri =
+    match ws.root_path with
+    | None -> None
+    | Some p -> Some (`String (Uri_path.file_uri_of_path p))
+  in
+  match root_uri with
+  | None -> None
+  | Some root_uri_json ->
+      if ws.startup_diag_hover_ready_ms <> None && not ws.startup_diag_hover_notified then (
+        ws.startup_diag_hover_notified <- true;
+        Some
+          (`Assoc
+             [
+               "rootUri", root_uri_json;
+               "stage", `String "diagHoverReady";
+               ("readiness", startup_readiness_json ws);
+             ])
+      ) else if ws.startup_fully_nav_ready_ms <> None && not ws.startup_fully_nav_notified then (
+        ws.startup_fully_nav_notified <- true;
+        ws.startup_ready_notified <- true;
+        Some
+          (`Assoc
+             [
+               "rootUri", root_uri_json;
+               "stage", `String "fullyNavigable";
+               ("readiness", startup_readiness_json ws);
+             ])
+      ) else
+        None
+
+let consume_startup_phase_event_json (ws:t) : Yojson.Safe.t option =
+  update_startup_ready_state ws;
+  match ws.startup_phase, ws.startup_phase_notified with
+  | StartupReady, _ -> None
+  | phase, Some already when phase = already -> None
+  | phase, _ ->
+      ws.startup_phase_notified <- Some phase;
+      let root_uri_json =
+        match ws.root_path with
+        | None -> `Null
+        | Some p -> `String (Uri_path.file_uri_of_path p)
+      in
+      Some
+        (`Assoc
+           [
+             "rootUri", root_uri_json;
+             "phase", `String (startup_phase_to_string phase);
+             "elapsedMs", `Int (startup_elapsed_ms ws);
+             "targetMs", `Int ws.startup_nav_target_ms;
+           ])
+
+let consume_startup_miss_event_json (ws:t) : Yojson.Safe.t option =
+  update_startup_ready_state ws;
+  let root_uri =
+    match ws.root_path with
+    | None -> None
+    | Some p -> Some (`String (Uri_path.file_uri_of_path p))
+  in
+  match root_uri with
+  | None -> None
+  | Some root_uri_json ->
+      if ws.startup_diag_hover_miss_notified
+         && not ws.startup_diag_hover_miss_emitted
+         && ws.startup_diag_hover_ready_ms = None
+      then (
+        ws.startup_diag_hover_miss_emitted <- true;
+        Some
+          (`Assoc
+             [
+               "rootUri", root_uri_json;
+               "stage", `String "diagHoverReady";
+               "phase", `String (startup_phase_to_string ws.startup_phase);
+               "elapsedMs", `Int (startup_elapsed_ms ws);
+               "targetMs", `Int ws.startup_diag_hover_target_ms;
+             ])
+      ) else if ws.startup_nav_miss_notified
+                && not ws.startup_nav_miss_emitted
+                && ws.startup_fully_nav_ready_ms = None
+      then (
+        ws.startup_nav_miss_emitted <- true;
+        ws.startup_miss_emitted <- true;
+        Some
+          (`Assoc
+             [
+               "rootUri", root_uri_json;
+               "stage", `String "fullyNavigable";
+               "phase", `String (startup_phase_to_string ws.startup_phase);
+               "elapsedMs", `Int (startup_elapsed_ms ws);
+               "targetMs", `Int ws.startup_nav_target_ms;
+             ])
+      ) else
+        None
+
+let startup_background_budget_ms (ws:t) ~(base_budget_ms:int) : int =
+  update_startup_ready_state ws;
+  let base = max 1 base_budget_ms in
+  if ws.startup_fully_nav_ready_ms <> None then base
+  else
+    match ws.startup_phase with
+    | StartupAggressiveCatchUp ->
+        max base (max ws.startup_aggressive_bg_budget_ms ws.bg_high_large_budget_ms)
+    | StartupCold | StartupWarming | StartupReady ->
+        max base ws.bg_high_large_budget_ms
+
+let workspace_source_bytes_estimate (ws:t) : int =
+  match ws.index with
+  | None ->
+      0
+  | Some idx ->
+      let source_count = Workspace_index.source_count idx in
+      if ws.source_bytes_estimate_count = source_count then
+        (match ws.source_bytes_estimate with
+         | Some bytes -> max 0 bytes
+         | None -> 0)
+      else
+        let bytes =
+          Workspace_index.all_source_paths idx
+          |> List.fold_left (fun acc path ->
+               match file_size_bytes path with
+               | Some n when n > 0 -> acc + n
+               | _ -> acc)
+               0
+        in
+        ws.source_bytes_estimate <- Some bytes;
+        ws.source_bytes_estimate_count <- source_count;
+        max 0 bytes
+
+let workspace_profile_for_budget (ws:t) : workspace_profile =
+  match ws.workspace_profile_mode with
+  | ProfileModeSmall -> ProfileSmall
+  | ProfileModeMedium -> ProfileMedium
+  | ProfileModeLarge -> ProfileLarge
+  | ProfileModeAuto ->
+      let bytes = workspace_source_bytes_estimate ws in
+      if bytes >= profile_medium_max_bytes then ProfileLarge
+      else if bytes >= profile_small_max_bytes then ProfileMedium
+      else ProfileSmall
+
+let effective_bg_tick_budget_ms (ws:t) ~(base_budget_ms:int) : int =
+  let base = max 1 base_budget_ms in
+  match workspace_profile_for_budget ws with
+  | ProfileSmall -> base
+  | ProfileMedium -> max base 16
+  | ProfileLarge -> max base 24
 
 type semantic_validation_mode =
   | SemanticFull
@@ -359,7 +1719,10 @@ let lookup_scan_budget (ws:t) : int * int =
 let ensure_index_started (ws:t) : unit =
   match ws.root_path, ws.index with
   | Some root, None ->
-      ws.index <- Some (Workspace_index.start ~root)
+      let idx = Workspace_index.start ~root in
+      if Workspace_index.checkpoint_loaded idx then
+        Perf_stats.tick "index.checkpoint_loaded";
+      ws.index <- Some idx
   | _ ->
       ()
 
@@ -369,7 +1732,17 @@ let pump_index (ws:t) ~(max_dirs:int) ~(max_files:int) : unit =
   | None -> ()
   | Some idx ->
       (try
-         ignore (Workspace_index.scan_step idx ~max_dirs ~max_files)
+         let was_reconciling = Workspace_index.reconcile_pending idx in
+         let stale_before = Workspace_index.reconcile_stale_pruned idx in
+         let _dirs, files = Workspace_index.scan_step idx ~max_dirs ~max_files in
+         if files > 0 then ws.bg_seed_needs_refresh <- true;
+         if was_reconciling && not (Workspace_index.reconcile_pending idx) then (
+           Perf_stats.tick "index.reconcile_completed";
+           if Workspace_index.reconcile_stale_pruned idx > stale_before then
+             Perf_stats.tick "index.reconcile_pruned_stale";
+           ws.bg_seed_needs_refresh <- true;
+           enqueue_all_open_diag_revalidate ws ~reason:"reconcile"
+         )
        with _ -> ())
 
 let pump_index_background (ws:t) : unit =
@@ -382,22 +1755,665 @@ let pump_index_lookup (ws:t) : unit =
   let max_dirs, max_files = lookup_scan_budget ws in
   pump_index ws ~max_dirs ~max_files
 
+let index_checkpoint_loaded_for_report (ws:t) : bool =
+  match ws.index with
+  | None -> false
+  | Some idx -> Workspace_index.checkpoint_loaded idx
+
+let index_reconcile_pending_for_report (ws:t) : bool =
+  match ws.index with
+  | None -> false
+  | Some idx -> Workspace_index.reconcile_pending idx
+
+let index_reconcile_epoch_for_report (ws:t) : int =
+  match ws.index with
+  | None -> 0
+  | Some idx -> Workspace_index.reconcile_epoch idx
+
+let index_reconcile_sources_before_for_report (ws:t) : int =
+  match ws.index with
+  | None -> 0
+  | Some idx -> Workspace_index.reconcile_sources_before idx
+
+let index_reconcile_sources_after_for_report (ws:t) : int =
+  match ws.index with
+  | None -> 0
+  | Some idx -> Workspace_index.reconcile_sources_after idx
+
+let index_reconcile_stale_pruned_for_report (ws:t) : int =
+  match ws.index with
+  | None -> 0
+  | Some idx -> Workspace_index.reconcile_stale_pruned idx
+
+let is_import_word_char = function
+  | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+  | _ -> false
+
+let tokenize_upper_words_prefix ~(max_chars:int) (text:string) : string list =
+  let n = min (String.length text) (max 0 max_chars) in
+  let upper =
+    if n = String.length text then String.uppercase_ascii text
+    else String.uppercase_ascii (String.sub text 0 n)
+  in
+  let out = ref [] in
+  let rec scan i =
+    if i >= n then ()
+    else if is_import_word_char upper.[i] then (
+      let j = ref (i + 1) in
+      while !j < n && is_import_word_char upper.[!j] do
+        incr j
+      done;
+      out := String.sub upper i (!j - i) :: !out;
+      scan !j
+    ) else
+      scan (i + 1)
+  in
+  scan 0;
+  List.rev !out
+
+let quick_imports_from_deferred_doc_text (doc:Document.t) : Preprocess.import list =
+  let tokens =
+    tokenize_upper_words_prefix
+      ~max_chars:nav_miss_import_scan_max_chars
+      (Document.text doc)
+  in
+  let seen = Hashtbl.create 16 in
+  let out = ref [] in
+  let loc = Ast.Loc.none in
+  let push_name (raw:string) =
+    let name = normalize_name raw in
+    if name <> "" && not (Hashtbl.mem seen name) then (
+      Hashtbl.replace seen name true;
+      out :=
+        { Preprocess.kind = Preprocess.Compool; name; loc } :: !out
+    )
+  in
+  let rec collect = function
+    | ("COMPOOL" | "ICOMPOOL") :: name :: tl ->
+        push_name name;
+        collect tl
+    | _ :: tl ->
+        collect tl
+    | [] ->
+        ()
+  in
+  collect tokens;
+  List.rev !out
+
+let best_effort_doc_imports_for_scheduling (doc:Document.t) : Preprocess.import list =
+  let imports = Document.imports doc in
+  if imports <> [] then
+    imports
+  else if doc.Document.parse_rev = doc.Document.rev then
+    []
+  else
+    quick_imports_from_deferred_doc_text doc
+
+let uniq_norm_strings (xs:string list) : string list =
+  let seen = Hashtbl.create (max 16 (List.length xs)) in
+  let out = ref [] in
+  List.iter
+    (fun x ->
+      let k = normalize_name x in
+      if k <> "" && not (Hashtbl.mem seen k) then (
+        Hashtbl.replace seen k true;
+        out := k :: !out
+      ))
+    xs;
+  List.rev !out
+
+let resolve_manual_root_file (ws:t) (raw:string) : string =
+  if raw = "" then raw
+  else if Filename.is_relative raw then
+    match ws.root_path with
+    | Some root -> Filename.concat root raw
+    | None -> raw
+  else
+    raw
+
+let graph_entry_hint_for_path (ws:t) ~(path:string) : bool =
+  match ws.index with
+  | None -> false
+  | Some idx ->
+      Workspace_index.source_entry_hint idx ~path
+
+let graph_import_hints_for_path (ws:t) ~(path:string) ~(doc_opt:Document.t option) : string list =
+  match doc_opt with
+  | Some doc ->
+      best_effort_doc_imports_for_scheduling doc
+      |> List.filter_map (fun (imp:Preprocess.import) ->
+           match imp.kind with
+           | Preprocess.Compool ->
+               let key = normalize_name imp.name in
+               if key = "" then None else Some key)
+      |> uniq_norm_strings
+  | None ->
+      (match ws.index with
+       | None -> []
+       | Some idx -> Workspace_index.source_import_hints idx ~path)
+
+let graph_parse_quality_for_path (ws:t) ~(path_key:string) ~(doc_opt:Document.t option) : parse_quality =
+  match doc_opt with
+  | Some doc when doc.Document.parse_rev = doc.Document.rev -> ParseQualityFull
+  | _ ->
+      if Hashtbl.mem ws.quick_nav_done_set path_key || Hashtbl.mem ws.bg_parsed path_key then
+        ParseQualitySkeleton
+      else
+        ParseQualityNone
+
+let graph_file_class_for_path (ws:t) ~(path:string) ~(doc_opt:Document.t option) : file_class =
+  match doc_opt with
+  | Some _ -> FileClassOpen
+  | None ->
+      if graph_entry_hint_for_path ws ~path then FileClassEntry
+      else FileClassNormal
+
+let graph_queue_empty (ws:t) : bool =
+  Queue.is_empty ws.bg_root_small_queue
+  && Queue.is_empty ws.bg_root_large_queue
+
+let graph_closure_seed_complete (ws:t) : bool =
+  ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
+
+let graph_path_of_key (ws:t) (path_key:string) : string option =
+  match Hashtbl.find_opt ws.graph_nodes path_key with
+  | Some node -> Some node.gn_path
+  | None -> None
+
+let graph_neighbors_for_key
+    (ws:t)
+    ~(closure:(string, bool) Hashtbl.t)
+    (path_key:string)
+  : string list =
+  match Hashtbl.find_opt ws.graph_nodes path_key with
+  | None -> []
+  | Some node ->
+      let out = ref [] in
+      let seen = Hashtbl.create 16 in
+      let push_key (k:string) =
+        if k <> "" && Hashtbl.mem closure k && not (Hashtbl.mem seen k) then (
+          Hashtbl.replace seen k true;
+          out := k :: !out
+        )
+      in
+      List.iter (fun p -> push_key (normalize_path_key p)) node.gn_import_paths;
+      List.iter push_key node.gn_rev_importers;
+      List.rev !out
+
+let graph_refresh (ws:t) : unit =
+  if not ws.graph_needs_refresh then ()
+  else (
+    ws.graph_epoch <- ws.graph_epoch + 1;
+    Hashtbl.clear ws.graph_nodes;
+    Hashtbl.clear ws.graph_root_reason;
+    Hashtbl.clear ws.graph_root_closure_set;
+    ws.graph_root_closure_paths <- [||];
+    ws.graph_root_closure_cursor <- 0;
+    ws.graph_scc_count <- 0;
+
+    let path_seen = Hashtbl.create 8192 in
+    let add_path (acc:string list ref) (path:string) =
+      let key = normalize_path_key path in
+      if key <> "" && not (Hashtbl.mem path_seen key) then (
+        Hashtbl.replace path_seen key true;
+        acc := path :: !acc
+      )
+    in
+    let candidates = ref [] in
+    (match ws.index with
+     | None -> ()
+     | Some idx -> Workspace_index.all_source_paths idx |> List.iter (add_path candidates));
+    Hashtbl.iter
+      (fun _uri doc ->
+        match doc.Document.file with
+        | Some path -> add_path candidates path
+        | None -> ())
+      ws.docs;
+    ws.root_manual_files
+    |> List.iter (fun raw ->
+         let path = resolve_manual_root_file ws raw in
+         if path <> "" then add_path candidates path);
+    let paths = List.rev !candidates in
+
+    List.iter
+      (fun path ->
+        let path_key = normalize_path_key path in
+        if path_key <> "" then (
+          let doc_opt =
+            match find_open_doc_for_path ws ~path with
+            | Some d -> Some d
+            | None -> Hashtbl.find_opt ws.files path_key
+          in
+          let import_compools = graph_import_hints_for_path ws ~path ~doc_opt in
+          let import_paths =
+            import_compools
+            |> List.filter_map (fun compool ->
+                 match ws.index with
+                 | Some idx -> Workspace_index.find_compool idx ~name:compool
+                 | None -> None)
+            |> List.sort_uniq String.compare
+          in
+          let node =
+            {
+              gn_path = path;
+              gn_path_key = path_key;
+              gn_import_compools = import_compools;
+              gn_import_paths = import_paths;
+              gn_rev_importers = [];
+              gn_file_class = graph_file_class_for_path ws ~path ~doc_opt;
+              gn_size_class = size_class_of_path ws path;
+              gn_parse_quality = graph_parse_quality_for_path ws ~path_key ~doc_opt;
+              gn_epoch = ws.graph_epoch;
+            }
+          in
+          Hashtbl.replace ws.graph_nodes path_key node))
+      paths;
+
+    let reverse_sets : (string, (string, bool) Hashtbl.t) Hashtbl.t = Hashtbl.create 1024 in
+    Hashtbl.iter
+      (fun importer_key node ->
+        node.gn_import_paths
+        |> List.iter (fun provider_path ->
+             let provider_key = normalize_path_key provider_path in
+             if provider_key <> "" then
+               let set =
+                 match Hashtbl.find_opt reverse_sets provider_key with
+                 | Some s -> s
+                 | None ->
+                     let s = Hashtbl.create 8 in
+                     Hashtbl.replace reverse_sets provider_key s;
+                     s
+               in
+               Hashtbl.replace set importer_key true))
+      ws.graph_nodes;
+    Hashtbl.iter
+      (fun path_key node ->
+        let revs =
+          match Hashtbl.find_opt reverse_sets path_key with
+          | None -> []
+          | Some set -> Hashtbl.fold (fun k _ acc -> k :: acc) set []
+        in
+        node.gn_rev_importers <- revs)
+      ws.graph_nodes;
+
+    let open_roots =
+      Hashtbl.fold
+        (fun path_key node acc ->
+          if node.gn_file_class = FileClassOpen then path_key :: acc else acc)
+        ws.graph_nodes
+        []
+    in
+    let entry_roots =
+      Hashtbl.fold
+        (fun path_key node acc ->
+          if node.gn_file_class = FileClassEntry then path_key :: acc else acc)
+        ws.graph_nodes
+        []
+    in
+    let heuristic_roots =
+      Hashtbl.fold
+        (fun path_key node acc ->
+          if is_main_boot_heuristic node.gn_path then path_key :: acc else acc)
+        ws.graph_nodes
+        []
+    in
+    let manual_roots =
+      ws.root_manual_files
+      |> List.filter_map (fun raw ->
+           let path = resolve_manual_root_file ws raw in
+           let key = normalize_path_key path in
+           if key <> "" && Hashtbl.mem ws.graph_nodes key then Some key else None)
+    in
+
+    let roots =
+      match ws.root_model with
+      | RootModelManual ->
+          if manual_roots <> [] then open_roots @ manual_roots
+          else open_roots @ entry_roots @ heuristic_roots
+      | RootModelHeuristic ->
+          open_roots @ heuristic_roots
+      | RootModelAuto ->
+          if entry_roots <> [] then open_roots @ entry_roots
+          else if ws.root_heuristic_fallback then open_roots @ heuristic_roots
+          else open_roots
+    in
+    let roots =
+      roots
+      |> List.sort_uniq String.compare
+      |> List.sort (fun a b ->
+           match Hashtbl.find_opt ws.graph_nodes a, Hashtbl.find_opt ws.graph_nodes b with
+           | Some na, Some nb ->
+               compare (file_class_rank na.gn_file_class) (file_class_rank nb.gn_file_class)
+           | _ -> String.compare a b)
+    in
+    List.iter
+      (fun root_key ->
+        let reason =
+          if List.mem root_key open_roots then "open"
+          else if List.mem root_key entry_roots then "entry"
+          else if List.mem root_key manual_roots then "manual"
+          else if List.mem root_key heuristic_roots then "heuristic"
+          else "fallback"
+        in
+        Hashtbl.replace ws.graph_root_reason root_key reason)
+      roots;
+
+    let closure = Hashtbl.create (max 256 (ws.root_closure_target_files * 2)) in
+    let q : (string * int) Queue.t = Queue.create () in
+    roots |> List.iter (fun key -> Queue.add (key, 0) q);
+    while not (Queue.is_empty q)
+          && Hashtbl.length closure < ws.root_closure_target_files
+    do
+      let key, depth = Queue.pop q in
+      if key <> "" && not (Hashtbl.mem closure key) then (
+        Hashtbl.replace closure key true;
+        if depth < ws.root_closure_max_depth then
+          match Hashtbl.find_opt ws.graph_nodes key with
+          | None -> ()
+          | Some node ->
+              node.gn_import_paths
+              |> List.iter (fun p ->
+                   let k = normalize_path_key p in
+                   if k <> "" && Hashtbl.mem ws.graph_nodes k then
+                     Queue.add (k, depth + 1) q);
+              node.gn_rev_importers
+              |> List.iter (fun k ->
+                   if k <> "" && Hashtbl.mem ws.graph_nodes k then
+                     Queue.add (k, depth + 1) q)
+      )
+    done;
+    Hashtbl.iter (fun key _ -> Hashtbl.replace ws.graph_root_closure_set key true) closure;
+
+    let closure_paths =
+      Hashtbl.fold
+        (fun key _ acc ->
+          match graph_path_of_key ws key with
+          | Some path -> path :: acc
+          | None -> acc)
+        closure
+        []
+      |> List.sort String.compare
+      |> Array.of_list
+    in
+    ws.graph_root_closure_paths <- closure_paths;
+    ws.graph_root_closure_cursor <- 0;
+
+    let index_tbl : (string, int) Hashtbl.t = Hashtbl.create 1024 in
+    let low_tbl : (string, int) Hashtbl.t = Hashtbl.create 1024 in
+    let on_stack : (string, bool) Hashtbl.t = Hashtbl.create 1024 in
+    let stack : string Stack.t = Stack.create () in
+    let next_index = ref 0 in
+    let scc_count = ref 0 in
+    let rec strongconnect (v:string) : unit =
+      let idx = !next_index in
+      incr next_index;
+      Hashtbl.replace index_tbl v idx;
+      Hashtbl.replace low_tbl v idx;
+      Stack.push v stack;
+      Hashtbl.replace on_stack v true;
+      graph_neighbors_for_key ws ~closure v
+      |> List.iter (fun w ->
+           if not (Hashtbl.mem index_tbl w) then (
+             strongconnect w;
+             let low_v = Option.value (Hashtbl.find_opt low_tbl v) ~default:idx in
+             let low_w = Option.value (Hashtbl.find_opt low_tbl w) ~default:idx in
+             Hashtbl.replace low_tbl v (min low_v low_w)
+           ) else if Hashtbl.mem on_stack w then (
+             let low_v = Option.value (Hashtbl.find_opt low_tbl v) ~default:idx in
+             let idx_w = Option.value (Hashtbl.find_opt index_tbl w) ~default:idx in
+             Hashtbl.replace low_tbl v (min low_v idx_w)
+           ));
+      let low_v = Option.value (Hashtbl.find_opt low_tbl v) ~default:idx in
+      let idx_v = Option.value (Hashtbl.find_opt index_tbl v) ~default:idx in
+      if low_v = idx_v then (
+        incr scc_count;
+        let continue = ref true in
+        while !continue && not (Stack.is_empty stack) do
+          let w = Stack.pop stack in
+          Hashtbl.remove on_stack w;
+          if w = v then continue := false
+        done
+      )
+    in
+    Hashtbl.iter
+      (fun key _ ->
+        if not (Hashtbl.mem index_tbl key) then strongconnect key)
+      closure;
+    ws.graph_scc_count <- !scc_count;
+    ws.graph_needs_refresh <- false;
+    Perf_stats.tick "graph.refreshed";
+    Perf_stats.observe_ms "graph.root_candidates" (float_of_int (List.length roots));
+    Perf_stats.observe_ms "graph.root_closure_size" (float_of_int (Array.length ws.graph_root_closure_paths));
+    Perf_stats.observe_ms "graph.scc_count" (float_of_int ws.graph_scc_count)
+  )
+
+let ensure_graph_fresh (ws:t) : unit =
+  if ws.graph_needs_refresh then
+    graph_refresh ws
+
+let maybe_escalate_index_reconcile
+    ?(reason:string="unknown")
+    ?(has_imports_override:bool option)
+    (ws:t)
+    ~(doc:Document.t option)
+  : bool =
+  let has_imports =
+    match has_imports_override, doc with
+    | Some b, _ -> b
+    | None, None -> false
+    | None, Some d ->
+        best_effort_doc_imports_for_scheduling d <> []
+  in
+  match ws.index with
+  | None -> false
+  | Some idx ->
+      let compools = Workspace_index.compool_count idx in
+      let sources = Workspace_index.source_count idx in
+      if (not has_imports) || compools > 0 || sources <= 0 then false
+      else
+        let now = Perf_stats.now_ms () in
+        if now -. ws.index_reconcile_escalate_last_ms < float_of_int index_stale_reconcile_min_interval_ms then
+          false
+        else (
+          ws.index_reconcile_escalate_last_ms <- now;
+          ws.index_reconcile_escalations <- ws.index_reconcile_escalations + 1;
+          if Workspace_index.force_reconcile idx then
+            Perf_stats.tick "index.reconcile_started";
+          ws.bg_seed_needs_refresh <- true;
+          pump_index
+            ws
+            ~max_dirs:index_reconcile_escalate_dirs
+            ~max_files:index_reconcile_escalate_files;
+          ignore reason;
+          true
+        )
+
+let schedule_nav_miss_reconcile
+    (ws:t)
+    ~(doc:Document.t)
+    ~(symbol_key:string)
+  : unit =
+  let key = normalize_name symbol_key in
+  if key = "" then ()
+  else (
+    Perf_stats.tick "nav.miss_trigger_reconcile";
+    let imports = best_effort_doc_imports_for_scheduling doc in
+    let profile = workspace_profile_for_budget ws in
+    let nav_miss_high_cap =
+      match profile with
+      | ProfileLarge -> max nav_miss_high_enqueue_cap 64
+      | ProfileMedium -> max nav_miss_high_enqueue_cap 36
+      | ProfileSmall -> nav_miss_high_enqueue_cap
+    in
+    let quick_scan_files_budget =
+      match profile with
+      | ProfileLarge -> max nav_quick_scan_files 128
+      | ProfileMedium -> max nav_quick_scan_files 72
+      | ProfileSmall -> nav_quick_scan_files
+    in
+    let quick_scan_total_budget =
+      match profile with
+      | ProfileLarge -> max nav_quick_scan_total_bytes 4_194_304
+      | ProfileMedium -> max nav_quick_scan_total_bytes 2_359_296
+      | ProfileSmall -> nav_quick_scan_total_bytes
+    in
+    let high_budget =
+      if ws.startup_diag_hover_ready_ms <> None then max_int
+      else max 0 nav_miss_high_cap
+    in
+    let high_used = ref 0 in
+    let scheduled_paths : (string, bool) Hashtbl.t = Hashtbl.create 16 in
+    let enqueue_path_once (path:string) : unit =
+      let path_key = normalize_path_key path in
+      if path_key <> "" && not (Hashtbl.mem scheduled_paths path_key) then (
+        Hashtbl.replace scheduled_paths path_key true;
+        let use_high =
+          if !high_used < high_budget then (
+            incr high_used;
+            true
+          ) else
+            false
+        in
+        let lane = if use_high then LaneOpen else LaneRoot in
+        enqueue_bg_path ws ~lane ~reason_group:"nav_miss" ~high:use_high path
+      )
+    in
+    let enqueue_compool_path (name:string) : unit =
+      match ws.index with
+      | None -> ()
+      | Some idx ->
+          (match Workspace_index.find_compool idx ~name with
+           | None -> ()
+           | Some p -> enqueue_path_once p)
+    in
+    (match Hashtbl.find_opt ws.quick_nav_index key with
+     | None -> ()
+     | Some entries ->
+         List.iter
+           (fun (e:quick_nav_entry) ->
+             match Uri_path.file_path_of_uri e.qn_uri with
+             | Some p -> enqueue_path_once p
+             | None -> ())
+           entries);
+    imports
+    |> List.iter (fun (imp:Preprocess.import) ->
+         enqueue_compool_path imp.name);
+    (match ws.symbol_hints with
+     | None -> ()
+     | Some (values, types) ->
+         let add_candidates (tbl:(string, string list) Hashtbl.t) =
+           match Hashtbl.find_opt tbl key with
+           | None -> ()
+           | Some compools ->
+               List.iter enqueue_compool_path compools
+         in
+         add_candidates values;
+         add_candidates types);
+    if Hashtbl.length scheduled_paths = 0 then (
+      let pat = "PROC " ^ key in
+      let contains_pat (s:string) : bool =
+        let n = String.length s in
+        let m = String.length pat in
+        let rec loop i =
+          if i + m > n then false
+          else if String.sub s i m = pat then true
+          else loop (i + 1)
+        in
+        m > 0 && loop 0
+      in
+      let read_prefix (path:string) ~(max_bytes:int) : string option =
+        try
+          let ic = open_in_bin path in
+          Fun.protect
+            ~finally:(fun () -> close_in_noerr ic)
+            (fun () ->
+              let size =
+                try in_channel_length ic with _ -> max_bytes
+              in
+              let n = max 0 (min max_bytes size) in
+              Some (really_input_string ic n))
+        with _ ->
+          None
+      in
+      match ws.index with
+      | None -> ()
+      | Some idx ->
+          let rec scan scanned scanned_bytes = function
+            | [] -> ()
+            | _ when scanned >= quick_scan_files_budget -> ()
+            | _ when scanned_bytes >= quick_scan_total_budget -> ()
+            | path :: tl ->
+                (match read_prefix path ~max_bytes:nav_quick_scan_per_file_bytes with
+                 | None ->
+                     scan (scanned + 1) scanned_bytes tl
+                 | Some text ->
+                     let bytes = String.length text in
+                     let next_bytes = scanned_bytes + bytes in
+                     if next_bytes > quick_scan_total_budget then ()
+                     else (
+                       let upper = String.uppercase_ascii text in
+                       if contains_pat upper then enqueue_path_once path;
+                       scan (scanned + 1) next_bytes tl))
+          in
+          scan 0 0 (Workspace_index.all_source_paths idx);
+          if Hashtbl.length scheduled_paths = 0 then (
+            ensure_graph_fresh ws;
+            let rec enqueue_closure i remaining =
+              if remaining <= 0 || i >= Array.length ws.graph_root_closure_paths then ()
+              else (
+                enqueue_path_once ws.graph_root_closure_paths.(i);
+                enqueue_closure (i + 1) (remaining - 1)
+              )
+            in
+            enqueue_closure 0 (min 48 (Array.length ws.graph_root_closure_paths))
+          )
+    );
+    ignore
+      (maybe_escalate_index_reconcile
+         ws
+         ~doc:(Some doc)
+         ~reason:"nav_miss"
+         ~has_imports_override:(imports <> []))
+  )
+
+let invalidate_symbol_hints (ws:t) : unit =
+  ws.symbol_hints <- None
+
 let rescan (ws:t) : unit =
+  startup_mark_started ws;
+  mark_graph_dirty ws;
   invalidate_lsif_snapshot ws;
+  ws.parse_epoch <- ws.parse_epoch + 1;
   ws.lsif_snapshot_revision <- 0;
   Hashtbl.clear ws.files;
   Hashtbl.clear ws.nav_response_cache;
   Hashtbl.clear ws.bg_enqueued;
   Hashtbl.clear ws.bg_parsed;
+  Hashtbl.clear ws.closed_doc_last_touch;
   Hashtbl.clear ws.bg_closed_diags;
   Hashtbl.clear ws.bg_pending_diag_payloads;
   Hashtbl.clear ws.bg_pending_diag_set;
-  while not (Queue.is_empty ws.bg_high_queue) do ignore (Queue.pop ws.bg_high_queue) done;
-  while not (Queue.is_empty ws.bg_norm_queue) do ignore (Queue.pop ws.bg_norm_queue) done;
+  Hashtbl.clear ws.open_parse_generation;
+  Hashtbl.clear ws.open_provisional_since_ms;
+  Hashtbl.clear ws.quick_nav_index;
+  Hashtbl.clear ws.quick_nav_pending_set;
+  Hashtbl.clear ws.quick_nav_done_set;
+  Hashtbl.clear ws.nav_quick_scan_offset_by_path;
+  ws.quick_nav_index_done <- 0;
+  ws.quick_nav_index_total <- 0;
+  Hashtbl.clear ws.parse_worker_inflight;
+  while not (Queue.is_empty ws.bg_high_small_queue) do ignore (Queue.pop ws.bg_high_small_queue) done;
+  while not (Queue.is_empty ws.bg_norm_small_queue) do ignore (Queue.pop ws.bg_norm_small_queue) done;
+  while not (Queue.is_empty ws.bg_high_large_queue) do ignore (Queue.pop ws.bg_high_large_queue) done;
+  while not (Queue.is_empty ws.bg_norm_large_queue) do ignore (Queue.pop ws.bg_norm_large_queue) done;
+  while not (Queue.is_empty ws.quick_nav_pending_paths) do ignore (Queue.pop ws.quick_nav_pending_paths) done;
+  while not (Queue.is_empty ws.parse_worker_jobs) do ignore (Queue.pop ws.parse_worker_jobs) done;
+  while not (Queue.is_empty ws.parse_worker_results) do ignore (Queue.pop ws.parse_worker_results) done;
   while not (Queue.is_empty ws.bg_pending_diag_updates) do ignore (Queue.pop ws.bg_pending_diag_updates) done;
   ws.bg_seed_paths <- [||];
   ws.bg_seed_cursor <- 0;
-  ws.symbol_hints <- None;
+  ws.bg_seed_needs_refresh <- true;
+  invalidate_symbol_hints ws;
   if ws.sem_store_enabled then Semantic_store.reset ws.semantic_store;
   if ws.lsif_delta_enabled then Lsif_delta.reset ws.lsif_delta_state;
   match ws.root_path with
@@ -406,10 +2422,8 @@ let rescan (ws:t) : unit =
        let idx = Workspace_index.start ~root in
        ws.index <- Some idx;
        let max_dirs, max_files =
-         if is_probably_network_path root then
-           (index_startup_dirs_network, index_startup_files_network)
-         else
-           (index_startup_dirs, index_startup_files)
+         startup_scan_budget_for_root
+           ~network:(is_probably_network_path root)
        in
        (try
           ignore
@@ -528,7 +2542,7 @@ let has_compool_target (ws:t) (name:string) : bool =
            (match Workspace_index.find_compool idx ~name:key with
             | Some _ -> true
             | None ->
-                if Workspace_index.is_complete idx && allow_fallback_scan ws then
+                if allow_fallback_scan ws then
                   (match find_compool_path_fallback ws ~key with
                    | Some _ -> true
                    | None -> false)
@@ -590,6 +2604,11 @@ let is_builtin_function_name (name:string) : bool =
       true
   | _ ->
       false
+
+let is_control_stmt_keyword (name:string) : bool =
+  match normalize_name name with
+  | "EXIT" | "ABORT" | "STOP" -> true
+  | _ -> false
 
 let is_reserved_keyword (name:string) : bool =
   match normalize_name name with
@@ -720,23 +2739,58 @@ let read_file_text (path:string) : string option =
     Some txt
   with _ -> None
 
-let find_open_doc_for_path (ws:t) ~(path:string) : Document.t option =
-  let found_open = ref None in
-  Hashtbl.iter (fun _uri doc ->
-    match doc.Document.file with
-    | Some p when same_path p path -> found_open := Some doc
-    | _ -> ()
-  ) ws.docs;
-  !found_open
+let read_file_prefix_text (path:string) ~(max_bytes:int) : string option =
+  if max_bytes <= 0 then None
+  else
+    try
+      let ic = open_in_bin path in
+      let len = in_channel_length ic in
+      let take = min len max_bytes in
+      let txt = really_input_string ic take in
+      close_in_noerr ic;
+      Some txt
+    with _ -> None
+
+let read_file_window_text
+    (path:string)
+    ~(offset:int)
+    ~(max_bytes:int)
+  : (string * int) option =
+  if max_bytes <= 0 then None
+  else
+    try
+      let ic = open_in_bin path in
+      Fun.protect
+        ~finally:(fun () -> close_in_noerr ic)
+        (fun () ->
+          let len = in_channel_length ic in
+          let start = max 0 (min offset len) in
+          seek_in ic start;
+          let take = min max_bytes (len - start) in
+          if take <= 0 then
+            Some ("", 0)
+          else
+            let txt = really_input_string ic take in
+            let next =
+              if start + take >= len then 0
+              else start + take
+            in
+            Some (txt, next))
+    with _ ->
+      None
 
 let doc_from_path_cached_only (ws:t) (path:string) : Document.t option =
   let key = normalize_path_key path in
   match Hashtbl.find_opt ws.files key with
-  | Some d -> Some d
+  | Some d ->
+      touch_closed_doc_path ws ~path_key:key;
+      Some d
   | None ->
       (match find_open_doc_for_path ws ~path with
        | Some d ->
            Hashtbl.replace ws.files key d;
+           touch_closed_doc_path ws ~path_key:key;
+           evict_closed_docs_if_needed ws;
            Some d
        | None ->
            None)
@@ -746,20 +2800,37 @@ let doc_from_path_cached (ws:t) (path:string) : Document.t option =
   | Some d -> Some d
   | None ->
       let key = normalize_path_key path in
-      match read_file_text path with
-      | None -> None
-      | Some txt ->
-          let uri =
-            match Uri_path.docuri_of_path path with
-            | Some u -> u
-            | None ->
-                (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
-                 | u -> u
-                 | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
-          in
-          let d = Document.make ~uri ~file:(Some path) ~text:txt in
-          Hashtbl.replace ws.files key d;
-          Some d
+      let uri =
+        match Uri_path.docuri_of_path path with
+        | Some u -> u
+        | None ->
+            (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
+             | u -> u
+             | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
+      in
+      let d_opt =
+        match file_size_bytes path with
+        | Some n when is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes ~text_len:n ->
+            Some (make_doc_with_parse_guard ws ~uri ~file:(Some path) ~text:"" ~actual_bytes:n)
+        | _ ->
+            (match read_file_text path with
+             | None -> None
+             | Some txt ->
+                 let d =
+                   try parse_guarded_document_make ws ~uri ~file:(Some path) ~text:txt
+                   with exn ->
+                     ignore exn;
+                     Document.make ~uri ~file:(Some path) ~text:""
+                 in
+                 Some d)
+      in
+      (match d_opt with
+       | None -> None
+       | Some d ->
+           Hashtbl.replace ws.files key d;
+           touch_closed_doc_path ws ~path_key:key;
+           evict_closed_docs_if_needed ws;
+           Some d)
 
 let resolve_compool_doc_uncached (ws:t) ~(name:string) : Document.t option =
   let key = normalize_name name in
@@ -772,7 +2843,7 @@ let resolve_compool_doc_uncached (ws:t) ~(name:string) : Document.t option =
             (match Workspace_index.find_compool idx ~name:key with
              | Some p -> Some p
              | None ->
-                 if Workspace_index.is_complete idx && allow_fallback_scan ws then
+                 if allow_fallback_scan ws then
                    find_compool_path_fallback ws ~key
                  else
                    None)
@@ -1351,8 +3422,9 @@ let build_symbol_hint_index (ws:t) : (string, string list) Hashtbl.t * (string, 
        && !parsed_chars < symbol_hint_max_chars
     then (
       Hashtbl.replace seen_paths pk true;
-      match doc_from_path_cached ws p with
-      | None -> ()
+      match doc_from_path_cached_only ws p with
+      | None ->
+          enqueue_bg_path ws ~high:false p
       | Some d ->
           let txt_len = String.length d.Document.text in
           if !parsed_chars + txt_len <= symbol_hint_max_chars then (
@@ -1396,6 +3468,7 @@ let symbol_hint_index (ws:t) : (string, string list) Hashtbl.t * (string, string
   | None ->
       let idx = build_symbol_hint_index ws in
       ws.symbol_hints <- Some idx;
+      enqueue_all_open_diag_revalidate ws ~reason:"hint_ready";
       idx
 
 let sem_import_dirs (doc:Document.t) : compool_import_dir list =
@@ -1528,39 +3601,33 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
 
       let hint_tables
         : ((string, string list) Hashtbl.t * (string, string list) Hashtbl.t) option ref
-        = ref None
-      in
-      let get_hint_tables ()
-        : (string, string list) Hashtbl.t * (string, string list) Hashtbl.t =
-        match !hint_tables with
-        | Some t -> t
-        | None ->
-            let t = symbol_hint_index ws in
-            hint_tables := Some t;
-            t
+        = ref ws.symbol_hints
       in
       let hint_compools_for ~(is_type:bool) (name:string) : string list =
         let key = normalize_name name in
         if key = "" then []
         else
-          let hint_values, hint_types = get_hint_tables () in
-          let tbl = if is_type then hint_types else hint_values in
-          match Hashtbl.find_opt tbl key with
-          | None -> []
-          | Some xs ->
-              xs
-              |> List.filter (fun c ->
-                   match Hashtbl.find_opt imported_compools (normalize_name c) with
-                   | Some `All -> false
-                   | Some `Selected | None -> true)
-              |> List.sort_uniq String.compare
-              |> (fun ys ->
-                    let rec take n acc = function
-                      | [] -> List.rev acc
-                      | _ when n <= 0 -> List.rev acc
-                      | x :: tl -> take (n - 1) (x :: acc) tl
-                    in
-                    take 3 [] ys)
+          match !hint_tables with
+          | None ->
+              []
+          | Some (hint_values, hint_types) ->
+              let tbl = if is_type then hint_types else hint_values in
+              match Hashtbl.find_opt tbl key with
+              | None -> []
+              | Some xs ->
+                  xs
+                  |> List.filter (fun c ->
+                       match Hashtbl.find_opt imported_compools (normalize_name c) with
+                       | Some `All -> false
+                       | Some `Selected | None -> true)
+                  |> List.sort_uniq String.compare
+                  |> (fun ys ->
+                        let rec take n acc = function
+                          | [] -> List.rev acc
+                          | _ when n <= 0 -> List.rev acc
+                          | x :: tl -> take (n - 1) (x :: acc) tl
+                        in
+                        take 3 [] ys)
       in
       let suggest_missing_import ~(loc:Ast.Loc.t) ~(kind:string) ~(is_type:bool) ~(symbol:string) : unit =
         let compools = hint_compools_for ~is_type symbol in
@@ -1593,6 +3660,54 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
             in
             Hashtbl.replace exports_cache key x;
             x
+      in
+
+      let should_suppress_cross_module_unresolved ~(is_type:bool) ~(name:string) : bool =
+        if not warmup_suppress_crossmodule_unresolved then false
+        else if ws.startup_diag_hover_ready_ms <> None then false
+        else if import_dirs = [] then false
+        else
+          let key = normalize_name name in
+          if key = "" then false
+          else
+            let qualified_import_match =
+              match String.index_opt key '\'' with
+              | None -> false
+              | Some i ->
+                  if i <= 0 || i + 1 >= String.length key then false
+                  else
+                    let compool = String.sub key (i + 1) (String.length key - i - 1) in
+                    compool <> ""
+                    && List.exists (fun imp -> imp.compool = compool) import_dirs
+            in
+            if qualified_import_match then (
+              Perf_stats.tick "diag.xmodule_suppressed";
+              Perf_stats.tick "diag.warmup_suppressed";
+              true
+            ) else
+            let maybe_external =
+              List.exists (fun imp ->
+                let selected_match =
+                  List.exists (fun (nm, _loc) -> nm = key) imp.selected
+                in
+                match get_exports_for_compool imp.compool with
+                | None ->
+                    true
+                | Some exp ->
+                    let exported =
+                      if is_type then Hashtbl.mem exp.types key
+                      else Hashtbl.mem exp.values key
+                    in
+                    if imp.selected = [] then exported
+                    else selected_match
+              ) import_dirs
+            in
+            if maybe_external then (
+              Perf_stats.tick "diag.xmodule_suppressed";
+              Perf_stats.tick "diag.warmup_suppressed";
+              true
+            ) else
+              false
       in
 
       let scope = sem_scope_copy (sem_exports_of_program prog) in
@@ -1713,12 +3828,14 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
                     | _ ->
                         emit id.loc (Printf.sprintf "%S is a procedure and cannot be used as a value." id.v);
                         TyUnknown)
-               | None ->
-                    if has_import_hint ~is_type:false id.v then
-                      suggest_missing_import ~loc:id.loc ~kind:"Identifier" ~is_type:false ~symbol:id.v
-                    else
-                      emit id.loc (Printf.sprintf "Undefined identifier %S." id.v);
-                    TyUnknown)
+                | None ->
+                     if should_suppress_cross_module_unresolved ~is_type:false ~name:id.v then
+                       ()
+                     else if has_import_hint ~is_type:false id.v then
+                       suggest_missing_import ~loc:id.loc ~kind:"Identifier" ~is_type:false ~symbol:id.v
+                     else
+                       emit id.loc (Printf.sprintf "Undefined identifier %S." id.v);
+                     TyUnknown)
         | Ast.EUnop { rhs; _ } ->
             ty_of_expr scp current_proc rhs
         | Ast.EBinop { lhs; rhs; _ } ->
@@ -1796,14 +3913,15 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
                        emit callee.loc (Printf.sprintf "Cannot subscript %S." callee.v);
                        TyUnknown
                      ) else out_ty
-               | None ->
-                   emit callee.loc
-                     (Printf.sprintf
-                        "Undefined procedure %S. Declare it with REF PROC %S in scope."
-                        callee.v
-                        callee.v);
-                   List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) args;
-                   TyUnknown)
+                | None ->
+                    if not (should_suppress_cross_module_unresolved ~is_type:false ~name:callee.v) then
+                      emit callee.loc
+                        (Printf.sprintf
+                           "Undefined procedure %S. Declare it with REF PROC %S in scope."
+                           callee.v
+                           callee.v);
+                    List.iter (fun a -> ignore (ty_of_expr scp current_proc a)) args;
+                    TyUnknown)
         | Ast.EIndex { base; index } ->
             let bt = ty_of_expr scp current_proc base in
             List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) index;
@@ -1872,12 +3990,14 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
                   | _ ->
                       emit id.loc (Printf.sprintf "Cannot assign to procedure %S." id.v);
                       None)
-             | None ->
-                  if has_import_hint ~is_type:false id.v then
-                    suggest_missing_import ~loc:id.loc ~kind:"Item" ~is_type:false ~symbol:id.v
-                  else
-                    emit id.loc (Printf.sprintf "Undefined item %S." id.v);
-                  None)
+              | None ->
+                   if should_suppress_cross_module_unresolved ~is_type:false ~name:id.v then
+                     ()
+                   else if has_import_hint ~is_type:false id.v then
+                     suggest_missing_import ~loc:id.loc ~kind:"Item" ~is_type:false ~symbol:id.v
+                   else
+                     emit id.loc (Printf.sprintf "Undefined item %S." id.v);
+                   None)
         | Ast.EField _ | Ast.EAt _ | Ast.EDeref _ | Ast.EIndex _ ->
             Some (ty_of_expr scp current_proc e)
         | _ ->
@@ -1903,14 +4023,71 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
         | Ast.DDirective _ -> ()
       in
 
-      let rec check_stmt (scp:sem_scope) (current_proc:sem_proc_ctx option) (s:Ast.stmt Ast.node) : unit =
+      let rec collect_label_depths_for_stmt
+          (out:(string, int) Hashtbl.t)
+          ~(loop_depth:int)
+          (s:Ast.stmt Ast.node)
+        : unit =
+        match s.v with
+        | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _ ->
+            ()
+        | Ast.SDecl _ ->
+            ()
+        | Ast.SBlock xs ->
+            List.iter (collect_label_depths_for_stmt out ~loop_depth) xs
+        | Ast.SIf { then_; else_; _ } ->
+            collect_label_depths_for_stmt out ~loop_depth then_;
+            (match else_ with
+             | None -> ()
+             | Some e -> collect_label_depths_for_stmt out ~loop_depth e)
+        | Ast.SWhile { body; _ } ->
+            collect_label_depths_for_stmt out ~loop_depth:(loop_depth + 1) body
+        | Ast.SFor { init; step; body; _ } ->
+            (match init with
+             | None -> ()
+             | Some i -> collect_label_depths_for_stmt out ~loop_depth i);
+            (match step with
+             | None -> ()
+             | Some st -> collect_label_depths_for_stmt out ~loop_depth st);
+            collect_label_depths_for_stmt out ~loop_depth:(loop_depth + 1) body
+        | Ast.SLabel { label; body } ->
+            let key = normalize_name label.v in
+            if key <> "" && not (Hashtbl.mem out key) then
+              Hashtbl.add out key loop_depth;
+            collect_label_depths_for_stmt out ~loop_depth body
+      in
+
+      let collect_label_depths (s:Ast.stmt Ast.node) : (string, int) Hashtbl.t =
+        let out = Hashtbl.create 64 in
+        collect_label_depths_for_stmt out ~loop_depth:0 s;
+        out
+      in
+
+      let top_level_label_depths : (string, int) Hashtbl.t =
+        let out = Hashtbl.create 64 in
+        List.iter (function
+          | Ast.TopStmt s ->
+              collect_label_depths_for_stmt out ~loop_depth:0 s
+          | Ast.TopDecl _ ->
+              ()
+        ) prog;
+        out
+      in
+
+      let rec check_stmt
+          (scp:sem_scope)
+          (current_proc:sem_proc_ctx option)
+          ~(loop_depth:int)
+          ~(label_depths:(string, int) Hashtbl.t)
+          (s:Ast.stmt Ast.node)
+        : unit =
         match s.v with
         | Ast.SEmpty -> ()
         | Ast.SDecl d ->
             add_decl_symbol scp d;
-            check_decl scp current_proc d
+            check_decl scp current_proc ~loop_depth ~label_depths d
         | Ast.SBlock xs ->
-            List.iter (fun st -> check_stmt scp current_proc st) xs
+            List.iter (fun st -> check_stmt scp current_proc ~loop_depth ~label_depths st) xs
         | Ast.SAssign { lhs; rhs } ->
             let lhs_ty = ty_of_lvalue scp current_proc lhs in
             let rhs_ty = ty_of_expr scp current_proc rhs in
@@ -1923,15 +4100,53 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
                         "Type mismatch in assignment: left is %s, right is %s."
                         (sem_ty_to_string lt)
                          (sem_ty_to_string rhs_ty)))
-        | Ast.SCallStmt { callee; args } ->
-            ignore (ty_of_expr scp current_proc (Ast.node ~loc:s.loc (Ast.ECall { callee; args })))
+        | Ast.SCallStmt { callee; args; abort_label } ->
+            let ck = normalize_name callee.v in
+            if is_control_stmt_keyword ck then (
+              if ck = "EXIT" && loop_depth <= 0 then
+                emit callee.loc "EXIT is only valid inside a loop.";
+              if ck = "ABORT" && current_proc = None then
+                emit callee.loc "ABORT is only valid inside a procedure.";
+              if ck = "STOP" then
+                List.iter (fun arg -> ignore (ty_of_expr scp current_proc arg)) args;
+              if ck = "STOP" && List.length args > 1 then
+                emit callee.loc "STOP accepts at most one optional stop code expression."
+            ) else (
+              let diag_count_before = List.length !out in
+              ignore (ty_of_expr scp current_proc (Ast.node ~loc:s.loc (Ast.ECall { callee; args })));
+              let diag_count_after = List.length !out in
+              if diag_count_after = diag_count_before then
+                match sem_lookup_value scp callee.v with
+                | Some _ -> ()
+                | None ->
+                    if (not (sem_is_builtin_call callee.v))
+                       && not (should_suppress_cross_module_unresolved ~is_type:false ~name:callee.v)
+                    then
+                      emit callee.loc
+                        (Printf.sprintf
+                           "Undefined procedure %S. Declare it with REF PROC %S in scope."
+                           callee.v
+                           callee.v)
+            );
+            (match abort_label with
+             | None -> ()
+             | Some lab ->
+                 if current_proc = None then
+                   emit lab.loc "ABORT label phrase is only valid inside a procedure call statement."
+                 else
+                   let lk = normalize_name lab.v in
+                   if lk = "" || not (Hashtbl.mem label_depths lk) then
+                     emit lab.loc
+                       (Printf.sprintf "Undefined ABORT target label %S." lab.v))
         | Ast.SIf { cond; then_; else_ } ->
             ignore (ty_of_expr scp current_proc cond);
-            check_stmt scp current_proc then_;
-            (match else_ with None -> () | Some e -> check_stmt scp current_proc e)
+            check_stmt scp current_proc ~loop_depth ~label_depths then_;
+            (match else_ with
+             | None -> ()
+             | Some e -> check_stmt scp current_proc ~loop_depth ~label_depths e)
         | Ast.SWhile { cond; body } ->
             ignore (ty_of_expr scp current_proc cond);
-            check_stmt scp current_proc body
+            check_stmt scp current_proc ~loop_depth:(loop_depth + 1) ~label_depths body
         | Ast.SFor { init; cond; step; body } ->
             let for_scope =
               match init with
@@ -1944,17 +4159,40 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
               | _ ->
                   scp
             in
-            (match init with None -> () | Some i -> check_stmt for_scope current_proc i);
+            (match init with
+             | None -> ()
+             | Some i -> check_stmt for_scope current_proc ~loop_depth ~label_depths i);
             (match cond with None -> () | Some c -> ignore (ty_of_expr for_scope current_proc c));
-            (match step with None -> () | Some st -> check_stmt for_scope current_proc st);
-            check_stmt for_scope current_proc body
+            (match step with
+             | None -> ()
+             | Some st -> check_stmt for_scope current_proc ~loop_depth ~label_depths st);
+            check_stmt for_scope current_proc ~loop_depth:(loop_depth + 1) ~label_depths body
         | Ast.SReturn eo ->
+            if current_proc = None then
+              emit s.loc "RETURN is only valid inside a procedure.";
             (match eo with None -> () | Some e -> ignore (ty_of_expr scp current_proc e))
         | Ast.SLabel { body; _ } ->
-            check_stmt scp current_proc body
-        | Ast.SGoto _ -> ()
+            check_stmt scp current_proc ~loop_depth ~label_depths body
+        | Ast.SGoto id ->
+            let key = normalize_name id.v in
+            (match Hashtbl.find_opt label_depths key with
+             | None ->
+                 emit id.loc (Printf.sprintf "Undefined target label %S." id.v)
+             | Some target_depth ->
+                 if target_depth > loop_depth then
+                   emit id.loc
+                     (Printf.sprintf
+                        "GOTO to %S enters a deeper loop body, which is not allowed."
+                        id.v))
 
-      and check_decl (scp:sem_scope) (current_proc:sem_proc_ctx option) (d:Ast.decl Ast.node) : unit =
+      and check_decl
+          (scp:sem_scope)
+          (current_proc:sem_proc_ctx option)
+          ~(loop_depth:int)
+          ~label_depths:(_label_depths:(string, int) Hashtbl.t)
+          (d:Ast.decl Ast.node)
+        : unit =
+        let _ = loop_depth in
         match d.v with
         | Ast.DVar { dtype; init; _ } ->
             check_type_import_hints scp dtype;
@@ -1980,6 +4218,7 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
             ()
         | Ast.DProc p ->
             let proc_scope = sem_scope_copy scp in
+            let proc_label_depths = collect_label_depths p.v.body in
             List.iter (add_decl_symbol proc_scope) p.v.locals;
             let local_var_tys : (string, sem_ty) Hashtbl.t = Hashtbl.create 32 in
             List.iter (fun dlocal ->
@@ -2021,13 +4260,16 @@ let validate_semantics (ws:t) (doc:Document.t) : T.Diagnostic.t list =
               in
               sem_add_value proc_scope pname (SVVar inferred_ty)
             ) p.v.params;
-            List.iter (fun pd -> check_decl proc_scope proc_ctx pd) p.v.locals;
-            check_stmt proc_scope proc_ctx p.v.body
+            List.iter
+              (fun pd ->
+                check_decl proc_scope proc_ctx ~loop_depth:0 ~label_depths:proc_label_depths pd)
+              p.v.locals;
+            check_stmt proc_scope proc_ctx ~loop_depth:0 ~label_depths:proc_label_depths p.v.body
       in
 
       List.iter (function
-        | Ast.TopDecl d -> check_decl scope None d
-        | Ast.TopStmt s -> check_stmt scope None s
+        | Ast.TopDecl d -> check_decl scope None ~loop_depth:0 ~label_depths:top_level_label_depths d
+        | Ast.TopStmt s -> check_stmt scope None ~loop_depth:0 ~label_depths:top_level_label_depths s
       ) prog;
       List.rev !out
 
@@ -2060,6 +4302,7 @@ let store_doc
            [])
   in
   let doc = Document.with_import_diags (import_diags @ semantic_diags) doc in
+  mark_graph_dirty ws;
   let new_compool_key = compool_key_of_doc doc in
   let has_compool (d:Document.t) =
     match d.Document.compool_def with
@@ -2067,15 +4310,22 @@ let store_doc
     | Some name -> normalize_name name <> ""
   in
   if has_compool doc || Option.fold ~none:false ~some:has_compool old_doc then
-    ws.symbol_hints <- None;
+    invalidate_symbol_hints ws;
   Hashtbl.replace ws.docs uri doc;
+  let revalidate_importers_for_compool (key:string option) : unit =
+    match key with
+    | None -> ()
+    | Some key ->
+        let importers = importer_uris_for_compool_key ws ~compool_key:key in
+        invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
+        List.iter
+          (fun importer_uri ->
+            enqueue_open_diag_revalidate ws ~uri:importer_uri ~reason:"compool_change")
+          importers
+  in
+  revalidate_importers_for_compool old_compool_key;
+  revalidate_importers_for_compool new_compool_key;
   if ws.sem_store_enabled then (
-    Option.iter
-      (fun key -> invalidate_importer_nav_state_for_compool_key ws ~compool_key:key)
-      old_compool_key;
-    Option.iter
-      (fun key -> invalidate_importer_nav_state_for_compool_key ws ~compool_key:key)
-      new_compool_key;
     Semantic_store.remove_uri ws.semantic_store ~uri;
   );
   match doc.Document.file with
@@ -2083,34 +4333,51 @@ let store_doc
   | Some f ->
       let path_key = normalize_path_key f in
       Hashtbl.replace ws.files path_key doc;
-      Hashtbl.replace ws.bg_parsed path_key true
+      Hashtbl.replace ws.bg_parsed path_key true;
+      Hashtbl.remove ws.closed_doc_last_touch path_key
 
 let store_doc_fast (ws:t) (uri:T.DocumentUri.t) (doc:Document.t) : unit =
+  mark_graph_dirty ws;
   Hashtbl.replace ws.docs uri doc;
   match doc.Document.file with
   | None -> ()
   | Some f ->
       let path_key = normalize_path_key f in
       Hashtbl.replace ws.files path_key doc;
-      Hashtbl.replace ws.bg_parsed path_key true
+      if doc.Document.parse_rev = doc.Document.rev then
+        Hashtbl.replace ws.bg_parsed path_key true
+      else
+        Hashtbl.remove ws.bg_parsed path_key;
+      Hashtbl.remove ws.closed_doc_last_touch path_key
 
 let direct_import_paths (ws:t) (doc:Document.t) : string list =
-  match ws.index with
-  | None -> []
-  | Some idx ->
-      let acc = Hashtbl.create 16 in
-      List.iter (fun (imp:Preprocess.import) ->
-        match imp.kind with
-        | Preprocess.Compool ->
-            (match Workspace_index.find_compool idx ~name:imp.name with
-             | None -> ()
-             | Some p -> Hashtbl.replace acc (normalize_path_key p) p)
-      ) (Document.imports doc);
-      Hashtbl.fold (fun _ p xs -> p :: xs) acc []
+  let acc = Hashtbl.create 16 in
+  let resolve_compool_path (name:string) : string option =
+    let key = normalize_name name in
+    if key = "" then None
+    else
+      let from_index =
+        match ws.index with
+        | Some idx -> Workspace_index.find_compool idx ~name:key
+        | None -> None
+      in
+      match from_index with
+      | Some _ as p -> p
+      | None ->
+          if allow_fallback_scan ws then find_compool_path_fallback ws ~key else None
+  in
+  List.iter (fun (imp:Preprocess.import) ->
+    match imp.kind with
+    | Preprocess.Compool ->
+        (match resolve_compool_path imp.name with
+         | None -> ()
+         | Some p -> Hashtbl.replace acc (normalize_path_key p) p)
+  ) (Document.imports doc);
+  Hashtbl.fold (fun _ p xs -> p :: xs) acc []
 
 let enqueue_doc_imports_high (ws:t) (doc:Document.t) : unit =
   direct_import_paths ws doc
-  |> List.iter (fun p -> enqueue_bg_path ws ~high:true p)
+  |> List.iter (fun p -> enqueue_bg_path ws ~lane:LaneOpen ~reason_group:"open_import" ~high:true p)
 
 let background_doc_with_diags (ws:t) (doc:Document.t) : Document.t =
   let import_diags =
@@ -2135,43 +4402,468 @@ let queue_workspace_diag_update_for_doc (ws:t) (doc:Document.t) : unit =
   | None -> ()
   | Some path ->
       (match find_open_doc_for_path ws ~path with
-       | Some _ ->
-           ()
-       | None ->
-           let uri_s = Uri_path.docuri_to_string doc.Document.uri in
-           let filtered = filter_workspace_diags ws (Document.diagnostics doc) in
-           let prev =
-             match Hashtbl.find_opt ws.bg_closed_diags uri_s with
-             | Some ds -> ds
-             | None -> []
-           in
-           if prev <> filtered then (
-             if filtered = [] then Hashtbl.remove ws.bg_closed_diags uri_s
-             else Hashtbl.replace ws.bg_closed_diags uri_s filtered;
-             enqueue_bg_diag_update ws ~uri:doc.Document.uri ~diags:filtered
+      | Some _ ->
+          ()
+      | None ->
+           if bg_diag_allowed ws then (
+             let uri_s = Uri_path.docuri_to_string doc.Document.uri in
+             let filtered = filter_workspace_diags ws (Document.diagnostics doc) in
+             let prev =
+               match Hashtbl.find_opt ws.bg_closed_diags uri_s with
+               | Some ds -> ds
+               | None -> []
+             in
+             if prev <> filtered then (
+               if filtered = [] then Hashtbl.remove ws.bg_closed_diags uri_s
+               else Hashtbl.replace ws.bg_closed_diags uri_s filtered;
+               enqueue_bg_diag_update ws ~uri:doc.Document.uri ~diags:filtered
+             )
            ))
 
 let refresh_bg_seed_paths (ws:t) : unit =
+  ensure_graph_fresh ws;
   match ws.index with
   | None ->
       ws.bg_seed_paths <- [||];
-      ws.bg_seed_cursor <- 0
+      ws.bg_seed_cursor <- 0;
+      Hashtbl.clear ws.quick_nav_index;
+      Hashtbl.clear ws.quick_nav_done_set;
+      ws.quick_nav_index_done <- 0;
+      ws.quick_nav_index_total <- 0;
+      Hashtbl.clear ws.quick_nav_pending_set;
+      while not (Queue.is_empty ws.quick_nav_pending_paths) do
+        ignore (Queue.pop ws.quick_nav_pending_paths)
+      done;
+      ws.bg_seed_needs_refresh <- false
   | Some idx ->
       ws.bg_seed_paths <- Array.of_list (Workspace_index.all_source_paths idx);
-      ws.bg_seed_cursor <- 0
+      ws.bg_seed_cursor <- 0;
+      let total_unique = ref 0 in
+      let seen = Hashtbl.create (max 16 (Array.length ws.bg_seed_paths)) in
+      Array.iter (fun p ->
+        let key = normalize_path_key p in
+        if key <> "" && not (Hashtbl.mem seen key) then (
+          Hashtbl.replace seen key true;
+          incr total_unique;
+          if not (Hashtbl.mem ws.quick_nav_done_set key)
+             && not (Hashtbl.mem ws.quick_nav_pending_set key)
+          then (
+            Hashtbl.replace ws.quick_nav_pending_set key true;
+            Queue.add p ws.quick_nav_pending_paths
+          )
+        )
+      ) ws.bg_seed_paths;
+      ws.quick_nav_index_total <- !total_unique;
+      ws.quick_nav_index_done <- Hashtbl.length ws.quick_nav_done_set;
+      ws.bg_seed_needs_refresh <- false
 
 let seed_bg_paths_from_index (ws:t) : unit =
-  if ws.bg_seed_cursor >= Array.length ws.bg_seed_paths then
+  ensure_graph_fresh ws;
+  if ws.bg_seed_needs_refresh then
     refresh_bg_seed_paths ws;
-  let added = ref 0 in
-  while !added < bg_seed_paths_per_tick
-        && ws.bg_seed_cursor < Array.length ws.bg_seed_paths
-  do
-    let p = ws.bg_seed_paths.(ws.bg_seed_cursor) in
-    ws.bg_seed_cursor <- ws.bg_seed_cursor + 1;
-    enqueue_bg_path ws ~high:false p;
-    incr added
-  done
+  let per_tick =
+    match workspace_pressure_mode ws with
+    | PressureNormal -> bg_seed_paths_per_tick
+    | PressureSoft -> max 1 (bg_seed_paths_per_tick / 4)
+    | PressureCritical -> 0
+  in
+  if per_tick <= 0 then ()
+  else (
+    let added = ref 0 in
+    while !added < per_tick
+          && ws.graph_root_closure_cursor < Array.length ws.graph_root_closure_paths
+    do
+      let p = ws.graph_root_closure_paths.(ws.graph_root_closure_cursor) in
+      ws.graph_root_closure_cursor <- ws.graph_root_closure_cursor + 1;
+      enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"root_closure" ~high:false p;
+      incr added
+    done;
+    while !added < per_tick
+          && ws.bg_seed_cursor < Array.length ws.bg_seed_paths
+    do
+      let p = ws.bg_seed_paths.(ws.bg_seed_cursor) in
+      ws.bg_seed_cursor <- ws.bg_seed_cursor + 1;
+      enqueue_bg_path ws ~lane:LaneSweep ~reason_group:"seed_sweep" ~high:false p;
+      incr added
+    done
+  )
+
+let quick_nav_proc_kind = 12
+
+let parse_doc_worker
+    ~(max_bytes:int)
+    ~(uri:T.DocumentUri.t)
+    ~(file:string option)
+    ~(text:string)
+  : Document.t =
+  if is_parse_guard_exceeded ~max_bytes ~text_len:(String.length text) then
+    Document.make_unparsed
+      ~uri
+      ~file
+      ~text
+      ~parse_diags:[diag_parse_guard ~file ~max_bytes ~actual_bytes:(String.length text)]
+  else
+    try
+      Document.make ~uri ~file ~text
+    with exn ->
+      let fallback = Document.make ~uri ~file ~text:"" in
+      with_internal_phase_diag fallback ~phase:"worker-parse" ~exn
+
+let parse_job_path_key (job:parse_job) : string =
+  match job.pj_payload with
+  | ParseJobOpen x -> x.path_key
+  | ParseJobPath x -> x.path_key
+
+let parse_job_kind_of_queue_kind = function
+  | BgQueueHighLarge -> Some ParseJobHighLarge
+  | BgQueueRootLarge -> Some ParseJobRootLarge
+  | BgQueueNormalLarge -> Some ParseJobNormalLarge
+  | BgQueueHighSmall | BgQueueRootSmall | BgQueueNormalSmall -> None
+
+let parse_worker_loop (ws:t) () : unit =
+  let wait_job () =
+    Mutex.lock ws.parse_worker_mtx;
+    while (not ws.parse_worker_stop) && Queue.is_empty ws.parse_worker_jobs do
+      Condition.wait ws.parse_worker_cv ws.parse_worker_mtx
+    done;
+    let job_opt =
+      if ws.parse_worker_stop then None
+      else Some (Queue.pop ws.parse_worker_jobs)
+    in
+    Mutex.unlock ws.parse_worker_mtx;
+    job_opt
+  in
+  let push_result (res:parse_result) =
+    Mutex.lock ws.parse_worker_mtx;
+    Queue.add res ws.parse_worker_results;
+    Mutex.unlock ws.parse_worker_mtx
+  in
+  let rec loop () =
+    match wait_job () with
+    | None -> ()
+    | Some job ->
+        let result =
+          match job.pj_payload with
+          | ParseJobOpen { path_key; uri; file; text; generation } ->
+              let doc =
+                parse_doc_worker
+                  ~max_bytes:ws.parse_file_max_bytes
+                  ~uri
+                  ~file
+                  ~text
+              in
+              ParseResultOpen
+                {
+                  pr_kind = job.pj_kind;
+                  pr_epoch = job.pj_epoch;
+                  path_key;
+                  uri;
+                  generation;
+                  doc;
+                }
+          | ParseJobPath { path; path_key } ->
+              let uri =
+                match Uri_path.docuri_of_path path with
+                | Some u -> u
+                | None ->
+                    (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
+                     | u -> u
+                     | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
+              in
+              let doc_opt =
+                match read_file_text path with
+                | None -> None
+                | Some text ->
+                    Some
+                      (parse_doc_worker
+                         ~max_bytes:ws.parse_file_max_bytes
+                         ~uri
+                         ~file:(Some path)
+                         ~text)
+              in
+              ParseResultPath
+                {
+                  pr_kind = job.pj_kind;
+                  pr_epoch = job.pj_epoch;
+                  path;
+                  path_key;
+                  doc_opt;
+                }
+        in
+        push_result result;
+        loop ()
+  in
+  loop ()
+
+let ensure_parse_worker_started (ws:t) : unit =
+  if ws.parse_worker_started then ()
+  else (
+    ws.parse_worker_started <- true;
+    ignore (Thread.create (parse_worker_loop ws) ())
+  )
+
+let try_submit_large_parse_job
+    (ws:t)
+    ~(path:string)
+    ~(queue_kind:bg_queue_kind)
+  : bool =
+  match parse_job_kind_of_queue_kind queue_kind with
+  | None -> false
+  | Some pj_kind ->
+      let path_key = normalize_path_key path in
+      if path_key = "" then true
+      else if Hashtbl.mem ws.parse_worker_inflight path_key then
+        true
+      else if Hashtbl.length ws.parse_worker_inflight >= ws.parse_worker_max_inflight then
+        false
+      else
+        let payload =
+          match find_open_doc_for_path ws ~path with
+          | Some doc ->
+              let generation =
+                match Hashtbl.find_opt ws.open_parse_generation (Uri_path.docuri_to_string doc.Document.uri) with
+                | Some g -> g
+                | None -> 0
+              in
+              ParseJobOpen
+                {
+                  path_key;
+                  uri = doc.Document.uri;
+                  file = doc.Document.file;
+                  text = doc.Document.text;
+                  generation;
+                }
+          | None ->
+              ParseJobPath { path; path_key }
+        in
+        let job = { pj_kind; pj_epoch = ws.parse_epoch; pj_payload = payload } in
+        Mutex.lock ws.parse_worker_mtx;
+        Queue.add job ws.parse_worker_jobs;
+        Condition.signal ws.parse_worker_cv;
+        Mutex.unlock ws.parse_worker_mtx;
+        Hashtbl.replace ws.parse_worker_inflight path_key pj_kind;
+        true
+
+let quick_nav_entry_add (ws:t) ~(key:string) (entry:quick_nav_entry) : unit =
+  let k = normalize_name key in
+  if k = "" then ()
+  else
+    let prev =
+      match Hashtbl.find_opt ws.quick_nav_index k with
+      | Some xs -> xs
+      | None -> []
+    in
+    if List.exists (fun x ->
+         Uri_path.docuri_to_string x.qn_uri = Uri_path.docuri_to_string entry.qn_uri
+         && x.qn_loc = entry.qn_loc) prev
+    then ()
+    else
+      Hashtbl.replace ws.quick_nav_index k (entry :: prev)
+
+let quick_nav_entries_of_path_prefix (path:string) ~(max_bytes:int) : quick_nav_entry list =
+  match read_file_prefix_text path ~max_bytes with
+  | None -> []
+  | Some text ->
+      let upper = String.uppercase_ascii text in
+      let n = String.length upper in
+      let idx = Text_index.of_string text in
+      let uri =
+        match Uri_path.docuri_of_path path with
+        | Some u -> u
+        | None ->
+            (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
+             | u -> u
+             | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
+      in
+      let rec scan i acc =
+        if i + 5 > n then List.rev acc
+        else if String.sub upper i 5 = "PROC " then
+          let s = i + 5 in
+          let j = ref s in
+          while !j < n && is_nav_ident_char upper.[!j] do
+            incr j
+          done;
+          let key = String.sub upper s (!j - s) |> normalize_name in
+          let acc =
+            if key = "" then acc
+            else
+              let l0, c0 = Text_index.line_col_of_offset idx s in
+              let l1, c1 = Text_index.line_col_of_offset idx !j in
+              let loc =
+                Ast.Loc.make
+                  ~file:(Some path)
+                  ~start_pos:{ line = l0 + 1; col = c0; offset = s }
+                  ~end_pos:{ line = l1 + 1; col = c1; offset = !j }
+              in
+              {
+                qn_uri = uri;
+                qn_name = key;
+                qn_key = key;
+                qn_loc = loc;
+                qn_kind = quick_nav_proc_kind;
+                qn_container = None;
+              } :: acc
+          in
+          scan (i + 1) acc
+        else
+          scan (i + 1) acc
+      in
+      scan 0 []
+
+let quick_nav_index_step (ws:t) ~(budget_ms:int) : unit =
+  if budget_ms <= 0 then ()
+  else
+    let deadline = Perf_stats.now_ms () +. float_of_int budget_ms in
+    let rec loop () =
+      if Perf_stats.now_ms () >= deadline then ()
+      else if Queue.is_empty ws.quick_nav_pending_paths then ()
+      else
+        let path = Queue.pop ws.quick_nav_pending_paths in
+        let path_key = normalize_path_key path in
+        Hashtbl.remove ws.quick_nav_pending_set path_key;
+        if path_key <> "" then (
+          let entries =
+            quick_nav_entries_of_path_prefix path ~max_bytes:nav_quick_scan_per_file_bytes
+          in
+          List.iter (fun e -> quick_nav_entry_add ws ~key:e.qn_key e) entries;
+          if not (Hashtbl.mem ws.quick_nav_done_set path_key) then (
+            Hashtbl.replace ws.quick_nav_done_set path_key true;
+            ws.quick_nav_index_done <- ws.quick_nav_index_done + 1
+          )
+        );
+        loop ()
+    in
+    loop ()
+
+let apply_parse_result_open
+    (ws:t)
+    ~(pr_kind:parse_job_kind)
+    ~(pr_epoch:int)
+    ~(path_key:string)
+    ~(uri:T.DocumentUri.t)
+    ~(generation:int)
+    ~(doc:Document.t)
+  : unit =
+  Hashtbl.remove ws.parse_worker_inflight path_key;
+  if pr_epoch <> ws.parse_epoch then
+    Perf_stats.tick "bg.parse.stale_result_drop"
+  else
+  let latest_generation =
+    match Hashtbl.find_opt ws.open_parse_generation (Uri_path.docuri_to_string uri) with
+    | Some g -> g
+    | None -> 0
+  in
+  if latest_generation <> generation then
+    Perf_stats.tick "diag.open.stale_generation_drop"
+  else (
+    ignore pr_kind;
+    store_doc ~import_lookup_pump:false ws uri doc;
+    let uri_key = Uri_path.docuri_to_string uri in
+    if doc.Document.parse_rev = doc.Document.rev then (
+      enqueue_open_diag_revalidate ws ~uri ~reason:"open_parse";
+      (match Hashtbl.find_opt ws.open_provisional_since_ms uri_key with
+       | None -> ()
+       | Some t0 ->
+           let lag = max 0.0 (Perf_stats.now_ms () -. t0) in
+           Perf_stats.observe_ms "diag.open.authoritative_lag_ms" lag;
+           Hashtbl.remove ws.open_provisional_since_ms uri_key);
+      Hashtbl.remove ws.open_parse_generation uri_key
+    ) else
+      Hashtbl.replace ws.open_provisional_since_ms uri_key (Perf_stats.now_ms ());
+    (match doc.Document.file with
+     | Some p ->
+         let pk = normalize_path_key p in
+         Hashtbl.replace ws.files pk doc;
+         Hashtbl.replace ws.bg_parsed pk true;
+         Hashtbl.remove ws.closed_doc_last_touch pk
+     | None -> ());
+    enqueue_doc_imports_high ws doc;
+    (match compool_key_of_doc doc with
+     | None -> ()
+     | Some key ->
+         let importers = importer_uris_for_compool_key ws ~compool_key:key in
+         invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
+         List.iter
+           (fun importer_uri ->
+             enqueue_open_diag_revalidate ws ~uri:importer_uri ~reason:"compool_change")
+           importers);
+    invalidate_lsif_snapshot ws
+  )
+
+let apply_parse_result_path
+    (ws:t)
+    ~(pr_kind:parse_job_kind)
+    ~(pr_epoch:int)
+    ~(path_key:string)
+    ~(doc_opt:Document.t option)
+  : unit =
+  Hashtbl.remove ws.parse_worker_inflight path_key;
+  if pr_epoch <> ws.parse_epoch then
+    Perf_stats.tick "bg.parse.stale_result_drop"
+  else
+    match doc_opt with
+    | None -> ()
+    | Some doc ->
+        let doc =
+          match pr_kind with
+          | ParseJobHighLarge ->
+              background_doc_with_diags ws doc
+          | ParseJobRootLarge ->
+              background_doc_with_diags ws doc
+          | ParseJobNormalLarge ->
+              if ws.startup_fully_nav_ready_ms <> None then
+                background_doc_with_diags ws doc
+              else
+                doc
+        in
+        invalidate_lsif_snapshot ws;
+        Hashtbl.replace ws.files path_key doc;
+        Hashtbl.replace ws.bg_parsed path_key true;
+        touch_closed_doc_path ws ~path_key;
+        evict_closed_docs_if_needed ws;
+        (match compool_key_of_doc doc with
+         | None -> ()
+         | Some key ->
+             let importers = importer_uris_for_compool_key ws ~compool_key:key in
+             invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
+             List.iter
+               (fun importer_uri ->
+                 enqueue_open_diag_revalidate ws ~uri:importer_uri ~reason:"compool_change")
+               importers);
+        queue_workspace_diag_update_for_doc ws doc
+
+let drain_parse_worker_results (ws:t) ~(max_items:int) : unit =
+  if max_items <= 0 then ()
+  else
+    let rec loop n =
+      if n <= 0 then ()
+      else (
+        Mutex.lock ws.parse_worker_mtx;
+        let next =
+          if Queue.is_empty ws.parse_worker_results then None
+          else Some (Queue.pop ws.parse_worker_results)
+        in
+        Mutex.unlock ws.parse_worker_mtx;
+        match next with
+        | None -> ()
+        | Some (ParseResultOpen x) ->
+            apply_parse_result_open ws
+              ~pr_kind:x.pr_kind
+              ~pr_epoch:x.pr_epoch
+              ~path_key:x.path_key
+              ~uri:x.uri
+              ~generation:x.generation
+              ~doc:x.doc;
+            loop (n - 1)
+        | Some (ParseResultPath x) ->
+            apply_parse_result_path ws
+              ~pr_kind:x.pr_kind
+              ~pr_epoch:x.pr_epoch
+              ~path_key:x.path_key
+              ~doc_opt:x.doc_opt;
+            loop (n - 1))
+    in
+    loop max_items
 
 let background_parse_path (ws:t) (path:string) : unit =
   let path_key = normalize_path_key path in
@@ -2179,62 +4871,293 @@ let background_parse_path (ws:t) (path:string) : unit =
   else
     match find_open_doc_for_path ws ~path with
     | Some open_doc ->
-        invalidate_lsif_snapshot ws;
-        Hashtbl.replace ws.files path_key open_doc;
-        Hashtbl.replace ws.bg_parsed path_key true;
-        (match compool_key_of_doc open_doc with
-         | None -> ()
-         | Some key ->
-             invalidate_importer_nav_state_for_compool_key ws ~compool_key:key)
-    | None ->
-        (match read_file_text path with
-         | None -> ()
-         | Some text ->
-             let uri =
-               match Uri_path.docuri_of_path path with
-               | Some u -> u
-               | None ->
-                   (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
-                    | u -> u
-                    | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
-             in
-             let doc0 =
-               try Document.make ~uri ~file:(Some path) ~text
+        let uri = open_doc.Document.uri in
+        let uri_key = Uri_path.docuri_to_string uri in
+        if open_doc.Document.parse_rev = open_doc.Document.rev
+           && not (Hashtbl.mem ws.open_parse_generation uri_key)
+        then (
+          Hashtbl.replace ws.bg_parsed path_key true;
+          Hashtbl.remove ws.closed_doc_last_touch path_key
+        ) else (
+          let parse_generation =
+            match Hashtbl.find_opt ws.open_parse_generation uri_key with
+            | Some g -> g
+            | None -> 0
+          in
+          let parsed_doc =
+            if open_doc.Document.parse_rev = open_doc.Document.rev then
+              open_doc
+            else
+              (try
+                 Perf_stats.time "parse.open_doc_deferred" (fun () ->
+                 parse_guarded_document_make ws
+                     ~uri:open_doc.Document.uri
+                     ~file:open_doc.Document.file
+                     ~text:open_doc.Document.text)
                with exn ->
-                 let fallback = Document.make ~uri ~file:(Some path) ~text:"" in
-                 with_internal_phase_diag fallback ~phase:"bg-open-doc" ~exn
-             in
-             let doc = background_doc_with_diags ws doc0 in
+                 with_internal_phase_diag open_doc ~phase:"open-doc-deferred" ~exn)
+          in
+          let latest_generation =
+            match Hashtbl.find_opt ws.open_parse_generation uri_key with
+            | Some g -> g
+            | None -> 0
+          in
+          if latest_generation <> parse_generation then
+            Perf_stats.tick "diag.open.stale_generation_drop"
+          else (
+            store_doc ~import_lookup_pump:false ws uri parsed_doc;
+            if parsed_doc.Document.parse_rev = parsed_doc.Document.rev then (
+              let key = Uri_path.docuri_to_string uri in
+              enqueue_open_diag_revalidate ws ~uri ~reason:"open_parse";
+              (match Hashtbl.find_opt ws.open_provisional_since_ms key with
+               | None -> ()
+               | Some t0 ->
+                   let lag = max 0.0 (Perf_stats.now_ms () -. t0) in
+                   Perf_stats.observe_ms "diag.open.authoritative_lag_ms" lag;
+                   Hashtbl.remove ws.open_provisional_since_ms key);
+              Hashtbl.remove ws.open_parse_generation key
+            ) else
+              Hashtbl.replace ws.open_provisional_since_ms
+                (Uri_path.docuri_to_string uri)
+                (Perf_stats.now_ms ());
+            invalidate_lsif_snapshot ws;
+            Hashtbl.replace ws.files path_key parsed_doc;
+            Hashtbl.replace ws.bg_parsed path_key true;
+            Hashtbl.remove ws.closed_doc_last_touch path_key;
+            enqueue_doc_imports_high ws parsed_doc;
+            (match compool_key_of_doc parsed_doc with
+             | None -> ()
+             | Some key ->
+                 let importers = importer_uris_for_compool_key ws ~compool_key:key in
+                 invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
+                 List.iter
+                   (fun importer_uri ->
+                     enqueue_open_diag_revalidate ws ~uri:importer_uri ~reason:"compool_change")
+                   importers)
+          )
+        )
+    | None ->
+        let uri =
+          match Uri_path.docuri_of_path path with
+          | Some u -> u
+          | None ->
+              (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
+               | u -> u
+               | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
+        in
+        let doc_opt =
+          match file_size_bytes path with
+          | Some n when is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes ~text_len:n ->
+              Some (make_doc_with_parse_guard ws ~uri ~file:(Some path) ~text:"" ~actual_bytes:n)
+          | _ ->
+              (match read_file_text path with
+               | None -> None
+               | Some text ->
+                   let doc0 =
+                     try parse_guarded_document_make ws ~uri ~file:(Some path) ~text
+                     with exn ->
+                       let fallback = Document.make ~uri ~file:(Some path) ~text:"" in
+                       with_internal_phase_diag fallback ~phase:"bg-open-doc" ~exn
+                   in
+                   Some (background_doc_with_diags ws doc0))
+        in
+        (match doc_opt with
+         | None -> ()
+         | Some doc ->
              invalidate_lsif_snapshot ws;
              Hashtbl.replace ws.files path_key doc;
              Hashtbl.replace ws.bg_parsed path_key true;
+             touch_closed_doc_path ws ~path_key;
+             evict_closed_docs_if_needed ws;
              (match compool_key_of_doc doc with
               | None -> ()
-              | Some key ->
-                  invalidate_importer_nav_state_for_compool_key ws ~compool_key:key);
+             | Some key ->
+                  let importers = importer_uris_for_compool_key ws ~compool_key:key in
+                  invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
+                  List.iter
+                    (fun importer_uri ->
+                      enqueue_open_diag_revalidate ws ~uri:importer_uri ~reason:"compool_change")
+                    importers);
              queue_workspace_diag_update_for_doc ws doc)
 
-let background_tick (ws:t) ~(budget_ms:int) : unit =
+let revalidate_closed_docs_for_hint_readiness (ws:t) : unit =
+  Hashtbl.iter (fun path_key doc ->
+    if has_open_doc_for_path_key ws ~path_key then ()
+    else
+      let updated = background_doc_with_diags ws doc in
+      if Document.diagnostics updated <> Document.diagnostics doc then (
+        Hashtbl.replace ws.files path_key updated;
+        queue_workspace_diag_update_for_doc ws updated
+      )
+  ) ws.files
+
+let maybe_build_symbol_hints_background (ws:t) : unit =
+  if ws.symbol_hints <> None then ()
+  else
+    match ws.index with
+    | None -> ()
+    | Some idx ->
+        if Queue.is_empty ws.bg_high_small_queue
+           && Queue.is_empty ws.bg_norm_small_queue
+           && Queue.is_empty ws.bg_high_large_queue
+           && Queue.is_empty ws.bg_norm_large_queue
+          && Workspace_index.is_complete idx
+          && workspace_pressure_mode ws <> PressureCritical
+        then (
+          let idx =
+            Perf_stats.time "bg.hint_build" (fun () -> symbol_hint_index ws)
+          in
+          ws.symbol_hints <- Some idx;
+          revalidate_closed_docs_for_hint_readiness ws;
+          enqueue_all_open_diag_revalidate ws ~reason:"hint_ready";
+          Perf_stats.tick "diag.warmup_revalidate"
+        )
+
+let background_tick
+    (ws:t)
+    ~(budget_ms:int)
+    ~(mode:bg_tick_mode)
+    ~(idle_quiet_ms:int)
+    ~(last_message_ms:float)
+  : unit =
   if budget_ms <= 0 then ()
   else (
+    ensure_parse_worker_started ws;
     Perf_stats.tick "bg.tick";
+    Perf_stats.tick "startup.phase_tick";
+    update_pressure_state ws;
     pump_index_background ws;
-    seed_bg_paths_from_index ws;
-    let budget = float_of_int budget_ms in
+    if workspace_pressure_mode ws <> PressureCritical then
+      seed_bg_paths_from_index ws;
+    let diag_stage_pending =
+      ws.startup_diag_hover_ready_ms = None
+      || Hashtbl.length ws.open_parse_generation > 0
+      || not (startup_open_diag_revalidate_empty ws)
+    in
+    let parse_result_budget =
+      match mode with
+      | BgTickInteractive ->
+          if diag_stage_pending then 10
+          else if ws.startup_fully_nav_ready_ms = None then 4
+          else 2
+      | BgTickIdle -> 6
+    in
+    drain_parse_worker_results ws ~max_items:parse_result_budget;
+    let quick_nav_budget =
+      match mode with
+      | BgTickInteractive ->
+          if diag_stage_pending then
+            max 1 (budget_ms / 6)
+          else if ws.startup_fully_nav_ready_ms = None then
+            max 2 (budget_ms / 2)
+          else
+            max 1 (budget_ms / 4)
+      | BgTickIdle -> max 1 (budget_ms / 3)
+    in
+    quick_nav_index_step ws ~budget_ms:quick_nav_budget;
+    let budget =
+      match workspace_pressure_mode ws with
+      | PressureNormal -> float_of_int budget_ms
+      | PressureSoft -> float_of_int (max 1 (budget_ms / 2))
+      | PressureCritical -> float_of_int (max 1 (budget_ms / 4))
+    in
+    let required_idle_quiet_ms =
+      max 0 (max idle_quiet_ms ws.bg_large_parse_idle_quiet_ms)
+    in
+    let allow_normal_large =
+      match mode with
+      | BgTickInteractive ->
+          ws.startup_fully_nav_ready_ms = None
+          && Queue.is_empty ws.bg_high_large_queue
+          && Hashtbl.length ws.parse_worker_inflight < ws.parse_worker_max_inflight
+      | BgTickIdle ->
+          let since_last_msg = Perf_stats.now_ms () -. last_message_ms in
+          since_last_msg >= float_of_int required_idle_quiet_ms
+    in
+    let allow_root_large =
+      match mode with
+      | BgTickInteractive ->
+          ws.startup_diag_hover_ready_ms = None
+          || Hashtbl.length ws.open_parse_generation > 0
+      | BgTickIdle ->
+          let since_last_msg = Perf_stats.now_ms () -. last_message_ms in
+          since_last_msg >= float_of_int required_idle_quiet_ms
+    in
+    let prefer_open_base =
+      ws.startup_diag_hover_ready_ms = None
+      || Hashtbl.length ws.open_parse_generation > 0
+    in
+    let processed_total = ref 0 in
+    let processed_open = ref 0 in
+    let required_open_share =
+      let pct = max 0 (min 100 ws.sched_open_doc_min_share_pct) in
+      float_of_int pct /. 100.0
+    in
+    if mode = BgTickIdle
+       && (not allow_normal_large)
+       && not (Queue.is_empty ws.bg_norm_large_queue)
+    then
+      Perf_stats.tick "bg.parse.large_deferred_busy";
     let deadline = Perf_stats.now_ms () +. budget in
     let keep = ref true in
     while !keep && Perf_stats.now_ms () < deadline do
-      match dequeue_bg_path ws with
+      let prefer_open =
+        if not prefer_open_base then false
+        else if !processed_total <= 0 then true
+        else
+          let share = float_of_int !processed_open /. float_of_int !processed_total in
+          share < required_open_share
+      in
+      match dequeue_bg_path ws ~mode ~allow_normal_large ~allow_root_large ~prefer_open with
       | None ->
           keep := false
       | Some (path, prio) ->
-          (match prio with
-           | `High -> Perf_stats.tick "bg.queue_high"
-           | `Normal -> Perf_stats.tick "bg.queue_normal");
-          ignore (Perf_stats.time "bg.parse_doc" (fun () ->
-            background_parse_path ws path
-          ))
+          incr processed_total;
+          let path_key = normalize_path_key path in
+          if has_open_doc_for_path_key ws ~path_key then incr processed_open;
+          (match lane_of_bg_queue_kind prio with
+           | LaneOpen -> Perf_stats.tick "sched.lane_a_ticks"
+           | LaneRoot -> Perf_stats.tick "sched.lane_b_ticks"
+           | LaneSweep -> Perf_stats.tick "sched.lane_c_ticks");
+          if prio = BgQueueNormalSmall
+             && workspace_pressure_mode ws = PressureCritical
+          then (
+            enqueue_bg_path ws ~lane:LaneSweep ~reason_group:"pressure_backoff" ~high:false path;
+            keep := false
+          ) else (
+            (match prio with
+             | BgQueueHighSmall -> Perf_stats.tick "bg.queue_high"
+             | BgQueueRootSmall -> Perf_stats.tick "bg.queue_root"
+             | BgQueueNormalSmall -> Perf_stats.tick "bg.queue_normal"
+             | BgQueueHighLarge | BgQueueRootLarge | BgQueueNormalLarge ->
+                 Perf_stats.tick "bg.parse.large_started");
+            (match prio with
+             | BgQueueHighLarge | BgQueueRootLarge | BgQueueNormalLarge ->
+                 if try_submit_large_parse_job ws ~path ~queue_kind:prio then
+                   ()
+                 else (
+                   let lane =
+                     match prio with
+                     | BgQueueRootLarge -> LaneRoot
+                     | BgQueueHighLarge ->
+                         if has_open_doc_for_path_key ws ~path_key:(normalize_path_key path) then
+                           LaneOpen
+                         else
+                           LaneSweep
+                     | _ -> LaneSweep
+                   in
+                   enqueue_bg_path ws ~lane ~high:(prio = BgQueueHighLarge || prio = BgQueueRootLarge) path;
+                   keep := false
+                 )
+             | BgQueueHighSmall | BgQueueRootSmall | BgQueueNormalSmall ->
+                 ignore
+                   (Perf_stats.time "bg.parse_doc" (fun () ->
+                      background_parse_path ws path)))
+          )
     done
+    ;
+    maybe_build_symbol_hints_background ws;
+    update_startup_ready_state ws
   )
 
 let drain_pending_diag_updates
@@ -2242,6 +5165,7 @@ let drain_pending_diag_updates
     ~(max_items:int)
   : (T.DocumentUri.t * T.Diagnostic.t list) list =
   if max_items <= 0 then []
+  else if not (bg_diag_allowed ws) then []
   else
     let rec loop n acc =
       if n <= 0 || Queue.is_empty ws.bg_pending_diag_updates then
@@ -2254,38 +5178,170 @@ let drain_pending_diag_updates
              loop n acc
          | Some (uri, diags) ->
              Hashtbl.remove ws.bg_pending_diag_payloads key;
-             loop (n - 1) ((uri, diags) :: acc))
+             if Hashtbl.mem ws.docs uri then (
+               Perf_stats.tick "diag.open.stale_generation_drop";
+               loop n acc
+             ) else
+               loop (n - 1) ((uri, diags) :: acc))
     in
     loop max_items []
 
-let open_doc (ws:t) ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) : unit =
+let drain_open_diag_revalidate_uris
+    (ws:t)
+    ~(max_items:int)
+  : T.DocumentUri.t list =
+  if max_items <= 0 then []
+  else
+    let rec loop n acc =
+      if n <= 0 || Queue.is_empty ws.open_diag_revalidate_updates then
+        List.rev acc
+      else
+        let key = Queue.pop ws.open_diag_revalidate_updates in
+        Hashtbl.remove ws.open_diag_revalidate_set key;
+        match Hashtbl.find_opt ws.open_diag_revalidate_payloads key with
+        | None ->
+            loop n acc
+        | Some (uri, _reason) ->
+            Hashtbl.remove ws.open_diag_revalidate_payloads key;
+            (match Hashtbl.find_opt ws.docs uri with
+             | None ->
+                 loop n acc
+             | Some doc ->
+                 store_doc ~import_lookup_pump:false ws uri doc;
+                 Perf_stats.tick "diag.open.revalidate_drained";
+                 loop (n - 1) (uri :: acc))
+    in
+    let out = loop max_items [] in
+    if out <> [] then update_startup_ready_state ws;
+    out
+
+let startup_diag_hover_ready_now (ws:t) : bool =
+  update_startup_ready_state ws;
+  ws.startup_diag_hover_ready_ms <> None
+
+let startup_is_ready_now (ws:t) : bool =
+  update_startup_ready_state ws;
+  ws.startup_ready_ms <> None
+
+let startup_readiness_json_for_report (ws:t) : Yojson.Safe.t =
+  update_startup_ready_state ws;
+  startup_readiness_json ws
+
+let workspace_ready_event_json (ws:t) : Yojson.Safe.t option =
+  consume_workspace_ready_event_json ws
+
+let startup_phase_event_json (ws:t) : Yojson.Safe.t option =
+  consume_startup_phase_event_json ws
+
+let startup_miss_event_json (ws:t) : Yojson.Safe.t option =
+  consume_startup_miss_event_json ws
+
+let open_doc_converged (ws:t) ~(uri:T.DocumentUri.t) : bool =
+  match Hashtbl.find_opt ws.docs uri with
+  | None -> false
+  | Some doc -> doc.Document.parse_rev = doc.Document.rev
+
+let open_doc_generation_key (uri:T.DocumentUri.t) : string =
+  Uri_path.docuri_to_string uri
+
+let bump_open_parse_generation (ws:t) ~(uri:T.DocumentUri.t) : int =
+  let key = open_doc_generation_key uri in
+  let next =
+    match Hashtbl.find_opt ws.open_parse_generation key with
+    | Some n -> n + 1
+    | None -> 1
+  in
+  Hashtbl.replace ws.open_parse_generation key next;
+  next
+
+let mark_open_doc_provisional (ws:t) ~(uri:T.DocumentUri.t) : unit =
+  let key = open_doc_generation_key uri in
+  Hashtbl.replace ws.open_provisional_since_ms key (Perf_stats.now_ms ())
+
+let mark_open_doc_authoritative (ws:t) ~(uri:T.DocumentUri.t) : unit =
+  let key = open_doc_generation_key uri in
+  (match Hashtbl.find_opt ws.open_provisional_since_ms key with
+   | None -> ()
+   | Some t0 ->
+       let lag = max 0.0 (Perf_stats.now_ms () -. t0) in
+       Perf_stats.observe_ms "diag.open.authoritative_lag_ms" lag;
+       Hashtbl.remove ws.open_provisional_since_ms key);
+  Hashtbl.remove ws.open_parse_generation key
+
+let open_doc
+    ?(force_provisional:bool=false)
+    (ws:t)
+    ~(uri:T.DocumentUri.t)
+    ~(file:string option)
+    ~(text:string)
+  : unit =
   invalidate_lsif_snapshot ws;
+  startup_mark_started ws;
   (* If no workspace root was set, fall back to the first opened file's directory. *)
   (match ws.root_path, file with
    | None, Some f ->
-       ws.root_path <- Some (Filename.dirname f);
+       set_root_path ws (Some (Filename.dirname f));
        rescan ws
    | _ -> ());
   clear_nav_response_cache_for_uri ws ~uri;
-  let doc =
-    try
-      Perf_stats.time "parse.open_doc" (fun () -> Document.make ~uri ~file ~text)
-    with exn ->
-      let fallback = Document.make ~uri ~file ~text:"" in
-      with_internal_phase_diag fallback ~phase:"open-doc" ~exn
+  let should_defer_parse =
+    force_provisional
+    || didopen_always_provisional
+    || (didopen_defer_parse_enabled
+        && String.length text >= didopen_defer_parse_min_doc_chars)
   in
-  store_doc ws uri doc;
+  ignore (bump_open_parse_generation ws ~uri);
+  if should_defer_parse then mark_open_doc_provisional ws ~uri
+  else mark_open_doc_authoritative ws ~uri;
+  if should_defer_parse then Perf_stats.tick "open.parse_deferred";
+  let doc =
+    if should_defer_parse then
+      if is_parse_guard_exceeded
+           ~max_bytes:ws.parse_file_max_bytes
+           ~text_len:(String.length text)
+      then
+        make_doc_with_parse_guard ws ~uri ~file ~text ~actual_bytes:(String.length text)
+      else
+        Document.make_unparsed ~uri ~file ~text ~parse_diags:[]
+    else
+      (try
+         Perf_stats.time "parse.open_doc" (fun () -> parse_guarded_document_make ws ~uri ~file ~text)
+       with exn ->
+         let fallback = Document.make ~uri ~file ~text:"" in
+         with_internal_phase_diag fallback ~phase:"open-doc" ~exn)
+  in
+  if should_defer_parse then
+    store_doc_fast ws uri doc
+  else
+    store_doc ws uri doc;
   (match file with
-   | Some p -> Hashtbl.replace ws.bg_parsed (normalize_path_key p) true
+   | Some p ->
+       let path_key = normalize_path_key p in
+      if should_defer_parse then (
+        Hashtbl.remove ws.bg_parsed path_key;
+         enqueue_bg_path ws ~lane:LaneOpen ~reason_group:"did_open_deferred" ~high:true p
+       ) else
+         Hashtbl.replace ws.bg_parsed path_key true
    | None -> ());
-  enqueue_doc_imports_high ws doc;
-  background_tick ws ~budget_ms:120;
-  pump_index_background ws
+  if not should_defer_parse then
+    enqueue_doc_imports_high ws doc;
+  if not (should_defer_parse && didopen_disable_foreground_tick) then
+    background_tick ws
+      ~budget_ms:(if should_defer_parse then 40 else 120)
+      ~mode:BgTickInteractive
+      ~idle_quiet_ms:ws.bg_large_parse_idle_quiet_ms
+      ~last_message_ms:(Perf_stats.now_ms ());
+  if not force_provisional then
+    pump_index_background ws;
+  ignore (maybe_escalate_index_reconcile ws ~doc:(Some doc) ~reason:"didOpen");
+  update_startup_ready_state ws
 
 let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChangeEvent.t list) : unit =
   if changes = [] then ()
   else
+  mark_graph_dirty ws;
   invalidate_lsif_snapshot ws;
+  ignore (bump_open_parse_generation ws ~uri);
   let old_doc = Hashtbl.find_opt ws.docs uri in
   let clear_cache_for_full_sync =
     List.exists (fun (ch:T.TextDocumentContentChangeEvent.t) -> ch.range = None) changes
@@ -2312,25 +5368,60 @@ let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChan
   | None ->
       let file = Uri_path.file_path_of_uri uri in
       let base = Document.make ~uri ~file ~text:"" in
-      let doc =
-        try
-          Perf_stats.time "parse.change_doc" (fun () ->
-            Document.apply_changes_and_reparse ~changes base)
-        with exn ->
-          with_internal_phase_diag base ~phase:"apply-changes" ~exn
+      let draft =
+        Perf_stats.time "apply.change_doc_fast" (fun () ->
+          Document.apply_changes_no_reparse ~changes base)
       in
-      let semantic_mode = semantic_mode_for_rev doc.rev in
-      store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc;
+      if is_parse_guard_exceeded
+           ~max_bytes:ws.parse_file_max_bytes
+           ~text_len:(String.length draft.Document.text)
+      then (
+        let guarded =
+          Document.with_parse_diags
+            [diag_parse_guard
+               ~file:draft.Document.file
+               ~max_bytes:ws.parse_file_max_bytes
+               ~actual_bytes:(String.length draft.Document.text)]
+            draft
+        in
+        Perf_stats.tick "parse.large_file_guard";
+        store_doc_fast ws uri guarded
+      ) else (
+        let doc =
+          try
+            Perf_stats.time "parse.change_doc" (fun () ->
+              Document.apply_changes_and_reparse ~changes base)
+          with exn ->
+            with_internal_phase_diag base ~phase:"apply-changes" ~exn
+        in
+        let semantic_mode = semantic_mode_for_rev doc.rev in
+        store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc
+      );
       pump_index_background ws
   | Some doc ->
-      let next_rev = doc.Document.rev + 1 in
-      if should_defer_reparse_for_change doc ~changes ~next_rev then (
-        let doc' =
-          Perf_stats.time "apply.change_doc_fast" (fun () ->
-            Document.apply_changes_no_reparse ~changes doc)
+      let doc_fast =
+        Perf_stats.time "apply.change_doc_fast" (fun () ->
+          Document.apply_changes_no_reparse ~changes doc)
+      in
+      let next_rev = doc_fast.Document.rev in
+      if is_parse_guard_exceeded
+           ~max_bytes:ws.parse_file_max_bytes
+           ~text_len:(String.length doc_fast.Document.text)
+      then (
+        let guarded =
+          Document.with_parse_diags
+            [diag_parse_guard
+               ~file:doc_fast.Document.file
+               ~max_bytes:ws.parse_file_max_bytes
+               ~actual_bytes:(String.length doc_fast.Document.text)]
+            doc_fast
         in
+        Perf_stats.tick "parse.large_file_guard";
+        store_doc_fast ws uri guarded;
+        pump_index_background ws
+      ) else if should_defer_reparse_for_change doc ~changes ~next_rev then (
         Perf_stats.tick "change.parse_deferred";
-        store_doc_fast ws uri doc';
+        store_doc_fast ws uri doc_fast;
         pump_index_background ws
       ) else (
         let doc' =
@@ -2343,29 +5434,54 @@ let change_doc (ws:t) ~(uri:T.DocumentUri.t) ~(changes:T.TextDocumentContentChan
         let semantic_mode = semantic_mode_for_rev doc'.rev in
         store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc';
         pump_index_background ws
-      )
+      );
+  (match Hashtbl.find_opt ws.docs uri with
+   | Some latest ->
+       if latest.Document.parse_rev = latest.Document.rev then
+         mark_open_doc_authoritative ws ~uri
+       else
+         mark_open_doc_provisional ws ~uri;
+       ignore (maybe_escalate_index_reconcile ws ~doc:(Some latest) ~reason:"didChange")
+   | None -> ());
+  update_startup_ready_state ws
 
 let close_doc (ws:t) ~(uri:T.DocumentUri.t) : unit =
+  mark_graph_dirty ws;
   invalidate_lsif_snapshot ws;
   clear_nav_response_cache_for_uri ws ~uri;
+  let closed_path_key : string option ref = ref None in
   (match Hashtbl.find_opt ws.docs uri with
    | Some d ->
+        (match d.Document.file with
+         | Some p -> closed_path_key := Some (normalize_path_key p)
+         | None -> ());
         (match d.Document.compool_def with
-        | Some name when normalize_name name <> "" -> ws.symbol_hints <- None
+        | Some name when normalize_name name <> "" -> invalidate_symbol_hints ws
         | _ -> ());
         enqueue_doc_imports_high ws d
    | None -> ());
   Hashtbl.remove ws.docs uri;
+  Hashtbl.remove ws.open_parse_generation (open_doc_generation_key uri);
+  Hashtbl.remove ws.open_provisional_since_ms (open_doc_generation_key uri);
+  Hashtbl.remove ws.open_diag_revalidate_payloads (open_doc_generation_key uri);
+  Hashtbl.remove ws.open_diag_revalidate_set (open_doc_generation_key uri);
+  (match !closed_path_key with
+   | Some key ->
+       touch_closed_doc_path ws ~path_key:key;
+       evict_closed_docs_if_needed ws
+   | None -> ());
   if ws.sem_store_enabled then
     (match Semantic_store.snapshot_for_uri ws.semantic_store ~uri with
      | Some snap when snap.Doc_snapshot.path_key <> None -> ()
      | _ -> Semantic_store.remove_uri ws.semantic_store ~uri);
-  pump_index_background ws
+  pump_index_background ws;
+  update_startup_ready_state ws
 
 let apply_watched_file_changes
     (ws:t)
     ~(changes:(string * [ `Created | `Changed | `Deleted ]) list)
   : unit =
+  if changes <> [] then mark_graph_dirty ws;
   if changes <> [] then invalidate_lsif_snapshot ws;
   if changes <> [] then Hashtbl.clear ws.nav_response_cache;
   ensure_index_started ws;
@@ -2387,6 +5503,7 @@ let apply_watched_file_changes
            let path_key = normalize_path_key path in
            Hashtbl.remove ws.files path_key;
            Hashtbl.remove ws.bg_parsed path_key;
+           Hashtbl.remove ws.closed_doc_last_touch path_key;
            (match kind with
             | `Deleted ->
                 (match Uri_path.docuri_of_path path with
@@ -2395,7 +5512,7 @@ let apply_watched_file_changes
                      enqueue_bg_diag_update ws ~uri ~diags:[]
                  | None -> ())
             | `Created | `Changed ->
-                enqueue_bg_path ws ~high:true path)
+                enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"watch_change" ~high:true path)
          with _ -> ()
        ) changes;
        let max_dirs, max_files =
@@ -2404,7 +5521,7 @@ let apply_watched_file_changes
          else
            (index_background_dirs, index_bootstrap_files)
        in
-       (try
+        (try
           ignore
             (Workspace_index.scan_step idx
                ~max_dirs
@@ -2419,8 +5536,10 @@ let apply_watched_file_changes
     ) changes
   );
   ws.bg_seed_cursor <- 0;
-  if !hints_dirty then ws.symbol_hints <- None
-  else if !sem_dirty then ws.symbol_hints <- None
+  ws.bg_seed_needs_refresh <- true;
+  if !hints_dirty then invalidate_symbol_hints ws
+  else if !sem_dirty then invalidate_symbol_hints ws;
+  update_startup_ready_state ws
 
 let revalidate_all (ws:t) : T.DocumentUri.t list =
   let uris = Hashtbl.fold (fun uri _ acc -> uri :: acc) ws.docs [] in
@@ -2429,6 +5548,7 @@ let revalidate_all (ws:t) : T.DocumentUri.t list =
     | None -> ()
     | Some doc -> store_doc ws uri doc
   ) uris;
+  update_startup_ready_state ws;
   uris
 
 let diagnostics_for (ws:t) ~(uri:T.DocumentUri.t) : T.Diagnostic.t list =
@@ -2445,47 +5565,49 @@ let cst_dump_for (ws:t) ~(uri:T.DocumentUri.t) : string option =
   match Hashtbl.find_opt ws.docs uri with
   | None -> None
   | Some doc ->
-      let lexbuf = Lexing.from_string doc.Document.text in
-      (match doc.Document.file with
-       | None -> ()
-       | Some f ->
-           lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-      let b = Buffer.create 4096 in
-      Buffer.add_string b "CST (token stream)\n";
-      let add_token_row idx tok sp ep lexeme =
-        let line0 = max 1 sp.Lexing.pos_lnum in
-        let line1 = max 1 ep.Lexing.pos_lnum in
-        let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
-        let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
-        let tok_s = Parse.Debug.string_of_token tok in
-        let lex = String.escaped lexeme in
-        Buffer.add_string b
-          (Printf.sprintf
-             "%5d  %-14s %-28s @ %d:%d-%d:%d\n"
-             idx
-             tok_s
-             ("\"" ^ lex ^ "\"")
-             line0
-             col0
-             line1
-             col1)
-      in
-      let rec loop idx =
-        let tok = Lexer.token lexbuf in
-        let sp = Lexing.lexeme_start_p lexbuf in
-        let ep = Lexing.lexeme_end_p lexbuf in
-        let lexeme = Lexing.lexeme lexbuf in
-        add_token_row idx tok sp ep lexeme;
-        match tok with
-        | Parser.EOF -> ()
-        | _ -> loop (idx + 1)
-      in
-      (try loop 1 with exn ->
-         Buffer.add_string b
-           (Printf.sprintf
-              "\n<tokenization stopped: %s>\n"
-              (Printexc.to_string exn)));
-      Some (Buffer.contents b)
+      Lexer.with_session_state (fun () ->
+        let lexbuf = Lexing.from_string doc.Document.text in
+        (match doc.Document.file with
+         | None -> ()
+         | Some f ->
+             lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
+        let b = Buffer.create 4096 in
+        Buffer.add_string b "CST (token stream)\n";
+        let add_token_row idx tok sp ep lexeme =
+          let line0 = max 1 sp.Lexing.pos_lnum in
+          let line1 = max 1 ep.Lexing.pos_lnum in
+          let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
+          let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
+          let tok_s = Parse.Debug.string_of_token tok in
+          let lex = String.escaped lexeme in
+          Buffer.add_string b
+            (Printf.sprintf
+               "%5d  %-14s %-28s @ %d:%d-%d:%d\n"
+               idx
+               tok_s
+               ("\"" ^ lex ^ "\"")
+               line0
+               col0
+               line1
+               col1)
+        in
+        let rec loop idx =
+          let tok = Lexer.token lexbuf in
+          let sp = Lexing.lexeme_start_p lexbuf in
+          let ep = Lexing.lexeme_end_p lexbuf in
+          let lexeme = Lexing.lexeme lexbuf in
+          add_token_row idx tok sp ep lexeme;
+          match tok with
+          | Parser.EOF -> ()
+          | _ -> loop (idx + 1)
+        in
+        (try loop 1 with exn ->
+           Buffer.add_string b
+             (Printf.sprintf
+                "\n<tokenization stopped: %s>\n"
+                (Printexc.to_string exn)));
+        Some (Buffer.contents b)
+      )
 
 let lsp_pos_of_lex (p:Lexing.position) : Yojson.Safe.t =
   let line0 = max 0 (p.pos_lnum - 1) in
@@ -3070,10 +6192,15 @@ let docs_for_lookup (ws:t) (doc:Document.t) : Document.t list =
   |> List.iter (fun p ->
        match doc_at_path_cached ws p with
        | None ->
-           enqueue_bg_path ws ~high:true p
+           enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"lookup_import" ~high:true p
        | Some d ->
            add_doc d);
   List.rev !out
+
+let has_unscoped_fallback_context (doc:Document.t) : bool =
+  doc.Document.ast = None
+  || doc.Document.parse_diags <> []
+  || Document.imports doc = []
 
 let docs_for_rename (ws:t) (doc:Document.t) : Document.t list =
   let seen = Hashtbl.create 64 in
@@ -3086,6 +6213,8 @@ let docs_for_rename (ws:t) (doc:Document.t) : Document.t list =
     )
   in
   docs_for_lookup ws doc |> List.iter add_doc;
+  if has_unscoped_fallback_context doc then
+    Hashtbl.iter (fun _ d -> add_doc d) ws.files;
   Hashtbl.iter (fun _ d -> add_doc d) ws.docs;
   List.rev !out
 
@@ -3548,7 +6677,7 @@ let build_doc_nav (ws:t) (doc:Document.t) : doc_nav =
     | Ast.SAssign { lhs; rhs } ->
         walk_expr scope ~container lhs;
         walk_expr scope ~container rhs
-    | Ast.SCallStmt { callee; args } ->
+    | Ast.SCallStmt { callee; args; _ } ->
         use_value scope callee;
         List.iter (walk_expr scope ~container) args
     | Ast.SIf { cond; then_; else_ } ->
@@ -3701,24 +6830,40 @@ let line_text_in_doc (doc:Document.t) ~(line1:int) : string option =
         let n = if n > 0 && raw.[n - 1] = '\r' then n - 1 else n in
         Some (String.trim (if n <= 0 then "" else String.sub raw 0 n))
 
+let line_text_in_file ~(path:string) ~(line1:int) : string option =
+  if line1 <= 0 then None
+  else
+    try
+      let ic = open_in_bin path in
+      Fun.protect
+        ~finally:(fun () -> close_in_noerr ic)
+        (fun () ->
+          let rec loop cur =
+            if cur >= line1 then
+              Some (String.trim (input_line ic))
+            else (
+              ignore (input_line ic);
+              loop (cur + 1)
+            )
+          in
+          loop 1)
+    with _ -> None
+
 let source_line_for_def (ws:t) (d:def) : string option =
-  let doc_opt =
-    match doc_of_uri ws d.uri with
-    | Some d0 -> Some d0
-    | None ->
-        (match d.loc.Ast.Loc.file with
-         | Some p ->
-             (match doc_at_path_cached ws p with
-              | Some d0 -> Some d0
-              | None ->
-                  enqueue_bg_path ws ~high:true p;
-                  None)
-         | None -> None)
-  in
-  match doc_opt with
-  | None -> None
+  let line1 = d.loc.Ast.Loc.start_pos.line in
+  match doc_of_uri ws d.uri with
   | Some d0 ->
-      line_text_in_doc d0 ~line1:d.loc.Ast.Loc.start_pos.line
+      line_text_in_doc d0 ~line1
+  | None ->
+      (match d.loc.Ast.Loc.file with
+       | None -> None
+       | Some p ->
+           (match doc_at_path_cached ws p with
+            | Some d0 ->
+                line_text_in_doc d0 ~line1
+            | None ->
+                enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"source_line" ~high:true p;
+                line_text_in_file ~path:p ~line1))
 
 let literal_to_string = function
   | Ast.LInt s -> s
@@ -3802,7 +6947,7 @@ let proc_signature_for_def (ws:t) (d:def) : string option =
                (match doc_at_path_cached ws p with
                 | Some d0 -> Some d0
                 | None ->
-                    enqueue_bg_path ws ~high:true p;
+                    enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"signature" ~high:true p;
                     None)
            | None -> None)
     in
@@ -3853,7 +6998,7 @@ let find_compool_target (ws:t) ~(name:string) : Document.t option =
             (match Workspace_index.find_compool idx ~name:key with
              | Some p -> Some p
              | None ->
-                 if Workspace_index.is_complete idx && allow_fallback_scan ws then
+                 if allow_fallback_scan ws then
                    find_compool_path_fallback ws ~key
                  else
                    None)
@@ -3866,7 +7011,7 @@ let find_compool_target (ws:t) ~(name:string) : Document.t option =
            (match doc_at_path_cached ws path with
             | Some d -> Some d
             | None ->
-                enqueue_bg_path ws ~high:true path;
+                enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"compool_target" ~high:true path;
                 None))
 
 let nav_for_doc_cached
@@ -3936,21 +7081,36 @@ let fallback_defs_by_name (ws:t) (doc:Document.t) (key:string) : def list =
            collect_doc_defs d |> List.filter (fun x -> x.key = key))
       |> uniq_defs
     in
+    let from_semantic_store () : def list =
+      if not ws.sem_store_enabled then []
+      else
+        Semantic_store.sym_ids_for_key ws.semantic_store ~key
+        |> List.concat_map (fun sym_id -> Semantic_store.defs_for_sym_id ws.semantic_store sym_id)
+        |> List.map def_of_snapshot_def
+        |> List.filter (fun d -> d.key = key)
+        |> uniq_defs
+    in
     let local_hits = collect (docs_for_lookup ws doc) in
     if local_hits <> [] then local_hits
-    else collect (docs_for_rename ws doc)
+    else
+      let sem_hits = from_semantic_store () in
+      if sem_hits <> [] then sem_hits
+      else collect (docs_for_rename ws doc)
 
 let allow_unscoped_fallback (doc:Document.t) : bool =
-  doc.Document.ast = None || doc.Document.parse_diags <> []
+  has_unscoped_fallback_context doc
 
 let is_ref_proc_decl_line (line:string) : bool =
   let toks =
     tokenize_ident_words (normalize_name line)
     |> List.map (fun (w, _, _) -> w)
   in
-  match toks with
-  | "REF" :: "PROC" :: _ -> true
-  | _ -> false
+  let rec has_ref_proc = function
+    | "REF" :: "PROC" :: _ -> true
+    | _ :: tl -> has_ref_proc tl
+    | [] -> false
+  in
+  has_ref_proc toks
 
 let is_likely_proc_implementation (ws:t) (d:def) : bool =
   if d.kind <> sym_kind_func then true
@@ -3959,13 +7119,261 @@ let is_likely_proc_implementation (ws:t) (d:def) : bool =
     | None -> true
     | Some line -> not (is_ref_proc_decl_line line)
 
-let proc_defs_by_key (ws:t) (doc:Document.t) ~(key:string) : def list =
+let substring_matches_at (s:string) ~(sub:string) ~(at:int) : bool =
+  let n = String.length s in
+  let m = String.length sub in
+  if at < 0 || m <= 0 || at + m > n then false
+  else
+    let rec loop i =
+      if i >= m then true
+      else if s.[at + i] <> sub.[i] then false
+      else loop (i + 1)
+    in
+    loop 0
+
+let find_substring_from (s:string) ~(sub:string) ~(start:int) : int option =
+  let n = String.length s in
+  let m = String.length sub in
+  if m <= 0 then Some (max 0 start)
+  else
+    let rec loop i =
+      if i + m > n then None
+      else if substring_matches_at s ~sub ~at:i then Some i
+      else loop (i + 1)
+    in
+    loop (max 0 start)
+
+let find_proc_def_name_offsets ~(upper_text:string) ~(key:string) : (int * int) option =
+  if key = "" then None
+  else
+    let pat = "DEF PROC " ^ key in
+    let key_len = String.length key in
+    let rec loop from =
+      match find_substring_from upper_text ~sub:pat ~start:from with
+      | None -> None
+      | Some i ->
+          let name_s = i + 9 in
+          let name_e = name_s + key_len in
+          let before_ok = i = 0 || not (is_ident_char upper_text.[i - 1]) in
+          let after_ok =
+            name_e >= String.length upper_text || not (is_ident_char upper_text.[name_e])
+          in
+          if before_ok && after_ok then Some (name_s, name_e)
+          else loop (i + 1)
+    in
+    loop 0
+
+let find_proc_decl_name_offsets ~(upper_text:string) ~(key:string) : (int * int) option =
+  if key = "" then None
+  else
+    let pat = "PROC " ^ key in
+    let key_len = String.length key in
+    let rec loop from =
+      match find_substring_from upper_text ~sub:pat ~start:from with
+      | None -> None
+      | Some i ->
+          let name_s = i + 5 in
+          let name_e = name_s + key_len in
+          let before_ok = i = 0 || not (is_ident_char upper_text.[i - 1]) in
+          let after_ok =
+            name_e >= String.length upper_text || not (is_ident_char upper_text.[name_e])
+          in
+          if before_ok && after_ok then Some (name_s, name_e)
+          else loop (i + 1)
+    in
+    loop 0
+
+let docuri_of_path_unsafe (path:string) : T.DocumentUri.t =
+  match Uri_path.docuri_of_path path with
+  | Some u -> u
+  | None ->
+      (match T.DocumentUri.t_of_yojson (`String (Uri_path.file_uri_of_path path)) with
+       | u -> u
+       | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
+
+let quick_proc_defs_from_nav_index (ws:t) (doc:Document.t) ~(key:string) : def list =
   if key = "" then []
   else
-    docs_for_rename ws doc
-    |> List.concat_map collect_doc_defs
-    |> List.filter (fun d -> d.kind = sym_kind_func && d.key = key)
+    let current_path_key =
+      match doc.Document.file with
+      | None -> None
+      | Some p -> Some (normalize_path_key p)
+    in
+    let entries =
+      match Hashtbl.find_opt ws.quick_nav_index key with
+      | None -> []
+      | Some xs -> xs
+    in
+    entries
+    |> List.filter_map (fun e ->
+         let same_doc =
+           match Uri_path.file_path_of_uri e.qn_uri, current_path_key with
+           | Some p, Some cur -> normalize_path_key p = cur
+           | _ -> false
+         in
+         if same_doc then None
+         else (
+           (match Uri_path.file_path_of_uri e.qn_uri with
+            | Some p -> enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"quick_nav_hit" ~high:true p
+            | None -> ());
+           Some
+             {
+               uri = e.qn_uri;
+               name = e.qn_name;
+               key = e.qn_key;
+               loc = e.qn_loc;
+               kind = e.qn_kind;
+               container = e.qn_container;
+             }))
     |> uniq_defs
+
+let quick_proc_defs_from_index_sources (ws:t) (doc:Document.t) ~(key:string) : def list =
+  if key = ""
+     || nav_quick_scan_files <= 0
+     || nav_quick_scan_total_bytes <= 0
+     || nav_quick_scan_per_file_bytes <= 0
+  then
+    []
+  else
+    let indexed_hits = quick_proc_defs_from_nav_index ws doc ~key in
+    if indexed_hits <> [] then indexed_hits
+    else
+      match ws.index with
+      | None -> []
+      | Some idx ->
+        let profile = workspace_profile_for_budget ws in
+        let scan_files_budget =
+          match profile with
+          | ProfileLarge -> max nav_quick_scan_files 128
+          | ProfileMedium -> max nav_quick_scan_files 72
+          | ProfileSmall -> nav_quick_scan_files
+        in
+        let scan_total_budget =
+          match profile with
+          | ProfileLarge -> max nav_quick_scan_total_bytes 4_194_304
+          | ProfileMedium -> max nav_quick_scan_total_bytes 2_359_296
+          | ProfileSmall -> nav_quick_scan_total_bytes
+        in
+        let scan_per_file_budget =
+          match profile with
+          | ProfileLarge -> max nav_quick_scan_per_file_bytes 393_216
+          | ProfileMedium -> nav_quick_scan_per_file_bytes
+          | ProfileSmall -> nav_quick_scan_per_file_bytes
+        in
+        let current_path_key =
+          match doc.Document.file with
+          | None -> None
+          | Some p -> Some (normalize_path_key p)
+        in
+        ensure_graph_fresh ws;
+        let seen_paths = Hashtbl.create 512 in
+        let candidate_paths_rev = ref [] in
+        let push_path (path:string) =
+          let key = normalize_path_key path in
+          if key <> "" && not (Hashtbl.mem seen_paths key) then (
+            Hashtbl.replace seen_paths key true;
+            candidate_paths_rev := path :: !candidate_paths_rev
+          )
+        in
+        Array.iter push_path ws.graph_root_closure_paths;
+        Workspace_index.all_source_paths idx |> List.iter push_path;
+        let candidate_paths = List.rev !candidate_paths_rev in
+        let mk_quick_hit ~(path:string) ~(text:string) ~(s:int) ~(e:int) : def =
+          let uri = docuri_of_path_unsafe path in
+          let idx = Text_index.of_string text in
+          let loc = loc_of_offsets ~file:(Some path) ~idx ~s ~e in
+          { uri; name = key; key; loc; kind = sym_kind_func; container = None }
+        in
+        let rec scan scanned scanned_bytes (fallback:def option) = function
+          | [] ->
+              (match fallback with
+               | None -> []
+               | Some d -> [ d ])
+          | _ when scanned >= scan_files_budget -> []
+          | _ when scanned_bytes >= scan_total_budget -> []
+          | path :: tl ->
+              let path_key = normalize_path_key path in
+              let is_current =
+                match current_path_key with
+                | Some k -> k = path_key
+                | None -> false
+              in
+              if is_current then scan scanned scanned_bytes fallback tl
+              else (
+                enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"quick_nav_scan" ~high:true path;
+                if Hashtbl.mem ws.files path_key then scan scanned scanned_bytes fallback tl
+                else
+                  let offset =
+                    match Hashtbl.find_opt ws.nav_quick_scan_offset_by_path path_key with
+                    | Some n when n >= 0 -> n
+                    | _ -> 0
+                  in
+                  match read_file_window_text path ~offset ~max_bytes:scan_per_file_budget with
+                  | None ->
+                      scan (scanned + 1) scanned_bytes fallback tl
+                  | Some (text, next_offset) ->
+                      Hashtbl.replace ws.nav_quick_scan_offset_by_path path_key next_offset;
+                      let text_len = String.length text in
+                      if text_len = 0 then
+                        scan (scanned + 1) scanned_bytes fallback tl
+                      else
+                      let next_bytes = scanned_bytes + text_len in
+                      if next_bytes > scan_total_budget then
+                        (match fallback with
+                         | None -> []
+                         | Some d -> [ d ])
+                      else
+                        let upper_text = String.uppercase_ascii text in
+                        (match find_proc_def_name_offsets ~upper_text ~key with
+                         | Some (s, e) ->
+                             [ mk_quick_hit ~path ~text ~s ~e ]
+                         | None ->
+                             let fallback =
+                               match fallback with
+                               | Some _ -> fallback
+                               | None ->
+                                   (match find_proc_decl_name_offsets ~upper_text ~key with
+                                    | None -> None
+                                    | Some (s, e) -> Some (mk_quick_hit ~path ~text ~s ~e))
+                             in
+                             scan (scanned + 1) next_bytes fallback tl)
+              )
+        in
+        scan 0 0 None candidate_paths
+
+let proc_defs_by_key (ws:t) (doc:Document.t) ~(key:string) : def list =
+  if key = "" then []
+  else (
+    pump_index_lookup ws;
+    let from_local_docs () : def list =
+      docs_for_rename ws doc
+      |> List.concat_map collect_doc_defs
+      |> List.filter (fun d -> d.kind = sym_kind_func && d.key = key)
+      |> uniq_defs
+    in
+    let from_semantic_store () : def list =
+      if not ws.sem_store_enabled then []
+      else
+        Semantic_store.sym_ids_for_key ws.semantic_store ~key
+        |> List.concat_map (fun sym_id -> Semantic_store.defs_for_sym_id ws.semantic_store sym_id)
+        |> List.map def_of_snapshot_def
+        |> List.filter (fun d -> d.kind = sym_kind_func && d.key = key)
+        |> uniq_defs
+    in
+    let sem_hits = from_semantic_store () in
+    let sem_has_impl = List.exists (is_likely_proc_implementation ws) sem_hits in
+    if sem_has_impl then sem_hits
+    else
+      let local_hits = from_local_docs () in
+      let local_has_impl = List.exists (is_likely_proc_implementation ws) local_hits in
+      if local_has_impl then local_hits
+      else
+      let quick_hits =
+        quick_proc_defs_from_index_sources ws doc ~key
+      in
+      let combined = uniq_defs (sem_hits @ local_hits @ quick_hits) in
+      combined
+  )
 
 let proc_impl_defs_by_key (ws:t) (doc:Document.t) ~(key:string) : def list =
   let defs = proc_defs_by_key ws doc ~key in

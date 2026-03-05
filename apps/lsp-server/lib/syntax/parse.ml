@@ -146,13 +146,14 @@ let parse_diags_to_lsp ~(file:string option) : T.Diagnostic.t list =
          Some (diag_warn (attach_file file loc) msg))
 
 let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
-  (* Clear stale recovery/warn diags from previous runs *)
-  Parse_diags.clear ();
+  Lexer.with_session_state (fun () ->
+    (* Clear stale recovery/warn diags from previous runs *)
+    Parse_diags.clear ();
 
-  if String.trim text = "" then
-    { ast = None; diags = []; ast_dump = None }
-  else
-    let lexbuf = Lexing.from_string text in
+    if String.trim text = "" then
+      { ast = None; diags = []; ast_dump = None }
+    else
+      let lexbuf = Lexing.from_string text in
 
     (match file with
      | None -> ()
@@ -320,4 +321,12 @@ let parse_text ~(file:string option) ~(dump_ast:bool) ~(text:string) : output =
         let errs = List.rev !parse_errors in
         let p = lexbuf.lex_curr_p in
         let loc = loc_of_lex file p p in
-        { ast = None; diags = errs @ extra @ [diag_error loc ("Unhandled exception: " ^ Printexc.to_string exn)]; ast_dump = None }
+        {
+          ast = None;
+          diags =
+            errs
+            @ extra
+            @ [diag_error loc ("Unhandled exception: " ^ Printexc.to_string exn)];
+          ast_dump = None;
+        }
+  )

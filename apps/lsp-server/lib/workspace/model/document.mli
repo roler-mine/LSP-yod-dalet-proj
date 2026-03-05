@@ -24,6 +24,12 @@ type t = private {
 }
 
 val make : uri:T.DocumentUri.t -> file:string option -> text:string -> t
+val make_unparsed :
+  uri:T.DocumentUri.t ->
+  file:string option ->
+  text:string ->
+  parse_diags:T.Diagnostic.t list ->
+  t
 
 val apply_changes_and_reparse :
   changes:T.TextDocumentContentChangeEvent.t list ->
@@ -36,6 +42,7 @@ val apply_changes_no_reparse :
   t
 
 val with_import_diags : T.Diagnostic.t list -> t -> t
+val with_parse_diags : T.Diagnostic.t list -> t -> t
 
 val diagnostics : t -> T.Diagnostic.t list
 val ast_dump : t -> string option

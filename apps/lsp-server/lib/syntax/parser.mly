@@ -902,24 +902,24 @@ return_stmt:
   ;
 
 exit_stmt:
-  | EXIT { n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "EXIT"; args = [] }) }
+  | EXIT { n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "EXIT"; args = []; abort_label = None }) }
   ;
 
 abort_stmt:
-  | ABORT { n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "ABORT"; args = [] }) }
+  | ABORT { n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "ABORT"; args = []; abort_label = None }) }
   ;
 
 stop_stmt:
   | STOP eo=expr_opt
       {
         let args = match eo with None -> [] | Some e -> [e] in
-        n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "STOP"; args })
+        n $startpos $endpos (Ast.SCallStmt { callee = nid $startpos $endpos "STOP"; args; abort_label = None })
       }
   ;
 
 call_stmt:
-  | callee=ident args=actuals_opt _ab=abort_phrase_opt
-      { n $startpos $endpos (Ast.SCallStmt { callee; args }) }
+  | callee=ident args=actuals_opt ab=abort_phrase_opt
+      { n $startpos $endpos (Ast.SCallStmt { callee; args; abort_label = ab }) }
   ;
 
 abort_phrase_opt:

@@ -14,6 +14,16 @@ let is_nonempty_location_list_json (j:Yojson.Safe.t) : bool =
   | `List (_ :: _) -> true
   | _ -> false
 
+let is_empty_location_list_json (j:Yojson.Safe.t) : bool =
+  match j with
+  | `List [] -> true
+  | _ -> false
+
+let is_nav_lookup_miss_json (j:Yojson.Safe.t) : bool =
+  match j with
+  | `Null -> true
+  | _ -> is_empty_location_list_json j
+
 let is_nonempty_hover_json (j:Yojson.Safe.t) : bool =
   match j with
   | `Null -> false
@@ -21,6 +31,16 @@ let is_nonempty_hover_json (j:Yojson.Safe.t) : bool =
 
 let request_pos_suffix (pos:T.Position.t) : string =
   Printf.sprintf "@%d:%d" pos.line pos.character
+
+let adjust_nav_position (doc:Document.t) (pos:T.Position.t) : T.Position.t =
+  match nav_word_at_position doc pos with
+  | Some _ -> pos
+  | None when pos.character > 0 ->
+      let prev = { pos with T.Position.character = pos.character - 1 } in
+      (match nav_word_at_position doc prev with
+       | Some _ -> prev
+       | None -> pos)
+  | None -> pos
 
 type nav_budget = {
   ws : t;
@@ -60,6 +80,18 @@ let nav_compute_with_budget (budget:nav_budget) (f:unit -> Yojson.Safe.t) : Yojs
   let out = f () in
   ignore (nav_budget_check budget);
   out
+
+let nav_cache_write_allowed_for_request (ws:t) ~(uri:T.DocumentUri.t) : bool =
+  (not (index_reconcile_pending_for_report ws))
+  && open_doc_converged ws ~uri
+  && Hashtbl.length ws.open_parse_generation = 0
+  && Queue.is_empty ws.open_diag_revalidate_updates
+  && ws.startup_fully_nav_ready_ms <> None
+  && Queue.is_empty ws.bg_high_large_queue
+
+let allow_fallback_for_ws (ws:t) (doc:Document.t) : bool =
+  allow_unscoped_fallback doc
+  || ws.startup_fully_nav_ready_ms = None
 
 type nav_cache_hit =
   | CacheExact of Yojson.Safe.t
@@ -104,102 +136,125 @@ let definition_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojs
   match doc_of_uri ws uri with
   | None -> `Null
   | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          match import_under_cursor doc pos with
-          | Some imp ->
-              let hits = defs_for_import_cursor ws imp in
-              if hits = [] then `Null else `List (List.map def_to_loc_json hits)
-          | None ->
-              let allow_fallback = allow_unscoped_fallback doc in
-              (match define_under_cursor doc pos with
-               | Some (dm, _) ->
-                   let d = def_of_preprocess_define doc dm in
-                   `List [ def_to_loc_json d ]
-               | None ->
-              let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
-              let nav = nav_for_doc_cached ws cache doc in
-              let docs_cache : Document.t list option ref = ref None in
-              let docs_for_symbol () =
-                match !docs_cache with
-                | Some xs -> xs
-                | None ->
-                    let xs = docs_for_lookup ws doc in
-                    docs_cache := Some xs;
-                    xs
-              in
-              let hit =
-                match symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos with
-                | None -> None
-                | Some (sym_id, _) ->
-                    (match Hashtbl.find_opt nav.defs_by_id sym_id with
-                     | Some _ as d0 -> d0
-                     | None ->
-                         if ws.sem_store_enabled then
-                           (match Semantic_store.defs_for_sym_id ws.semantic_store sym_id with
-                            | d0 :: _ -> Some (def_of_snapshot_def d0)
-                            | [] ->
-                                if nav_budget_check budget then None
-                                else find_def_for_sym_id ws cache ~docs:(docs_for_symbol ()) ~sym_id)
-                         else if nav_budget_check budget then None
-                         else find_def_for_sym_id ws cache ~docs:(docs_for_symbol ()) ~sym_id)
-              in
-              (match hit with
-               | Some d ->
-                   let defs =
-                     if d.kind = sym_kind_func && not (is_likely_proc_implementation ws d)
-                     then
-                       let impls = proc_impl_defs_by_key ws doc ~key:d.key in
-                       if impls = [] then [ d ] else impls
-                     else
-                       [ d ]
-                   in
-                   `List (List.map def_to_loc_json defs)
-               | None ->
-                   if nav_budget_check budget then `Null
-                   else
-                     let proc_by_name =
-                       if not allow_fallback then []
+      let definition_for_pos (pos:T.Position.t) : Yojson.Safe.t =
+        let pos = adjust_nav_position doc pos in
+        let budget = nav_budget_start ws in
+        let compute () =
+          if nav_budget_check budget then `Null
+          else
+            match import_under_cursor doc pos with
+            | Some imp ->
+                let hits = defs_for_import_cursor ws imp in
+                if hits = [] then `Null else `List (List.map def_to_loc_json hits)
+            | None ->
+                let startup_quick_hits =
+                  match nav_word_at_position doc pos with
+                  | None -> []
+                  | Some (nm, _) ->
+                      let key = normalize_name nm in
+                      if key = "" then [] else proc_impl_defs_by_key ws doc ~key
+                in
+                if startup_quick_hits <> [] then
+                  `List (List.map def_to_loc_json startup_quick_hits)
+                else
+                let allow_fallback = allow_fallback_for_ws ws doc in
+                (match define_under_cursor doc pos with
+                 | Some (dm, _) ->
+                     let d = def_of_preprocess_define doc dm in
+                     `List [ def_to_loc_json d ]
+                 | None ->
+                let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
+                let nav = nav_for_doc_cached ws cache doc in
+                let docs_cache : Document.t list option ref = ref None in
+                let docs_for_symbol () =
+                  match !docs_cache with
+                  | Some xs -> xs
+                  | None ->
+                      let xs = docs_for_lookup ws doc in
+                      docs_cache := Some xs;
+                      xs
+                in
+                let hit =
+                  match symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos with
+                  | None -> None
+                  | Some (sym_id, _) ->
+                      (match Hashtbl.find_opt nav.defs_by_id sym_id with
+                       | Some _ as d0 -> d0
+                       | None ->
+                           if ws.sem_store_enabled then
+                             (match Semantic_store.defs_for_sym_id ws.semantic_store sym_id with
+                              | d0 :: _ -> Some (def_of_snapshot_def d0)
+                              | [] ->
+                                  if nav_budget_check budget then None
+                                  else find_def_for_sym_id ws cache ~docs:(docs_for_symbol ()) ~sym_id)
+                           else if nav_budget_check budget then None
+                           else find_def_for_sym_id ws cache ~docs:(docs_for_symbol ()) ~sym_id)
+                in
+                (match hit with
+                 | Some d ->
+                     let defs =
+                       if d.kind = sym_kind_func && not (is_likely_proc_implementation ws d)
+                       then
+                         let impls = proc_impl_defs_by_key ws doc ~key:d.key in
+                         if impls = [] then [ d ] else impls
                        else
-                         match nav_word_at_position doc pos with
-                         | None -> []
-                         | Some (nm, _) ->
-                             let key = normalize_name nm in
-                             if key = "" then [] else proc_impl_defs_by_key ws doc ~key
+                         [ d ]
                      in
-                     if proc_by_name <> [] then
-                       `List (List.map def_to_loc_json proc_by_name)
-                     else if not allow_fallback || nav_budget_check budget then `Null
+                     `List (List.map def_to_loc_json defs)
+                 | None ->
+                     if nav_budget_check budget then `Null
                      else
-                       let by_name =
-                         match nav_word_at_position doc pos with
-                         | None -> []
-                         | Some (nm, _) -> fallback_defs_by_name ws doc (normalize_name nm)
+                       let proc_by_name =
+                         if not allow_fallback then []
+                         else
+                           match nav_word_at_position doc pos with
+                           | None -> []
+                           | Some (nm, _) ->
+                               let key = normalize_name nm in
+                               if key = "" then [] else proc_impl_defs_by_key ws doc ~key
                        in
-                       if by_name = [] then `Null
-                       else `List (List.map def_to_loc_json by_name)))
+                       if proc_by_name <> [] then
+                         `List (List.map def_to_loc_json proc_by_name)
+                       else if not allow_fallback || nav_budget_check budget then `Null
+                       else
+                         let by_name =
+                           match nav_word_at_position doc pos with
+                           | None -> []
+                           | Some (nm, _) -> fallback_defs_by_name ws doc (normalize_name nm)
+                         in
+                         if by_name = [] then `Null
+                         else `List (List.map def_to_loc_json by_name)))
+        in
+        match symbol_key_at_position doc pos with
+        | None ->
+            nav_compute_with_budget budget compute
+        | Some key ->
+            let kind_exact = "definition" ^ request_pos_suffix pos in
+            let kind_symbol = "definition:symbol" in
+            (match nav_cache_get ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key with
+             | Some (CacheExact cached) ->
+                 Perf_stats.tick "nav.response_cache_hit";
+                 cached
+             | Some (CacheSymbol cached) ->
+                 Perf_stats.tick "nav.response_cache_symbol_hit";
+                 cached
+             | None ->
+                 Perf_stats.tick "nav.response_cache_miss";
+                 let computed = nav_compute_with_budget budget compute in
+                 if is_nav_lookup_miss_json computed then
+                   schedule_nav_miss_reconcile ws ~doc ~symbol_key:key;
+                 if (not budget.exceeded)
+                    && nav_cache_write_allowed_for_request ws ~uri
+                    && is_nonempty_location_list_json computed
+                 then
+                   nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key ~payload:computed;
+                 computed)
       in
-      match symbol_key_at_position doc pos with
-      | None ->
-          nav_compute_with_budget budget compute
-      | Some key ->
-          let kind_exact = "definition" ^ request_pos_suffix pos in
-          let kind_symbol = "definition:symbol" in
-          (match nav_cache_get ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key with
-           | Some (CacheExact cached) ->
-               Perf_stats.tick "nav.response_cache_hit";
-               cached
-           | Some (CacheSymbol cached) ->
-               Perf_stats.tick "nav.response_cache_symbol_hit";
-               cached
-           | None ->
-               Perf_stats.tick "nav.response_cache_miss";
-               let computed = nav_compute_with_budget budget compute in
-               if (not budget.exceeded) && is_nonempty_location_list_json computed then
-                 nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key ~payload:computed;
-               computed)
+      let primary = definition_for_pos pos in
+      if is_nav_lookup_miss_json primary && pos.character > 0 then
+        definition_for_pos { pos with T.Position.character = pos.character - 1 }
+      else
+        primary
 
 let implementation_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Safe.t =
   match doc_of_uri ws uri with
@@ -261,7 +316,7 @@ let implementation_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
                    match key_opt with
                    | None -> []
                    | Some key ->
-                       if allow_unscoped_fallback doc && not (nav_budget_check budget)
+                       if allow_fallback_for_ws ws doc && not (nav_budget_check budget)
                        then proc_impl_defs_by_key ws doc ~key
                        else []
                in
@@ -284,7 +339,12 @@ let implementation_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
            | None ->
                Perf_stats.tick "nav.response_cache_miss";
                let computed = nav_compute_with_budget budget compute in
-               if (not budget.exceeded) && is_nonempty_location_list_json computed then
+               if is_nav_lookup_miss_json computed then
+                 schedule_nav_miss_reconcile ws ~doc ~symbol_key:key;
+               if (not budget.exceeded)
+                  && nav_cache_write_allowed_for_request ws ~uri
+                  && is_nonempty_location_list_json computed
+               then
                  nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key ~payload:computed;
                computed)
 
@@ -312,25 +372,27 @@ let occurrences_in_doc_fallback (doc:Document.t) ~(key:string) : (T.DocumentUri.
 
 let occurrences_in_doc (doc:Document.t) ~(key:string) : (T.DocumentUri.t * Ast.Loc.t) list =
   try
-    let lexbuf = Lexing.from_string doc.Document.text in
-    (match doc.Document.file with
-     | None -> ()
-     | Some f ->
-         lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-    let rec loop acc =
-      let tok = Lexer.token lexbuf in
-      let sp = Lexing.lexeme_start_p lexbuf in
-      let ep = Lexing.lexeme_end_p lexbuf in
-      match tok with
-      | Parser.EOF ->
-          List.rev acc
-      | Parser.ID s when normalize_name s = key ->
-          let loc = Ast.Loc.of_lexing_positions sp ep ~file:doc.Document.file in
-          loop ((doc.Document.uri, loc) :: acc)
-      | _ ->
-          loop acc
-    in
-    loop []
+    Lexer.with_session_state (fun () ->
+      let lexbuf = Lexing.from_string doc.Document.text in
+      (match doc.Document.file with
+       | None -> ()
+       | Some f ->
+           lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
+      let rec loop acc =
+        let tok = Lexer.token lexbuf in
+        let sp = Lexing.lexeme_start_p lexbuf in
+        let ep = Lexing.lexeme_end_p lexbuf in
+        match tok with
+        | Parser.EOF ->
+            List.rev acc
+        | Parser.ID s when normalize_name s = key ->
+            let loc = Ast.Loc.of_lexing_positions sp ep ~file:doc.Document.file in
+            loop ((doc.Document.uri, loc) :: acc)
+        | _ ->
+            loop acc
+      in
+      loop []
+    )
   with _ ->
     occurrences_in_doc_fallback doc ~key
 
@@ -452,12 +514,12 @@ let references_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(incl
                         else
                           let docs = docs_for_rename ws doc in
                           let proc_defs =
-                            if allow_unscoped_fallback doc then proc_defs_by_key ws doc ~key
+                            if allow_fallback_for_ws ws doc then proc_defs_by_key ws doc ~key
                             else []
                           in
                           let defs =
                             if proc_defs <> [] then proc_defs
-                            else if allow_unscoped_fallback doc then
+                            else if allow_fallback_for_ws ws doc then
                               docs
                               |> List.concat_map collect_doc_defs
                               |> List.filter (fun d -> d.key = key)
@@ -503,7 +565,12 @@ let references_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(incl
            | None ->
                Perf_stats.tick "nav.response_cache_miss";
                let computed = nav_compute_with_budget budget compute in
-               if (not budget.exceeded) && is_nonempty_location_list_json computed then
+               if is_nav_lookup_miss_json computed then
+                 schedule_nav_miss_reconcile ws ~doc ~symbol_key:key;
+               if (not budget.exceeded)
+                  && nav_cache_write_allowed_for_request ws ~uri
+                  && is_nonempty_location_list_json computed
+               then
                  nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key ~payload:computed;
                computed)
 
@@ -606,7 +673,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                       | None -> ([], Some loc)
                       | Some (nm, wloc) ->
                           let defs0 =
-                            if allow_unscoped_fallback doc && not (nav_budget_check budget)
+                            if allow_fallback_for_ws ws doc && not (nav_budget_check budget)
                             then fallback_defs_by_name ws doc (normalize_name nm)
                             else []
                           in
@@ -616,7 +683,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                  | None -> ([], None)
                  | Some (nm, wloc) ->
                      let defs0 =
-                       if allow_unscoped_fallback doc && not (nav_budget_check budget)
+                       if allow_fallback_for_ws ws doc && not (nav_budget_check budget)
                        then fallback_defs_by_name ws doc (normalize_name nm)
                        else []
                      in
@@ -632,7 +699,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                  | None -> []
                  | Some (nm, _) ->
                      let key = normalize_name nm in
-                     if key = "" || not (allow_unscoped_fallback doc) || nav_budget_check budget
+                     if key = "" || not (allow_fallback_for_ws ws doc) || nav_budget_check budget
                      then []
                      else proc_impl_defs_by_key ws doc ~key)
             | _ ->
@@ -666,10 +733,12 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                     Printf.sprintf "### %s `%s`\nDefined at `%s`"
                       (kind_name d.kind) d.name (file_line_of_def d)
                   in
+                  let sig_line = proc_signature_for_def ws d in
+                  let src_line = source_line_for_def ws d in
                   let primary_decl =
-                    match proc_signature_for_def ws d with
+                    match sig_line with
                     | Some sig_line -> Some sig_line
-                    | None -> source_line_for_def ws d
+                    | None -> src_line
                   in
                   let decl_block =
                     match primary_decl with
@@ -680,7 +749,7 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
                         else Printf.sprintf "\n```jovial\n%s\n```" line
                   in
                   let extra =
-                    match source_line_for_def ws d, proc_signature_for_def ws d with
+                    match src_line, sig_line with
                     | Some src, Some sig_line when String.trim src <> String.trim sig_line ->
                         let src = truncate_text 280 src in
                         if String.trim src = "" then ""
@@ -722,7 +791,10 @@ let hover_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : Yojson.Sa
            | None ->
                Perf_stats.tick "nav.response_cache_miss";
                let computed = nav_compute_with_budget budget compute in
-               if (not budget.exceeded) && is_nonempty_hover_json computed then
+               if (not budget.exceeded)
+                  && nav_cache_write_allowed_for_request ws ~uri
+                  && is_nonempty_hover_json computed
+               then
                  nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key ~payload:computed;
                computed)
 
@@ -768,7 +840,7 @@ let prepare_rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
                 | None -> `Null
                 | Some (nm, word_loc) ->
                     let key = normalize_name nm in
-                    if key = "" || not (allow_unscoped_fallback doc) then `Null
+                    if key = "" || not (allow_fallback_for_ws ws doc) then `Null
                     else
                       let has_any =
                         docs_for_rename ws doc
@@ -849,7 +921,7 @@ let rename_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) ~(new_name
                   | None -> `Null
                   | Some (nm, _) ->
                       let key = normalize_name nm in
-                      if key = "" || not (allow_unscoped_fallback doc) then `Null
+                      if key = "" || not (allow_fallback_for_ws ws doc) then `Null
                       else (
                         List.iter (fun d ->
                           if not (nav_budget_check budget) then
@@ -1400,7 +1472,7 @@ let signature_help_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(pos:T.Position.t) : 
                     |> uniq_defs
                   in
                   if from_docs <> [] then from_docs
-                  else if allow_unscoped_fallback doc then proc_defs_by_key ws doc ~key
+                  else if allow_fallback_for_ws ws doc then proc_defs_by_key ws doc ~key
                   else []
               in
               if defs = [] then `Null
@@ -1712,7 +1784,7 @@ let inlay_hints_json_for (ws:t) ~(uri:T.DocumentUri.t) ~(range:T.Range.t) : Yojs
         | Ast.SDecl d -> walk_decl d
         | Ast.SBlock xs -> List.iter walk_stmt xs
         | Ast.SAssign { lhs; rhs } -> walk_expr lhs; walk_expr rhs
-        | Ast.SCallStmt { callee; args } ->
+        | Ast.SCallStmt { callee; args; _ } ->
             add_call_hints callee args;
             List.iter walk_expr args
         | Ast.SIf { cond; then_; else_ } ->

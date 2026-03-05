@@ -83,24 +83,26 @@ let diag_error (loc:Ast.Loc.t) (msg:string) : T.Diagnostic.t =
     loc
 
 let lex_all_tokens ~(file:string option) ~(text:string) : lex_tok array =
-  let lexbuf = Lexing.from_string text in
-  (match file with
-   | None -> ()
-   | Some f ->
-       lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-  let rec gather acc =
-    try
-      let tok = Lexer.token lexbuf in
-      let sp = Lexing.lexeme_start_p lexbuf in
-      let ep = Lexing.lexeme_end_p lexbuf in
-      let acc = (tok, sp, ep) :: acc in
-      match tok with
-      | Parser.EOF -> List.rev acc
-      | _ -> gather acc
-    with _ ->
-      List.rev acc
-  in
-  gather [] |> Array.of_list
+  Lexer.with_session_state (fun () ->
+    let lexbuf = Lexing.from_string text in
+    (match file with
+     | None -> ()
+     | Some f ->
+         lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
+    let rec gather acc =
+      try
+        let tok = Lexer.token lexbuf in
+        let sp = Lexing.lexeme_start_p lexbuf in
+        let ep = Lexing.lexeme_end_p lexbuf in
+        let acc = (tok, sp, ep) :: acc in
+        match tok with
+        | Parser.EOF -> List.rev acc
+        | _ -> gather acc
+      with _ ->
+        List.rev acc
+    in
+    gather [] |> Array.of_list
+  )
 
 let tok_at (arr:lex_tok array) (i:int) : Parser.token =
   let (t, _, _) = arr.(i) in

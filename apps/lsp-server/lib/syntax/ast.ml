@@ -105,7 +105,7 @@ and stmt =
   | SBlock of stmt node list
   | SDecl of decl node
   | SAssign of { lhs : expr node; rhs : expr node }
-  | SCallStmt of { callee : ident; args : expr node list }
+  | SCallStmt of { callee : ident; args : expr node list; abort_label : ident option }
   | SIf of { cond : expr node; then_ : stmt node; else_ : stmt node option }
   | SWhile of { cond : expr node; body : stmt node }
   | SFor of { init : stmt node option; cond : expr node option; step : stmt node option; body : stmt node }
@@ -330,10 +330,11 @@ module Debug = struct
             (pp_expr opts b (depth + 1)) lhs
             (pp_expr opts b (depth + 1)) rhs
             (pp_loc_if opts) s.loc
-      | SCallStmt { callee; args } ->
-          Format.fprintf fmt "@[SCall(%a, [%a])@]%a"
+      | SCallStmt { callee; args; abort_label } ->
+          Format.fprintf fmt "@[SCall(%a, [%a], abort=%a)@]%a"
             pp_ident callee
             (pp_list (pp_expr opts b (depth + 1))) args
+            (pp_opt pp_ident) abort_label
             (pp_loc_if opts) s.loc
       | SIf { cond; then_; else_ } ->
           Format.fprintf fmt "@[SIf(cond=%a; then=%a; else=%a)@]%a"

@@ -4,9 +4,18 @@ type t = {
   sources : (string, string) Hashtbl.t;   (* normalized path -> source filepath *)
   sources_by_dir : (string, (string, bool) Hashtbl.t) Hashtbl.t;  (* normalized dir -> normalized source path keys *)
   file_compool_keys : (string, string) Hashtbl.t;  (* normalized path -> COMPOOL key *)
+  source_import_hints : (string, string list) Hashtbl.t;  (* normalized path -> imported compool keys *)
+  source_entry_hints : (string, bool) Hashtbl.t;  (* normalized path -> entrypoint hint *)
   pending_dirs : string Queue.t;
   seen_dirs : (string, bool) Hashtbl.t;
   mutable complete : bool;
+  mutable checkpoint_loaded : bool;
+  mutable reconcile_pending : bool;
+  mutable reconcile_epoch : int;
+  reconcile_seen_epoch : (string, int) Hashtbl.t;
+  mutable reconcile_sources_before : int;
+  mutable reconcile_sources_after : int;
+  mutable reconcile_stale_pruned : int;
   checkpoint_file : string;
   resume_spot_file : string;
   mutable checkpoint_dirty : bool;
@@ -18,12 +27,15 @@ type file_change_kind =
   | Changed
   | Deleted
 
-let checkpoint_version = 2
+let checkpoint_version = 4
 let checkpoint_write_every_ops = 200
 
 let normalize_path_key (p:string) : string =
   let p = String.map (fun c -> if c = '\\' then '/' else c) p in
   if Sys.win32 then String.lowercase_ascii p else p
+
+let normalize_key (s:string) : string =
+  String.uppercase_ascii (String.trim s)
 
 let workspace_cache_key (root:string) : string =
   Digest.to_hex (Digest.string (normalize_path_key root))
@@ -40,6 +52,36 @@ let resume_spot_file_path ~(root:string) : string =
 
 let root t = t.root
 let compool_count t = Hashtbl.length t.compools
+let source_count t = Hashtbl.length t.sources
+let checkpoint_loaded t = t.checkpoint_loaded
+let reconcile_pending t = t.reconcile_pending
+let reconcile_epoch t = t.reconcile_epoch
+let reconcile_sources_before t = t.reconcile_sources_before
+let reconcile_sources_after t = t.reconcile_sources_after
+let reconcile_stale_pruned t = t.reconcile_stale_pruned
+let source_import_hints (t:t) ~(path:string) : string list =
+  let path_key = normalize_path_key path in
+  match Hashtbl.find_opt t.source_import_hints path_key with
+  | Some xs -> xs
+  | None -> []
+
+let source_entry_hint (t:t) ~(path:string) : bool =
+  let path_key = normalize_path_key path in
+  match Hashtbl.find_opt t.source_entry_hints path_key with
+  | Some b -> b
+  | None -> false
+
+let source_entry_paths (t:t) : string list =
+  Hashtbl.fold
+    (fun path_key is_entry acc ->
+      if is_entry then
+        match Hashtbl.find_opt t.sources path_key with
+        | Some path -> path :: acc
+        | None -> acc
+      else
+        acc)
+    t.source_entry_hints
+    []
 
 let mark_checkpoint_dirty (t:t) : unit =
   t.checkpoint_dirty <- true;
@@ -152,16 +194,47 @@ let checkpoint_json (t:t) : Yojson.Safe.t =
     in
     `List dirs
   in
+  let source_import_hints_json =
+    let xs =
+      Hashtbl.fold
+        (fun path_key compools acc ->
+          let compools_json =
+            compools |> List.map (fun c -> `String c)
+          in
+          (`Assoc [ "path", `String path_key; "compools", `List compools_json ]) :: acc)
+        t.source_import_hints
+        []
+    in
+    `List xs
+  in
+  let source_entry_hints_json =
+    let xs =
+      Hashtbl.fold
+        (fun path_key is_entry acc ->
+          if is_entry then (`String path_key) :: acc else acc)
+        t.source_entry_hints
+        []
+    in
+    `List xs
+  in
   `Assoc [
     "version", `Int checkpoint_version;
     "root", `String t.root;
     "complete", `Bool t.complete;
+    "checkpointLoaded", `Bool t.checkpoint_loaded;
+    "reconcilePending", `Bool t.reconcile_pending;
+    "reconcileEpoch", `Int t.reconcile_epoch;
+    "reconcileSourcesBefore", `Int t.reconcile_sources_before;
+    "reconcileSourcesAfter", `Int t.reconcile_sources_after;
+    "reconcileStalePruned", `Int t.reconcile_stale_pruned;
     "pendingDirs", `List (List.map (fun d -> `String d) pending_dirs);
     "seenDirs", `List seen_dirs;
     "compools", json_of_string_pairs t.compools;
     "sources", json_of_string_pairs t.sources;
     "sourcesByDir", sources_by_dir_json;
     "fileCompoolKeys", json_of_string_pairs t.file_compool_keys;
+    "sourceImportHints", source_import_hints_json;
+    "sourceEntryHints", source_entry_hints_json;
   ]
 
 let save_checkpoint (t:t) : unit =
@@ -200,6 +273,26 @@ let prepend_pending_dir_raw (t:t) (dir:string) : unit =
     ) old;
     Hashtbl.replace t.seen_dirs key true
 
+let start_reconcile (t:t) : bool =
+  if not (is_dir t.root) then false
+  else
+    let was_pending = t.reconcile_pending in
+    t.reconcile_epoch <- t.reconcile_epoch + 1;
+    t.reconcile_pending <- true;
+    t.reconcile_sources_before <- Hashtbl.length t.sources;
+    t.reconcile_sources_after <- t.reconcile_sources_before;
+    t.reconcile_stale_pruned <- 0;
+    t.complete <- false;
+    let root_key = normalize_path_key t.root in
+    if Hashtbl.mem t.seen_dirs root_key then
+      Hashtbl.remove t.seen_dirs root_key;
+    prepend_pending_dir_raw t t.root;
+    mark_checkpoint_dirty t;
+    not was_pending
+
+let force_reconcile (t:t) : bool =
+  start_reconcile t
+
 let load_checkpoint (t:t) : bool =
   match read_all_text t.checkpoint_file with
   | None -> false
@@ -212,7 +305,7 @@ let load_checkpoint (t:t) : bool =
                match field "version" with
                | Some j ->
                    (match int_of_json j with
-                    | Some v -> v = checkpoint_version
+                    | Some v -> v >= 2 && v <= checkpoint_version
                     | None -> false)
                | None -> false
              in
@@ -229,7 +322,10 @@ let load_checkpoint (t:t) : bool =
                Hashtbl.clear t.sources;
                Hashtbl.clear t.sources_by_dir;
                Hashtbl.clear t.file_compool_keys;
+               Hashtbl.clear t.source_import_hints;
+               Hashtbl.clear t.source_entry_hints;
                Hashtbl.clear t.seen_dirs;
+               Hashtbl.clear t.reconcile_seen_epoch;
                clear_queue t.pending_dirs;
 
                (match field "compools" with
@@ -266,6 +362,36 @@ let load_checkpoint (t:t) : bool =
                     string_pairs_of_json j
                     |> List.iter (fun (k, v) -> Hashtbl.replace t.file_compool_keys k v)
                 | None -> ());
+               (match field "sourceImportHints" with
+                | Some (`List hints) ->
+                    List.iter
+                      (function
+                        | `Assoc fields ->
+                            (match List.assoc_opt "path" fields, List.assoc_opt "compools" fields with
+                             | Some (`String path_key), Some (`List compools_json) ->
+                                 let compools =
+                                   compools_json
+                                   |> List.filter_map (function
+                                        | `String s ->
+                                            let key = normalize_key s in
+                                            if key = "" then None else Some key
+                                        | _ -> None)
+                                 in
+                                 if path_key <> "" then
+                                   Hashtbl.replace t.source_import_hints path_key compools
+                             | _ -> ())
+                        | _ -> ())
+                      hints
+                | _ -> ());
+               (match field "sourceEntryHints" with
+                | Some (`List paths) ->
+                    List.iter
+                      (function
+                        | `String path_key when path_key <> "" ->
+                            Hashtbl.replace t.source_entry_hints path_key true
+                        | _ -> ())
+                      paths
+                | _ -> ());
                (match field "seenDirs" with
                 | Some j ->
                     string_list_of_json j
@@ -279,6 +405,30 @@ let load_checkpoint (t:t) : bool =
                 | None -> ());
 
                t.complete <- bool_of_json_default (field "complete") ~default:false;
+               t.checkpoint_loaded <-
+                 bool_of_json_default (field "checkpointLoaded") ~default:true;
+               t.reconcile_pending <-
+                 bool_of_json_default (field "reconcilePending") ~default:false;
+               t.reconcile_epoch <-
+                 (match field "reconcileEpoch" with
+                  | Some j ->
+                      (match int_of_json j with Some n when n >= 0 -> n | _ -> 0)
+                  | None -> 0);
+               t.reconcile_sources_before <-
+                 (match field "reconcileSourcesBefore" with
+                  | Some j ->
+                      (match int_of_json j with Some n when n >= 0 -> n | _ -> Hashtbl.length t.sources)
+                  | None -> Hashtbl.length t.sources);
+               t.reconcile_sources_after <-
+                 (match field "reconcileSourcesAfter" with
+                  | Some j ->
+                      (match int_of_json j with Some n when n >= 0 -> n | _ -> Hashtbl.length t.sources)
+                  | None -> Hashtbl.length t.sources);
+               t.reconcile_stale_pruned <-
+                 (match field "reconcileStalePruned" with
+                  | Some j ->
+                      (match int_of_json j with Some n when n >= 0 -> n | _ -> 0)
+                  | None -> 0);
                if Hashtbl.length t.sources_by_dir = 0 then (
                  Hashtbl.iter (fun path_key path ->
                    let dir = normalize_path_key (Filename.dirname path) in
@@ -292,6 +442,11 @@ let load_checkpoint (t:t) : bool =
                            s
                      in
                      Hashtbl.replace set path_key true
+                 ) t.sources
+               );
+               if t.reconcile_pending then (
+                 Hashtbl.iter (fun path_key _ ->
+                   Hashtbl.replace t.reconcile_seen_epoch path_key t.reconcile_epoch
                  ) t.sources
                );
                t.checkpoint_dirty <- false;
@@ -349,8 +504,58 @@ let read_prefix path bytes =
     Some s
   with _ -> None
 
-let normalize_key (s:string) : string =
-  String.uppercase_ascii (String.trim s)
+let is_hint_word_char = function
+  | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+  | _ -> false
+
+let tokenize_upper_hint_words (text:string) : string list =
+  let upper = String.uppercase_ascii text in
+  let n = String.length upper in
+  let out = ref [] in
+  let rec scan i =
+    if i >= n then ()
+    else if is_hint_word_char upper.[i] then (
+      let j = ref (i + 1) in
+      while !j < n && is_hint_word_char upper.[!j] do
+        incr j
+      done;
+      out := String.sub upper i (!j - i) :: !out;
+      scan !j
+    ) else
+      scan (i + 1)
+  in
+  scan 0;
+  List.rev !out
+
+let import_hints_from_prefix (text:string) : string list =
+  let seen = Hashtbl.create 16 in
+  let out = ref [] in
+  let push_name (raw:string) =
+    let key = normalize_key raw in
+    if key <> "" && not (Hashtbl.mem seen key) then (
+      Hashtbl.replace seen key true;
+      out := key :: !out
+    )
+  in
+  let rec collect = function
+    | ("COMPOOL" | "ICOMPOOL") :: name :: tl ->
+        push_name name;
+        collect tl
+    | _ :: tl ->
+        collect tl
+    | [] ->
+        ()
+  in
+  collect (tokenize_upper_hint_words text);
+  List.rev !out
+
+let entry_hint_from_prefix (text:string) : bool =
+  let rec has_program = function
+    | "PROGRAM" :: _ -> true
+    | _ :: tl -> has_program tl
+    | [] -> false
+  in
+  has_program (tokenize_upper_hint_words text)
 
 let starts_with ~(prefix:string) (s:string) : bool =
   let n = String.length s in
@@ -420,6 +625,8 @@ let set_compool_for_path (t:t) ~(path:string) ~(path_key:string) ~(compool_key:s
 
 let index_source_file (t:t) (path:string) : bool =
   let path_key = normalize_path_key path in
+  if t.reconcile_pending then
+    Hashtbl.replace t.reconcile_seen_epoch path_key t.reconcile_epoch;
   let prev_source = Hashtbl.find_opt t.sources path_key in
   (match prev_source with
    | Some prev when prev <> path ->
@@ -432,23 +639,57 @@ let index_source_file (t:t) (path:string) : bool =
     | Some prev when prev = path -> false
     | _ -> true
   in
-  let compool_changed =
+  let compool_changed, hints_changed =
     match read_prefix path 65536 with
     | None ->
-        remove_compool_for_path t ~path_key
+        let compool_removed = remove_compool_for_path t ~path_key in
+        let import_changed =
+          Hashtbl.mem t.source_import_hints path_key
+        in
+        let entry_changed =
+          match Hashtbl.find_opt t.source_entry_hints path_key with
+          | Some true -> true
+          | _ -> false
+        in
+        Hashtbl.remove t.source_import_hints path_key;
+        Hashtbl.remove t.source_entry_hints path_key;
+        (compool_removed, import_changed || entry_changed)
     | Some txt ->
-        (match Preprocess.scan_compool_def ~text:txt with
-         | None ->
-             remove_compool_for_path t ~path_key
-         | Some name ->
-             let def_key = normalize_key name in
-             let stem_key = file_stem_key path in
-             if def_key = stem_key then
-               set_compool_for_path t ~path ~path_key ~compool_key:def_key
-             else
-               remove_compool_for_path t ~path_key)
+        let compool_changed =
+          match Preprocess.scan_compool_def ~text:txt with
+          | None ->
+              remove_compool_for_path t ~path_key
+          | Some name ->
+              let def_key = normalize_key name in
+              let stem_key = file_stem_key path in
+              if def_key = stem_key then
+                set_compool_for_path t ~path ~path_key ~compool_key:def_key
+              else
+                remove_compool_for_path t ~path_key
+        in
+        let import_hints = import_hints_from_prefix txt in
+        let import_changed =
+          match Hashtbl.find_opt t.source_import_hints path_key with
+          | Some prev -> prev <> import_hints
+          | None -> import_hints <> []
+        in
+        if import_hints = [] then
+          Hashtbl.remove t.source_import_hints path_key
+        else
+          Hashtbl.replace t.source_import_hints path_key import_hints;
+        let entry_hint = entry_hint_from_prefix txt in
+        let entry_changed =
+          match Hashtbl.find_opt t.source_entry_hints path_key with
+          | Some prev -> prev <> entry_hint
+          | None -> entry_hint
+        in
+        if entry_hint then
+          Hashtbl.replace t.source_entry_hints path_key true
+        else
+          Hashtbl.remove t.source_entry_hints path_key;
+        (compool_changed, import_changed || entry_changed)
   in
-  source_changed || compool_changed
+  source_changed || compool_changed || hints_changed
 
 let remove_source_file (t:t) (path:string) : bool =
   let path_key = normalize_path_key path in
@@ -460,8 +701,28 @@ let remove_source_file (t:t) (path:string) : bool =
    | None ->
        remove_source_dir_entry t ~path_key ~path);
   Hashtbl.remove t.sources path_key;
+  let had_import_hints = Hashtbl.mem t.source_import_hints path_key in
+  Hashtbl.remove t.source_import_hints path_key;
+  let had_entry_hint = Hashtbl.mem t.source_entry_hints path_key in
+  Hashtbl.remove t.source_entry_hints path_key;
   let compool_removed = remove_compool_for_path t ~path_key in
-  had_source || compool_removed
+  had_source || compool_removed || had_import_hints || had_entry_hint
+
+let finalize_reconcile_if_complete (t:t) : unit =
+  if t.reconcile_pending && Queue.is_empty t.pending_dirs then (
+    let stale_paths =
+      Hashtbl.fold (fun path_key path acc ->
+        match Hashtbl.find_opt t.reconcile_seen_epoch path_key with
+        | Some epoch when epoch = t.reconcile_epoch -> acc
+        | _ -> path :: acc
+      ) t.sources []
+    in
+    List.iter (fun path -> ignore (remove_source_file t path)) stale_paths;
+    t.reconcile_stale_pruned <- List.length stale_paths;
+    t.reconcile_sources_after <- Hashtbl.length t.sources;
+    t.reconcile_pending <- false;
+    mark_checkpoint_dirty t
+  )
 
 let enqueue_dir (t:t) (dir:string) : unit =
   let key = normalize_path_key dir in
@@ -520,9 +781,18 @@ let start ~(root:string) : t =
       sources = Hashtbl.create 512;
       sources_by_dir = Hashtbl.create 256;
       file_compool_keys = Hashtbl.create 97;
+      source_import_hints = Hashtbl.create 256;
+      source_entry_hints = Hashtbl.create 256;
       pending_dirs = Queue.create ();
       seen_dirs = Hashtbl.create 256;
       complete = false;
+      checkpoint_loaded = false;
+      reconcile_pending = false;
+      reconcile_epoch = 0;
+      reconcile_seen_epoch = Hashtbl.create 512;
+      reconcile_sources_before = 0;
+      reconcile_sources_after = 0;
+      reconcile_stale_pruned = 0;
       checkpoint_file = checkpoint_file_path ~root;
       resume_spot_file = resume_spot_file_path ~root;
       checkpoint_dirty = false;
@@ -530,15 +800,17 @@ let start ~(root:string) : t =
     }
   in
   let restored = load_checkpoint t in
+  t.checkpoint_loaded <- restored;
   if not restored then enqueue_dir t root;
   apply_resume_spot_if_any t;
-  if Queue.is_empty t.pending_dirs && not t.complete then
+  if restored then ignore (start_reconcile t)
+  else if Queue.is_empty t.pending_dirs && not t.complete then
     enqueue_dir t root;
   maybe_save_checkpoint t ~force:false;
   t
 
 let is_complete (t:t) : bool =
-  t.complete
+  t.complete && not t.reconcile_pending
 
 let scan_step (t:t) ~(max_dirs:int) ~(max_files:int) : int * int =
   let dirs_budget = max 0 max_dirs in
@@ -573,11 +845,12 @@ let scan_step (t:t) ~(max_dirs:int) ~(max_files:int) : int * int =
        with _ -> ())
   done;
   if Queue.is_empty t.pending_dirs then (
+    finalize_reconcile_if_complete t;
     if not t.complete then mark_checkpoint_dirty t;
     t.complete <- true;
     clear_resume_spot t
   );
-  maybe_save_checkpoint t ~force:t.complete;
+  maybe_save_checkpoint t ~force:(t.complete && not t.reconcile_pending);
   (!dirs_done, !files_done)
 
 let build ~(root:string) : t =

@@ -223,31 +223,33 @@ let semantic_lex_tokens_for_doc
     (doc:Document.t)
     ~(macro_keys:(string, bool) Hashtbl.t)
   : semantic_token list =
-  let lexbuf = Lexing.from_string doc.Document.text in
-  (match doc.Document.file with
-   | None -> ()
-   | Some f ->
-       lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-  let out = ref [] in
-  let rec loop () =
-    let tok = Lexer.token lexbuf in
-    let sp = Lexing.lexeme_start_p lexbuf in
-    let ep = Lexing.lexeme_end_p lexbuf in
-    let line0 = max 0 (sp.Lexing.pos_lnum - 1) in
-    let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
-    let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
-    (match semantic_class_of_lex_token ~macro_keys tok with
+  Lexer.with_session_state (fun () ->
+    let lexbuf = Lexing.from_string doc.Document.text in
+    (match doc.Document.file with
      | None -> ()
-     | Some (typ, mods) ->
-         (match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
-          | None -> ()
-          | Some st -> out := st :: !out));
-    match tok with
-    | Parser.EOF -> ()
-    | _ -> loop ()
-  in
-  (try loop () with _ -> ());
-  List.rev !out
+     | Some f ->
+         lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
+    let out = ref [] in
+    let rec loop () =
+      let tok = Lexer.token lexbuf in
+      let sp = Lexing.lexeme_start_p lexbuf in
+      let ep = Lexing.lexeme_end_p lexbuf in
+      let line0 = max 0 (sp.Lexing.pos_lnum - 1) in
+      let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
+      let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
+      (match semantic_class_of_lex_token ~macro_keys tok with
+       | None -> ()
+       | Some (typ, mods) ->
+           (match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
+            | None -> ()
+            | Some st -> out := st :: !out));
+      match tok with
+      | Parser.EOF -> ()
+      | _ -> loop ()
+    in
+    (try loop () with _ -> ());
+    List.rev !out
+  )
 
 let semantic_tokens_json_of_tokens (tokens:semantic_token list) : Yojson.Safe.t =
   let data_rev = ref [] in
@@ -595,7 +597,18 @@ let debug_report_for (ws:t) ~(uri:T.DocumentUri.t) ~(max_tokens:int) : Yojson.Sa
       let compools =
         match ws.index with
         | None ->
-            `Assoc [ "count", `Int 0; "sources", `Int 0; "complete", `Bool false; "sample", `List [] ]
+            `Assoc [
+              "count", `Int 0;
+              "sources", `Int 0;
+              "complete", `Bool false;
+              "checkpointLoaded", `Bool false;
+              "reconcilePending", `Bool false;
+              "reconcileEpoch", `Int 0;
+              "sourcesBeforeReconcile", `Int 0;
+              "sourcesAfterReconcile", `Int 0;
+              "stalePrunedCount", `Int 0;
+              "sample", `List [];
+            ]
         | Some idx ->
             let sources = Workspace_index.all_source_paths idx in
             let sample =
@@ -606,6 +619,12 @@ let debug_report_for (ws:t) ~(uri:T.DocumentUri.t) ~(max_tokens:int) : Yojson.Sa
               "count", `Int (Workspace_index.compool_count idx);
               "sources", `Int (List.length sources);
               "complete", `Bool (Workspace_index.is_complete idx);
+              "checkpointLoaded", `Bool (index_checkpoint_loaded_for_report ws);
+              "reconcilePending", `Bool (index_reconcile_pending_for_report ws);
+              "reconcileEpoch", `Int (index_reconcile_epoch_for_report ws);
+              "sourcesBeforeReconcile", `Int (index_reconcile_sources_before_for_report ws);
+              "sourcesAfterReconcile", `Int (index_reconcile_sources_after_for_report ws);
+              "stalePrunedCount", `Int (index_reconcile_stale_pruned_for_report ws);
               "sample", `List sample;
             ]
       in
@@ -631,26 +650,28 @@ let debug_report_for (ws:t) ~(uri:T.DocumentUri.t) ~(max_tokens:int) : Yojson.Sa
 
       let tokens =
         let text = Document.text doc in
-        let lexbuf = Lexing.from_string text in
-        let rec loop i acc =
-          if i >= max_tokens then List.rev acc
-          else
-            let t = Lexer.token lexbuf in
-            let sp = Lexing.lexeme_start_p lexbuf in
-            let ep = Lexing.lexeme_end_p lexbuf in
-            let lex = Lexing.lexeme lexbuf in
-            let item =
-              `Assoc [
-                "token", `String (Parse.Debug.string_of_token t);
-                "lexeme", `String lex;
-                "range", lsp_range_of_lex sp ep;
-              ]
-            in
-            match t with
-            | Parser.EOF -> List.rev (item :: acc)
-            | _ -> loop (i+1) (item :: acc)
-        in
-        loop 0 []
+        Lexer.with_session_state (fun () ->
+          let lexbuf = Lexing.from_string text in
+          let rec loop i acc =
+            if i >= max_tokens then List.rev acc
+            else
+              let t = Lexer.token lexbuf in
+              let sp = Lexing.lexeme_start_p lexbuf in
+              let ep = Lexing.lexeme_end_p lexbuf in
+              let lex = Lexing.lexeme lexbuf in
+              let item =
+                `Assoc [
+                  "token", `String (Parse.Debug.string_of_token t);
+                  "lexeme", `String lex;
+                  "range", lsp_range_of_lex sp ep;
+                ]
+              in
+              match t with
+              | Parser.EOF -> List.rev (item :: acc)
+              | _ -> loop (i + 1) (item :: acc)
+          in
+          loop 0 []
+        )
       in
 
       let workspace_diag_mode_s =
@@ -660,25 +681,72 @@ let debug_report_for (ws:t) ~(uri:T.DocumentUri.t) ~(max_tokens:int) : Yojson.Sa
         | WorkspaceDiagsAll -> "all"
       in
 
+      let oldest_open_unconverged_ms =
+        let now = Perf_stats.now_ms () in
+        Hashtbl.fold (fun _ started acc ->
+          let age = max 0.0 (now -. started) in
+          match acc with
+          | None -> Some age
+          | Some prev -> Some (max prev age)
+        ) ws.open_provisional_since_ms None
+      in
+
       let background =
+        let pressure_mode = workspace_pressure_mode ws |> pressure_mode_to_string in
+        let pressure_live_mb = workspace_pressure_live_mb ws in
+        let xmodule_prereqs_ready = xmodule_diag_prereqs_ready ws in
+        let xmodule_suppression_active =
+          warmup_suppress_crossmodule_unresolved
+          && not xmodule_prereqs_ready
+        in
         `Assoc [
           "diagMode", `String workspace_diag_mode_s;
-          "queueHigh", `Int (Queue.length ws.bg_high_queue);
-          "queueNormal", `Int (Queue.length ws.bg_norm_queue);
+          "pressureMode", `String pressure_mode;
+          "pressureLiveMB", `Int pressure_live_mb;
+          "xmoduleDiagPrereqsReady", `Bool xmodule_prereqs_ready;
+          "xmoduleSuppressionActive", `Bool xmodule_suppression_active;
+          "queueHighSmall", `Int (Queue.length ws.bg_high_small_queue);
+          "queueRootSmall", `Int (Queue.length ws.bg_root_small_queue);
+          "queueNormalSmall", `Int (Queue.length ws.bg_norm_small_queue);
+          "queueHighLarge", `Int (Queue.length ws.bg_high_large_queue);
+          "queueRootLarge", `Int (Queue.length ws.bg_root_large_queue);
+          "queueNormalLarge", `Int (Queue.length ws.bg_norm_large_queue);
           "enqueuedSet", `Int (Hashtbl.length ws.bg_enqueued);
+          "parseWorkerInFlight", `Int (Hashtbl.length ws.parse_worker_inflight);
+          "parseWorkerJobs", `Int (Queue.length ws.parse_worker_jobs);
+          "parseWorkerResults", `Int (Queue.length ws.parse_worker_results);
           "parsedDocs", `Int (Hashtbl.length ws.bg_parsed);
+          "closedDocLruMax", `Int ws.closed_doc_lru_max;
+          "closedDocTouched", `Int (Hashtbl.length ws.closed_doc_last_touch);
           "seedCursor", `Int ws.bg_seed_cursor;
           "seedTotal", `Int (Array.length ws.bg_seed_paths);
+          "seedNeedsRefresh", `Bool ws.bg_seed_needs_refresh;
+          "graphNeedsRefresh", `Bool ws.graph_needs_refresh;
+          "graphEpoch", `Int ws.graph_epoch;
+          "graphSccCount", `Int ws.graph_scc_count;
+          "graphRoots", `Int (Hashtbl.length ws.graph_root_reason);
+          "graphNodes", `Int (Hashtbl.length ws.graph_nodes);
+          "graphRootClosureCursor", `Int ws.graph_root_closure_cursor;
+          "graphRootClosureTotal", `Int (Array.length ws.graph_root_closure_paths);
           "closedDiagUris", `Int (Hashtbl.length ws.bg_closed_diags);
           "pendingDiagUpdates", `Int (Queue.length ws.bg_pending_diag_updates);
           "pendingDiagPayloads", `Int (Hashtbl.length ws.bg_pending_diag_payloads);
           "pendingDiagSet", `Int (Hashtbl.length ws.bg_pending_diag_set);
+          "openDiagRevalidateUpdates", `Int (Queue.length ws.open_diag_revalidate_updates);
+          "openDiagRevalidatePayloads", `Int (Hashtbl.length ws.open_diag_revalidate_payloads);
+          "openDiagRevalidateSet", `Int (Hashtbl.length ws.open_diag_revalidate_set);
+          "openPendingGenerations", `Int (Hashtbl.length ws.open_parse_generation);
+          ( "oldestOpenUnconvergedMs",
+            match oldest_open_unconverged_ms with
+            | None -> `Null
+            | Some ms -> `Int (int_of_float ms) );
         ]
       in
 
       `Assoc [
         "uri", `String (Uri_path.docuri_to_string uri);
         "root", root;
+        "startup", startup_readiness_json_for_report ws;
         "compools", compools;
         "imports", `List imports;
         "background", background;
@@ -767,6 +835,8 @@ let docs_for_lsif (ws:t) : Document.t list =
   (* Keep LSIF export non-blocking for interactive navigation requests.
      Index growth continues via background pumps triggered by workspace events. *)
   pump_index_background ws;
+  let pressure = workspace_pressure_mode ws in
+  let load_budget = lsif_doc_load_budget_for_pressure ws in
   let seen = Hashtbl.create 512 in
   let out = ref [] in
   let add_doc (doc:Document.t) =
@@ -776,23 +846,54 @@ let docs_for_lsif (ws:t) : Document.t list =
       out := doc :: !out
     )
   in
-  Hashtbl.iter (fun _ doc ->
+  let open_docs =
+    Hashtbl.fold (fun _ doc acc -> doc :: acc) ws.docs []
+  in
+  List.iter (fun doc ->
     Perf_stats.tick "lsif.docs_from_open";
-    add_doc doc
-  ) ws.docs;
+    let ready_doc =
+      if doc.Document.parse_rev = doc.Document.rev then doc
+      else
+        Perf_stats.time "lsif.doc_load" (fun () ->
+          try
+            let parsed =
+              parse_guarded_document_make ws
+                ~uri:doc.Document.uri
+                ~file:doc.Document.file
+                ~text:doc.Document.text
+              |> background_doc_with_diags ws
+            in
+            store_doc ~import_lookup_pump:false ws doc.Document.uri parsed;
+            parsed
+          with _ ->
+            doc)
+    in
+    add_doc ready_doc
+  ) open_docs;
+  let loaded = ref 0 in
   (match ws.index with
    | None -> ()
    | Some idx ->
-       if not (is_network_root ws) then
+       if not (is_network_root ws) && load_budget > 0 then
          Workspace_index.all_source_paths idx
          |> List.iter (fun p ->
-              Perf_stats.tick "lsif.docs_path_scan";
-              match Perf_stats.time "lsif.doc_load" (fun () -> doc_at_path ws p) with
-              | None ->
-                  Perf_stats.tick "lsif.doc_load_miss"
-              | Some d ->
-                  Perf_stats.tick "lsif.doc_load_hit";
-                  add_doc d));
+              if !loaded < load_budget then (
+                Perf_stats.tick "lsif.docs_path_scan";
+                let doc_opt =
+                  match pressure with
+                  | PressureNormal ->
+                      Perf_stats.time "lsif.doc_load" (fun () -> doc_at_path ws p)
+                  | PressureSoft | PressureCritical ->
+                      Perf_stats.time "lsif.doc_load" (fun () -> doc_at_path_cached ws p)
+                in
+                match doc_opt with
+                | None ->
+                    Perf_stats.tick "lsif.doc_load_miss"
+                | Some d ->
+                    Perf_stats.tick "lsif.doc_load_hit";
+                    incr loaded;
+                    add_doc d
+              )));
   List.rev !out
 
 let sorted_assoc_values
@@ -822,6 +923,19 @@ let lsif_index_payload
   List.iter (fun doc ->
     let nav = nav_for_doc_cached ws nav_cache doc in
     Hashtbl.iter (fun sym_id d -> add_definition sym_id d) nav.defs_by_id;
+    if Hashtbl.length nav.defs_by_id = 0 then
+      collect_doc_defs doc
+      |> List.iter (fun d ->
+           if d.key <> "" then (
+             let sym_id = def_symbol_id d in
+             add_definition sym_id d;
+             let bucket = lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind in
+             lsif_add_key_index key_index ~key:d.key ~sym_id;
+             lsif_add_ref bucket.sb_refs
+               ~uri:d.uri
+               ~loc:d.loc
+               ~declaration:true
+           ));
     Hashtbl.iter (fun sym_id occs ->
       match Hashtbl.find_opt nav.defs_by_id sym_id with
       | None -> ()
@@ -898,30 +1012,60 @@ let lsif_index_payload
   revision)
 
 let current_lsif_revision (ws:t) : int =
-  if ws.sem_store_enabled then Semantic_store.global_rev ws.semantic_store
-  else ws.lsif_snapshot_revision
+  ws.lsif_snapshot_revision
+
+let revision_of_lsif_payload (payload:Yojson.Safe.t) : int option =
+  match payload with
+  | `Assoc fields ->
+      (match List.assoc_opt "revision" fields with
+       | Some (`Int n) -> Some n
+       | Some (`Intlit s) ->
+           (try Some (int_of_string s) with _ -> None)
+       | _ -> None)
+  | _ -> None
 
 let ensure_lsif_snapshot
+    ?(allow_stale_startup:bool=true)
     (ws:t)
   : Yojson.Safe.t * (string, Yojson.Safe.t) Hashtbl.t * int =
+  let pressure = workspace_pressure_mode ws in
   let current_revision = current_lsif_revision ws in
-  match ws.lsif_snapshot_payload, ws.lsif_snapshot_symbols with
-  | Some payload, Some symbols when ws.lsif_snapshot_revision = current_revision ->
-      Perf_stats.tick "lsif.snapshot_hit";
-      (payload, symbols, current_revision)
+  match pressure, ws.lsif_snapshot_payload, ws.lsif_snapshot_symbols with
+  | PressureCritical, Some payload, Some symbols ->
+      Perf_stats.tick "lsif.defer_critical";
+      (payload, symbols, ws.lsif_snapshot_revision)
   | _ ->
-      Perf_stats.tick "lsif.snapshot_miss";
-      let payload, symbols, payload_revision =
-        Perf_stats.time "lsif.snapshot_rebuild_ms" (fun () ->
-          lsif_index_payload ws)
-      in
-      let revision =
-        if ws.sem_store_enabled then payload_revision else current_revision
-      in
-      ws.lsif_snapshot_revision <- revision;
-      ws.lsif_snapshot_payload <- Some payload;
-      ws.lsif_snapshot_symbols <- Some symbols;
-      (payload, symbols, revision)
+      (match ws.lsif_snapshot_payload, ws.lsif_snapshot_symbols with
+       | Some payload, Some symbols
+         when ws.lsif_snapshot_revision = current_revision
+              && (match revision_of_lsif_payload payload with
+                  | Some payload_rev -> payload_rev = current_revision
+                  | None -> true) ->
+           Perf_stats.tick "lsif.snapshot_hit";
+           (payload, symbols, current_revision)
+       | Some payload, Some symbols
+         when allow_stale_startup && ws.startup_fully_nav_ready_ms = None ->
+           Perf_stats.tick "lsif.snapshot_hit";
+           Perf_stats.tick "lsif.snapshot_hit_stale_startup";
+           let payload_revision =
+             match revision_of_lsif_payload payload with
+             | Some n -> n
+             | None -> ws.lsif_snapshot_revision
+           in
+           (payload, symbols, payload_revision)
+       | _ ->
+           Perf_stats.tick "lsif.snapshot_miss";
+           let payload, symbols, payload_revision =
+             Perf_stats.time "lsif.snapshot_rebuild_ms" (fun () ->
+               lsif_index_payload ws)
+           in
+           let revision =
+             if ws.sem_store_enabled then payload_revision else current_revision
+           in
+           ws.lsif_snapshot_revision <- revision;
+           ws.lsif_snapshot_payload <- Some payload;
+           ws.lsif_snapshot_symbols <- Some symbols;
+           (payload, symbols, revision))
 
 let lsif_index_json (ws:t) : Yojson.Safe.t =
   let payload, symbols_table, revision = ensure_lsif_snapshot ws in
@@ -953,7 +1097,9 @@ let lsif_delta_json (ws:t) ~(base_revision:int) : Yojson.Safe.t =
         upserts = [];
       }
   else
-    let _payload, symbols_table, revision = ensure_lsif_snapshot ws in
+    let _payload, symbols_table, revision =
+      ensure_lsif_snapshot ws ~allow_stale_startup:false
+    in
     let delta =
       Lsif_delta.diff ws.lsif_delta_state
         ~base_revision

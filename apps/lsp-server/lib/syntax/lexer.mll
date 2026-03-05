@@ -17,6 +17,7 @@
   let define_got_string = ref false
   let compool_active     = ref false
   let compool_got_string = ref false
+  let lexer_lock = Mutex.create ()
 
   let define_enter () =
     define_active := true;
@@ -33,6 +34,26 @@
   let compool_reset () =
     compool_active := false;
     compool_got_string := false
+
+  let reset_session_state () =
+    define_reset ();
+    compool_reset ()
+
+  let with_lock (f: unit -> 'a) : 'a =
+    Mutex.lock lexer_lock;
+    try
+      let out = f () in
+      Mutex.unlock lexer_lock;
+      out
+    with exn ->
+      Mutex.unlock lexer_lock;
+      raise exn
+
+  let with_session_state (f: unit -> 'a) : 'a =
+    with_lock (fun () ->
+      reset_session_state ();
+      f ()
+    )
 
   let kw s : Parser.token option =
     match String.uppercase_ascii s with

@@ -69,6 +69,36 @@ let make ~(uri:T.DocumentUri.t) ~(file:string option) ~(text:string) : t =
   in
   reparse doc
 
+let make_unparsed
+    ~(uri:T.DocumentUri.t)
+    ~(file:string option)
+    ~(text:string)
+    ~(parse_diags:T.Diagnostic.t list)
+  : t =
+  let doc =
+    {
+      uri; file;
+      rev = 1;
+      parse_rev = 0;
+      text;
+      index = Text_index.of_string text;
+
+      pre_text = text;
+      imports = [];
+      compool_def = None;
+      defines = [];
+
+      pre_diags = [];
+      import_diags = [];
+      parse_diags;
+
+      ast = None;
+
+      diags = [];
+    }
+  in
+  recompute_diags doc
+
 let diagnostics (d:t) = d.diags
 let imports (d:t) = d.imports
 let text (d:t) = d.text
@@ -160,3 +190,6 @@ let apply_changes_and_reparse ~(changes:T.TextDocumentContentChangeEvent.t list)
 
 let with_import_diags (import_diags:T.Diagnostic.t list) (d:t) : t =
   recompute_diags { d with import_diags }
+
+let with_parse_diags (parse_diags:T.Diagnostic.t list) (d:t) : t =
+  recompute_diags { d with parse_diags; ast = None }
