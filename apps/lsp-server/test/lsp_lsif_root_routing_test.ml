@@ -50,6 +50,11 @@ let symbol_keys_of_index (fields:(string * Yojson.Safe.t) list) : string list =
            | _ -> None)
   | _ -> []
 
+let index_has_symbols (fields:(string * Yojson.Safe.t) list) : bool =
+  match List.assoc_opt "symbols" fields with
+  | Some (`List (_ :: _)) -> true
+  | _ -> false
+
 let contains_key (keys:string list) (key:string) : bool =
   let key = String.uppercase_ascii key in
   List.exists (fun k -> k = key) keys
@@ -156,22 +161,26 @@ let () =
     Lsp_test_helpers.send_notification srv ~method_:"textDocument/didOpen"
       ~params:(open_doc_params ~uri:b_uri ~text:b_text);
 
-    let idx_a_resp, _ =
-      Lsp_test_helpers.request_timed srv
-        ~id:2
-        ~method_:"workspace/executeCommand"
-        ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String a_uri ])
-        ~timeout_s:(min timeout_s (remaining_budget ()))
+    let rec poll_index ~uri next_id deadline =
+      if Unix.gettimeofday () >= deadline then
+        failf "lsif root routing test timed out waiting for non-empty index (%s)" uri;
+      let resp, _ =
+        Lsp_test_helpers.request_timed srv
+          ~id:next_id
+          ~method_:"workspace/executeCommand"
+          ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String uri ])
+          ~timeout_s:(min timeout_s (remaining_budget ()))
+      in
+      let fields = result_assoc resp in
+      if index_has_symbols fields then (fields, next_id + 1)
+      else (
+        Thread.delay 0.1;
+        poll_index ~uri (next_id + 1) deadline
+      )
     in
-    let idx_b_resp, _ =
-      Lsp_test_helpers.request_timed srv
-        ~id:3
-        ~method_:"workspace/executeCommand"
-        ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String b_uri ])
-        ~timeout_s:(min timeout_s (remaining_budget ()))
-    in
-    let idx_a_fields = result_assoc idx_a_resp in
-    let idx_b_fields = result_assoc idx_b_resp in
+    let deadline = Unix.gettimeofday () +. min 4.0 (max 1.0 (remaining_budget ())) in
+    let idx_a_fields, next_id = poll_index ~uri:a_uri 2 deadline in
+    let idx_b_fields, next_id = poll_index ~uri:b_uri next_id deadline in
     assert_index_contains_only_root_symbol
       ~index_fields:idx_a_fields
       ~must_have:"ALPHA_ROOT"
@@ -187,14 +196,14 @@ let () =
 
     let delta_a_resp, _ =
       Lsp_test_helpers.request_timed srv
-        ~id:4
+        ~id:next_id
         ~method_:"workspace/executeCommand"
         ~params:(exec_params ~command:"jovial.dumpLsifDelta" ~arguments:[ `String a_uri; `Int rev_a ])
         ~timeout_s:(min timeout_s (remaining_budget ()))
     in
     let delta_b_resp, _ =
       Lsp_test_helpers.request_timed srv
-        ~id:5
+        ~id:(next_id + 1)
         ~method_:"workspace/executeCommand"
         ~params:(exec_params ~command:"jovial.dumpLsifDelta" ~arguments:[ `String b_uri; `Int rev_b ])
         ~timeout_s:(min timeout_s (remaining_budget ()))

@@ -41,6 +41,11 @@ let find_symbol_id_by_key (fields:(string * Yojson.Safe.t) list) ~(key:string) :
            | _ -> None)
   | _ -> None
 
+let index_has_symbols (fields:(string * Yojson.Safe.t) list) : bool =
+  match List.assoc_opt "symbols" fields with
+  | Some (`List (_ :: _)) -> true
+  | _ -> false
+
 let text_end_line_col (text:string) : int * int =
   let line = ref 0 in
   let col = ref 0 in
@@ -217,14 +222,26 @@ let () =
         ~timeout_s:(min timeout_s (remaining_budget ()))
     );
 
-    let idx_resp, _ =
-      Lsp_test_helpers.request_timed srv
-        ~id:2
-        ~method_:"workspace/executeCommand"
-        ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String doc_uri ])
-        ~timeout_s:(min timeout_s (remaining_budget ()))
+    let rec poll_index next_id deadline =
+      if Unix.gettimeofday () >= deadline then
+        failf "lsif delta by-id baseline index did not become non-empty";
+      let idx_resp, _ =
+        Lsp_test_helpers.request_timed srv
+          ~id:next_id
+          ~method_:"workspace/executeCommand"
+          ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String doc_uri ])
+          ~timeout_s:(min timeout_s (remaining_budget ()))
+      in
+      let fields = result_assoc idx_resp in
+      if index_has_symbols fields then fields
+      else (
+        Thread.delay 0.1;
+        poll_index (next_id + 1) deadline
+      )
     in
-    let idx_fields = result_assoc idx_resp in
+    let idx_fields =
+      poll_index 2 (Unix.gettimeofday () +. min 4.0 (max 1.0 (remaining_budget ())))
+    in
     let base_revision = int_field_default idx_fields ~name:"revision" ~default:(-1) in
     if base_revision < 0 then failf "lsif index revision was missing/invalid";
     let old_value_id =

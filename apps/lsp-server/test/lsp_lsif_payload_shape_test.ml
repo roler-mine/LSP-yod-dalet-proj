@@ -32,6 +32,11 @@ let symbols_and_ids (result_fields:(string * Yojson.Safe.t) list) : Yojson.Safe.
   ) symbols;
   (symbols, ids)
 
+let index_has_symbols (result_fields:(string * Yojson.Safe.t) list) : bool =
+  match List.assoc_opt "symbols" result_fields with
+  | Some (`List (_ :: _)) -> true
+  | _ -> false
+
 let assert_key_index_shape
     ~(ids:(string, bool) Hashtbl.t)
     (result_fields:(string * Yojson.Safe.t) list)
@@ -118,14 +123,26 @@ let () =
         ~timeout_s:(min timeout_s (remaining_budget ()))
     );
 
-    let lsif_resp, _ =
-      Lsp_test_helpers.request_timed srv
-        ~id:2
-        ~method_:"workspace/executeCommand"
-        ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String doc_uri ])
-        ~timeout_s:(min timeout_s (remaining_budget ()))
+    let rec poll_index next_id deadline =
+      if Unix.gettimeofday () >= deadline then
+        failf "lsif payload shape test timed out waiting for non-empty symbols[]";
+      let resp, _ =
+        Lsp_test_helpers.request_timed srv
+          ~id:next_id
+          ~method_:"workspace/executeCommand"
+          ~params:(exec_params ~command:"jovial.dumpLsifIndex" ~arguments:[ `String doc_uri ])
+          ~timeout_s:(min timeout_s (remaining_budget ()))
+      in
+      let fields = result_assoc resp in
+      if index_has_symbols fields then fields
+      else (
+        Thread.delay 0.1;
+        poll_index (next_id + 1) deadline
+      )
     in
-    let result_fields = result_assoc lsif_resp in
+    let result_fields =
+      poll_index 2 (Unix.gettimeofday () +. min 4.0 (max 1.0 (remaining_budget ())))
+    in
     if List.assoc_opt "version" result_fields <> None then
       failf "lsif index payload should not include explicit version field";
     let symbols, ids = symbols_and_ids result_fields in

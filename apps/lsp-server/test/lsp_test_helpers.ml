@@ -308,16 +308,16 @@ let force_kill (srv:server_proc) : unit =
 
 let with_server ?(env:(string * string) list = []) ~(server_path:string) (f:server_proc -> 'a) : 'a =
   let srv = start_server ~server_path ~env in
-  try
-    let out = f srv in
-    out
-  with exn ->
+  let cleanup () =
     (try close_out_noerr srv.stdin_w with _ -> ());
-    (try ignore (wait_for_exit srv ~timeout_s:1.0) with _ ->
+    (try ignore (wait_for_exit srv ~timeout_s:0.4) with _ ->
        force_kill srv;
        (try ignore (wait_for_exit srv ~timeout_s:0.5) with _ -> ()));
-    (try close_in_noerr srv.stdout_r with _ -> ());
-    raise exn
+    (try close_in_noerr srv.stdout_r with _ -> ())
+  in
+  Fun.protect
+    ~finally:cleanup
+    (fun () -> f srv)
 
 let lsp_doc_uri_of_path (path:string) : string =
   Lib.Uri_path.file_uri_of_path path
@@ -338,6 +338,101 @@ let line_col_of_first (text:string) ~(needle:string) : int * int =
     else lc (i + 1) line (col + 1)
   in
   lc 0 0 0
+
+let normalize_uri_for_compare (u:string) : string =
+  match Lib.Uri_path.file_path_of_uri_string u with
+  | Some p ->
+      let p = String.map (fun c -> if c = '\\' then '/' else c) p in
+      if Sys.win32 then String.lowercase_ascii p else p
+  | None ->
+      String.lowercase_ascii (String.trim u)
+
+let parse_publish_diagnostics (msg:Yojson.Safe.t) : (string * Yojson.Safe.t list) option =
+  match msg with
+  | `Assoc fields -> (
+      match List.assoc_opt "method" fields, List.assoc_opt "params" fields with
+      | Some (`String "textDocument/publishDiagnostics"), Some (`Assoc params) -> (
+          match List.assoc_opt "uri" params, List.assoc_opt "diagnostics" params with
+          | Some (`String uri), Some (`List ds) -> Some (uri, ds)
+          | _ -> None)
+      | _ -> None)
+  | _ ->
+      None
+
+let diag_message (d:Yojson.Safe.t) : string option =
+  match d with
+  | `Assoc fields -> (
+      match List.assoc_opt "message" fields with
+      | Some (`String msg) -> Some msg
+      | _ -> None)
+  | _ -> None
+
+let diag_severity (d:Yojson.Safe.t) : int option =
+  match d with
+  | `Assoc fields -> (
+      match List.assoc_opt "severity" fields with
+      | Some (`Int n) -> Some n
+      | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+      | _ -> None)
+  | _ -> None
+
+let is_timeout_failure_message (msg:string) : bool =
+  let needle = "timed out waiting for LSP message" in
+  let n = String.length msg in
+  let m = String.length needle in
+  let rec has_at i =
+    if i + m > n then false
+    else if String.sub msg i m = needle then true
+    else has_at (i + 1)
+  in
+  has_at 0
+
+let wait_for_publish_diagnostics_for_uri
+    ~(srv:server_proc)
+    ~(target_uri:string)
+    ~(timeout_s:float)
+  : Yojson.Safe.t list option =
+  let debug =
+    match Sys.getenv_opt "JOVIAL_TEST_DEBUG_DIAG_WAIT" with
+    | Some "1" | Some "true" | Some "TRUE" -> true
+    | _ -> false
+  in
+  let target_norm = normalize_uri_for_compare target_uri in
+  let deadline = Unix.gettimeofday () +. timeout_s in
+  let rec loop () =
+    let now = Unix.gettimeofday () in
+    if now >= deadline then None
+    else
+      let chunk = min 0.25 (deadline -. now) in
+      if chunk <= 0.0 then None
+      else
+        try
+          let msg = wait_for_message srv ~timeout_s:chunk in
+          (match parse_publish_diagnostics msg with
+           | Some (uri, diags) ->
+               let uri_norm = normalize_uri_for_compare uri in
+               (if debug then
+                  let msgs =
+                    diags
+                    |> List.filter_map diag_message
+                    |> String.concat " || "
+                  in
+                  prerr_endline
+                    (Printf.sprintf
+                      "diag-wait target=%s observed=%s match=%b msgs=[%s]"
+                      target_norm
+                      uri_norm
+                      (uri_norm = target_norm)
+                      msgs));
+               if uri_norm = target_norm then Some diags
+               else loop ()
+           | _ ->
+               loop ())
+        with
+        | Failure m when is_timeout_failure_message m -> loop ()
+        | exn -> raise exn
+  in
+  loop ()
 
 let definition_request_params ~(uri:string) ~(line:int) ~(character:int) : Yojson.Safe.t =
   `Assoc [

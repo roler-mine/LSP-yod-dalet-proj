@@ -56,7 +56,11 @@ let find_update_for_uri
 
 let queue_background_reparse (ws:Lib.Workspace.t) ~(path:string) : unit =
   Lib.Workspace.apply_watched_file_changes ws ~changes:[ path, `Changed ];
-  Lib.Workspace.background_tick ws ~budget_ms:400
+  Lib.Workspace.background_tick ws
+    ~budget_ms:400
+    ~mode:Lib.Workspace.BgTickIdle
+    ~idle_quiet_ms:0
+    ~last_message_ms:0.0
 
 let () =
   Random.self_init ();
