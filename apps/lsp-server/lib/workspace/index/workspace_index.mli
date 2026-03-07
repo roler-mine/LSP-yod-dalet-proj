@@ -1,13 +1,8 @@
 type t
-
-type file_change_kind =
-  | Created
-  | Changed
-  | Deleted
+type file_change_kind = Created | Changed | Deleted
 
 val start : root:string -> t
 val build : root:string -> t
-
 val root : t -> string
 val compool_count : t -> int
 val source_count : t -> int

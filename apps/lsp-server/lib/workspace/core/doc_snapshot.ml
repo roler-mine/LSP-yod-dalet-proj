@@ -11,14 +11,7 @@ type nav_def = {
 }
 
 type nav_occ = T.DocumentUri.t * Ast.Loc.t
-
-type token = {
-  line : int;
-  start : int;
-  len : int;
-  typ : int;
-  mods : int;
-}
+type token = { line : int; start : int; len : int; typ : int; mods : int }
 
 type t = {
   uri : T.DocumentUri.t;
@@ -36,19 +29,13 @@ type t = {
   symbol_keys_touched : string list;
 }
 
-let build
-    ~(uri:T.DocumentUri.t)
-    ~(path_key:string option)
-    ~(doc_rev:int)
-    ~(text:string)
-    ~(imports:Preprocess.import list)
-    ~(defines:Preprocess.define list)
-    ~(compool_def:string option)
-    ~(nav_defs:(string * nav_def) list)
-    ~(nav_occs:(string * nav_occ list) list)
-    ~(proc_param_map:(string * string list) list)
-    ~(symbol_keys_touched:string list)
-  : t =
+let build ~(uri : T.DocumentUri.t) ~(path_key : string option) ~(doc_rev : int)
+    ~(text : string) ~(imports : Preprocess.import list)
+    ~(defines : Preprocess.define list) ~(compool_def : string option)
+    ~(nav_defs : (string * nav_def) list)
+    ~(nav_occs : (string * nav_occ list) list)
+    ~(proc_param_map : (string * string list) list)
+    ~(symbol_keys_touched : string list) : t =
   let text_hash = Digest.to_hex (Digest.string text) in
   {
     uri;
@@ -66,8 +53,8 @@ let build
     symbol_keys_touched;
   }
 
-let set_doc_symbols (snap:t) (symbols:Yojson.Safe.t list) : unit =
+let set_doc_symbols (snap : t) (symbols : Yojson.Safe.t list) : unit =
   snap.doc_symbols <- Some symbols
 
-let set_semantic_tokens_full (snap:t) (tokens:token list) : unit =
+let set_semantic_tokens_full (snap : t) (tokens : token list) : unit =
   snap.semantic_tokens_full <- Some tokens

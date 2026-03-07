@@ -10,8 +10,4 @@ module Debug : sig
   val string_of_token : Parser.token -> string
 end
 
-val parse_text :
-  file:string option ->
-  dump_ast:bool ->
-  text:string ->
-  output
+val parse_text : file:string option -> dump_ast:bool -> text:string -> output

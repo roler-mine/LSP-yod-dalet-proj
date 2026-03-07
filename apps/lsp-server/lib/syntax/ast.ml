@@ -2,26 +2,19 @@
 
 module Loc = struct
   type pos = {
-    line : int;   (* 1-based *)
-    col : int;    (* 0-based *)
+    line : int; (* 1-based *)
+    col : int; (* 0-based *)
     offset : int; (* 0-based absolute char offset *)
   }
 
-  type t = {
-    file : string option;
-    start_pos : pos;
-    end_pos : pos;
-  }
+  type t = { file : string option; start_pos : pos; end_pos : pos }
 
   let none =
     let z = { line = 1; col = 0; offset = 0 } in
     { file = None; start_pos = z; end_pos = z }
 
-  let make ~start_pos ~end_pos ~file =
-  { file; start_pos; end_pos }
-
-let make_no_file ~start_pos ~end_pos =
-  { file = None; start_pos; end_pos }
+  let make ~start_pos ~end_pos ~file = { file; start_pos; end_pos }
+  let make_no_file ~start_pos ~end_pos = { file = None; start_pos; end_pos }
 
   let of_lexing_positions (sp : Lexing.position) (ep : Lexing.position) ~file =
     let mk (p : Lexing.position) =
@@ -35,17 +28,13 @@ let make_no_file ~start_pos ~end_pos =
     in
     { file; start_pos = mk sp; end_pos = mk ep }
 
-  let of_lexing_positions_no_file sp ep =
-    of_lexing_positions sp ep ~file:None
-
+  let of_lexing_positions_no_file sp ep = of_lexing_positions sp ep ~file:None
   let start_offset (t : t) = t.start_pos.offset
   let end_offset (t : t) = t.end_pos.offset
 
   let pp fmt (t : t) =
     let file = match t.file with Some f -> f | None -> "<nofile>" in
-    Format.fprintf fmt "%s:%d:%d-%d:%d"
-      file
-      t.start_pos.line t.start_pos.col
+    Format.fprintf fmt "%s:%d:%d-%d:%d" file t.start_pos.line t.start_pos.col
       t.end_pos.line t.end_pos.col
 
   let to_string t = Format.asprintf "%a" pp t
@@ -70,10 +59,24 @@ type literal =
 type unop = UPlus | UMinus | UNot | UBitNot
 
 type binop =
-  | BAdd | BSub | BMul | BDiv | BMod
-  | BAnd | BOr
-  | BBitAnd | BBitOr | BBitXor | BShl | BShr
-  | BEq | BNe | BLt | BLe | BGt | BGe
+  | BAdd
+  | BSub
+  | BMul
+  | BDiv
+  | BMod
+  | BAnd
+  | BOr
+  | BBitAnd
+  | BBitOr
+  | BBitXor
+  | BShl
+  | BShr
+  | BEq
+  | BNe
+  | BLt
+  | BLe
+  | BGt
+  | BGe
 
 type type_expr =
   | TName of ident
@@ -83,9 +86,7 @@ type type_expr =
   | TFunc of { params : param node list; returns : type_expr node option }
 
 and field_decl = { fname : ident; ftype : type_expr node }
-
 and param_mode = In | Out | InOut
-
 and param = { pname : ident; pmode : param_mode; ptype : type_expr node }
 
 and expr =
@@ -105,20 +106,33 @@ and stmt =
   | SBlock of stmt node list
   | SDecl of decl node
   | SAssign of { lhs : expr node; rhs : expr node }
-  | SCallStmt of { callee : ident; args : expr node list; abort_label : ident option }
+  | SCallStmt of {
+      callee : ident;
+      args : expr node list;
+      abort_label : ident option;
+    }
   | SIf of { cond : expr node; then_ : stmt node; else_ : stmt node option }
   | SWhile of { cond : expr node; body : stmt node }
-  | SFor of { init : stmt node option; cond : expr node option; step : stmt node option; body : stmt node }
+  | SFor of {
+      init : stmt node option;
+      cond : expr node option;
+      step : stmt node option;
+      body : stmt node;
+    }
   | SReturn of expr node option
   | SLabel of { label : ident; body : stmt node }
   | SGoto of ident
 
 and storage = Automatic | Static | External
-
 and proc_use = UseNormal | UseRec | UseRent
 
 and decl =
-  | DVar of { name : ident; dtype : type_expr node; init : expr node option; storage : storage }
+  | DVar of {
+      name : ident;
+      dtype : type_expr node;
+      init : expr node option;
+      storage : storage;
+    }
   | DConst of { name : ident; dtype : type_expr node option; value : expr node }
   | DType of { name : ident; defn : type_expr node }
   | DProc of proc node
@@ -151,10 +165,11 @@ module Debug = struct
     | None -> Format.pp_print_string fmt "None"
     | Some x -> Format.fprintf fmt "Some(%a)" ppv x
 
-  let rec pp_list ?(sep = ";") (pp : Format.formatter -> 'a -> unit) fmt (xs : 'a list) =
+  let rec pp_list ?(sep = ";") (pp : Format.formatter -> 'a -> unit) fmt
+      (xs : 'a list) =
     match xs with
     | [] -> ()
-    | [x] -> pp fmt x
+    | [ x ] -> pp fmt x
     | x :: tl ->
         pp fmt x;
         Format.fprintf fmt "%s@ " sep;
@@ -166,7 +181,10 @@ module Debug = struct
     match b.nodes_left with
     | None -> true
     | Some n ->
-        if n <= 0 then false else (b.nodes_left <- Some (n - 1); true)
+        if n <= 0 then false
+        else (
+          b.nodes_left <- Some (n - 1);
+          true)
 
   let over_depth (opts : dump_opts) (depth : int) =
     match opts.max_depth with None -> false | Some md -> depth > md
@@ -211,38 +229,40 @@ module Debug = struct
 
   let rec pp_type_expr opts b depth fmt (t : type_expr node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
-    else if over_depth opts depth then Format.pp_print_string fmt "<depth-limit>"
+    else if over_depth opts depth then
+      Format.pp_print_string fmt "<depth-limit>"
     else
       match t.v with
       | TName n ->
           Format.fprintf fmt "TName(%a)%a" pp_ident n (pp_loc_if opts) t.loc
       | TPointer inner ->
           Format.fprintf fmt "@[TPointer(%a)@]%a"
-            (pp_type_expr opts b (depth + 1)) inner
-            (pp_loc_if opts) t.loc
+            (pp_type_expr opts b (depth + 1))
+            inner (pp_loc_if opts) t.loc
       | TArray { elem; dims } ->
           Format.fprintf fmt "@[TArray(elem=%a; dims=[%a])@]%a"
-            (pp_type_expr opts b (depth + 1)) elem
-            (pp_list (pp_expr opts b (depth + 1))) dims
-            (pp_loc_if opts) t.loc
+            (pp_type_expr opts b (depth + 1))
+            elem
+            (pp_list (pp_expr opts b (depth + 1)))
+            dims (pp_loc_if opts) t.loc
       | TRecord fields ->
           Format.fprintf fmt "@[TRecord([%a])@]%a"
-            (pp_list (pp_field_decl opts b (depth + 1))) fields
-            (pp_loc_if opts) t.loc
+            (pp_list (pp_field_decl opts b (depth + 1)))
+            fields (pp_loc_if opts) t.loc
       | TFunc { params; returns } ->
           Format.fprintf fmt "@[TFunc(params=[%a]; returns=%a)@]%a"
-            (pp_list (pp_param opts b (depth + 1))) params
-            (pp_opt (pp_type_expr opts b (depth + 1))) returns
-            (pp_loc_if opts) t.loc
+            (pp_list (pp_param opts b (depth + 1)))
+            params
+            (pp_opt (pp_type_expr opts b (depth + 1)))
+            returns (pp_loc_if opts) t.loc
 
   and pp_field_decl opts b depth fmt (f : field_decl node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = f.v in
-      Format.fprintf fmt "@[Field(%a : %a)@]%a"
-        pp_ident x.fname
-        (pp_type_expr opts b (depth + 1)) x.ftype
-        (pp_loc_if opts) f.loc
+      Format.fprintf fmt "@[Field(%a : %a)@]%a" pp_ident x.fname
+        (pp_type_expr opts b (depth + 1))
+        x.ftype (pp_loc_if opts) f.loc
 
   and pp_param_mode fmt = function
     | In -> Format.pp_print_string fmt "In"
@@ -253,15 +273,15 @@ module Debug = struct
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = p.v in
-      Format.fprintf fmt "@[Param(%a %a : %a)@]%a"
-        pp_param_mode x.pmode
+      Format.fprintf fmt "@[Param(%a %a : %a)@]%a" pp_param_mode x.pmode
         pp_ident x.pname
-        (pp_type_expr opts b (depth + 1)) x.ptype
-        (pp_loc_if opts) p.loc
+        (pp_type_expr opts b (depth + 1))
+        x.ptype (pp_loc_if opts) p.loc
 
   and pp_expr opts b depth fmt (e : expr node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
-    else if over_depth opts depth then Format.pp_print_string fmt "<depth-limit>"
+    else if over_depth opts depth then
+      Format.pp_print_string fmt "<depth-limit>"
     else
       match e.v with
       | EName id ->
@@ -269,104 +289,104 @@ module Debug = struct
       | ELit lit ->
           Format.fprintf fmt "ELit(%a)%a" pp_literal lit (pp_loc_if opts) e.loc
       | EUnop { op; rhs } ->
-          Format.fprintf fmt "@[EUnop(%a, %a)@]%a"
-            pp_unop op
-            (pp_expr opts b (depth + 1)) rhs
-            (pp_loc_if opts) e.loc
+          Format.fprintf fmt "@[EUnop(%a, %a)@]%a" pp_unop op
+            (pp_expr opts b (depth + 1))
+            rhs (pp_loc_if opts) e.loc
       | EBinop { op; lhs; rhs } ->
-          Format.fprintf fmt "@[EBinop(%a, %a, %a)@]%a"
-            pp_binop op
-            (pp_expr opts b (depth + 1)) lhs
-            (pp_expr opts b (depth + 1)) rhs
-            (pp_loc_if opts) e.loc
+          Format.fprintf fmt "@[EBinop(%a, %a, %a)@]%a" pp_binop op
+            (pp_expr opts b (depth + 1))
+            lhs
+            (pp_expr opts b (depth + 1))
+            rhs (pp_loc_if opts) e.loc
       | ECall { callee; args } ->
-          Format.fprintf fmt "@[ECall(%a, [%a])@]%a"
-            pp_ident callee
-            (pp_list (pp_expr opts b (depth + 1))) args
-            (pp_loc_if opts) e.loc
+          Format.fprintf fmt "@[ECall(%a, [%a])@]%a" pp_ident callee
+            (pp_list (pp_expr opts b (depth + 1)))
+            args (pp_loc_if opts) e.loc
       | EIndex { base; index } ->
           Format.fprintf fmt "@[EIndex(base=%a; index=[%a])@]%a"
-            (pp_expr opts b (depth + 1)) base
-            (pp_list (pp_expr opts b (depth + 1))) index
-            (pp_loc_if opts) e.loc
+            (pp_expr opts b (depth + 1))
+            base
+            (pp_list (pp_expr opts b (depth + 1)))
+            index (pp_loc_if opts) e.loc
       | EField { base; field } ->
           Format.fprintf fmt "@[EField(%a.%a)@]%a"
-            (pp_expr opts b (depth + 1)) base
-            pp_ident field
-            (pp_loc_if opts) e.loc
+            (pp_expr opts b (depth + 1))
+            base pp_ident field (pp_loc_if opts) e.loc
       | EAt { field; ptr } ->
           Format.fprintf fmt "@[EAt(%a @ %a)@]%a"
-            (pp_expr opts b (depth + 1)) field
-            (pp_expr opts b (depth + 1)) ptr
-            (pp_loc_if opts) e.loc
-
+            (pp_expr opts b (depth + 1))
+            field
+            (pp_expr opts b (depth + 1))
+            ptr (pp_loc_if opts) e.loc
       | EDeref { ptr } ->
           Format.fprintf fmt "@[EDeref(@ %a)@]%a"
-            (pp_expr opts b (depth + 1)) ptr
-            (pp_loc_if opts) e.loc
-
+            (pp_expr opts b (depth + 1))
+            ptr (pp_loc_if opts) e.loc
       | EParen inner ->
           Format.fprintf fmt "@[EParen(%a)@]%a"
-            (pp_expr opts b (depth + 1)) inner
-            (pp_loc_if opts) e.loc
+            (pp_expr opts b (depth + 1))
+            inner (pp_loc_if opts) e.loc
 
   and pp_stmt opts b depth fmt (s : stmt node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
-    else if over_depth opts depth then Format.pp_print_string fmt "<depth-limit>"
+    else if over_depth opts depth then
+      Format.pp_print_string fmt "<depth-limit>"
     else
       match s.v with
-      | SEmpty ->
-          Format.fprintf fmt "SEmpty%a" (pp_loc_if opts) s.loc
+      | SEmpty -> Format.fprintf fmt "SEmpty%a" (pp_loc_if opts) s.loc
       | SBlock xs ->
           Format.fprintf fmt "@[SBlock([%a])@]%a"
-            (pp_list (pp_stmt opts b (depth + 1))) xs
-            (pp_loc_if opts) s.loc
+            (pp_list (pp_stmt opts b (depth + 1)))
+            xs (pp_loc_if opts) s.loc
       | SDecl d ->
           Format.fprintf fmt "@[SDecl(%a)@]%a"
-            (pp_decl opts b (depth + 1)) d
-            (pp_loc_if opts) s.loc
+            (pp_decl opts b (depth + 1))
+            d (pp_loc_if opts) s.loc
       | SAssign { lhs; rhs } ->
           Format.fprintf fmt "@[SAssign(lhs=%a; rhs=%a)@]%a"
-            (pp_expr opts b (depth + 1)) lhs
-            (pp_expr opts b (depth + 1)) rhs
-            (pp_loc_if opts) s.loc
+            (pp_expr opts b (depth + 1))
+            lhs
+            (pp_expr opts b (depth + 1))
+            rhs (pp_loc_if opts) s.loc
       | SCallStmt { callee; args; abort_label } ->
-          Format.fprintf fmt "@[SCall(%a, [%a], abort=%a)@]%a"
-            pp_ident callee
-            (pp_list (pp_expr opts b (depth + 1))) args
-            (pp_opt pp_ident) abort_label
-            (pp_loc_if opts) s.loc
+          Format.fprintf fmt "@[SCall(%a, [%a], abort=%a)@]%a" pp_ident callee
+            (pp_list (pp_expr opts b (depth + 1)))
+            args (pp_opt pp_ident) abort_label (pp_loc_if opts) s.loc
       | SIf { cond; then_; else_ } ->
           Format.fprintf fmt "@[SIf(cond=%a; then=%a; else=%a)@]%a"
-            (pp_expr opts b (depth + 1)) cond
-            (pp_stmt opts b (depth + 1)) then_
-            (pp_opt (pp_stmt opts b (depth + 1))) else_
-            (pp_loc_if opts) s.loc
+            (pp_expr opts b (depth + 1))
+            cond
+            (pp_stmt opts b (depth + 1))
+            then_
+            (pp_opt (pp_stmt opts b (depth + 1)))
+            else_ (pp_loc_if opts) s.loc
       | SWhile { cond; body } ->
           Format.fprintf fmt "@[SWhile(cond=%a; body=%a)@]%a"
-            (pp_expr opts b (depth + 1)) cond
-            (pp_stmt opts b (depth + 1)) body
-            (pp_loc_if opts) s.loc
+            (pp_expr opts b (depth + 1))
+            cond
+            (pp_stmt opts b (depth + 1))
+            body (pp_loc_if opts) s.loc
       | SFor { init; cond; step; body } ->
           Format.fprintf fmt "@[SFor(init=%a; cond=%a; step=%a; body=%a)@]%a"
-            (pp_opt (pp_stmt opts b (depth + 1))) init
-            (pp_opt (pp_expr opts b (depth + 1))) cond
-            (pp_opt (pp_stmt opts b (depth + 1))) step
-            (pp_stmt opts b (depth + 1)) body
-            (pp_loc_if opts) s.loc
+            (pp_opt (pp_stmt opts b (depth + 1)))
+            init
+            (pp_opt (pp_expr opts b (depth + 1)))
+            cond
+            (pp_opt (pp_stmt opts b (depth + 1)))
+            step
+            (pp_stmt opts b (depth + 1))
+            body (pp_loc_if opts) s.loc
       | SReturn eo ->
           Format.fprintf fmt "@[SReturn(%a)@]%a"
-            (pp_opt (pp_expr opts b (depth + 1))) eo
-            (pp_loc_if opts) s.loc
+            (pp_opt (pp_expr opts b (depth + 1)))
+            eo (pp_loc_if opts) s.loc
       | SLabel { label; body } ->
-          Format.fprintf fmt "@[SLabel(%a: %a)@]%a"
-            pp_ident label
-            (pp_stmt opts b (depth + 1)) body
-            (pp_loc_if opts) s.loc
+          Format.fprintf fmt "@[SLabel(%a: %a)@]%a" pp_ident label
+            (pp_stmt opts b (depth + 1))
+            body (pp_loc_if opts) s.loc
       | SGoto id ->
-          Format.fprintf fmt "@[SGoto(%a)@]%a"
-            pp_ident id
-            (pp_loc_if opts) s.loc
+          Format.fprintf fmt "@[SGoto(%a)@]%a" pp_ident id (pp_loc_if opts)
+            s.loc
 
   and pp_storage fmt = function
     | Automatic -> Format.pp_print_string fmt "Automatic"
@@ -378,51 +398,50 @@ module Debug = struct
     | UseRec -> Format.pp_print_string fmt "REC"
     | UseRent -> Format.pp_print_string fmt "RENT"
 
-  and pp_string_node fmt (s : string node) =
-    Format.fprintf fmt "%S" s.v
+  and pp_string_node fmt (s : string node) = Format.fprintf fmt "%S" s.v
 
   and pp_decl opts b depth fmt (d : decl node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       match d.v with
       | DVar { name; dtype; init; storage } ->
-          Format.fprintf fmt "@[DVar(%a : %a; storage=%a; init=%a)@]%a"
-            pp_ident name
-            (pp_type_expr opts b (depth + 1)) dtype
-            pp_storage storage
-            (pp_opt (pp_expr opts b (depth + 1))) init
-            (pp_loc_if opts) d.loc
+          Format.fprintf fmt "@[DVar(%a : %a; storage=%a; init=%a)@]%a" pp_ident
+            name
+            (pp_type_expr opts b (depth + 1))
+            dtype pp_storage storage
+            (pp_opt (pp_expr opts b (depth + 1)))
+            init (pp_loc_if opts) d.loc
       | DConst { name; dtype; value } ->
-          Format.fprintf fmt "@[DConst(%a : %a; value=%a)@]%a"
-            pp_ident name
-            (pp_opt (pp_type_expr opts b (depth + 1))) dtype
-            (pp_expr opts b (depth + 1)) value
-            (pp_loc_if opts) d.loc
+          Format.fprintf fmt "@[DConst(%a : %a; value=%a)@]%a" pp_ident name
+            (pp_opt (pp_type_expr opts b (depth + 1)))
+            dtype
+            (pp_expr opts b (depth + 1))
+            value (pp_loc_if opts) d.loc
       | DType { name; defn } ->
-          Format.fprintf fmt "@[DType(%a = %a)@]%a"
-            pp_ident name
-            (pp_type_expr opts b (depth + 1)) defn
-            (pp_loc_if opts) d.loc
-      | DProc p ->
-          pp_proc opts b (depth + 1) fmt p
+          Format.fprintf fmt "@[DType(%a = %a)@]%a" pp_ident name
+            (pp_type_expr opts b (depth + 1))
+            defn (pp_loc_if opts) d.loc
+      | DProc p -> pp_proc opts b (depth + 1) fmt p
       | DDirective { name; args } ->
-          Format.fprintf fmt "@[DDirective(%a, [%a])@]%a"
-            pp_ident name
-            (pp_list pp_string_node) args
-            (pp_loc_if opts) d.loc
+          Format.fprintf fmt "@[DDirective(%a, [%a])@]%a" pp_ident name
+            (pp_list pp_string_node) args (pp_loc_if opts) d.loc
 
   and pp_proc opts b depth fmt (p : proc node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = p.v in
-      Format.fprintf fmt "@[DProc(name=%a; use=%a; params=[%a]; returns=%a; locals=[%a]; body=%a)@]%a"
-        pp_ident x.name
-        pp_proc_use x.use_attr
-        (pp_list (pp_param opts b (depth + 1))) x.params
-        (pp_opt (pp_type_expr opts b (depth + 1))) x.returns
-        (pp_list (pp_decl opts b (depth + 1))) x.locals
-        (pp_stmt opts b (depth + 1)) x.body
-        (pp_loc_if opts) p.loc
+      Format.fprintf fmt
+        "@[DProc(name=%a; use=%a; params=[%a]; returns=%a; locals=[%a]; \
+         body=%a)@]%a"
+        pp_ident x.name pp_proc_use x.use_attr
+        (pp_list (pp_param opts b (depth + 1)))
+        x.params
+        (pp_opt (pp_type_expr opts b (depth + 1)))
+        x.returns
+        (pp_list (pp_decl opts b (depth + 1)))
+        x.locals
+        (pp_stmt opts b (depth + 1))
+        x.body (pp_loc_if opts) p.loc
 
   let pp_toplevel opts b fmt = function
     | TopDecl d -> Format.fprintf fmt "TopDecl(%a)" (pp_decl opts b 0) d
@@ -431,8 +450,7 @@ module Debug = struct
   let pp_program ?(opts = default_opts) fmt (p : program) =
     let b = { nodes_left = opts.max_nodes } in
     Format.fprintf fmt "@[<v>Program[@,%a@]@]"
-      (pp_list ~sep:", "
-         (fun fmt tl ->
+      (pp_list ~sep:", " (fun fmt tl ->
            Format.fprintf fmt "@[<hov>%a@]" (pp_toplevel opts b) tl))
       p
 

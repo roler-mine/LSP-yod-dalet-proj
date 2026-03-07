@@ -11,14 +11,7 @@ type nav_def = {
 }
 
 type nav_occ = T.DocumentUri.t * Ast.Loc.t
-
-type token = {
-  line : int;
-  start : int;
-  len : int;
-  typ : int;
-  mods : int;
-}
+type token = { line : int; start : int; len : int; typ : int; mods : int }
 
 type t = {
   uri : T.DocumentUri.t;

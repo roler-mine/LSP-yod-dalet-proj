@@ -5,10 +5,7 @@ type workspace_diag_mode = Workspace_settings.workspace_diag_mode =
   | WorkspaceDiagsErrors
   | WorkspaceDiagsAll
 
-type pressure_mode =
-  | PressureNormal
-  | PressureSoft
-  | PressureCritical
+type pressure_mode = PressureNormal | PressureSoft | PressureCritical
 
 type startup_phase =
   | StartupCold
@@ -20,14 +17,8 @@ type startup_ready_stage =
   | StartupStageDiagHoverReady
   | StartupStageFullyNavigable
 
-type bg_tick_mode =
-  | BgTickInteractive
-  | BgTickIdle
-
-type workspace_profile =
-  | ProfileSmall
-  | ProfileMedium
-  | ProfileLarge
+type bg_tick_mode = BgTickInteractive | BgTickIdle
+type workspace_profile = ProfileSmall | ProfileMedium | ProfileLarge
 
 type workspace_profile_mode = Workspace_settings.workspace_profile_mode =
   | ProfileModeAuto
@@ -53,24 +44,15 @@ type parse_job_kind =
   | ParseJobRootLarge
   | ParseJobNormalLarge
 
-type file_class =
-  | FileClassOpen
-  | FileClassEntry
-  | FileClassNormal
-
-type file_size_class =
-  | FileSizeSmall
-  | FileSizeLarge
+type file_class = FileClassOpen | FileClassEntry | FileClassNormal
+type file_size_class = FileSizeSmall | FileSizeLarge
 
 type parse_quality =
   | ParseQualityNone
   | ParseQualitySkeleton
   | ParseQualityFull
 
-type schedule_lane =
-  | LaneOpen
-  | LaneRoot
-  | LaneSweep
+type schedule_lane = LaneOpen | LaneRoot | LaneSweep
 
 type graph_node = {
   gn_path : string;
@@ -92,10 +74,7 @@ type parse_job_payload =
       text : string;
       generation : int;
     }
-  | ParseJobPath of {
-      path : string;
-      path_key : string;
-    }
+  | ParseJobPath of { path : string; path_key : string }
 
 type parse_job = {
   pj_kind : parse_job_kind;
@@ -166,7 +145,8 @@ type t = {
   mutable graph_scc_count : int;
   bg_closed_diags : (string, T.Diagnostic.t list) Hashtbl.t;
   bg_pending_diag_updates : string Queue.t;
-  bg_pending_diag_payloads : (string, (T.DocumentUri.t * T.Diagnostic.t list)) Hashtbl.t;
+  bg_pending_diag_payloads :
+    (string, T.DocumentUri.t * T.Diagnostic.t list) Hashtbl.t;
   bg_pending_diag_set : (string, bool) Hashtbl.t;
   mutable bg_seed_needs_refresh : bool;
   mutable closed_doc_lru_clock : int;
@@ -201,7 +181,7 @@ type t = {
   startup_aggressive_window_ms : int;
   startup_aggressive_bg_budget_ms : int;
   open_diag_revalidate_updates : string Queue.t;
-  open_diag_revalidate_payloads : (string, (T.DocumentUri.t * string)) Hashtbl.t;
+  open_diag_revalidate_payloads : (string, T.DocumentUri.t * string) Hashtbl.t;
   open_diag_revalidate_set : (string, bool) Hashtbl.t;
   mutable index_reconcile_escalate_last_ms : float;
   mutable index_reconcile_escalations : int;

@@ -11,14 +11,10 @@ type delta = {
 val create : unit -> t
 val revision : t -> int
 val reset : t -> unit
-
 val symbols_of_index_json : Yojson.Safe.t -> (string, Yojson.Safe.t) Hashtbl.t
 
 val update_full :
-  t ->
-  revision:int ->
-  symbols:(string, Yojson.Safe.t) Hashtbl.t ->
-  unit
+  t -> revision:int -> symbols:(string, Yojson.Safe.t) Hashtbl.t -> unit
 
 val diff :
   t ->

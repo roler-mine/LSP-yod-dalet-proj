@@ -1,27 +1,22 @@
-(** lib/ast.mli
-    Core AST + source locations + debug dump/pretty-printing.
-*)
+(** lib/ast.mli Core AST + source locations + debug dump/pretty-printing. *)
 
 module Loc : sig
-  type pos = { line:int; col:int; offset:int }
-  type t = { file:string option; start_pos:pos; end_pos:pos }
+  type pos = { line : int; col : int; offset : int }
+  type t = { file : string option; start_pos : pos; end_pos : pos }
 
   val none : t
-
   val make : start_pos:pos -> end_pos:pos -> file:string option -> t
   val make_no_file : start_pos:pos -> end_pos:pos -> t
 
-  val of_lexing_positions : Lexing.position -> Lexing.position -> file:string option -> t
-  val of_lexing_positions_no_file : Lexing.position -> Lexing.position -> t
+  val of_lexing_positions :
+    Lexing.position -> Lexing.position -> file:string option -> t
 
+  val of_lexing_positions_no_file : Lexing.position -> Lexing.position -> t
   val start_offset : t -> int
   val end_offset : t -> int
-
   val pp : Format.formatter -> t -> unit
   val to_string : t -> string
 end
-
-
 
 type 'a node = { loc : Loc.t; v : 'a }
 
@@ -39,17 +34,27 @@ type literal =
   | LChar of char
   | LBool of bool
 
-type unop =
-  | UPlus
-  | UMinus
-  | UNot
-  | UBitNot
+type unop = UPlus | UMinus | UNot | UBitNot
 
 type binop =
-  | BAdd | BSub | BMul | BDiv | BMod
-  | BAnd | BOr
-  | BBitAnd | BBitOr | BBitXor | BShl | BShr
-  | BEq | BNe | BLt | BLe | BGt | BGe
+  | BAdd
+  | BSub
+  | BMul
+  | BDiv
+  | BMod
+  | BAnd
+  | BOr
+  | BBitAnd
+  | BBitOr
+  | BBitXor
+  | BShl
+  | BShr
+  | BEq
+  | BNe
+  | BLt
+  | BLe
+  | BGt
+  | BGe
 
 type type_expr =
   | TName of ident
@@ -58,18 +63,9 @@ type type_expr =
   | TRecord of field_decl node list
   | TFunc of { params : param node list; returns : type_expr node option }
 
-and field_decl = {
-  fname : ident;
-  ftype : type_expr node;
-}
-
+and field_decl = { fname : ident; ftype : type_expr node }
 and param_mode = In | Out | InOut
-
-and param = {
-  pname : ident;
-  pmode : param_mode;
-  ptype : type_expr node;
-}
+and param = { pname : ident; pmode : param_mode; ptype : type_expr node }
 
 and expr =
   | EName of ident
@@ -88,23 +84,25 @@ and stmt =
   | SBlock of stmt node list
   | SDecl of decl node
   | SAssign of { lhs : expr node; rhs : expr node }
-  | SCallStmt of { callee : ident; args : expr node list; abort_label : ident option }
+  | SCallStmt of {
+      callee : ident;
+      args : expr node list;
+      abort_label : ident option;
+    }
   | SIf of { cond : expr node; then_ : stmt node; else_ : stmt node option }
   | SWhile of { cond : expr node; body : stmt node }
-  | SFor of { init : stmt node option; cond : expr node option; step : stmt node option; body : stmt node }
+  | SFor of {
+      init : stmt node option;
+      cond : expr node option;
+      step : stmt node option;
+      body : stmt node;
+    }
   | SReturn of expr node option
   | SLabel of { label : ident; body : stmt node }
   | SGoto of ident
 
-and storage =
-  | Automatic
-  | Static
-  | External
-
-and proc_use =
-  | UseNormal
-  | UseRec
-  | UseRent
+and storage = Automatic | Static | External
+and proc_use = UseNormal | UseRec | UseRent
 
 and decl =
   | DVar of {
@@ -113,15 +111,8 @@ and decl =
       init : expr node option;
       storage : storage;
     }
-  | DConst of {
-      name : ident;
-      dtype : type_expr node option;
-      value : expr node;
-    }
-  | DType of {
-      name : ident;
-      defn : type_expr node;
-    }
+  | DConst of { name : ident; dtype : type_expr node option; value : expr node }
+  | DType of { name : ident; defn : type_expr node }
   | DProc of proc node
   | DDirective of { name : ident; args : string node list }
 
@@ -134,10 +125,7 @@ and proc = {
   body : stmt node;
 }
 
-type toplevel =
-  | TopDecl of decl node
-  | TopStmt of stmt node
-
+type toplevel = TopDecl of decl node | TopStmt of stmt node
 type program = toplevel list
 
 module Debug : sig
@@ -148,7 +136,6 @@ module Debug : sig
   }
 
   val default_opts : dump_opts
-
   val pp_program : ?opts:dump_opts -> Format.formatter -> program -> unit
   val to_string : ?opts:dump_opts -> program -> string
 end

@@ -2,49 +2,45 @@ module Lib = Jovial_lsp_lib
 
 let failf fmt = Printf.ksprintf failwith fmt
 
-let getenv_int (name:string) ~(default:int) : int =
+let getenv_int (name : string) ~(default : int) : int =
   match Sys.getenv_opt name with
   | None -> default
-  | Some raw ->
-      (try int_of_string (String.trim raw) with _ -> default)
+  | Some raw -> ( try int_of_string (String.trim raw) with _ -> default)
 
-let sleep_seconds (secs:float) : unit =
-  ignore (Unix.select [] [] [] secs)
+let sleep_seconds (secs : float) : unit = ignore (Unix.select [] [] [] secs)
 
-let mk_temp_dir (prefix:string) : string =
+let mk_temp_dir (prefix : string) : string =
   let root = Filename.get_temp_dir_name () in
   let rec pick attempts =
-    if attempts <= 0 then failf "failed to create temporary directory for %s" prefix;
+    if attempts <= 0 then
+      failf "failed to create temporary directory for %s" prefix;
     let name =
-      Printf.sprintf "%s-%d-%06x"
-        prefix
-        (Unix.getpid ())
+      Printf.sprintf "%s-%d-%06x" prefix (Unix.getpid ())
         (Random.bits () land 0xFFFFFF)
     in
     let path = Filename.concat root name in
     try
       Unix.mkdir path 0o755;
       path
-    with _ ->
-      pick (attempts - 1)
+    with _ -> pick (attempts - 1)
   in
   pick 32
 
-let ensure_dir (path:string) : unit =
-  if Sys.file_exists path then ()
-  else Unix.mkdir path 0o755
+let ensure_dir (path : string) : unit =
+  if Sys.file_exists path then () else Unix.mkdir path 0o755
 
-let write_text (path:string) (text:string) : unit =
+let write_text (path : string) (text : string) : unit =
   let oc = open_out_bin path in
   output_string oc text;
   close_out oc
 
-let json_assoc_find (k:string) (fields:(string * Yojson.Safe.t) list) : Yojson.Safe.t =
+let json_assoc_find (k : string) (fields : (string * Yojson.Safe.t) list) :
+    Yojson.Safe.t =
   match List.assoc_opt k fields with
   | Some v -> v
   | None -> failf "missing JSON key %S" k
 
-let has_non_null_result (resp:Yojson.Safe.t) : bool =
+let has_non_null_result (resp : Yojson.Safe.t) : bool =
   match resp with
   | `Assoc fields -> (
       match List.assoc_opt "result" fields with
@@ -62,21 +58,22 @@ type server_proc = {
   mutable msg_reader_done : bool;
 }
 
-let env_with_overrides (overrides:(string * string) list) : string array =
+let env_with_overrides (overrides : (string * string) list) : string array =
   let tbl = Hashtbl.create 128 in
-  Array.iter (fun kv ->
-    match String.index_opt kv '=' with
-    | None -> ()
-    | Some idx ->
-        let key = String.sub kv 0 idx in
-        let value = String.sub kv (idx + 1) (String.length kv - idx - 1) in
-        Hashtbl.replace tbl key value
-  ) (Unix.environment ());
+  Array.iter
+    (fun kv ->
+      match String.index_opt kv '=' with
+      | None -> ()
+      | Some idx ->
+          let key = String.sub kv 0 idx in
+          let value = String.sub kv (idx + 1) (String.length kv - idx - 1) in
+          Hashtbl.replace tbl key value)
+    (Unix.environment ());
   List.iter (fun (k, v) -> Hashtbl.replace tbl k v) overrides;
-  Hashtbl.fold (fun k v acc -> (k ^ "=" ^ v) :: acc) tbl []
-  |> Array.of_list
+  Hashtbl.fold (fun k v acc -> (k ^ "=" ^ v) :: acc) tbl [] |> Array.of_list
 
-let start_server ~(server_path:string) ~(env:(string * string) list) : server_proc =
+let start_server ~(server_path : string) ~(env : (string * string) list) :
+    server_proc =
   let child_stdin_r, child_stdin_w = Unix.pipe () in
   let child_stdout_r, child_stdout_w = Unix.pipe () in
   let null_path = if Sys.win32 then "NUL" else "/dev/null" in
@@ -88,17 +85,12 @@ let start_server ~(server_path:string) ~(env:(string * string) list) : server_pr
   let parent_stderr = Unix.descr_of_out_channel stderr in
   let child_stderr_w =
     if inherit_stderr then parent_stderr
-    else Unix.openfile null_path [Unix.O_WRONLY] 0o666
+    else Unix.openfile null_path [ Unix.O_WRONLY ] 0o666
   in
   let argv = [| server_path |] in
   let envp = env_with_overrides env in
   let pid =
-    Unix.create_process_env
-      server_path
-      argv
-      envp
-      child_stdin_r
-      child_stdout_w
+    Unix.create_process_env server_path argv envp child_stdin_r child_stdout_w
       child_stderr_w
   in
   Unix.close child_stdin_r;
@@ -108,8 +100,7 @@ let start_server ~(server_path:string) ~(env:(string * string) list) : server_pr
   let stdout_r = Unix.in_channel_of_descr child_stdout_r in
   if Sys.win32 then (
     set_binary_mode_out stdin_w true;
-    set_binary_mode_in stdout_r true
-  );
+    set_binary_mode_in stdout_r true);
   let msg_q : Yojson.Safe.t Queue.t = Queue.create () in
   let msg_mtx = Mutex.create () in
   let srv =
@@ -123,58 +114,68 @@ let start_server ~(server_path:string) ~(env:(string * string) list) : server_pr
       msg_reader_done = false;
     }
   in
-  ignore (Thread.create (fun () ->
-    let set_error msg =
-      Mutex.lock srv.msg_mtx;
-      if srv.msg_error = None then srv.msg_error <- Some msg;
-      srv.msg_reader_done <- true;
-      Mutex.unlock srv.msg_mtx
-    in
-    let rec loop () =
-      match Lib.Lsp_io.read_message srv.stdout_r with
-      | None ->
-          set_error "server closed stdout while waiting for LSP message"
-      | Some txt ->
-          (match
-             try Ok (Yojson.Safe.from_string txt)
-             with exn ->
-               Error (Printf.sprintf "invalid LSP JSON payload: %s" (Printexc.to_string exn))
-           with
-           | Ok msg ->
-               Mutex.lock srv.msg_mtx;
-               Queue.add msg srv.msg_q;
-               Mutex.unlock srv.msg_mtx;
-               loop ()
-           | Error msg ->
-               set_error msg)
-    in
-    (try loop () with exn ->
-       set_error (Printf.sprintf "failed reading LSP message: %s" (Printexc.to_string exn)))
-  ) ());
+  ignore
+    (Thread.create
+       (fun () ->
+         let set_error msg =
+           Mutex.lock srv.msg_mtx;
+           if srv.msg_error = None then srv.msg_error <- Some msg;
+           srv.msg_reader_done <- true;
+           Mutex.unlock srv.msg_mtx
+         in
+         let rec loop () =
+           match Lib.Lsp_io.read_message srv.stdout_r with
+           | None ->
+               set_error "server closed stdout while waiting for LSP message"
+           | Some txt -> (
+               match
+                 try Ok (Yojson.Safe.from_string txt)
+                 with exn ->
+                   Error
+                     (Printf.sprintf "invalid LSP JSON payload: %s"
+                        (Printexc.to_string exn))
+               with
+               | Ok msg ->
+                   Mutex.lock srv.msg_mtx;
+                   Queue.add msg srv.msg_q;
+                   Mutex.unlock srv.msg_mtx;
+                   loop ()
+               | Error msg -> set_error msg)
+         in
+         try loop ()
+         with exn ->
+           set_error
+             (Printf.sprintf "failed reading LSP message: %s"
+                (Printexc.to_string exn)))
+       ());
   srv
 
-let send_json (srv:server_proc) (j:Yojson.Safe.t) : unit =
+let send_json (srv : server_proc) (j : Yojson.Safe.t) : unit =
   Lib.Lsp_io.write_message srv.stdin_w j;
   flush srv.stdin_w
 
-let send_request (srv:server_proc) ~(id:int) ~(method_:string) ~(params:Yojson.Safe.t) : unit =
+let send_request (srv : server_proc) ~(id : int) ~(method_ : string)
+    ~(params : Yojson.Safe.t) : unit =
   send_json srv
-    (`Assoc [
-      "jsonrpc", `String "2.0";
-      "id", `Int id;
-      "method", `String method_;
-      "params", params;
-    ])
+    (`Assoc
+       [
+         ("jsonrpc", `String "2.0");
+         ("id", `Int id);
+         ("method", `String method_);
+         ("params", params);
+       ])
 
-let send_notification (srv:server_proc) ~(method_:string) ~(params:Yojson.Safe.t) : unit =
+let send_notification (srv : server_proc) ~(method_ : string)
+    ~(params : Yojson.Safe.t) : unit =
   send_json srv
-    (`Assoc [
-      "jsonrpc", `String "2.0";
-      "method", `String method_;
-      "params", params;
-    ])
+    (`Assoc
+       [
+         ("jsonrpc", `String "2.0");
+         ("method", `String method_);
+         ("params", params);
+       ])
 
-let wait_for_message (srv:server_proc) ~(timeout_s:float) : Yojson.Safe.t =
+let wait_for_message (srv : server_proc) ~(timeout_s : float) : Yojson.Safe.t =
   let deadline = Unix.gettimeofday () +. timeout_s in
   let rec loop () =
     Mutex.lock srv.msg_mtx;
@@ -186,143 +187,130 @@ let wait_for_message (srv:server_proc) ~(timeout_s:float) : Yojson.Safe.t =
     Mutex.unlock srv.msg_mtx;
     match next_msg with
     | Some msg -> msg
-    | None ->
-        (match err with
-         | Some msg -> failf "%s" msg
-         | None ->
-             if done_ then failf "server closed stdout while waiting for LSP message"
-             else if Unix.gettimeofday () >= deadline then
-               failf "timed out waiting for LSP message"
-             else (
-               Thread.delay 0.01;
-               loop ()))
+    | None -> (
+        match err with
+        | Some msg -> failf "%s" msg
+        | None ->
+            if done_ then
+              failf "server closed stdout while waiting for LSP message"
+            else if Unix.gettimeofday () >= deadline then
+              failf "timed out waiting for LSP message"
+            else (
+              Thread.delay 0.01;
+              loop ()))
   in
   loop ()
 
-let int_of_json_id (j:Yojson.Safe.t) : int option =
+let int_of_json_id (j : Yojson.Safe.t) : int option =
   match j with
   | `Int n -> Some n
-  | `Intlit s ->
-      (try Some (int_of_string s) with _ -> None)
+  | `Intlit s -> ( try Some (int_of_string s) with _ -> None)
   | _ -> None
 
-let wait_for_response (srv:server_proc) ~(id:int) ~(timeout_s:float) : Yojson.Safe.t =
+let wait_for_response (srv : server_proc) ~(id : int) ~(timeout_s : float) :
+    Yojson.Safe.t =
   let deadline = Unix.gettimeofday () +. timeout_s in
   let rec loop () =
     let remaining = deadline -. Unix.gettimeofday () in
-    if remaining <= 0.0 then
-      failf "timed out waiting for response id=%d" id;
+    if remaining <= 0.0 then failf "timed out waiting for response id=%d" id;
     let msg = wait_for_message srv ~timeout_s:remaining in
     match msg with
-    | `Assoc fields ->
-        (match List.assoc_opt "id" fields with
-         | Some id_json ->
-             (match int_of_json_id id_json with
-              | Some got when got = id -> msg
-              | _ -> loop ())
-         | None ->
-             loop ())
-    | _ ->
-        loop ()
+    | `Assoc fields -> (
+        match List.assoc_opt "id" fields with
+        | Some id_json -> (
+            match int_of_json_id id_json with
+            | Some got when got = id -> msg
+            | _ -> loop ())
+        | None -> loop ())
+    | _ -> loop ()
   in
   loop ()
 
-let request_timed
-    (srv:server_proc)
-    ~(id:int)
-    ~(method_:string)
-    ~(params:Yojson.Safe.t)
-    ~(timeout_s:float)
-  : Yojson.Safe.t * float =
+let request_timed (srv : server_proc) ~(id : int) ~(method_ : string)
+    ~(params : Yojson.Safe.t) ~(timeout_s : float) : Yojson.Safe.t * float =
   let t0 = Unix.gettimeofday () in
   send_request srv ~id ~method_ ~params;
   let resp = wait_for_response srv ~id ~timeout_s in
   let elapsed_ms = (Unix.gettimeofday () -. t0) *. 1000.0 in
-  if elapsed_ms > (timeout_s *. 1000.0) then
-    failf
-      "request %s(id=%d) exceeded timeout: %.1fms > %.1fms"
-      method_
-      id
-      elapsed_ms
-      (timeout_s *. 1000.0);
+  if elapsed_ms > timeout_s *. 1000.0 then
+    failf "request %s(id=%d) exceeded timeout: %.1fms > %.1fms" method_ id
+      elapsed_ms (timeout_s *. 1000.0);
   (resp, elapsed_ms)
 
-let initialize_and_open
-    (srv:server_proc)
-    ~(root_uri:string)
-    ~(doc_uri:string)
-    ~(doc_text:string)
-    ~(timeout_s:float)
-  : float =
+let initialize_and_open (srv : server_proc) ~(root_uri : string)
+    ~(doc_uri : string) ~(doc_text : string) ~(timeout_s : float) : float =
   let init_params =
-    `Assoc [
-      "processId", `Null;
-      "rootUri", `String root_uri;
-      "capabilities", `Assoc [];
-    ]
+    `Assoc
+      [
+        ("processId", `Null);
+        ("rootUri", `String root_uri);
+        ("capabilities", `Assoc []);
+      ]
   in
-  let (init_resp, init_ms) =
+  let init_resp, init_ms =
     request_timed srv ~id:1 ~method_:"initialize" ~params:init_params ~timeout_s
   in
   if not (has_non_null_result init_resp) then
     failf "initialize returned null/empty result";
   send_notification srv ~method_:"initialized" ~params:(`Assoc []);
   send_notification srv ~method_:"textDocument/didOpen"
-    ~params:(`Assoc [
-      "textDocument",
-      `Assoc [
-        "uri", `String doc_uri;
-        "languageId", `String "jovial";
-        "version", `Int 1;
-        "text", `String doc_text;
-      ];
-    ]);
+    ~params:
+      (`Assoc
+         [
+           ( "textDocument",
+             `Assoc
+               [
+                 ("uri", `String doc_uri);
+                 ("languageId", `String "jovial");
+                 ("version", `Int 1);
+                 ("text", `String doc_text);
+               ] );
+         ]);
   init_ms
 
-let shutdown_and_exit (srv:server_proc) ~(timeout_s:float) : unit =
+let shutdown_and_exit (srv : server_proc) ~(timeout_s : float) : unit =
   ignore
     (request_timed srv ~id:9901 ~method_:"shutdown" ~params:`Null ~timeout_s);
   send_notification srv ~method_:"exit" ~params:`Null
 
-let close_stdin (srv:server_proc) : unit =
-  close_out_noerr srv.stdin_w
+let close_stdin (srv : server_proc) : unit = close_out_noerr srv.stdin_w
 
-let wait_for_exit (srv:server_proc) ~(timeout_s:float) : Unix.process_status =
+let wait_for_exit (srv : server_proc) ~(timeout_s : float) : Unix.process_status
+    =
   let deadline = Unix.gettimeofday () +. timeout_s in
   let rec loop () =
-    match Unix.waitpid [Unix.WNOHANG] srv.pid with
+    match Unix.waitpid [ Unix.WNOHANG ] srv.pid with
     | 0, _ ->
         if Unix.gettimeofday () >= deadline then
           failf "server pid=%d did not exit within %.2fs" srv.pid timeout_s;
         sleep_seconds 0.02;
         loop ()
-    | _, st ->
-        st
+    | _, st -> st
   in
   loop ()
 
-let force_kill (srv:server_proc) : unit =
+let force_kill (srv : server_proc) : unit =
   (try Unix.kill srv.pid Sys.sigterm with _ -> ());
   sleep_seconds 0.05;
-  (try Unix.kill srv.pid Sys.sigkill with _ -> ())
+  try Unix.kill srv.pid Sys.sigkill with _ -> ()
 
-let with_server ?(env:(string * string) list = []) ~(server_path:string) (f:server_proc -> 'a) : 'a =
+let with_server ?(env : (string * string) list = []) ~(server_path : string)
+    (f : server_proc -> 'a) : 'a =
   let srv = start_server ~server_path ~env in
   let cleanup () =
     (try close_out_noerr srv.stdin_w with _ -> ());
-    (try ignore (wait_for_exit srv ~timeout_s:0.4) with _ ->
+    (try ignore (wait_for_exit srv ~timeout_s:0.4)
+     with _ -> (
        force_kill srv;
-       (try ignore (wait_for_exit srv ~timeout_s:0.5) with _ -> ()));
-    (try close_in_noerr srv.stdout_r with _ -> ())
+       try ignore (wait_for_exit srv ~timeout_s:0.5) with _ -> ()));
+    try close_in_noerr srv.stdout_r with _ -> ()
   in
-  Fun.protect
-    ~finally:cleanup
-    (fun () -> f srv)
+  Fun.protect ~finally:cleanup (fun () -> f srv)
 
-let lsp_doc_uri_of_path (path:string) : string =
+let lsp_doc_uri_of_path (path : string) : string =
   Lib.Uri_path.file_uri_of_path path
 
-let line_col_of_first (text:string) ~(needle:string) : int * int =
+let line_col_of_first (text : string) ~(needle : string) : int * int =
   let n = String.length text in
   let m = String.length needle in
   if m = 0 then failf "needle must not be empty";
@@ -339,27 +327,31 @@ let line_col_of_first (text:string) ~(needle:string) : int * int =
   in
   lc 0 0 0
 
-let normalize_uri_for_compare (u:string) : string =
+let normalize_uri_for_compare (u : string) : string =
   match Lib.Uri_path.file_path_of_uri_string u with
   | Some p ->
       let p = String.map (fun c -> if c = '\\' then '/' else c) p in
       if Sys.win32 then String.lowercase_ascii p else p
-  | None ->
-      String.lowercase_ascii (String.trim u)
+  | None -> String.lowercase_ascii (String.trim u)
 
-let parse_publish_diagnostics (msg:Yojson.Safe.t) : (string * Yojson.Safe.t list) option =
+let parse_publish_diagnostics (msg : Yojson.Safe.t) :
+    (string * Yojson.Safe.t list) option =
   match msg with
   | `Assoc fields -> (
-      match List.assoc_opt "method" fields, List.assoc_opt "params" fields with
-      | Some (`String "textDocument/publishDiagnostics"), Some (`Assoc params) -> (
-          match List.assoc_opt "uri" params, List.assoc_opt "diagnostics" params with
+      match
+        (List.assoc_opt "method" fields, List.assoc_opt "params" fields)
+      with
+      | Some (`String "textDocument/publishDiagnostics"), Some (`Assoc params)
+        -> (
+          match
+            (List.assoc_opt "uri" params, List.assoc_opt "diagnostics" params)
+          with
           | Some (`String uri), Some (`List ds) -> Some (uri, ds)
           | _ -> None)
       | _ -> None)
-  | _ ->
-      None
+  | _ -> None
 
-let diag_message (d:Yojson.Safe.t) : string option =
+let diag_message (d : Yojson.Safe.t) : string option =
   match d with
   | `Assoc fields -> (
       match List.assoc_opt "message" fields with
@@ -367,16 +359,16 @@ let diag_message (d:Yojson.Safe.t) : string option =
       | _ -> None)
   | _ -> None
 
-let diag_severity (d:Yojson.Safe.t) : int option =
+let diag_severity (d : Yojson.Safe.t) : int option =
   match d with
   | `Assoc fields -> (
       match List.assoc_opt "severity" fields with
       | Some (`Int n) -> Some n
-      | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+      | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
       | _ -> None)
   | _ -> None
 
-let is_timeout_failure_message (msg:string) : bool =
+let is_timeout_failure_message (msg : string) : bool =
   let needle = "timed out waiting for LSP message" in
   let n = String.length msg in
   let m = String.length needle in
@@ -387,11 +379,8 @@ let is_timeout_failure_message (msg:string) : bool =
   in
   has_at 0
 
-let wait_for_publish_diagnostics_for_uri
-    ~(srv:server_proc)
-    ~(target_uri:string)
-    ~(timeout_s:float)
-  : Yojson.Safe.t list option =
+let wait_for_publish_diagnostics_for_uri ~(srv : server_proc)
+    ~(target_uri : string) ~(timeout_s : float) : Yojson.Safe.t list option =
   let debug =
     match Sys.getenv_opt "JOVIAL_TEST_DEBUG_DIAG_WAIT" with
     | Some "1" | Some "true" | Some "TRUE" -> true
@@ -408,34 +397,29 @@ let wait_for_publish_diagnostics_for_uri
       else
         try
           let msg = wait_for_message srv ~timeout_s:chunk in
-          (match parse_publish_diagnostics msg with
-           | Some (uri, diags) ->
-               let uri_norm = normalize_uri_for_compare uri in
-               (if debug then
-                  let msgs =
-                    diags
-                    |> List.filter_map diag_message
-                    |> String.concat " || "
-                  in
-                  prerr_endline
-                    (Printf.sprintf
+          match parse_publish_diagnostics msg with
+          | Some (uri, diags) ->
+              let uri_norm = normalize_uri_for_compare uri in
+              (if debug then
+                 let msgs =
+                   diags |> List.filter_map diag_message |> String.concat " || "
+                 in
+                 prerr_endline
+                   (Printf.sprintf
                       "diag-wait target=%s observed=%s match=%b msgs=[%s]"
-                      target_norm
-                      uri_norm
-                      (uri_norm = target_norm)
-                      msgs));
-               if uri_norm = target_norm then Some diags
-               else loop ()
-           | _ ->
-               loop ())
+                      target_norm uri_norm (uri_norm = target_norm) msgs));
+              if uri_norm = target_norm then Some diags else loop ()
+          | _ -> loop ()
         with
         | Failure m when is_timeout_failure_message m -> loop ()
         | exn -> raise exn
   in
   loop ()
 
-let definition_request_params ~(uri:string) ~(line:int) ~(character:int) : Yojson.Safe.t =
-  `Assoc [
-    "textDocument", `Assoc [ "uri", `String uri ];
-    "position", `Assoc [ "line", `Int line; "character", `Int character ];
-  ]
+let definition_request_params ~(uri : string) ~(line : int) ~(character : int) :
+    Yojson.Safe.t =
+  `Assoc
+    [
+      ("textDocument", `Assoc [ ("uri", `String uri) ]);
+      ("position", `Assoc [ ("line", `Int line); ("character", `Int character) ]);
+    ]

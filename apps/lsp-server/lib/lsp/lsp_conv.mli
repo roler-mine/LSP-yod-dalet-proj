@@ -2,7 +2,6 @@ module T = Lsp.Types
 
 val position_of_ast_pos : Ast.Loc.pos -> T.Position.t
 val range_of_loc : Ast.Loc.t -> T.Range.t
-
 val location_of_loc : uri:T.DocumentUri.t -> Ast.Loc.t -> T.Location.t
 
 val diagnostic :

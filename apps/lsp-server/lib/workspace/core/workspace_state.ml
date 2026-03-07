@@ -118,10 +118,10 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     request_cancel_checker = None;
   }
 
-let invalidate_lsif_snapshot (ws:t) : unit =
+let invalidate_lsif_snapshot (ws : t) : unit =
   ws.lsif_snapshot_revision <- ws.lsif_snapshot_revision + 1
 
-let normalize_name (s:string) : string =
+let normalize_name (s : string) : string =
   String.uppercase_ascii (String.trim s)
 
 let lane_of_bg_queue_kind = function
@@ -139,8 +139,8 @@ let queue_kind_priority = function
   | BgQueueRootSmall | BgQueueRootLarge -> 1
   | BgQueueHighSmall | BgQueueHighLarge -> 2
 
-let size_class_of_path (ws:t) (path:string) : file_size_class =
-  match (try Some (Unix.stat path).Unix.st_size with _ -> None) with
+let size_class_of_path (ws : t) (path : string) : file_size_class =
+  match try Some (Unix.stat path).Unix.st_size with _ -> None with
   | Some n when n >= ws.bg_large_file_bytes -> FileSizeLarge
   | _ -> FileSizeSmall
 
@@ -149,16 +149,15 @@ let file_class_rank = function
   | FileClassEntry -> 1
   | FileClassNormal -> 2
 
-let basename_upper (path:string) : string =
+let basename_upper (path : string) : string =
   Filename.basename path |> String.uppercase_ascii
 
-let is_main_boot_heuristic (path:string) : bool =
+let is_main_boot_heuristic (path : string) : bool =
   let b = basename_upper path in
   String.length b >= 4
   && (String.sub b 0 4 = "MAIN" || String.sub b 0 4 = "BOOT")
 
-let mark_graph_dirty (ws:t) : unit =
-  ws.graph_needs_refresh <- true
+let mark_graph_dirty (ws : t) : unit = ws.graph_needs_refresh <- true
 
 let is_nav_ident_start_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '_' | '$' -> true
@@ -168,106 +167,101 @@ let is_nav_ident_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | '$' | '\'' -> true
   | _ -> false
 
-let ident_keys_of_text (text:string) : string list =
+let ident_keys_of_text (text : string) : string list =
   let n = String.length text in
   let out = Hashtbl.create 16 in
   let rec loop i =
     if i >= n then ()
     else
       let c = text.[i] in
-      if is_nav_ident_start_char c
-         && (i = 0 || not (is_nav_ident_char text.[i - 1]))
-      then
+      if
+        is_nav_ident_start_char c
+        && (i = 0 || not (is_nav_ident_char text.[i - 1]))
+      then (
         let j = ref (i + 1) in
         while !j < n && is_nav_ident_char text.[!j] do
           incr j
         done;
         let key = normalize_name (String.sub text i (!j - i)) in
         if key <> "" then Hashtbl.replace out key true;
-        loop !j
-      else
-        loop (i + 1)
+        loop !j)
+      else loop (i + 1)
   in
   loop 0;
   Hashtbl.fold (fun k _ acc -> k :: acc) out []
 
-let nav_response_cache_key ~(kind:string) ~(uri:T.DocumentUri.t) ~(symbol_key:string) : string =
-  Printf.sprintf "%s|%s|%s" kind (Uri_path.docuri_to_string uri) (normalize_name symbol_key)
+let nav_response_cache_key ~(kind : string) ~(uri : T.DocumentUri.t)
+    ~(symbol_key : string) : string =
+  Printf.sprintf "%s|%s|%s" kind
+    (Uri_path.docuri_to_string uri)
+    (normalize_name symbol_key)
 
-let nav_response_cache_get
-    (ws:t)
-    ~(kind:string)
-    ~(uri:T.DocumentUri.t)
-    ~(symbol_key:string)
-  : Yojson.Safe.t option =
-  Hashtbl.find_opt ws.nav_response_cache (nav_response_cache_key ~kind ~uri ~symbol_key)
+let nav_response_cache_get (ws : t) ~(kind : string) ~(uri : T.DocumentUri.t)
+    ~(symbol_key : string) : Yojson.Safe.t option =
+  Hashtbl.find_opt ws.nav_response_cache
+    (nav_response_cache_key ~kind ~uri ~symbol_key)
 
-let nav_response_cache_put
-    (ws:t)
-    ~(kind:string)
-    ~(uri:T.DocumentUri.t)
-    ~(symbol_key:string)
-    ~(payload:Yojson.Safe.t)
-  : unit =
+let nav_response_cache_put (ws : t) ~(kind : string) ~(uri : T.DocumentUri.t)
+    ~(symbol_key : string) ~(payload : Yojson.Safe.t) : unit =
   let key = normalize_name symbol_key in
   if key <> "" then
     Hashtbl.replace ws.nav_response_cache
       (nav_response_cache_key ~kind ~uri ~symbol_key:key)
       payload
 
-let parse_nav_response_cache_key (k:string) : (string * string * string) option =
+let parse_nav_response_cache_key (k : string) :
+    (string * string * string) option =
   match String.split_on_char '|' k with
-  | kind :: uri_s :: sym :: [] -> Some (kind, uri_s, sym)
-  | kind :: uri_s :: sym_parts ->
-      Some (kind, uri_s, String.concat "|" sym_parts)
+  | [ kind; uri_s; sym ] -> Some (kind, uri_s, sym)
+  | kind :: uri_s :: sym_parts -> Some (kind, uri_s, String.concat "|" sym_parts)
   | _ -> None
 
-let clear_nav_response_cache_for_uri (ws:t) ~(uri:T.DocumentUri.t) : unit =
+let clear_nav_response_cache_for_uri (ws : t) ~(uri : T.DocumentUri.t) : unit =
   let uri_s = Uri_path.docuri_to_string uri in
   let stale =
-    Hashtbl.fold (fun k _ acc ->
-      match parse_nav_response_cache_key k with
-      | Some (_, u, _) when u = uri_s -> k :: acc
-      | _ -> acc
-    ) ws.nav_response_cache []
+    Hashtbl.fold
+      (fun k _ acc ->
+        match parse_nav_response_cache_key k with
+        | Some (_, u, _) when u = uri_s -> k :: acc
+        | _ -> acc)
+      ws.nav_response_cache []
   in
   List.iter (fun k -> Hashtbl.remove ws.nav_response_cache k) stale
 
-let invalidate_nav_response_cache_for_keys
-    (ws:t)
-    ~(uri:T.DocumentUri.t)
-    ~(keys:string list)
-  : unit =
+let invalidate_nav_response_cache_for_keys (ws : t) ~(uri : T.DocumentUri.t)
+    ~(keys : string list) : unit =
   if keys = [] then ()
   else
     let uri_s = Uri_path.docuri_to_string uri in
     let keyset = Hashtbl.create (max 16 (List.length keys * 2)) in
-    List.iter (fun k ->
-      let kk = normalize_name k in
-      if kk <> "" then Hashtbl.replace keyset kk true
-    ) keys;
+    List.iter
+      (fun k ->
+        let kk = normalize_name k in
+        if kk <> "" then Hashtbl.replace keyset kk true)
+      keys;
     if Hashtbl.length keyset = 0 then ()
     else
       let stale =
-        Hashtbl.fold (fun k _ acc ->
-          match parse_nav_response_cache_key k with
-          | Some (_, u, sym) when u = uri_s && Hashtbl.mem keyset (normalize_name sym) -> k :: acc
-          | _ -> acc
-        ) ws.nav_response_cache []
+        Hashtbl.fold
+          (fun k _ acc ->
+            match parse_nav_response_cache_key k with
+            | Some (_, u, sym)
+              when u = uri_s && Hashtbl.mem keyset (normalize_name sym) ->
+                k :: acc
+            | _ -> acc)
+          ws.nav_response_cache []
       in
       List.iter (fun k -> Hashtbl.remove ws.nav_response_cache k) stale
 
-let compool_key_of_doc (doc:Document.t) : string option =
+let compool_key_of_doc (doc : Document.t) : string option =
   match doc.Document.compool_def with
   | None -> None
   | Some raw ->
       let key = normalize_name raw in
       if key = "" then None else Some key
 
-let invalidate_importer_nav_state_for_compool_key
-    (ws:t)
-    ~(compool_key:string)
-  : unit =
+let invalidate_importer_nav_state_for_compool_key (ws : t)
+    ~(compool_key : string) : unit =
   if not ws.sem_store_enabled then ()
   else
     let key = normalize_name compool_key in
@@ -275,123 +269,110 @@ let invalidate_importer_nav_state_for_compool_key
     else
       Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
       |> List.iter (fun uri ->
-           Semantic_store.remove_uri ws.semantic_store ~uri;
-           clear_nav_response_cache_for_uri ws ~uri)
+          Semantic_store.remove_uri ws.semantic_store ~uri;
+          clear_nav_response_cache_for_uri ws ~uri)
 
-let importer_uris_for_compool_key
-    (ws:t)
-    ~(compool_key:string)
-  : T.DocumentUri.t list =
+let importer_uris_for_compool_key (ws : t) ~(compool_key : string) :
+    T.DocumentUri.t list =
   let key = normalize_name compool_key in
   if key = "" then []
   else
     let seen : (string, bool) Hashtbl.t = Hashtbl.create 64 in
     let out = ref [] in
-    let add_uri (uri:T.DocumentUri.t) =
+    let add_uri (uri : T.DocumentUri.t) =
       let uri_key = Uri_path.docuri_to_string uri in
       if not (Hashtbl.mem seen uri_key) then (
         Hashtbl.replace seen uri_key true;
-        out := uri :: !out
-      )
+        out := uri :: !out)
     in
     if ws.sem_store_enabled then
       Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
       |> List.iter add_uri;
     Hashtbl.iter
       (fun uri doc ->
-        if List.exists
-             (fun (imp:Preprocess.import) ->
-               imp.kind = Preprocess.Compool && normalize_name imp.name = key)
-             (Document.imports doc)
-        then
-          add_uri uri)
+        if
+          List.exists
+            (fun (imp : Preprocess.import) ->
+              imp.kind = Preprocess.Compool && normalize_name imp.name = key)
+            (Document.imports doc)
+        then add_uri uri)
       ws.docs;
     List.rev !out
 
-let normalize_path_key (p:string) : string =
+let normalize_path_key (p : string) : string =
   let p = String.map (fun c -> if c = '\\' then '/' else c) p in
   if Sys.win32 then String.lowercase_ascii p else p
 
-let same_path a b =
-  normalize_path_key a = normalize_path_key b
+let same_path a b = normalize_path_key a = normalize_path_key b
 
-let file_size_bytes (path:string) : int option =
-  try
-    Some (Unix.(stat path).st_size)
-  with _ ->
-    None
+let file_size_bytes (path : string) : int option =
+  try Some Unix.(stat path).st_size with _ -> None
 
-let is_parse_guard_exceeded ~(max_bytes:int) ~(text_len:int) : bool =
+let is_parse_guard_exceeded ~(max_bytes : int) ~(text_len : int) : bool =
   max_bytes > 0 && text_len > max_bytes
 
-let diag_parse_guard ~(file:string option) ~(max_bytes:int) ~(actual_bytes:int) : T.Diagnostic.t =
+let diag_parse_guard ~(file : string option) ~(max_bytes : int)
+    ~(actual_bytes : int) : T.Diagnostic.t =
   let z = { Ast.Loc.line = 1; col = 0; offset = 0 } in
   let loc = Ast.Loc.make ~file ~start_pos:z ~end_pos:z in
-  Lsp_conv.diagnostic
-    ~severity:T.DiagnosticSeverity.Error
-    ~source:"parse"
-    ~message:(Printf.sprintf
-      "File parse skipped (%d bytes exceeds guard %d bytes)."
-      actual_bytes
-      max_bytes)
+  Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"parse"
+    ~message:
+      (Printf.sprintf "File parse skipped (%d bytes exceeds guard %d bytes)."
+         actual_bytes max_bytes)
     loc
 
-let make_doc_with_parse_guard
-    (ws:t)
-    ~(uri:T.DocumentUri.t)
-    ~(file:string option)
-    ~(text:string)
-    ~(actual_bytes:int)
-  : Document.t =
+let make_doc_with_parse_guard (ws : t) ~(uri : T.DocumentUri.t)
+    ~(file : string option) ~(text : string) ~(actual_bytes : int) : Document.t
+    =
   Perf_stats.tick "parse.large_file_guard";
-  Document.make_unparsed
-    ~uri
-    ~file
-    ~text
-    ~parse_diags:[diag_parse_guard ~file ~max_bytes:ws.parse_file_max_bytes ~actual_bytes]
+  Document.make_unparsed ~uri ~file ~text
+    ~parse_diags:
+      [
+        diag_parse_guard ~file ~max_bytes:ws.parse_file_max_bytes ~actual_bytes;
+      ]
 
-let parse_guarded_document_make
-    (ws:t)
-    ~(uri:T.DocumentUri.t)
-    ~(file:string option)
-    ~(text:string)
-  : Document.t =
-  if is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes ~text_len:(String.length text) then
-    make_doc_with_parse_guard ws ~uri ~file ~text ~actual_bytes:(String.length text)
-  else
-    Document.make ~uri ~file ~text
+let parse_guarded_document_make (ws : t) ~(uri : T.DocumentUri.t)
+    ~(file : string option) ~(text : string) : Document.t =
+  if
+    is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
+      ~text_len:(String.length text)
+  then
+    make_doc_with_parse_guard ws ~uri ~file ~text
+      ~actual_bytes:(String.length text)
+  else Document.make ~uri ~file ~text
 
-let has_open_doc_for_path_key (ws:t) ~(path_key:string) : bool =
-  Hashtbl.fold (fun _uri doc acc ->
-    acc
-    ||
-    match doc.Document.file with
-    | None -> false
-    | Some p -> normalize_path_key p = path_key
-  ) ws.docs false
+let has_open_doc_for_path_key (ws : t) ~(path_key : string) : bool =
+  Hashtbl.fold
+    (fun _uri doc acc ->
+      acc
+      ||
+      match doc.Document.file with
+      | None -> false
+      | Some p -> normalize_path_key p = path_key)
+    ws.docs false
 
-let touch_closed_doc_path (ws:t) ~(path_key:string) : unit =
+let touch_closed_doc_path (ws : t) ~(path_key : string) : unit =
   if path_key = "" then ()
   else if has_open_doc_for_path_key ws ~path_key then
     Hashtbl.remove ws.closed_doc_last_touch path_key
   else (
     ws.closed_doc_lru_clock <- ws.closed_doc_lru_clock + 1;
-    Hashtbl.replace ws.closed_doc_last_touch path_key ws.closed_doc_lru_clock
-  )
+    Hashtbl.replace ws.closed_doc_last_touch path_key ws.closed_doc_lru_clock)
 
-let evict_closed_docs_if_needed (ws:t) : unit =
+let evict_closed_docs_if_needed (ws : t) : unit =
   let max_closed = max 1 ws.closed_doc_lru_max in
   let closed =
-    Hashtbl.fold (fun path_key doc acc ->
-      if has_open_doc_for_path_key ws ~path_key then acc
-      else
-        let touch =
-          match Hashtbl.find_opt ws.closed_doc_last_touch path_key with
-          | Some t -> t
-          | None -> 0
-        in
-        (path_key, touch, doc) :: acc
-    ) ws.files []
+    Hashtbl.fold
+      (fun path_key doc acc ->
+        if has_open_doc_for_path_key ws ~path_key then acc
+        else
+          let touch =
+            match Hashtbl.find_opt ws.closed_doc_last_touch path_key with
+            | Some t -> t
+            | None -> 0
+          in
+          (path_key, touch, doc) :: acc)
+      ws.files []
   in
   Perf_stats.tick "mem.closed_doc_count";
   let closed_count = List.length closed in
@@ -417,65 +398,52 @@ let evict_closed_docs_if_needed (ws:t) : unit =
     in
     drop to_drop sorted
 
-let find_open_doc_for_path (ws:t) ~(path:string) : Document.t option =
+let find_open_doc_for_path (ws : t) ~(path : string) : Document.t option =
   let found_open = ref None in
-  Hashtbl.iter (fun _uri doc ->
-    match doc.Document.file with
-    | Some p when same_path p path -> found_open := Some doc
-    | _ -> ()
-  ) ws.docs;
+  Hashtbl.iter
+    (fun _uri doc ->
+      match doc.Document.file with
+      | Some p when same_path p path -> found_open := Some doc
+      | _ -> ())
+    ws.docs;
   !found_open
 
-let classify_bg_queue_kind
-    (ws:t)
-    ~(lane:schedule_lane)
-    ~(high:bool)
-    ~(path:string)
-  : bg_queue_kind =
+let classify_bg_queue_kind (ws : t) ~(lane : schedule_lane) ~(high : bool)
+    ~(path : string) : bg_queue_kind =
   let size_opt = file_size_bytes path in
   let is_large =
-    match size_opt with
-    | Some n -> n >= ws.bg_large_file_bytes
-    | None -> false
+    match size_opt with Some n -> n >= ws.bg_large_file_bytes | None -> false
   in
-  match lane, is_large with
+  match (lane, is_large) with
   | LaneOpen, false -> BgQueueHighSmall
   | LaneOpen, true -> BgQueueHighLarge
   | LaneRoot, false -> BgQueueRootSmall
   | LaneRoot, true -> BgQueueRootLarge
-  | LaneSweep, false ->
-      if high then BgQueueHighSmall else BgQueueNormalSmall
-  | LaneSweep, true ->
-      if high then BgQueueHighLarge else BgQueueNormalLarge
+  | LaneSweep, false -> if high then BgQueueHighSmall else BgQueueNormalSmall
+  | LaneSweep, true -> if high then BgQueueHighLarge else BgQueueNormalLarge
 
-let enqueue_bg_path
-    ?(lane:schedule_lane=LaneSweep)
-    ?(reason_group:string="generic")
-    (ws:t)
-    ~(high:bool)
-    (path:string)
-  : unit =
+let enqueue_bg_path ?(lane : schedule_lane = LaneSweep)
+    ?(reason_group : string = "generic") (ws : t) ~(high : bool) (path : string)
+    : unit =
   let path_key = normalize_path_key path in
   if path_key <> "" then
-    if Hashtbl.mem ws.parse_worker_inflight path_key then
-      ()
+    if Hashtbl.mem ws.parse_worker_inflight path_key then ()
     else
       let requested = classify_bg_queue_kind ws ~lane ~high ~path in
       let doc_generation =
         match find_open_doc_for_path ws ~path with
-        | Some doc ->
-            (match Hashtbl.find_opt ws.open_parse_generation (Uri_path.docuri_to_string doc.Document.uri) with
-             | Some g -> g
-             | None -> 0)
+        | Some doc -> (
+            match
+              Hashtbl.find_opt ws.open_parse_generation
+                (Uri_path.docuri_to_string doc.Document.uri)
+            with
+            | Some g -> g
+            | None -> 0)
         | None -> 0
       in
       let work_key =
-        Printf.sprintf "%s|%s|%s|g%d|d%d"
-          path_key
-          (string_of_lane lane)
-          reason_group
-          ws.graph_epoch
-          doc_generation
+        Printf.sprintf "%s|%s|%s|g%d|d%d" path_key (string_of_lane lane)
+          reason_group ws.graph_epoch doc_generation
       in
       let now = Perf_stats.now_ms () in
       let is_cooldown_hit =
@@ -484,49 +452,39 @@ let enqueue_bg_path
             ws.graph_requeue_cooldown_ms > 0
             && lane <> LaneOpen
             && now -. last_ms < float_of_int ws.graph_requeue_cooldown_ms
-        | None ->
-            false
+        | None -> false
       in
-      if is_cooldown_hit then
-        Perf_stats.tick "sched.requeue_cooldown_hit"
+      if is_cooldown_hit then Perf_stats.tick "sched.requeue_cooldown_hit"
       else (
         Hashtbl.replace ws.bg_enqueue_recent_ms work_key now;
         match Hashtbl.find_opt ws.bg_enqueued path_key with
-        | None ->
+        | None -> (
             Hashtbl.replace ws.bg_enqueued path_key requested;
-            (match requested with
-             | BgQueueHighSmall -> Queue.add path ws.bg_high_small_queue
-             | BgQueueRootSmall -> Queue.add path ws.bg_root_small_queue
-             | BgQueueNormalSmall -> Queue.add path ws.bg_norm_small_queue
-             | BgQueueHighLarge -> Queue.add path ws.bg_high_large_queue
-             | BgQueueRootLarge -> Queue.add path ws.bg_root_large_queue
-             | BgQueueNormalLarge -> Queue.add path ws.bg_norm_large_queue)
+            match requested with
+            | BgQueueHighSmall -> Queue.add path ws.bg_high_small_queue
+            | BgQueueRootSmall -> Queue.add path ws.bg_root_small_queue
+            | BgQueueNormalSmall -> Queue.add path ws.bg_norm_small_queue
+            | BgQueueHighLarge -> Queue.add path ws.bg_high_large_queue
+            | BgQueueRootLarge -> Queue.add path ws.bg_root_large_queue
+            | BgQueueNormalLarge -> Queue.add path ws.bg_norm_large_queue)
         | Some current ->
             if queue_kind_priority requested > queue_kind_priority current then (
               Hashtbl.replace ws.bg_enqueued path_key requested;
               (match requested with
-               | BgQueueHighSmall -> Queue.add path ws.bg_high_small_queue
-               | BgQueueRootSmall -> Queue.add path ws.bg_root_small_queue
-               | BgQueueNormalSmall -> Queue.add path ws.bg_norm_small_queue
-               | BgQueueHighLarge -> Queue.add path ws.bg_high_large_queue
-               | BgQueueRootLarge -> Queue.add path ws.bg_root_large_queue
-               | BgQueueNormalLarge -> Queue.add path ws.bg_norm_large_queue);
-              Perf_stats.tick "bg.queue_promoted"
-            ) else
-              Perf_stats.tick "sched.duplicate_work_dropped"
-      )
+              | BgQueueHighSmall -> Queue.add path ws.bg_high_small_queue
+              | BgQueueRootSmall -> Queue.add path ws.bg_root_small_queue
+              | BgQueueNormalSmall -> Queue.add path ws.bg_norm_small_queue
+              | BgQueueHighLarge -> Queue.add path ws.bg_high_large_queue
+              | BgQueueRootLarge -> Queue.add path ws.bg_root_large_queue
+              | BgQueueNormalLarge -> Queue.add path ws.bg_norm_large_queue);
+              Perf_stats.tick "bg.queue_promoted")
+            else Perf_stats.tick "sched.duplicate_work_dropped")
 
-let dequeue_bg_path
-    (ws:t)
-    ~(mode:bg_tick_mode)
-    ~(allow_normal_large:bool)
-    ~(allow_root_large:bool)
-    ~(prefer_open:bool)
-  : (string * bg_queue_kind) option =
-  let rec pop_from_queue
-      (q:string Queue.t)
-      ~(expect:bg_queue_kind)
-    : (string * bg_queue_kind) option =
+let dequeue_bg_path (ws : t) ~(mode : bg_tick_mode) ~(allow_normal_large : bool)
+    ~(allow_root_large : bool) ~(prefer_open : bool) :
+    (string * bg_queue_kind) option =
+  let rec pop_from_queue (q : string Queue.t) ~(expect : bg_queue_kind) :
+      (string * bg_queue_kind) option =
     if Queue.is_empty q then None
     else
       let p = Queue.pop q in
@@ -535,8 +493,7 @@ let dequeue_bg_path
       | Some kind when kind = expect ->
           Hashtbl.remove ws.bg_enqueued key;
           Some (p, kind)
-      | _ ->
-          pop_from_queue q ~expect
+      | _ -> pop_from_queue q ~expect
   in
   let pop_high_small () =
     pop_from_queue ws.bg_high_small_queue ~expect:BgQueueHighSmall
@@ -556,8 +513,7 @@ let dequeue_bg_path
   in
   let pop_norm_large () =
     match mode with
-    | BgTickInteractive
-    | BgTickIdle ->
+    | BgTickInteractive | BgTickIdle ->
         if not allow_normal_large then None
         else pop_from_queue ws.bg_norm_large_queue ~expect:BgQueueNormalLarge
   in
@@ -568,39 +524,59 @@ let dequeue_bg_path
   let pops =
     if prefer_open then
       if prioritize_open_large then
-        [ pop_high_large; pop_high_small; pop_root_small; pop_root_large; pop_norm_small; pop_norm_large ]
+        [
+          pop_high_large;
+          pop_high_small;
+          pop_root_small;
+          pop_root_large;
+          pop_norm_small;
+          pop_norm_large;
+        ]
       else
-        [ pop_high_small; pop_high_large; pop_root_small; pop_root_large; pop_norm_small; pop_norm_large ]
+        [
+          pop_high_small;
+          pop_high_large;
+          pop_root_small;
+          pop_root_large;
+          pop_norm_small;
+          pop_norm_large;
+        ]
+    else if prioritize_open_large then
+      [
+        pop_root_small;
+        pop_root_large;
+        pop_high_large;
+        pop_high_small;
+        pop_norm_small;
+        pop_norm_large;
+      ]
     else
-      if prioritize_open_large then
-        [ pop_root_small; pop_root_large; pop_high_large; pop_high_small; pop_norm_small; pop_norm_large ]
-      else
-        [ pop_root_small; pop_root_large; pop_high_small; pop_high_large; pop_norm_small; pop_norm_large ]
+      [
+        pop_root_small;
+        pop_root_large;
+        pop_high_small;
+        pop_high_large;
+        pop_norm_small;
+        pop_norm_large;
+      ]
   in
   let rec pick = function
     | [] -> None
-    | f :: tl ->
-        (match f () with
-         | Some _ as hit -> hit
-         | None -> pick tl)
+    | f :: tl -> ( match f () with Some _ as hit -> hit | None -> pick tl)
   in
   pick pops
 
-let enqueue_bg_diag_update
-    (ws:t)
-    ~(uri:T.DocumentUri.t)
-    ~(diags:T.Diagnostic.t list)
-  : unit =
+let enqueue_bg_diag_update (ws : t) ~(uri : T.DocumentUri.t)
+    ~(diags : T.Diagnostic.t list) : unit =
   let key = Uri_path.docuri_to_string uri in
   if Hashtbl.mem ws.bg_pending_diag_payloads key then
     Perf_stats.tick "bg.diag_pending_overwrite";
   Hashtbl.replace ws.bg_pending_diag_payloads key (uri, diags);
   if not (Hashtbl.mem ws.bg_pending_diag_set key) then (
     Hashtbl.replace ws.bg_pending_diag_set key true;
-    Queue.add key ws.bg_pending_diag_updates
-  )
+    Queue.add key ws.bg_pending_diag_updates)
 
-let tick_open_diag_revalidate_reason (reason:string) : unit =
+let tick_open_diag_revalidate_reason (reason : string) : unit =
   match String.lowercase_ascii (String.trim reason) with
   | "compool" | "compool_change" ->
       Perf_stats.tick "diag.open.revalidate_reason_compool"
@@ -608,51 +584,42 @@ let tick_open_diag_revalidate_reason (reason:string) : unit =
       Perf_stats.tick "diag.open.revalidate_reason_reconcile"
   | "hint" | "hint_ready" | "xmodule_ready" ->
       Perf_stats.tick "diag.open.revalidate_reason_hint_ready"
-  | _ ->
-      ()
+  | _ -> ()
 
-let enqueue_open_diag_revalidate
-    (ws:t)
-    ~(uri:T.DocumentUri.t)
-    ~(reason:string)
-  : unit =
+let enqueue_open_diag_revalidate (ws : t) ~(uri : T.DocumentUri.t)
+    ~(reason : string) : unit =
   if Hashtbl.mem ws.docs uri then (
     let key = Uri_path.docuri_to_string uri in
     Hashtbl.replace ws.open_diag_revalidate_payloads key (uri, reason);
     if not (Hashtbl.mem ws.open_diag_revalidate_set key) then (
       Hashtbl.replace ws.open_diag_revalidate_set key true;
-      Queue.add key ws.open_diag_revalidate_updates
-    );
+      Queue.add key ws.open_diag_revalidate_updates);
     Perf_stats.tick "diag.open.revalidate_enqueued";
-    tick_open_diag_revalidate_reason reason
-  )
+    tick_open_diag_revalidate_reason reason)
 
-let enqueue_all_open_diag_revalidate
-    (ws:t)
-    ~(reason:string)
-  : unit =
+let enqueue_all_open_diag_revalidate (ws : t) ~(reason : string) : unit =
   Hashtbl.iter
     (fun uri _ -> enqueue_open_diag_revalidate ws ~uri ~reason)
     ws.docs
 
-let filter_workspace_diags (ws:t) (diags:T.Diagnostic.t list) : T.Diagnostic.t list =
+let filter_workspace_diags (ws : t) (diags : T.Diagnostic.t list) :
+    T.Diagnostic.t list =
   match ws.workspace_diag_mode with
   | WorkspaceDiagsOff -> []
   | WorkspaceDiagsAll -> diags
   | WorkspaceDiagsErrors ->
-      List.filter (fun (d:T.Diagnostic.t) ->
-        match d.severity with
-        | Some T.DiagnosticSeverity.Error -> true
-        | _ -> false
-      ) diags
+      List.filter
+        (fun (d : T.Diagnostic.t) ->
+          match d.severity with
+          | Some T.DiagnosticSeverity.Error -> true
+          | _ -> false)
+        diags
 
-let is_probably_network_path (p:string) : bool =
+let is_probably_network_path (p : string) : bool =
   let n = String.length p in
-  n >= 2
-  && ((p.[0] = '\\' && p.[1] = '\\')
-      || (p.[0] = '/' && p.[1] = '/'))
+  n >= 2 && ((p.[0] = '\\' && p.[1] = '\\') || (p.[0] = '/' && p.[1] = '/'))
 
-let set_root_path (ws:t) (root:string option) : unit =
+let set_root_path (ws : t) (root : string option) : unit =
   if ws.root_path <> root then (
     mark_graph_dirty ws;
     ws.root_path <- root;
@@ -674,20 +641,18 @@ let set_root_path (ws:t) (root:string option) : unit =
     Hashtbl.clear ws.open_diag_revalidate_set;
     while not (Queue.is_empty ws.open_diag_revalidate_updates) do
       ignore (Queue.pop ws.open_diag_revalidate_updates)
-    done
-  )
+    done)
 
-let set_root_uri (ws:t) (root_uri:T.DocumentUri.t option) : unit =
+let set_root_uri (ws : t) (root_uri : T.DocumentUri.t option) : unit =
   set_root_path ws
-    (match root_uri with
-     | None -> None
-     | Some u -> Uri_path.file_path_of_uri u)
+    (match root_uri with None -> None | Some u -> Uri_path.file_path_of_uri u)
 
 let is_import_word_char = function
   | 'A' .. 'Z' | '0' .. '9' | '_' -> true
   | _ -> false
 
-let tokenize_upper_words_prefix ~(max_chars:int) (text:string) : string list =
+let tokenize_upper_words_prefix ~(max_chars : int) (text : string) : string list
+    =
   let n = min (String.length text) (max 0 max_chars) in
   let upper =
     if n = String.length text then String.uppercase_ascii text
@@ -702,52 +667,45 @@ let tokenize_upper_words_prefix ~(max_chars:int) (text:string) : string list =
         incr j
       done;
       out := String.sub upper i (!j - i) :: !out;
-      scan !j
-    ) else
-      scan (i + 1)
+      scan !j)
+    else scan (i + 1)
   in
   scan 0;
   List.rev !out
 
-let quick_imports_from_deferred_doc_text (doc:Document.t) : Preprocess.import list =
+let quick_imports_from_deferred_doc_text (doc : Document.t) :
+    Preprocess.import list =
   let tokens =
-    tokenize_upper_words_prefix
-      ~max_chars:nav_miss_import_scan_max_chars
+    tokenize_upper_words_prefix ~max_chars:nav_miss_import_scan_max_chars
       (Document.text doc)
   in
   let seen = Hashtbl.create 16 in
   let out = ref [] in
   let loc = Ast.Loc.none in
-  let push_name (raw:string) =
+  let push_name (raw : string) =
     let name = normalize_name raw in
     if name <> "" && not (Hashtbl.mem seen name) then (
       Hashtbl.replace seen name true;
-      out :=
-        { Preprocess.kind = Preprocess.Compool; name; loc } :: !out
-    )
+      out := { Preprocess.kind = Preprocess.Compool; name; loc } :: !out)
   in
   let rec collect = function
     | ("COMPOOL" | "ICOMPOOL") :: name :: tl ->
         push_name name;
         collect tl
-    | _ :: tl ->
-        collect tl
-    | [] ->
-        ()
+    | _ :: tl -> collect tl
+    | [] -> ()
   in
   collect tokens;
   List.rev !out
 
-let best_effort_doc_imports_for_scheduling (doc:Document.t) : Preprocess.import list =
+let best_effort_doc_imports_for_scheduling (doc : Document.t) :
+    Preprocess.import list =
   let imports = Document.imports doc in
-  if imports <> [] then
-    imports
-  else if doc.Document.parse_rev = doc.Document.rev then
-    []
-  else
-    quick_imports_from_deferred_doc_text doc
+  if imports <> [] then imports
+  else if doc.Document.parse_rev = doc.Document.rev then []
+  else quick_imports_from_deferred_doc_text doc
 
-let uniq_norm_strings (xs:string list) : string list =
+let uniq_norm_strings (xs : string list) : string list =
   let seen = Hashtbl.create (max 16 (List.length xs)) in
   let out = ref [] in
   List.iter
@@ -755,65 +713,56 @@ let uniq_norm_strings (xs:string list) : string list =
       let k = normalize_name x in
       if k <> "" && not (Hashtbl.mem seen k) then (
         Hashtbl.replace seen k true;
-        out := k :: !out
-      ))
+        out := k :: !out))
     xs;
   List.rev !out
 
-let diagnostics_for (ws:t) ~(uri:T.DocumentUri.t) : T.Diagnostic.t list =
+let diagnostics_for (ws : t) ~(uri : T.DocumentUri.t) : T.Diagnostic.t list =
   match Hashtbl.find_opt ws.docs uri with
   | None -> []
   | Some doc -> Document.diagnostics doc
 
-let ast_dump_for (ws:t) ~(uri:T.DocumentUri.t) : string option =
+let ast_dump_for (ws : t) ~(uri : T.DocumentUri.t) : string option =
   match Hashtbl.find_opt ws.docs uri with
   | None -> None
   | Some doc -> Document.ast_dump doc
 
-let cst_dump_for (ws:t) ~(uri:T.DocumentUri.t) : string option =
+let cst_dump_for (ws : t) ~(uri : T.DocumentUri.t) : string option =
   match Hashtbl.find_opt ws.docs uri with
   | None -> None
   | Some doc ->
       Lexer.with_session_state (fun () ->
-        let lexbuf = Lexing.from_string doc.Document.text in
-        (match doc.Document.file with
-         | None -> ()
-         | Some f ->
-             lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-        let b = Buffer.create 4096 in
-        Buffer.add_string b "CST (token stream)\n";
-        let add_token_row idx tok sp ep lexeme =
-          let line0 = max 1 sp.Lexing.pos_lnum in
-          let line1 = max 1 ep.Lexing.pos_lnum in
-          let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
-          let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
-          let tok_s = Parse.Debug.string_of_token tok in
-          let lex = String.escaped lexeme in
-          Buffer.add_string b
-            (Printf.sprintf
-               "%5d  %-14s %-28s @ %d:%d-%d:%d\n"
-               idx
-               tok_s
-               ("\"" ^ lex ^ "\"")
-               line0
-               col0
-               line1
-               col1)
-        in
-        let rec loop idx =
-          let tok = Lexer.token lexbuf in
-          let sp = Lexing.lexeme_start_p lexbuf in
-          let ep = Lexing.lexeme_end_p lexbuf in
-          let lexeme = Lexing.lexeme lexbuf in
-          add_token_row idx tok sp ep lexeme;
-          match tok with
-          | Parser.EOF -> ()
-          | _ -> loop (idx + 1)
-        in
-        (try loop 1 with exn ->
-           Buffer.add_string b
-             (Printf.sprintf
-                "\n<tokenization stopped: %s>\n"
-                (Printexc.to_string exn)));
-        Some (Buffer.contents b)
-      )
+          let lexbuf = Lexing.from_string doc.Document.text in
+          (match doc.Document.file with
+          | None -> ()
+          | Some f ->
+              lexbuf.lex_curr_p <-
+                { lexbuf.lex_curr_p with Lexing.pos_fname = f });
+          let b = Buffer.create 4096 in
+          Buffer.add_string b "CST (token stream)\n";
+          let add_token_row idx tok sp ep lexeme =
+            let line0 = max 1 sp.Lexing.pos_lnum in
+            let line1 = max 1 ep.Lexing.pos_lnum in
+            let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
+            let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
+            let tok_s = Parse.Debug.string_of_token tok in
+            let lex = String.escaped lexeme in
+            Buffer.add_string b
+              (Printf.sprintf "%5d  %-14s %-28s @ %d:%d-%d:%d\n" idx tok_s
+                 ("\"" ^ lex ^ "\"")
+                 line0 col0 line1 col1)
+          in
+          let rec loop idx =
+            let tok = Lexer.token lexbuf in
+            let sp = Lexing.lexeme_start_p lexbuf in
+            let ep = Lexing.lexeme_end_p lexbuf in
+            let lexeme = Lexing.lexeme lexbuf in
+            add_token_row idx tok sp ep lexeme;
+            match tok with Parser.EOF -> () | _ -> loop (idx + 1)
+          in
+          (try loop 1
+           with exn ->
+             Buffer.add_string b
+               (Printf.sprintf "\n<tokenization stopped: %s>\n"
+                  (Printexc.to_string exn)));
+          Some (Buffer.contents b))

@@ -39,7 +39,8 @@ let empty_client_overrides : client_overrides =
 let from_env () : t =
   {
     sem_refresh_every_didchange =
-      max 1 (Env_utils.nonneg_int "JOVIAL_SEM_REFRESH_EVERY_DIDCHANGE" ~default:8);
+      max 1
+        (Env_utils.nonneg_int "JOVIAL_SEM_REFRESH_EVERY_DIDCHANGE" ~default:8);
     bg_tick_budget_ms =
       max 1 (Env_utils.nonneg_int "JOVIAL_BG_TICK_BUDGET_MS" ~default:8);
     bg_diag_batch_size =
@@ -51,25 +52,27 @@ let from_env () : t =
     diag_min_fair_tick_ms =
       max 0 (Env_utils.nonneg_int "JOVIAL_DIAG_MIN_FAIR_TICK_MS" ~default:1);
     bg_large_parse_idle_quiet_ms =
-      max 0 (Env_utils.nonneg_int "JOVIAL_BG_LARGE_PARSE_IDLE_QUIET_MS" ~default:150);
+      max 0
+        (Env_utils.nonneg_int "JOVIAL_BG_LARGE_PARSE_IDLE_QUIET_MS" ~default:150);
     open_diag_revalidate_batch_size =
       max 1
-        (Env_utils.nonneg_int "JOVIAL_OPEN_DIAG_REVALIDATE_BATCH_SIZE" ~default:8);
+        (Env_utils.nonneg_int "JOVIAL_OPEN_DIAG_REVALIDATE_BATCH_SIZE"
+           ~default:8);
     watch_coalesce_ttl_ms =
       max 0 (Env_utils.nonneg_int "JOVIAL_WATCH_COALESCE_TTL_MS" ~default:250);
     inbox_max_items =
       max 16 (Env_utils.nonneg_int "JOVIAL_INBOX_MAX_ITEMS" ~default:2048);
   }
 
-let apply_client_overrides (settings:t) (overrides:client_overrides) : t =
+let apply_client_overrides (settings : t) (overrides : client_overrides) : t =
   {
     settings with
     bg_tick_budget_ms =
       (match overrides.bg_tick_budget_ms with
-       | Some n -> max 1 n
-       | None -> settings.bg_tick_budget_ms);
+      | Some n -> max 1 n
+      | None -> settings.bg_tick_budget_ms);
     bg_diag_batch_size =
       (match overrides.bg_diag_batch_size with
-       | Some n -> max 1 n
-       | None -> settings.bg_diag_batch_size);
+      | Some n -> max 1 n
+      | None -> settings.bg_diag_batch_size);
   }

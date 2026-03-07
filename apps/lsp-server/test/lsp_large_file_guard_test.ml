@@ -3,49 +3,49 @@ module T = Lsp.Types
 
 let failf fmt = Printf.ksprintf failwith fmt
 
-let getenv_int (name:string) ~(default:int) : int =
+let getenv_int (name : string) ~(default : int) : int =
   match Sys.getenv_opt name with
   | None -> default
-  | Some raw ->
-      (try int_of_string (String.trim raw) with _ -> default)
+  | Some raw -> ( try int_of_string (String.trim raw) with _ -> default)
 
-let uri_of_path (path:string) : T.DocumentUri.t =
+let uri_of_path (path : string) : T.DocumentUri.t =
   match Lib.Uri_path.docuri_of_path path with
   | Some u -> u
   | None -> failf "failed to convert path to uri: %s" path
 
-let has_guard_diag (diags:T.Diagnostic.t list) : bool =
-  List.exists (fun (d:T.Diagnostic.t) ->
-    let msg =
-      match d.message with
-      | `String s -> String.lowercase_ascii s
-      | `MarkupContent mc ->
-          String.lowercase_ascii
-            (match mc.value with
-             | s -> s)
-    in
-    let contains needle =
-      let n = String.length msg in
-      let m = String.length needle in
-      let rec loop i =
-        if i + m > n then false
-        else if String.sub msg i m = needle then true
-        else loop (i + 1)
+let has_guard_diag (diags : T.Diagnostic.t list) : bool =
+  List.exists
+    (fun (d : T.Diagnostic.t) ->
+      let msg =
+        match d.message with
+        | `String s -> String.lowercase_ascii s
+        | `MarkupContent mc ->
+            String.lowercase_ascii (match mc.value with s -> s)
       in
-      if m = 0 then true else loop 0
-    in
-    contains "parse skipped" || contains "exceeds guard"
-  ) diags
+      let contains needle =
+        let n = String.length msg in
+        let m = String.length needle in
+        let rec loop i =
+          if i + m > n then false
+          else if String.sub msg i m = needle then true
+          else loop (i + 1)
+        in
+        if m = 0 then true else loop 0
+      in
+      contains "parse skipped" || contains "exceeds guard")
+    diags
 
 let () =
   Random.self_init ();
   let hard_timeout_s =
-    float_of_int (max 1 (getenv_int "JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S" ~default:300))
+    float_of_int
+      (max 1 (getenv_int "JOVIAL_TEST_INDEXING_HARD_TIMEOUT_S" ~default:300))
   in
   let started = Unix.gettimeofday () in
-  let ensure_budget (phase:string) : unit =
+  let ensure_budget (phase : string) : unit =
     if hard_timeout_s -. (Unix.gettimeofday () -. started) <= 0.0 then
-      failf "large-file guard test exceeded hard timeout (%.1fs) at %s" hard_timeout_s phase
+      failf "large-file guard test exceeded hard timeout (%.1fs) at %s"
+        hard_timeout_s phase
   in
 
   ensure_budget "before setup";

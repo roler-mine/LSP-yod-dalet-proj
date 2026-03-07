@@ -1,9 +1,7 @@
 module T = Lsp.Types
 
 let get_assoc (j : Yojson.Safe.t) : (string * Yojson.Safe.t) list option =
-  match j with
-  | `Assoc xs -> Some xs
-  | _ -> None
+  match j with `Assoc xs -> Some xs | _ -> None
 
 let find_field (k : string) (xs : (string * Yojson.Safe.t) list) =
   List.assoc_opt k xs
@@ -11,193 +9,182 @@ let find_field (k : string) (xs : (string * Yojson.Safe.t) list) =
 let method_of_msg (j : Yojson.Safe.t) : string option =
   match get_assoc j with
   | None -> None
-  | Some xs ->
-      (match find_field "method" xs with
-       | Some (`String m) -> Some m
-       | _ -> None)
+  | Some xs -> (
+      match find_field "method" xs with Some (`String m) -> Some m | _ -> None)
 
 let id_of_msg (j : Yojson.Safe.t) : Yojson.Safe.t option =
-  match get_assoc j with
-  | None -> None
-  | Some xs -> find_field "id" xs
+  match get_assoc j with None -> None | Some xs -> find_field "id" xs
 
 let params_of_msg (j : Yojson.Safe.t) : Yojson.Safe.t =
   match get_assoc j with
   | None -> `Null
-  | Some xs -> (match find_field "params" xs with Some p -> p | None -> `Null)
+  | Some xs -> (
+      match find_field "params" xs with Some p -> p | None -> `Null)
 
 let is_request (j : Yojson.Safe.t) : bool =
   match id_of_msg j with Some _ -> true | None -> false
 
-let parse_uri_arg (arg:Yojson.Safe.t) : T.DocumentUri.t option =
+let parse_uri_arg (arg : Yojson.Safe.t) : T.DocumentUri.t option =
   match arg with
-  | `String s ->
-      Uri_path.docuri_of_string s
-  | `Assoc xs ->
-      (match List.assoc_opt "uri" xs with
-       | Some (`String s) -> Uri_path.docuri_of_string s
-       | _ -> None)
+  | `String s -> Uri_path.docuri_of_string s
+  | `Assoc xs -> (
+      match List.assoc_opt "uri" xs with
+      | Some (`String s) -> Uri_path.docuri_of_string s
+      | _ -> None)
   | _ -> None
 
-let parse_int_arg (arg:Yojson.Safe.t) : int option =
+let parse_int_arg (arg : Yojson.Safe.t) : int option =
   match arg with
   | `Int n -> Some n
-  | `Intlit s -> (try Some (int_of_string s) with _ -> None)
+  | `Intlit s -> ( try Some (int_of_string s) with _ -> None)
   | _ -> None
 
-let parse_text_document_uri (params:Yojson.Safe.t) : T.DocumentUri.t option =
+let parse_text_document_uri (params : Yojson.Safe.t) : T.DocumentUri.t option =
   match get_assoc params with
   | None -> None
-  | Some xs ->
-      (match find_field "textDocument" xs with
-       | Some (`Assoc tdxs) ->
-           (match find_field "uri" tdxs with
-            | Some (`String s) -> Uri_path.docuri_of_string s
-            | _ -> None)
-       | _ -> None)
+  | Some xs -> (
+      match find_field "textDocument" xs with
+      | Some (`Assoc tdxs) -> (
+          match find_field "uri" tdxs with
+          | Some (`String s) -> Uri_path.docuri_of_string s
+          | _ -> None)
+      | _ -> None)
 
-let parse_position (params:Yojson.Safe.t) : T.Position.t option =
+let parse_position (params : Yojson.Safe.t) : T.Position.t option =
   let int_field key xs =
     match find_field key xs with
     | Some (`Int n) -> Some n
-    | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
     | _ -> None
   in
   match get_assoc params with
   | None -> None
-  | Some xs ->
-      (match find_field "position" xs with
-       | Some (`Assoc pxs) ->
-           (match int_field "line" pxs, int_field "character" pxs with
-            | Some line, Some character -> Some { T.Position.line; character }
-            | _ -> None)
-       | _ -> None)
+  | Some xs -> (
+      match find_field "position" xs with
+      | Some (`Assoc pxs) -> (
+          match (int_field "line" pxs, int_field "character" pxs) with
+          | Some line, Some character -> Some { T.Position.line; character }
+          | _ -> None)
+      | _ -> None)
 
-let parse_position_obj (j:Yojson.Safe.t) : T.Position.t option =
+let parse_position_obj (j : Yojson.Safe.t) : T.Position.t option =
   let int_field key xs =
     match find_field key xs with
     | Some (`Int n) -> Some n
-    | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
     | _ -> None
   in
   match get_assoc j with
   | None -> None
-  | Some xs ->
-      (match int_field "line" xs, int_field "character" xs with
-       | Some line, Some character -> Some { T.Position.line; character }
-       | _ -> None)
+  | Some xs -> (
+      match (int_field "line" xs, int_field "character" xs) with
+      | Some line, Some character -> Some { T.Position.line; character }
+      | _ -> None)
 
-let parse_range (params:Yojson.Safe.t) : T.Range.t option =
+let parse_range (params : Yojson.Safe.t) : T.Range.t option =
   match get_assoc params with
   | None -> None
-  | Some xs ->
-      (match find_field "range" xs with
-       | Some (`Assoc rxs) ->
-           (match find_field "start" rxs, find_field "end" rxs with
-            | Some s, Some e ->
-                (match parse_position_obj s, parse_position_obj e with
-                 | Some start, Some end_ -> Some { T.Range.start; end_ }
-                 | _ -> None)
-            | _ -> None)
-       | _ -> None)
+  | Some xs -> (
+      match find_field "range" xs with
+      | Some (`Assoc rxs) -> (
+          match (find_field "start" rxs, find_field "end" rxs) with
+          | Some s, Some e -> (
+              match (parse_position_obj s, parse_position_obj e) with
+              | Some start, Some end_ -> Some { T.Range.start; end_ }
+              | _ -> None)
+          | _ -> None)
+      | _ -> None)
 
-let parse_new_name (params:Yojson.Safe.t) : string option =
+let parse_new_name (params : Yojson.Safe.t) : string option =
   match get_assoc params with
   | None -> None
-  | Some xs ->
-      (match find_field "newName" xs with
-       | Some (`String s) -> Some s
-       | _ -> None)
+  | Some xs -> (
+      match find_field "newName" xs with
+      | Some (`String s) -> Some s
+      | _ -> None)
 
-let parse_include_declaration (params:Yojson.Safe.t) : bool =
+let parse_include_declaration (params : Yojson.Safe.t) : bool =
   match get_assoc params with
   | None -> true
-  | Some xs ->
-      (match find_field "context" xs with
-       | Some (`Assoc cxs) ->
-           (match find_field "includeDeclaration" cxs with
-            | Some (`Bool b) -> b
-            | _ -> true)
-       | _ -> true)
+  | Some xs -> (
+      match find_field "context" xs with
+      | Some (`Assoc cxs) -> (
+          match find_field "includeDeclaration" cxs with
+          | Some (`Bool b) -> b
+          | _ -> true)
+      | _ -> true)
 
-let parse_workspace_symbol_query (params:Yojson.Safe.t) : string =
+let parse_workspace_symbol_query (params : Yojson.Safe.t) : string =
   match get_assoc params with
   | None -> ""
-  | Some xs ->
-      (match find_field "query" xs with
-       | Some (`String s) -> s
-       | _ -> "")
+  | Some xs -> (
+      match find_field "query" xs with Some (`String s) -> s | _ -> "")
 
-let parse_cancel_request_id (params:Yojson.Safe.t) : Yojson.Safe.t option =
+let parse_cancel_request_id (params : Yojson.Safe.t) : Yojson.Safe.t option =
+  match get_assoc params with None -> None | Some xs -> find_field "id" xs
+
+let parse_root_uri (params : Yojson.Safe.t) : T.DocumentUri.t option =
   match get_assoc params with
   | None -> None
-  | Some xs -> find_field "id" xs
+  | Some xs -> (
+      match find_field "rootUri" xs with
+      | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
+      | _ -> (
+          match find_field "workspaceFolders" xs with
+          | Some (`List (`Assoc f0 :: _)) -> (
+              match find_field "uri" f0 with
+              | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
+              | _ -> None)
+          | _ -> None))
 
-let parse_root_uri (params:Yojson.Safe.t) : T.DocumentUri.t option =
-  match get_assoc params with
-  | None -> None
-  | Some xs ->
-      (match find_field "rootUri" xs with
-       | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
-       | _ ->
-           (match find_field "workspaceFolders" xs with
-            | Some (`List ((`Assoc f0) :: _)) ->
-                (match find_field "uri" f0 with
-                 | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
-                 | _ -> None)
-            | _ -> None))
-
-let parse_workspace_folder_roots (params:Yojson.Safe.t) : T.DocumentUri.t list =
+let parse_workspace_folder_roots (params : Yojson.Safe.t) : T.DocumentUri.t list
+    =
   match get_assoc params with
   | None -> []
-  | Some xs ->
-      (match find_field "workspaceFolders" xs with
-       | Some (`List folders) ->
-           folders
-           |> List.filter_map (function
-                | `Assoc fxs ->
-                    (match find_field "uri" fxs with
-                     | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
-                     | _ -> None)
+  | Some xs -> (
+      match find_field "workspaceFolders" xs with
+      | Some (`List folders) ->
+          folders
+          |> List.filter_map (function
+            | `Assoc fxs -> (
+                match find_field "uri" fxs with
+                | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
                 | _ -> None)
-       | _ -> [])
+            | _ -> None)
+      | _ -> [])
 
-let parse_root_uris (params:Yojson.Safe.t) : T.DocumentUri.t list =
+let parse_root_uris (params : Yojson.Safe.t) : T.DocumentUri.t list =
   let roots = parse_workspace_folder_roots params in
   if roots <> [] then roots
-  else
-    match parse_root_uri params with
-    | Some u -> [ u ]
-    | None -> []
+  else match parse_root_uri params with Some u -> [ u ] | None -> []
 
-let parse_root_path (params:Yojson.Safe.t) : string option =
+let parse_root_path (params : Yojson.Safe.t) : string option =
   match get_assoc params with
   | None -> None
-  | Some xs ->
-      (match find_field "rootPath" xs with
-       | Some (`String s) when s <> "" -> Some s
-       | _ -> None)
+  | Some xs -> (
+      match find_field "rootPath" xs with
+      | Some (`String s) when s <> "" -> Some s
+      | _ -> None)
 
-let parse_semantic_tokens_refresh_support (params:Yojson.Safe.t) : bool =
+let parse_semantic_tokens_refresh_support (params : Yojson.Safe.t) : bool =
   match get_assoc params with
   | None -> false
-  | Some xs ->
-      (match find_field "capabilities" xs with
-       | Some (`Assoc cxs) ->
-           (match find_field "workspace" cxs with
-            | Some (`Assoc wxs) ->
-                (match find_field "semanticTokens" wxs with
-                 | Some (`Assoc stxs) ->
-                     (match find_field "refreshSupport" stxs with
-                      | Some (`Bool b) -> b
-                      | _ -> false)
-                 | _ -> false)
-            | _ -> false)
-       | _ -> false)
+  | Some xs -> (
+      match find_field "capabilities" xs with
+      | Some (`Assoc cxs) -> (
+          match find_field "workspace" cxs with
+          | Some (`Assoc wxs) -> (
+              match find_field "semanticTokens" wxs with
+              | Some (`Assoc stxs) -> (
+                  match find_field "refreshSupport" stxs with
+                  | Some (`Bool b) -> b
+                  | _ -> false)
+              | _ -> false)
+          | _ -> false)
+      | _ -> false)
 
-let parse_watched_file_changes
-    (params:Yojson.Safe.t)
-    : bool * int * (string * [ `Created | `Changed | `Deleted ]) list =
+let parse_watched_file_changes (params : Yojson.Safe.t) :
+    bool * int * (string * [ `Created | `Changed | `Deleted ]) list =
   let parse_kind = function
     | `Int 1 | `Intlit "1" -> Some `Created
     | `Int 2 | `Intlit "2" -> Some `Changed
@@ -206,77 +193,75 @@ let parse_watched_file_changes
   in
   match get_assoc params with
   | None -> (false, 0, [])
-  | Some xs ->
-      (match find_field "changes" xs with
-       | Some (`List changes) ->
-           let parsed =
-             changes
-             |> List.filter_map (function
-                  | `Assoc cxs ->
-                      (match find_field "uri" cxs, find_field "type" cxs with
-                       | Some (`String u), Some kind_json ->
-                           (match Uri_path.docuri_of_string u, parse_kind kind_json with
-                            | Some uri, Some kind ->
-                                (match Uri_path.file_path_of_uri uri with
-                                 | Some path -> Some (path, kind)
-                                 | None -> None)
-                            | _ -> None)
-                       | _ -> None)
+  | Some xs -> (
+      match find_field "changes" xs with
+      | Some (`List changes) ->
+          let parsed =
+            changes
+            |> List.filter_map (function
+              | `Assoc cxs -> (
+                  match (find_field "uri" cxs, find_field "type" cxs) with
+                  | Some (`String u), Some kind_json -> (
+                      match
+                        (Uri_path.docuri_of_string u, parse_kind kind_json)
+                      with
+                      | Some uri, Some kind -> (
+                          match Uri_path.file_path_of_uri uri with
+                          | Some path -> Some (path, kind)
+                          | None -> None)
+                      | _ -> None)
                   | _ -> None)
-           in
-           (true, List.length changes, parsed)
-       | _ -> (false, 0, []))
+              | _ -> None)
+          in
+          (true, List.length changes, parsed)
+      | _ -> (false, 0, []))
 
-let assoc_field (name:string) (json:Yojson.Safe.t) : Yojson.Safe.t option =
-  match get_assoc json with
-  | None -> None
-  | Some xs -> find_field name xs
+let assoc_field (name : string) (json : Yojson.Safe.t) : Yojson.Safe.t option =
+  match get_assoc json with None -> None | Some xs -> find_field name xs
 
-let parse_client_overrides (params:Yojson.Safe.t) : Lsp_runtime_settings.client_overrides =
+let parse_client_overrides (params : Yojson.Safe.t) :
+    Lsp_runtime_settings.client_overrides =
   let open Lsp_runtime_settings in
-  let int_field (json:Yojson.Safe.t option) : int option =
+  let int_field (json : Yojson.Safe.t option) : int option =
     match json with
     | Some (`Int n) -> Some n
-    | Some (`Intlit s) -> (try Some (int_of_string s) with _ -> None)
+    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
     | _ -> None
   in
   let jovial =
-    assoc_field "initializationOptions" params
-    |> fun value -> Option.bind value (assoc_field "jovial")
+    assoc_field "initializationOptions" params |> fun value ->
+    Option.bind value (assoc_field "jovial")
   in
   let workspace = Option.bind jovial (assoc_field "workspace") in
   let background = Option.bind jovial (assoc_field "background") in
   let server = Option.bind jovial (assoc_field "server") in
   let workspace_diag_mode =
-    Option.bind workspace (assoc_field "diagnosticsMode")
-    |> function
-      | Some (`String raw) -> Workspace_settings.workspace_diag_mode_of_string raw
-      | _ -> None
+    Option.bind workspace (assoc_field "diagnosticsMode") |> function
+    | Some (`String raw) -> Workspace_settings.workspace_diag_mode_of_string raw
+    | _ -> None
   in
   let workspace_profile_mode =
-    Option.bind workspace (assoc_field "profileMode")
-    |> function
-      | Some (`String raw) -> Workspace_settings.workspace_profile_mode_of_string raw
-      | _ -> None
+    Option.bind workspace (assoc_field "profileMode") |> function
+    | Some (`String raw) ->
+        Workspace_settings.workspace_profile_mode_of_string raw
+    | _ -> None
   in
   let root_model =
-    Option.bind workspace (assoc_field "rootModel")
-    |> function
-      | Some (`String raw) -> Workspace_settings.root_model_of_string raw
-      | _ -> None
+    Option.bind workspace (assoc_field "rootModel") |> function
+    | Some (`String raw) -> Workspace_settings.root_model_of_string raw
+    | _ -> None
   in
   let root_manual_files =
-    Option.bind workspace (assoc_field "manualRootFiles")
-    |> function
-      | Some (`List xs) ->
-          Some
-            (xs
-             |> List.filter_map (function
-                  | `String s ->
-                      let trimmed = String.trim s in
-                      if trimmed = "" then None else Some trimmed
-                  | _ -> None))
-      | _ -> None
+    Option.bind workspace (assoc_field "manualRootFiles") |> function
+    | Some (`List xs) ->
+        Some
+          (xs
+          |> List.filter_map (function
+            | `String s ->
+                let trimmed = String.trim s in
+                if trimmed = "" then None else Some trimmed
+            | _ -> None))
+    | _ -> None
   in
   {
     workspace_diag_mode;
