@@ -2,6 +2,13 @@
 
 This folder is organized by server responsibility.
 
+## `config/` - Runtime Settings
+
+- `env_utils.*`: shared environment parsing helpers
+- `workspace_settings.*`: typed workspace configuration and client override application
+- `workspace_tuning.*`: global workspace heuristic/tuning values
+- `lsp_runtime_settings.*`: server-loop settings and initialize-time overrides
+
 ## `syntax/` - Language Front-End
 
 - `ast.*`: core JOVIAL AST and location types
@@ -21,4 +28,5 @@ This folder is organized by server responsibility.
 
 - `lsp_io.*`: JSON-RPC message framing
 - `lsp_conv.*`: AST/location to LSP conversion helpers
+- `lsp_request.*`: request/parameter parsing and initialize-option decoding
 - `lsp_server.*`: request routing and feature handlers

@@ -1,6 +1,13 @@
 module T = Lsp.Types
 open Ast
-open Workspace_base
+open Workspace_state
+open Workspace_runtime
+open Workspace_index_graph
+open Workspace_imports
+open Workspace_background
+open Workspace_nav_model
+open Workspace_nav_lookup
+open Workspace_tuning
 
 type semantic_token = {
   st_line : int;
@@ -1108,3 +1115,70 @@ let lsif_delta_json (ws:t) ~(base_revision:int) : Yojson.Safe.t =
     in
     Lsif_delta.update_full ws.lsif_delta_state ~revision ~symbols:symbols_table;
     Lsif_delta.delta_json delta
+
+let semantic_tokens_data_of_tokens (tokens:semantic_token list) : int array =
+  let data_rev = ref [] in
+  let prev_line = ref 0 in
+  let prev_start = ref 0 in
+  let first = ref true in
+  List.iter (fun t ->
+    let delta_line, delta_start =
+      if !first then
+        (t.st_line, t.st_start)
+      else if t.st_line = !prev_line then
+        (0, t.st_start - !prev_start)
+      else
+        (t.st_line - !prev_line, t.st_start)
+    in
+    data_rev :=
+      t.st_mods :: t.st_typ :: t.st_len :: delta_start :: delta_line :: !data_rev;
+    first := false;
+    prev_line := t.st_line;
+    prev_start := t.st_start
+  ) tokens;
+  Array.of_list (List.rev !data_rev)
+
+let semantic_tokens_for
+    (ws:t)
+    ~(uri:T.DocumentUri.t)
+    ~(range:T.Range.t option)
+  : T.SemanticTokens.t option =
+  match doc_of_uri ws uri with
+  | None -> None
+  | Some doc ->
+      let data =
+        semantic_tokens_for_doc ws doc ~range
+        |> semantic_tokens_data_of_tokens
+      in
+      let resultId = Some Digest.(to_hex (string doc.Document.text)) in
+      Some (T.SemanticTokens.create ~data ?resultId ())
+
+let semantic_tokens_full_for (ws:t) ~(uri:T.DocumentUri.t) : T.SemanticTokens.t option =
+  semantic_tokens_for ws ~uri ~range:None
+
+let semantic_tokens_range_for (ws:t) ~(uri:T.DocumentUri.t) ~(range:T.Range.t)
+  : T.SemanticTokens.t option =
+  semantic_tokens_for ws ~uri ~range:(Some range)
+
+let rec document_symbol_t_of_doc_symbol (s:doc_symbol) : T.DocumentSymbol.t =
+  T.DocumentSymbol.create
+    ~name:s.ds_name
+    ~kind:(symbol_kind_of_def_kind s.ds_kind)
+    ~range:(Lsp_conv.range_of_loc s.ds_range)
+    ~selectionRange:(Lsp_conv.range_of_loc s.ds_selection)
+    ?detail:s.ds_detail
+    ~children:(List.map document_symbol_t_of_doc_symbol s.ds_children)
+    ()
+
+let document_symbols_for (ws:t) ~(uri:T.DocumentUri.t)
+  : [ `DocumentSymbol of T.DocumentSymbol.t | `SymbolInformation of T.SymbolInformation.t ] list =
+  match doc_of_uri ws uri with
+  | None -> []
+  | Some doc ->
+      let from_ast = document_symbols_from_ast doc in
+      if from_ast <> [] then
+        List.map (fun symbol -> `DocumentSymbol (document_symbol_t_of_doc_symbol symbol)) from_ast
+      else
+        collect_doc_defs doc
+        |> uniq_defs
+        |> List.map (fun d -> `SymbolInformation (symbol_info_of_def d))

@@ -30,6 +30,7 @@ Desktop.ini
 **/node_modules/
 *.tsbuildinfo
 apps/vscode-extension/out/
+apps/vscode-extension/out-test/
 apps/vscode-extension/.eslintcache
 apps/vscode-extension/*.vsix
 apps/vscode-extension/runtime/server/**/*.exe

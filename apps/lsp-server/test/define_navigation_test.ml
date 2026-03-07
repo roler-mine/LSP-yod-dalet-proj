@@ -30,37 +30,16 @@ let position_of_offset (s:string) (off:int) : T.Position.t =
   in
   loop 0 0 0
 
-let json_assoc_find (k:string) (fields:(string * Yojson.Safe.t) list) : Yojson.Safe.t =
-  match List.assoc_opt k fields with
-  | Some v -> v
-  | None -> failf "missing JSON key %S" k
+let line_of_first_definition_location (locations:T.Location.t list) : int =
+  match locations with
+  | loc :: _ -> loc.range.start.line
+  | [] -> failf "expected at least one definition location"
 
-let line_of_first_definition_location (j:Yojson.Safe.t) : int =
-  match j with
-  | `List (`Assoc fields :: _) ->
-      (match json_assoc_find "range" fields with
-       | `Assoc rf ->
-           (match json_assoc_find "start" rf with
-            | `Assoc sf ->
-                (match json_assoc_find "line" sf with
-                 | `Int line -> line
-                 | _ -> failf "unexpected JSON type for range.start.line")
-            | _ -> failf "unexpected JSON type for range.start")
-       | _ -> failf "unexpected JSON type for range")
-  | _ ->
-      failf "unexpected definition JSON shape"
-
-let hover_markdown_value (j:Yojson.Safe.t) : string =
-  match j with
-  | `Assoc fields ->
-      (match json_assoc_find "contents" fields with
-       | `Assoc c ->
-           (match json_assoc_find "value" c with
-            | `String s -> s
-            | _ -> failf "unexpected JSON type for contents.value")
-       | _ -> failf "unexpected JSON type for contents")
-  | _ ->
-      failf "unexpected hover JSON shape"
+let hover_markdown_value (hover:T.Hover.t option) : string =
+  match hover with
+  | None -> failf "expected hover payload"
+  | Some { contents = `MarkupContent mc; _ } -> mc.value
+  | Some _ -> failf "unexpected hover payload shape"
 
 let expect_eq_int ~(name:string) ~(got:int) ~(want:int) : unit =
   if got <> want then failf "%s: expected %d, got %d" name want got
@@ -113,9 +92,9 @@ let () =
     |> fun off -> position_of_offset source_text (off + 1)
   in
 
-  let def_obj = Lib.Workspace.definition_json_for ws ~uri ~pos:pos_usage_obj in
-  let def_call = Lib.Workspace.definition_json_for ws ~uri ~pos:pos_usage_call in
-  let def_injected = Lib.Workspace.definition_json_for ws ~uri ~pos:pos_usage_injected in
+  let def_obj = Lib.Workspace.definition_locations_for ws ~uri ~pos:pos_usage_obj in
+  let def_call = Lib.Workspace.definition_locations_for ws ~uri ~pos:pos_usage_call in
+  let def_injected = Lib.Workspace.definition_locations_for ws ~uri ~pos:pos_usage_injected in
 
   expect_eq_int
     ~name:"goto object-like DEFINE"
@@ -130,7 +109,7 @@ let () =
     ~got:(line_of_first_definition_location def_injected)
     ~want:def_line_obj;
 
-  let hover_injected = Lib.Workspace.hover_json_for ws ~uri ~pos:pos_usage_injected in
+  let hover_injected = Lib.Workspace.hover_for ws ~uri ~pos:pos_usage_injected in
   let hover_text = hover_markdown_value hover_injected in
   expect_contains ~name:"hover define title" ~haystack:hover_text ~needle:"define `TWELVE`";
   expect_contains ~name:"hover define expansion" ~haystack:hover_text ~needle:"Expands to: `12`";

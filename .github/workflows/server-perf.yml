@@ -1,0 +1,30 @@
+name: Server Perf
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  server-perf:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/lsp-server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.1.1
+
+      - name: Install server dependencies
+        run: opam install . --deps-only --with-test -y
+
+      - name: Run server perf suite
+        run: opam exec -- dune build @runtest-perf

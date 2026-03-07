@@ -30,25 +30,10 @@ let position_of_offset (s:string) (off:int) : T.Position.t =
   in
   loop 0 0 0
 
-let json_assoc_find (k:string) (fields:(string * Yojson.Safe.t) list) : Yojson.Safe.t =
-  match List.assoc_opt k fields with
-  | Some v -> v
-  | None -> failf "missing JSON key %S" k
-
-let line_of_first_definition_location (j:Yojson.Safe.t) : int =
-  match j with
-  | `List (`Assoc fields :: _) ->
-      (match json_assoc_find "range" fields with
-       | `Assoc rf ->
-           (match json_assoc_find "start" rf with
-            | `Assoc sf ->
-                (match json_assoc_find "line" sf with
-                 | `Int line -> line
-                 | _ -> failf "unexpected JSON type for range.start.line")
-            | _ -> failf "unexpected JSON type for range.start")
-       | _ -> failf "unexpected JSON type for range")
-  | _ ->
-      failf "unexpected definition JSON shape"
+let line_of_first_definition_location (locations:T.Location.t list) : int =
+  match locations with
+  | loc :: _ -> loc.range.start.line
+  | [] -> failf "expected at least one definition location"
 
 let expect_eq_int ~(name:string) ~(got:int) ~(want:int) : unit =
   if got <> want then failf "%s: expected %d, got %d" name want got
@@ -85,8 +70,8 @@ let () =
     |> fun off -> position_of_offset source_text (off + 1)
   in
 
-  let def_inp = Lib.Workspace.definition_json_for ws ~uri ~pos:pos_inp_usage_in_bar in
-  let def_v = Lib.Workspace.definition_json_for ws ~uri ~pos:pos_v_usage_in_bar in
+  let def_inp = Lib.Workspace.definition_locations_for ws ~uri ~pos:pos_inp_usage_in_bar in
+  let def_v = Lib.Workspace.definition_locations_for ws ~uri ~pos:pos_v_usage_in_bar in
 
   expect_eq_int
     ~name:"BAR input parameter resolves in BAR scope"

@@ -123,6 +123,53 @@
           "minimum": 1,
           "description": "Maximum number of background diagnostic updates published per idle batch."
         },
+        "jovial.workspace.profileMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "small",
+            "medium",
+            "large"
+          ],
+          "description": "Workspace sizing profile used by the server when choosing indexing and scheduling defaults."
+        },
+        "jovial.workspace.rootModel": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "heuristic",
+            "manual"
+          ],
+          "description": "How the server chooses workspace roots for background indexing."
+        },
+        "jovial.workspace.manualRootFiles": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Manual root files used when jovial.workspace.rootModel is set to manual."
+        },
+        "jovial.server.parseMaxFileBytes": {
+          "type": "number",
+          "default": 16777216,
+          "minimum": 1,
+          "description": "Maximum file size the server will parse fully before applying file-size guards."
+        },
+        "jovial.server.pressureSoftMb": {
+          "type": "number",
+          "default": 512,
+          "minimum": 64,
+          "description": "Soft memory pressure threshold in MB for server background work."
+        },
+        "jovial.server.pressureCriticalMb": {
+          "type": "number",
+          "default": 768,
+          "minimum": 64,
+          "description": "Critical memory pressure threshold in MB for server background work."
+        },
         "jovial.autostart": {
           "type": "boolean",
           "default": true,
@@ -137,7 +184,14 @@
     "build:server:win-arm64": "node ../../tools/scripts/build-server.js --target win32-arm64 --out runtime/server/win32-arm64/jovial-lsp.exe",
     "verify:runtime": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64",
     "verify:runtime:host": "node ../../tools/scripts/verify-runtime-binaries.js --targets host",
+    "check": "tsc -p . --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint src test --ext .ts",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"test/fixtures/**/*.js\" \"*.json\" \"*.mjs\"",
     "compile": "tsc -p .",
+    "compile:test": "tsc -p tsconfig.test.json",
+    "test:unit": "npm run compile:test && node out-test/test/run_unit_tests.js",
+    "test:integration": "npm run compile && npm run compile:test && node out-test/test/run_integration_tests.js",
+    "test": "npm run test:unit && npm run test:integration",
     "watch": "tsc -p . -w",
     "vscode:prepublish": "npm run compile",
     "package:vsix:dev": "npm run build:server:host && npx @vscode/vsce package",
@@ -151,6 +205,12 @@
   "devDependencies": {
     "@types/node": "^20.19.35",
     "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^10.0.3",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.1",
     "typescript": "^5.0.0"
   }
 }

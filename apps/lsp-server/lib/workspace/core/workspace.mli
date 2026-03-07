@@ -6,7 +6,7 @@ type bg_tick_mode =
   | BgTickInteractive
   | BgTickIdle
 
-val create : unit -> t
+val create : ?settings:Workspace_settings.t -> unit -> t
 
 val set_root_uri : t -> T.DocumentUri.t option -> unit
 val set_root_path : t -> string option -> unit
@@ -43,22 +43,35 @@ val diagnostics_for : t -> uri:T.DocumentUri.t -> T.Diagnostic.t list
 val ast_dump_for : t -> uri:T.DocumentUri.t -> string option
 val cst_dump_for : t -> uri:T.DocumentUri.t -> string option
 
-val document_symbols_json_for : t -> uri:T.DocumentUri.t -> Yojson.Safe.t
-val definition_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val declaration_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val type_definition_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val implementation_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val references_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> include_decl:bool -> Yojson.Safe.t
-val workspace_symbols_json_for : t -> query:string -> Yojson.Safe.t
-val hover_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val signature_help_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val prepare_rename_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val rename_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> new_name:string -> Yojson.Safe.t
-val completion_json_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> Yojson.Safe.t
-val code_actions_json_for : t -> uri:T.DocumentUri.t -> range:T.Range.t -> Yojson.Safe.t
-val inlay_hints_json_for : t -> uri:T.DocumentUri.t -> range:T.Range.t -> Yojson.Safe.t
-val semantic_tokens_full_json_for : t -> uri:T.DocumentUri.t -> Yojson.Safe.t
-val semantic_tokens_range_json_for : t -> uri:T.DocumentUri.t -> range:T.Range.t -> Yojson.Safe.t
+val definition_locations_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
+val declaration_locations_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
+val type_definition_locations_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
+val implementation_locations_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
+val references_locations_for :
+  t -> uri:T.DocumentUri.t -> pos:T.Position.t -> include_decl:bool -> T.Location.t list
+val document_symbols_for :
+  t ->
+  uri:T.DocumentUri.t ->
+  [ `DocumentSymbol of T.DocumentSymbol.t | `SymbolInformation of T.SymbolInformation.t ] list
+val workspace_symbols_for : t -> query:string -> T.SymbolInformation.t list
+val hover_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Hover.t option
+val signature_help_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.SignatureHelp.t option
+val prepare_rename_for :
+  t ->
+  uri:T.DocumentUri.t ->
+  pos:T.Position.t ->
+  [ `Range of T.Range.t | `RangeWithPlaceholder of T.Range.t * string ] option
+val rename_for :
+  t ->
+  uri:T.DocumentUri.t ->
+  pos:T.Position.t ->
+  new_name:string ->
+  T.WorkspaceEdit.t option
+val completion_items_for : t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.CompletionItem.t list
+val code_actions_for : t -> uri:T.DocumentUri.t -> range:T.Range.t -> T.CodeAction.t list
+val inlay_hints_for : t -> uri:T.DocumentUri.t -> range:T.Range.t -> T.InlayHint.t list
+val semantic_tokens_full_for : t -> uri:T.DocumentUri.t -> T.SemanticTokens.t option
+val semantic_tokens_range_for : t -> uri:T.DocumentUri.t -> range:T.Range.t -> T.SemanticTokens.t option
 
 val lsif_index_json : t -> Yojson.Safe.t
 val lsif_delta_json : t -> base_revision:int -> Yojson.Safe.t

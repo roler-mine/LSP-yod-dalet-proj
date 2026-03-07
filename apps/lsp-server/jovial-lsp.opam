@@ -13,6 +13,7 @@ depends: [
   "lsp"
   "logs"
   "fmt"
+  "ocamlformat" {with-test}
   "odoc" {with-doc}
 ]
 build: [

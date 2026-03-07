@@ -39,6 +39,22 @@
  (action (run %{exe:semantic_tokens_cache_test.exe})))
 
 (executable
+ (name config_override_merge_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest-smoke)
+ (action (run %{exe:config_override_merge_test.exe})))
+
+(executable
+ (name typed_workspace_feature_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest-smoke)
+ (action (run %{exe:typed_workspace_feature_test.exe})))
+
+(executable
  (name lsif_delta_test)
  (libraries jovial_lsp_lib yojson))
 

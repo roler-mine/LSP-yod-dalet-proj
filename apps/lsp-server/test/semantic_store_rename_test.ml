@@ -53,18 +53,16 @@ let () =
     |> fun off -> position_of_offset source_text (off + 1)
   in
 
-  let prep = Lib.Workspace.prepare_rename_json_for ws ~uri ~pos:pos_counter in
+  let prep = Lib.Workspace.prepare_rename_for ws ~uri ~pos:pos_counter in
   (match prep with
-   | `Assoc _ -> ()
-   | _ -> failf "prepareRename should return an object");
+   | Some (`RangeWithPlaceholder _) -> ()
+   | Some (`Range _) -> ()
+   | None -> failf "prepareRename should return a range");
 
-  let rename = Lib.Workspace.rename_json_for ws ~uri ~pos:pos_counter ~new_name:"COUNT2" in
+  let rename = Lib.Workspace.rename_for ws ~uri ~pos:pos_counter ~new_name:"COUNT2" in
   let has_changes =
     match rename with
-    | `Assoc fields ->
-        (match List.assoc_opt "changes" fields with
-         | Some (`Assoc xs) -> xs <> []
-         | _ -> false)
+    | Some { T.WorkspaceEdit.changes = Some xs; _ } -> xs <> []
     | _ -> false
   in
   if not has_changes then failf "rename should produce workspace edits";

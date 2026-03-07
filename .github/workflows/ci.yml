@@ -6,6 +6,7 @@ on:
       - main
       - master
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,8 +29,11 @@ jobs:
       - name: Install server dependencies
         run: opam install . --deps-only --with-test -y
 
-      - name: Run server tests
-        run: opam exec -- dune runtest
+      - name: Check OCaml formatting
+        run: node ../../tools/scripts/check-ocamlformat.mjs
+
+      - name: Run server smoke and stability tests
+        run: opam exec -- dune build @runtest-smoke @runtest-stability
 
   extension-build:
     runs-on: windows-latest
@@ -50,5 +54,20 @@ jobs:
       - name: Install extension dependencies
         run: npm ci
 
+      - name: Lint extension
+        run: npm run lint
+
+      - name: Check extension formatting
+        run: npm run format:check
+
+      - name: Typecheck extension and tests
+        run: npm run check
+
       - name: Compile extension
         run: npm run compile
+
+      - name: Run extension unit tests
+        run: npm run test:unit
+
+      - name: Run extension integration tests
+        run: npm run test:integration

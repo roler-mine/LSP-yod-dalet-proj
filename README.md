@@ -37,7 +37,11 @@ Build extension:
 
 ```powershell
 cd ..\vscode-extension
-npm run compile
+npm run lint
+npm run format:check
+npm run check
+npm run test:unit
+npm run test:integration
 ```
 
 Run extension in VS Code (development):
@@ -97,7 +101,47 @@ code --install-extension .\apps\vscode-extension\jovial-lsp-client-0.0.1.vsix
 - `jovial.autostart`: auto-start server on file open
 - `jovial.trace`: LSP trace level (`off`, `messages`, `verbose`)
 - `jovial.lsif.fastPath`: optional LSIF-like cache for non-open-file nav (default: off to avoid indexing stalls)
+- `jovial.workspaceDiagnostics.mode`: typed workspace diagnostics mode sent through `initialize`
+- `jovial.workspace.profileMode`: workspace sizing profile sent through `initialize`
+- `jovial.workspace.rootModel`: root selection mode sent through `initialize`
+- `jovial.workspace.manualRootFiles`: manual root-file list for `rootModel=manual`
+- `jovial.background.indexBudgetMs`: idle background work budget sent through `initialize`
+- `jovial.background.diagBatchSize`: background diagnostic publish batch size sent through `initialize`
+- `jovial.server.parseMaxFileBytes`: parse-size guard sent through `initialize`
+- `jovial.server.pressureSoftMb`: soft memory pressure threshold sent through `initialize`
+- `jovial.server.pressureCriticalMb`: critical memory pressure threshold sent through `initialize`
 - `Jovial: Refresh LSIF Cache`: manual command to rebuild LSIF cache when `jovial.lsif.fastPath` is enabled
+
+The supported runtime config path is now `initializationOptions.jovial` with
+three fixed groups:
+
+- `jovial.workspace`
+- `jovial.background`
+- `jovial.server`
+
+Environment variables remain as fallbacks and advanced escape hatches for
+manual runs, tests, and low-level tuning.
+
+## Testing And CI
+
+- Extension unit tests: `npm --prefix ./apps/vscode-extension run test:unit`
+- Extension integration tests: `npm --prefix ./apps/vscode-extension run test:integration`
+- Extension lint/format/typecheck: `npm --prefix ./apps/vscode-extension run lint`, `format:check`, `check`
+- Server smoke/stability: `npm run test:server`
+- Cross-project local check: `npm run check`
+
+Main CI currently gates:
+
+- server OCaml format check
+- server smoke tests
+- server stability tests
+- extension lint
+- extension Prettier format check
+- extension typecheck
+- extension unit tests
+- extension integration tests
+
+Performance suites stay scheduled/manual rather than PR-blocking.
 
 ## Repository Hygiene
 

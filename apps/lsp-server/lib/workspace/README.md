@@ -11,6 +11,34 @@ Entry module:
 
 - `core/workspace.ml` (exposed as module `Workspace`)
 
+## Client-Supplied Settings
+
+The VS Code client now sends its primary runtime settings in LSP `initialize`
+options under `initializationOptions.jovial`. Environment variables remain
+supported as fallbacks for CLI/manual runs and advanced tuning.
+
+Supported typed groups:
+
+- `initializationOptions.jovial.workspace`
+- `initializationOptions.jovial.background`
+- `initializationOptions.jovial.server`
+
+Current user-facing typed settings:
+
+- `workspace.diagnosticsMode`
+- `workspace.profileMode`
+- `workspace.rootModel`
+- `workspace.manualRootFiles`
+- `background.indexBudgetMs`
+- `background.diagBatchSize`
+- `server.parseMaxFileBytes`
+- `server.pressureSoftMb`
+- `server.pressureCriticalMb`
+
+Normal LSP features now flow through typed workspace APIs and the transport
+layer serializes them in `lib/lsp/lsp_response.ml`. Standard requests should no
+longer depend on `Workspace.*_json_for` exports.
+
 ## didChange Semi-Check Tuning
 
 For incremental `textDocument/didChange`, the server can skip full-file semantic validation

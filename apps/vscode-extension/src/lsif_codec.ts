@@ -42,7 +42,9 @@ export type ParsedLsifDelta = {
 };
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
+  return v !== null && typeof v === "object"
+    ? (v as Record<string, unknown>)
+    : undefined;
 }
 
 function normalizeCount(v: unknown, fallback = 0): number {
@@ -111,7 +113,7 @@ function parseLocArray(value: unknown): LsifLocationData[] {
   return dedupeLocations(
     value
       .map((x) => parseLsifLocation(x))
-      .filter((x): x is LsifLocationData => !!x)
+      .filter((x): x is LsifLocationData => !!x),
   );
 }
 
@@ -163,7 +165,7 @@ function parseLsifSymbolEntry(v: unknown): LsifSymbolEntryData | undefined {
 
 function parseKeyIndex(
   value: unknown,
-  symbolsById: Map<string, LsifSymbolEntryData>
+  symbolsById: Map<string, LsifSymbolEntryData>,
 ): LsifKeyIndexEntryData[] {
   if (!Array.isArray(value)) return [];
   const out: LsifKeyIndexEntryData[] = [];
@@ -192,7 +194,9 @@ function parseKeyIndex(
   return out;
 }
 
-export function parseLsifIndexPayload(payload: unknown): ParsedLsifIndex | undefined {
+export function parseLsifIndexPayload(
+  payload: unknown,
+): ParsedLsifIndex | undefined {
   const root = asRecord(payload);
   if (!root) return undefined;
   const symbolsRaw = root["symbols"];
@@ -214,13 +218,14 @@ export function parseLsifIndexPayload(payload: unknown): ParsedLsifIndex | undef
       prev.push(sym.id);
       tmp.set(sym.key, prev);
     }
-    keyIndex =
-      Array.from(tmp.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, symbolIds]) => ({
-          key,
-          symbolIds: Array.from(new Set(symbolIds)).sort((a, b) => a.localeCompare(b)),
-        }));
+    keyIndex = Array.from(tmp.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, symbolIds]) => ({
+        key,
+        symbolIds: Array.from(new Set(symbolIds)).sort((a, b) =>
+          a.localeCompare(b),
+        ),
+      }));
   }
 
   return {
@@ -232,14 +237,20 @@ export function parseLsifIndexPayload(payload: unknown): ParsedLsifIndex | undef
   };
 }
 
-export function parseLsifDeltaPayload(payload: unknown): ParsedLsifDelta | undefined {
+export function parseLsifDeltaPayload(
+  payload: unknown,
+): ParsedLsifDelta | undefined {
   const root = asRecord(payload);
   if (!root) return undefined;
 
   const baseRaw = root["baseRevision"];
   const revRaw = root["revision"];
   const resetRaw = root["reset"];
-  if (typeof baseRaw !== "number" || typeof revRaw !== "number" || typeof resetRaw !== "boolean") {
+  if (
+    typeof baseRaw !== "number" ||
+    typeof revRaw !== "number" ||
+    typeof resetRaw !== "boolean"
+  ) {
     return undefined;
   }
 

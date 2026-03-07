@@ -1,2 +1,11 @@
 include Workspace_foundation
+include Workspace_state
+include Workspace_runtime
+include Workspace_index_graph
+include Workspace_imports
+include Workspace_semantics
+include Workspace_background
+include Workspace_doc_lifecycle
+include Workspace_nav_model
+include Workspace_nav_lookup
 include Workspace_navigation
