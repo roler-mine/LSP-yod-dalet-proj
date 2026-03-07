@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from "fs";
 import { spawnSync } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -20,37 +21,32 @@ function run(command, args) {
   }
 }
 
-const rgResult = spawnSync(
-  "rg",
-  [
-    "--files",
-    "apps/lsp-server",
-    "-g",
-    "*.ml",
-    "-g",
-    "*.mli",
-    "-g",
-    "*.mll",
-    "-g",
-    "*.mly",
-  ],
-  {
-    cwd: repoRoot,
-    encoding: "utf8",
+const workspaceRoot = path.join(repoRoot, "apps", "lsp-server");
+const allowedExtensions = new Set([".ml", ".mli", ".mll", ".mly"]);
+const ignoredDirs = new Set(["_build", "node_modules", ".git"]);
+
+function collectOcamlFiles(dirPath, out) {
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (!ignoredDirs.has(entry.name)) {
+        collectOcamlFiles(path.join(dirPath, entry.name), out);
+      }
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!allowedExtensions.has(path.extname(entry.name))) {
+      continue;
+    }
+    const fullPath = path.join(dirPath, entry.name);
+    out.push(path.relative(repoRoot, fullPath).replace(/\\/g, "/"));
   }
-);
-
-if (rgResult.error) {
-  throw rgResult.error;
-}
-if ((rgResult.status ?? 0) !== 0) {
-  process.exit(rgResult.status ?? 1);
 }
 
-const files = rgResult.stdout
-  .split(/\r?\n/)
-  .map((line) => line.trim())
-  .filter((line) => line.length > 0);
+const files = [];
+collectOcamlFiles(workspaceRoot, files);
+files.sort();
 
 if (files.length === 0) {
   process.exit(0);
