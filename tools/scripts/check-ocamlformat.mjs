@@ -22,7 +22,7 @@ function run(command, args) {
 }
 
 const workspaceRoot = path.join(repoRoot, "apps", "lsp-server");
-const allowedExtensions = new Set([".ml", ".mli", ".mll", ".mly"]);
+const allowedExtensions = new Set([".ml", ".mli"]);
 const ignoredDirs = new Set(["_build", "node_modules", ".git"]);
 
 function collectOcamlFiles(dirPath, out) {

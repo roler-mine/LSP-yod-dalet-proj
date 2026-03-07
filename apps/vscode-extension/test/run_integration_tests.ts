@@ -1,10 +1,9 @@
-import { spawn } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { pathToFileURL } from "url";
 
-import { downloadAndUnzipVSCode } from "@vscode/test-electron";
+import { downloadAndUnzipVSCode, runTests } from "@vscode/test-electron";
 
 function ensureDir(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -29,6 +28,17 @@ function findInstalledVsCode(): string | undefined {
   ].filter((candidate): candidate is string => Boolean(candidate));
 
   return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+function preferredVsCodeVersion(extensionDevelopmentPath: string): string {
+  const manifestPath = path.join(extensionDevelopmentPath, "package.json");
+  const raw = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+    engines?: { vscode?: unknown };
+  };
+  const engine = raw.engines?.vscode;
+  if (typeof engine !== "string") return "stable";
+  const match = engine.match(/(\d+\.\d+\.\d+)/);
+  return match?.[1] ?? "stable";
 }
 
 async function main(): Promise<void> {
@@ -79,46 +89,41 @@ async function main(): Promise<void> {
   });
   fs.writeFileSync(logPath, "", "utf8");
 
-  const vscodeExecutablePath =
-    findInstalledVsCode() ?? (await downloadAndUnzipVSCode());
-  const args = [
+  const extensionTestsEnv = {
+    ...process.env,
+    ELECTRON_RUN_AS_NODE: undefined,
+    JOVIAL_INTEGRATION_LOG: logPath,
+    JOVIAL_INTEGRATION_WORKSPACE: workspacePath,
+    JOVIAL_INTEGRATION_SAMPLE: samplePath,
+    JOVIAL_INTEGRATION_SAMPLE_URI: pathToFileURL(samplePath).toString(),
+  };
+  const launchArgs = [
     `--folder-uri=${pathToFileURL(workspacePath).toString()}`,
     "--disable-updates",
     "--skip-welcome",
     "--skip-release-notes",
+    "--disable-gpu",
     "--disable-workspace-trust",
-    `--extensionTestsPath=${extensionTestsPath}`,
-    `--extensionDevelopmentPath=${extensionDevelopmentPath}`,
     `--extensions-dir=${extensionsDir}`,
     `--user-data-dir=${userDataDir}`,
   ];
+  const shouldUseInstalledVsCode = process.env.CI !== "true";
+  const installedVsCode = shouldUseInstalledVsCode
+    ? findInstalledVsCode()
+    : undefined;
+  const vscodeExecutablePath =
+    installedVsCode ??
+    (await downloadAndUnzipVSCode({
+      version: preferredVsCodeVersion(extensionDevelopmentPath),
+    }));
 
-  await new Promise<void>((resolve, reject) => {
-    const env = {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: undefined,
-      JOVIAL_INTEGRATION_LOG: logPath,
-      JOVIAL_INTEGRATION_WORKSPACE: workspacePath,
-      JOVIAL_INTEGRATION_SAMPLE: samplePath,
-      JOVIAL_INTEGRATION_SAMPLE_URI: pathToFileURL(samplePath).toString(),
-    };
-    const child = spawn(vscodeExecutablePath, args, {
-      env,
-      stdio: "inherit",
-      shell: false,
-    });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(
-        new Error(
-          `VS Code integration test run failed with code=${code} signal=${signal}`,
-        ),
-      );
-    });
+  await runTests({
+    vscodeExecutablePath,
+    extensionDevelopmentPath,
+    extensionTestsPath,
+    extensionTestsEnv,
+    launchArgs,
+    reuseMachineInstall: false,
   });
 }
 

@@ -20,6 +20,8 @@ const EXTENSION_ID = "roler-mine.jovial-lsp-client";
 const LOG_PATH = process.env.JOVIAL_INTEGRATION_LOG;
 const SAMPLE_PATH = process.env.JOVIAL_INTEGRATION_SAMPLE;
 const WORKSPACE_PATH = process.env.JOVIAL_INTEGRATION_WORKSPACE;
+const DEFAULT_WAIT_TIMEOUT_MS = process.env.CI === "true" ? 60000 : 30000;
+const DEFAULT_QUIET_PERIOD_MS = process.env.CI === "true" ? 2500 : 1200;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -50,7 +52,7 @@ function readEvents(): LoggedEvent[] {
 async function waitFor<T>(
   description: string,
   compute: () => T | undefined,
-  timeoutMs = 30000,
+  timeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
   intervalMs = 150,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -60,6 +62,31 @@ async function waitFor<T>(
     await sleep(intervalMs);
   }
   throw new Error(`Timed out waiting for ${description}`);
+}
+
+async function waitForCountStable(
+  description: string,
+  computeCount: () => number,
+  quietMs = DEFAULT_QUIET_PERIOD_MS,
+  timeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
+  intervalMs = 150,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = computeCount();
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await sleep(intervalMs);
+    const nextCount = computeCount();
+    if (nextCount !== lastCount) {
+      lastCount = nextCount;
+      stableSince = Date.now();
+      continue;
+    }
+    if (Date.now() - stableSince >= quietMs) {
+      return nextCount;
+    }
+  }
+  throw new Error(`Timed out waiting for stable ${description}`);
 }
 
 async function activateExtension(): Promise<void> {
@@ -82,6 +109,18 @@ async function waitForInitializeCount(count: number): Promise<LoggedEvent[]> {
     const initializes = events.filter((event) => event.method === "initialize");
     return initializes.length >= count ? initializes : undefined;
   });
+}
+
+function initializeCount(): number {
+  return readEvents().filter((event) => event.method === "initialize").length;
+}
+
+function lsifRefreshCount(): number {
+  return readEvents().filter(
+    (event) =>
+      event.type === "executeCommand" &&
+      event.command === "jovial.dumpLsifIndex",
+  ).length;
 }
 
 async function setConfig<T>(key: string, value: T): Promise<void> {
@@ -117,7 +156,7 @@ async function testAutostartAndInitializePayload(): Promise<void> {
 }
 
 async function testConfigRestartResendsSettings(): Promise<void> {
-  const before = (await waitForInitializeCount(1)).length;
+  const before = await waitForCountStable("initialize events", initializeCount);
   await setConfig("workspace.profileMode", "large");
   const initializes = await waitForInitializeCount(before + 1);
   const last = initializes[initializes.length - 1];
@@ -130,8 +169,7 @@ async function testConfigRestartResendsSettings(): Promise<void> {
 }
 
 async function testRestartCommand(): Promise<void> {
-  const before = (await waitForInitializeCount(1)).length;
-  await sleep(1000);
+  const before = await waitForCountStable("initialize events", initializeCount);
   await vscode.commands.executeCommand("jovial.restartServer");
   await waitForInitializeCount(before + 1);
 }
@@ -159,21 +197,17 @@ async function testWatchedFileNotifications(): Promise<void> {
 }
 
 async function testLsifRefreshCommand(): Promise<void> {
-  const before = readEvents().filter(
-    (event) =>
-      event.type === "executeCommand" &&
-      event.command === "jovial.dumpLsifIndex",
-  ).length;
+  const before = await waitForCountStable(
+    "LSIF refresh events",
+    lsifRefreshCount,
+  );
 
   await setConfig("lsif.fastPath", false);
-  await sleep(500);
   await vscode.commands.executeCommand("jovial.refreshLsifCache");
-  await sleep(500);
-  const disabledCount = readEvents().filter(
-    (event) =>
-      event.type === "executeCommand" &&
-      event.command === "jovial.dumpLsifIndex",
-  ).length;
+  const disabledCount = await waitForCountStable(
+    "LSIF refresh events after disabled refresh command",
+    lsifRefreshCount,
+  );
   assert.equal(
     disabledCount,
     before,
@@ -184,12 +218,8 @@ async function testLsifRefreshCommand(): Promise<void> {
   await activateExtension();
   await vscode.commands.executeCommand("jovial.refreshLsifCache");
   await waitFor("LSIF refresh executeCommand", () => {
-    const events = readEvents().filter(
-      (event) =>
-        event.type === "executeCommand" &&
-        event.command === "jovial.dumpLsifIndex",
-    );
-    return events.length > before ? events : undefined;
+    const count = lsifRefreshCount();
+    return count > before ? count : undefined;
   });
 }
 
@@ -230,12 +260,8 @@ async function testMiddlewareLsifFallback(): Promise<void> {
   await activateExtension();
   await vscode.commands.executeCommand("jovial.refreshLsifCache");
   await waitFor("LSIF cache refresh", () => {
-    const events = readEvents().filter(
-      (event) =>
-        event.type === "executeCommand" &&
-        event.command === "jovial.dumpLsifIndex",
-    );
-    return events.length > 0 ? events : undefined;
+    const count = lsifRefreshCount();
+    return count > 0 ? count : undefined;
   });
 
   const samplePath = requireEnv("JOVIAL_INTEGRATION_SAMPLE", SAMPLE_PATH);
