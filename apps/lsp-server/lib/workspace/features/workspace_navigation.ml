@@ -1750,6 +1750,7 @@ let code_actions_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t)
 
 let collect_proc_param_map (doc : Document.t)
     (out : (string, string list) Hashtbl.t) : unit =
+  let doc = Document.ensure_parsed doc in
   let rec add_expr (e : Ast.expr Ast.node) : unit =
     match e.v with
     | Ast.EName _ | Ast.ELit _ -> ()
@@ -1816,6 +1817,7 @@ let inlay_hints_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t)
   match doc_of_uri ws uri with
   | None -> `List []
   | Some doc ->
+      let doc = Document.ensure_parsed doc in
       let proc_params : (string, string list) Hashtbl.t = Hashtbl.create 128 in
       docs_for_lookup ws doc
       |> List.iter (fun d -> collect_proc_param_map d proc_params);

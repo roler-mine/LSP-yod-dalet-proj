@@ -106,6 +106,21 @@ let parse_int_arg (arg : Yojson.Safe.t) : int option =
   | `Intlit s -> ( try Some (int_of_string s) with _ -> None)
   | _ -> None
 
+let parse_did_open_payload (params : Yojson.Safe.t) :
+    (T.DocumentUri.t * string) option =
+  match get_assoc params with
+  | None -> None
+  | Some xs -> (
+      match find_field "textDocument" xs with
+      | Some (`Assoc tdxs) -> (
+          match (find_field "uri" tdxs, find_field "text" tdxs) with
+          | Some (`String uri_s), Some (`String text) -> (
+              match Uri_path.docuri_of_string uri_s with
+              | Some uri -> Some (uri, text)
+              | None -> None)
+          | _ -> None)
+      | _ -> None)
+
 let parse_text_document_uri (params : Yojson.Safe.t) : T.DocumentUri.t option =
   match get_assoc params with
   | None -> None
@@ -342,6 +357,10 @@ let publish_open_diag_revalidate_updates (ws : Workspace.t) (oc : out_channel)
         publish_doc_diagnostics ws oc published_diags ~provisional:false ~uri)
       uris
 
+let startup_open_diag_batch_size (ws : Workspace.t) ~(base : int) : int =
+  let base = max 1 base in
+  if Workspace.startup_diag_hover_ready_now ws then base else 1
+
 let send_request (oc : out_channel) ~(id : Yojson.Safe.t) ~(method_ : string)
     ~(params : Yojson.Safe.t) : unit =
   Lsp_io.write_message oc
@@ -459,6 +478,10 @@ let handle_initialize (roots_state : roots_state)
       (Lsp_runtime_settings.from_env ())
       client_overrides;
   let workspace_settings = build_workspace_settings client_overrides in
+  let do_sync_rescan =
+    workspace_settings.Workspace_settings.workspace_diag_mode
+    <> Workspace_settings.WorkspaceDiagsOff
+  in
   roots_state.default_ws <- Workspace.create ~settings:workspace_settings ();
   let roots = parse_root_uris params in
   if roots = [] then (
@@ -467,7 +490,7 @@ let handle_initialize (roots_state : roots_state)
     | Some ru -> Workspace.set_root_uri roots_state.default_ws (Some ru)
     | None ->
         Workspace.set_root_path roots_state.default_ws (parse_root_path params));
-    Workspace.rescan roots_state.default_ws)
+    if do_sync_rescan then Workspace.rescan roots_state.default_ws)
   else (
     roots_state.roots <-
       roots
@@ -477,10 +500,10 @@ let handle_initialize (roots_state : roots_state)
           | Some root_path ->
               let ws = Workspace.create ~settings:workspace_settings () in
               Workspace.set_root_uri ws (Some root_uri);
-              Workspace.rescan ws;
+              if do_sync_rescan then Workspace.rescan ws;
               Some { root_path_key = normalize_path_key root_path; ws });
     Workspace.set_root_path roots_state.default_ws None;
-    Workspace.rescan roots_state.default_ws);
+    ());
   reset_all_refresh_counters pending_change_refreshes roots_state;
   respond oc ~id ~result:initialize_result_json
 
@@ -588,6 +611,20 @@ let handle_execute_command (roots_state : roots_state)
               ~message:"debugReport: missing uri argument"
         | Some uri ->
             let ws = ws_for_uri roots_state uri in
+            if
+              (not (Workspace.startup_is_ready_now ws))
+              && Workspace.open_doc_count ws >= 8
+            then (
+              try
+                ignore (Workspace.finish_last_open_doc_now_if_needed ws);
+                Workspace.background_tick ws ~budget_ms:20
+                  ~mode:Workspace.BgTickInteractive ~idle_quiet_ms:0
+                  ~last_message_ms:(Perf_stats.now_ms ())
+              with exn ->
+                Perf_stats.tick "loop.bg_exception";
+                prerr_endline
+                  (Printf.sprintf "debugReport maintenance tick failed: %s"
+                     (Printexc.to_string exn)));
             let j = Workspace.debug_report_for ws ~uri ~max_tokens in
             let j =
               match j with
@@ -625,27 +662,39 @@ let handle_notification (roots_state : roots_state)
       | None -> ())
   | "textDocument/didOpen" -> (
       try
-        let p = T.DidOpenTextDocumentParams.t_of_yojson params in
-        let td = p.textDocument in
-        let uri = td.uri in
-        let file = file_of_uri uri in
-        let ws = ws_for_uri roots_state uri in
-        Perf_stats.tick "diag.open.request";
-        try
-          Workspace.open_doc ws ~uri ~file ~text:td.text;
-          publish_doc_diagnostics ws oc published_diags ~provisional:true ~uri;
-          ws_refresh_counter_set pending_change_refreshes ws 0;
-          request_semantic_tokens_refresh oc
-            ~refresh_supported:!semantic_refresh_supported
-            next_server_request_id
-        with exn ->
-          Perf_stats.tick "diag.open.handler_exception";
-          prerr_endline
-            (Printf.sprintf "notification didOpen failed for %s: %s"
-               (Uri_path.docuri_to_string uri)
-               (Printexc.to_string exn));
-          publish_partial_diagnostics_on_failure ws oc published_diags ~uri
-            ~phase:"didOpen" ~exn
+        match parse_did_open_payload params with
+        | None -> raise (Failure "invalid didOpen payload")
+        | Some (uri, text) -> (
+            let file = file_of_uri uri in
+            let ws = ws_for_uri roots_state uri in
+            Perf_stats.tick "diag.open.request";
+            try
+              Hashtbl.remove published_diags (Uri_path.docuri_to_string uri);
+              (match Workspace.preview_open_doc_diags ws ~uri ~file ~text with
+              | None -> ()
+              | Some diags ->
+                  let published =
+                    publish_diagnostics_if_changed published_diags oc ~uri
+                      ~diags
+                  in
+                  if published then (
+                    Perf_stats.tick "diag.open.preview_publish";
+                    flush oc));
+              Workspace.open_doc ~inline_catch_up:false ws ~uri ~file ~text;
+              publish_doc_diagnostics ws oc published_diags ~provisional:true
+                ~uri;
+              ws_refresh_counter_set pending_change_refreshes ws 0;
+              request_semantic_tokens_refresh oc
+                ~refresh_supported:!semantic_refresh_supported
+                next_server_request_id
+            with exn ->
+              Perf_stats.tick "diag.open.handler_exception";
+              prerr_endline
+                (Printf.sprintf "notification didOpen failed for %s: %s"
+                   (Uri_path.docuri_to_string uri)
+                   (Printexc.to_string exn));
+              publish_partial_diagnostics_on_failure ws oc published_diags ~uri
+                ~phase:"didOpen" ~exn)
       with exn ->
         Perf_stats.tick "diag.open.decode_error";
         prerr_endline
@@ -1279,8 +1328,12 @@ let run (ic : in_channel) (oc : out_channel) : unit =
     all_workspaces_now ()
     |> List.iter (fun ws ->
         try
+          let open_diag_batch_size =
+            startup_open_diag_batch_size ws
+              ~base:!runtime_settings.open_diag_revalidate_batch_size
+          in
           publish_open_diag_revalidate_updates ws oc published_diags
-            ~max_items:!runtime_settings.open_diag_revalidate_batch_size;
+            ~max_items:open_diag_batch_size;
           publish_background_diag_updates ws oc published_diags
             ~max_items:!runtime_settings.bg_diag_batch_size
         with exn ->
@@ -1403,11 +1456,12 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                     (Printexc.to_string exn));
                reader_done := true));
       if not !reader_done then (
-        run_startup_fair_tick_if_needed ();
-        publish_background_for_all ();
-        notify_startup_phase_events ();
-        notify_startup_miss_events ();
-        notify_workspace_ready_events ();
+        if items = [] then (
+          run_startup_fair_tick_if_needed ();
+          publish_background_for_all ();
+          notify_startup_phase_events ();
+          notify_startup_miss_events ();
+          notify_workspace_ready_events ());
         let can_continue =
           try
             flush oc;

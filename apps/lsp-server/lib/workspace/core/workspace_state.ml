@@ -520,6 +520,7 @@ let dequeue_bg_path (ws : t) ~(mode : bg_tick_mode) ~(allow_normal_large : bool)
   let prioritize_open_large =
     ws.startup_diag_hover_ready_ms = None
     && Hashtbl.length ws.open_parse_generation > 0
+    && Queue.is_empty ws.bg_high_small_queue
   in
   let pops =
     if prefer_open then
@@ -588,7 +589,9 @@ let tick_open_diag_revalidate_reason (reason : string) : unit =
 
 let enqueue_open_diag_revalidate (ws : t) ~(uri : T.DocumentUri.t)
     ~(reason : string) : unit =
-  if Hashtbl.mem ws.docs uri then (
+  if ws.workspace_diag_mode = WorkspaceDiagsOff then
+    Perf_stats.tick "diag.open.revalidate_skipped_mode_off"
+  else if Hashtbl.mem ws.docs uri then (
     let key = Uri_path.docuri_to_string uri in
     Hashtbl.replace ws.open_diag_revalidate_payloads key (uri, reason);
     if not (Hashtbl.mem ws.open_diag_revalidate_set key) then (

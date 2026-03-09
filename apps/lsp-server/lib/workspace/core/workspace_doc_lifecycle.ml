@@ -8,19 +8,23 @@ open Workspace_semantics
 open Workspace_background
 open Workspace_tuning
 
-let compare_pos (a : T.Position.t) (b : T.Position.t) : int =
-  if a.line <> b.line then compare a.line b.line
-  else compare a.character b.character
-
 let normalize_lsp_range (r : T.Range.t) : T.Range.t =
-  if compare_pos r.start r.end_ <= 0 then r
+  if
+    (if r.start.line <> r.end_.line then compare r.start.line r.end_.line
+     else compare r.start.character r.end_.character)
+    <= 0
+  then r
   else { T.Range.start = r.end_; end_ = r.start }
 
 let merge_lsp_range (a : T.Range.t) (b : T.Range.t) : T.Range.t =
   let a = normalize_lsp_range a in
   let b = normalize_lsp_range b in
-  let start = if compare_pos a.start b.start <= 0 then a.start else b.start in
-  let end_ = if compare_pos a.end_ b.end_ >= 0 then a.end_ else b.end_ in
+  let cmp_pos (x : T.Position.t) (y : T.Position.t) =
+    if x.line <> y.line then compare x.line y.line
+    else compare x.character y.character
+  in
+  let start = if cmp_pos a.start b.start <= 0 then a.start else b.start in
+  let end_ = if cmp_pos a.end_ b.end_ >= 0 then a.end_ else b.end_ in
   { T.Range.start; end_ }
 
 let line_span_of_lsp_range (r : T.Range.t) : int =
@@ -59,61 +63,6 @@ let didchange_semi_range (changes : T.TextDocumentContentChangeEvent.t list) :
           if line_span_of_lsp_range r > didchange_semi_check_max_lines then None
           else Some r
 
-let offset_of_position_in_index (idx : Text_index.t) (p : T.Position.t) :
-    int option =
-  let clamp lo hi x = if x < lo then lo else if x > hi then hi else x in
-  let line_count = Text_index.line_count idx in
-  if line_count <= 0 then Some 0
-  else
-    let line = clamp 0 (line_count - 1) p.line in
-    match Text_index.line_start_offset idx ~line with
-    | None -> Some 0
-    | Some start -> (
-        let line_len =
-          match Text_index.line_length idx ~line with Some n -> n | None -> 0
-        in
-        let col = clamp 0 line_len p.character in
-        match Text_index.offset_of_line_col idx ~line ~col with
-        | Some off -> Some off
-        | None -> Some (start + col))
-
-let slice_of_range_for_text_index (text : string) (idx : Text_index.t)
-    (r : T.Range.t) : string option =
-  let r = normalize_lsp_range r in
-  match
-    ( offset_of_position_in_index idx r.start,
-      offset_of_position_in_index idx r.end_ )
-  with
-  | Some a, Some b ->
-      let a, b = if a <= b then (a, b) else (b, a) in
-      if a < 0 || b < a || b > String.length text then None
-      else Some (String.sub text a (b - a))
-  | _ -> None
-
-let apply_text_change_only (text : string) (idx : Text_index.t)
-    (ch : T.TextDocumentContentChangeEvent.t) : string * Text_index.t =
-  match ch.range with
-  | None ->
-      let text' = ch.text in
-      (text', Text_index.of_string text')
-  | Some r -> (
-      match
-        ( offset_of_position_in_index idx r.start,
-          offset_of_position_in_index idx r.end_ )
-      with
-      | Some a, Some b ->
-          let a, b = if a <= b then (a, b) else (b, a) in
-          if a < 0 || b < a || b > String.length text then (text, idx)
-          else
-            let before = String.sub text 0 a in
-            let after_len = String.length text - b in
-            let after =
-              if after_len <= 0 then "" else String.sub text b after_len
-            in
-            let text' = before ^ ch.text ^ after in
-            (text', Text_index.of_string text')
-      | _ -> (text, idx))
-
 let touched_ident_keys_for_changes ~(old_doc : Document.t option)
     ~(changes : T.TextDocumentContentChangeEvent.t list) : string list =
   let out = Hashtbl.create 32 in
@@ -139,10 +88,14 @@ let touched_ident_keys_for_changes ~(old_doc : Document.t option)
           (match ch.range with
           | None -> ()
           | Some r -> (
-              match slice_of_range_for_text_index !text_ref !idx_ref r with
+              match
+                Document.slice_of_range ~text:!text_ref ~index:!idx_ref r
+              with
               | None -> ()
               | Some removed_text -> add_keys (ident_keys_of_text removed_text)));
-          let text', idx' = apply_text_change_only !text_ref !idx_ref ch in
+          let text', idx' =
+            Document.apply_content_change ~text:!text_ref ~index:!idx_ref ch
+          in
           text_ref := text';
           idx_ref := idx')
         changes);
@@ -205,10 +158,49 @@ let mark_open_doc_authoritative (ws : t) ~(uri : T.DocumentUri.t) : unit =
       Hashtbl.remove ws.open_provisional_since_ms key);
   Hashtbl.remove ws.open_parse_generation key
 
-let open_doc ?(force_provisional : bool = false) (ws : t)
-    ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string) : unit =
+let should_defer_open_doc ?(force_provisional : bool = false) (ws : t)
+    ~(text : string) : bool =
+  let open_doc_count = Hashtbl.length ws.docs in
+  let workspace_forces_provisional = open_doc_count >= 8 in
+  force_provisional || didopen_always_provisional
+  || didopen_defer_parse_enabled
+     && String.length text >= didopen_defer_parse_min_doc_chars
+  || String.length text >= ws.bg_large_file_bytes
+  || workspace_forces_provisional
+  || workspace_pressure_mode ws <> PressureNormal
+
+let startup_open_doc_preview_enabled (ws : t) : bool =
+  ws.startup_diag_hover_ready_ms = None
+  && ws.workspace_diag_mode = WorkspaceDiagsOff
+
+let preview_open_doc_diags ?(force_provisional : bool = false) (ws : t)
+    ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string) :
+    T.Diagnostic.t list option =
+  let _ = uri in
+  if
+    is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
+      ~text_len:(String.length text)
+  then
+    Some
+      [
+        diag_parse_guard ~file ~max_bytes:ws.parse_file_max_bytes
+          ~actual_bytes:(String.length text);
+      ]
+  else if startup_open_doc_preview_enabled ws then Some []
+  else if should_defer_open_doc ~force_provisional ws ~text then Some []
+  else None
+
+type open_doc_install_result = {
+  doc : Document.t;
+  should_defer_parse : bool;
+  workspace_forces_provisional : bool;
+}
+
+let open_doc_install ?(force_provisional : bool = false) (ws : t)
+    ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string) :
+    open_doc_install_result =
   invalidate_lsif_snapshot ws;
-  startup_mark_started ws;
+  if Hashtbl.length ws.docs = 0 then startup_mark_started ws;
   (* If no workspace root was set, fall back to the first opened file's directory. *)
   (match (ws.root_path, file) with
   | None, Some f ->
@@ -216,11 +208,9 @@ let open_doc ?(force_provisional : bool = false) (ws : t)
       rescan ws
   | _ -> ());
   clear_nav_response_cache_for_uri ws ~uri;
-  let should_defer_parse =
-    force_provisional || didopen_always_provisional
-    || didopen_defer_parse_enabled
-       && String.length text >= didopen_defer_parse_min_doc_chars
-  in
+  let open_doc_count = Hashtbl.length ws.docs in
+  let workspace_forces_provisional = open_doc_count >= 8 in
+  let should_defer_parse = should_defer_open_doc ~force_provisional ws ~text in
   ignore (bump_open_parse_generation ws ~uri);
   if should_defer_parse then mark_open_doc_provisional ws ~uri
   else mark_open_doc_authoritative ws ~uri;
@@ -253,124 +243,155 @@ let open_doc ?(force_provisional : bool = false) (ws : t)
       else Hashtbl.replace ws.bg_parsed path_key true
   | None -> ());
   if not should_defer_parse then enqueue_doc_imports_high ws doc;
-  if not (should_defer_parse && didopen_disable_foreground_tick) then
-    background_tick ws
-      ~budget_ms:(if should_defer_parse then 40 else 120)
-      ~mode:BgTickInteractive ~idle_quiet_ms:ws.bg_large_parse_idle_quiet_ms
-      ~last_message_ms:(Perf_stats.now_ms ());
-  if not force_provisional then pump_index_background ws;
-  ignore (maybe_escalate_index_reconcile ws ~doc:(Some doc) ~reason:"didOpen");
-  update_startup_ready_state ws
+  update_startup_ready_state ws;
+  { doc; should_defer_parse; workspace_forces_provisional }
+
+let open_doc ?(force_provisional : bool = false)
+    ?(inline_catch_up : bool = true) (ws : t) ~(uri : T.DocumentUri.t)
+    ~(file : string option) ~(text : string) : unit =
+  let { doc; should_defer_parse; workspace_forces_provisional } =
+    open_doc_install ~force_provisional ws ~uri ~file ~text
+  in
+  if not inline_catch_up then Perf_stats.tick "diag.open.inline_work_deferred"
+  else (
+    if not (should_defer_parse && didopen_disable_foreground_tick) then
+      background_tick ws
+        ~budget_ms:(if should_defer_parse then 40 else 120)
+        ~mode:BgTickInteractive ~idle_quiet_ms:ws.bg_large_parse_idle_quiet_ms
+        ~last_message_ms:(Perf_stats.now_ms ());
+    let allow_inline_index_work =
+      (not force_provisional)
+      && (not workspace_forces_provisional)
+      && workspace_pressure_mode ws = PressureNormal
+    in
+    if allow_inline_index_work then pump_index_background ws;
+    if allow_inline_index_work then
+      ignore
+        (maybe_escalate_index_reconcile ws ~doc:(Some doc) ~reason:"didOpen");
+    if allow_inline_index_work && not should_defer_parse then
+      update_startup_ready_state ws)
 
 let change_doc (ws : t) ~(uri : T.DocumentUri.t)
     ~(changes : T.TextDocumentContentChangeEvent.t list) : unit =
-  if changes = [] then () else mark_graph_dirty ws;
-  invalidate_lsif_snapshot ws;
-  ignore (bump_open_parse_generation ws ~uri);
-  let old_doc = Hashtbl.find_opt ws.docs uri in
-  let clear_cache_for_full_sync =
-    List.exists
-      (fun (ch : T.TextDocumentContentChangeEvent.t) -> ch.range = None)
-      changes
-  in
-  if clear_cache_for_full_sync then clear_nav_response_cache_for_uri ws ~uri
+  if changes = [] then ()
   else
-    let touched = touched_ident_keys_for_changes ~old_doc ~changes in
-    invalidate_nav_response_cache_for_keys ws ~uri ~keys:touched;
-    let semantic_mode_for_rev (rev : int) : semantic_validation_mode =
-      let mode =
-        if rev mod didchange_semi_force_full_every = 0 then SemanticFull
-        else
-          match didchange_semi_range changes with
-          | Some r -> SemanticRangeSemi r
-          | None -> SemanticFull
-      in
-      (match mode with
-      | SemanticRangeSemi _ -> Perf_stats.tick "change.semantic_semi"
-      | SemanticFull -> Perf_stats.tick "change.semantic_full");
-      mode
+    let old_doc = Hashtbl.find_opt ws.docs uri in
+    let existing_doc_fast =
+      match old_doc with
+      | Some doc ->
+          Some
+            ( doc,
+              Perf_stats.time "apply.change_doc_fast" (fun () ->
+                  Document.apply_changes_no_reparse ~changes doc) )
+      | None -> None
     in
-    match old_doc with
-    | None ->
-        let file = Uri_path.file_path_of_uri uri in
-        let base = Document.make ~uri ~file ~text:"" in
-        let draft =
-          Perf_stats.time "apply.change_doc_fast" (fun () ->
-              Document.apply_changes_no_reparse ~changes base)
+    match existing_doc_fast with
+    | Some (doc, doc_fast) when doc_fast == doc -> Perf_stats.tick "change.noop"
+    | _ ->
+        mark_graph_dirty ws;
+        invalidate_lsif_snapshot ws;
+        ignore (bump_open_parse_generation ws ~uri);
+        let clear_cache_for_full_sync =
+          List.exists
+            (fun (ch : T.TextDocumentContentChangeEvent.t) -> ch.range = None)
+            changes
         in
-        (if
-           is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
-             ~text_len:(String.length draft.Document.text)
-         then (
-           let guarded =
-             Document.with_parse_diags
-               [
-                 diag_parse_guard ~file:draft.Document.file
-                   ~max_bytes:ws.parse_file_max_bytes
-                   ~actual_bytes:(String.length draft.Document.text);
-               ]
-               draft
-           in
-           Perf_stats.tick "parse.large_file_guard";
-           store_doc_fast ws uri guarded)
-         else
-           let doc =
-             try
-               Perf_stats.time "parse.change_doc" (fun () ->
-                   Document.apply_changes_and_reparse ~changes base)
-             with exn ->
-               with_internal_phase_diag base ~phase:"apply-changes" ~exn
-           in
-           let semantic_mode = semantic_mode_for_rev doc.rev in
-           store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc);
-        pump_index_background ws
-    | Some doc ->
-        let doc_fast =
-          Perf_stats.time "apply.change_doc_fast" (fun () ->
-              Document.apply_changes_no_reparse ~changes doc)
-        in
-        let next_rev = doc_fast.Document.rev in
-        (if
-           is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
-             ~text_len:(String.length doc_fast.Document.text)
-         then (
-           let guarded =
-             Document.with_parse_diags
-               [
-                 diag_parse_guard ~file:doc_fast.Document.file
-                   ~max_bytes:ws.parse_file_max_bytes
-                   ~actual_bytes:(String.length doc_fast.Document.text);
-               ]
-               doc_fast
-           in
-           Perf_stats.tick "parse.large_file_guard";
-           store_doc_fast ws uri guarded;
-           pump_index_background ws)
-         else if should_defer_reparse_for_change doc ~changes ~next_rev then (
-           Perf_stats.tick "change.parse_deferred";
-           store_doc_fast ws uri doc_fast;
-           pump_index_background ws)
-         else
-           let doc' =
-             try
-               Perf_stats.time "parse.change_doc" (fun () ->
-                   Document.apply_changes_and_reparse ~changes doc)
-             with exn ->
-               with_internal_phase_diag doc ~phase:"apply-changes" ~exn
-           in
-           let semantic_mode = semantic_mode_for_rev doc'.rev in
-           store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc';
-           pump_index_background ws);
-        (match Hashtbl.find_opt ws.docs uri with
-        | Some latest ->
-            if latest.Document.parse_rev = latest.Document.rev then
-              mark_open_doc_authoritative ws ~uri
-            else mark_open_doc_provisional ws ~uri;
-            ignore
-              (maybe_escalate_index_reconcile ws ~doc:(Some latest)
-                 ~reason:"didChange")
-        | None -> ());
-        update_startup_ready_state ws
+        if clear_cache_for_full_sync then
+          clear_nav_response_cache_for_uri ws ~uri
+        else
+          let touched = touched_ident_keys_for_changes ~old_doc ~changes in
+          invalidate_nav_response_cache_for_keys ws ~uri ~keys:touched;
+          let semantic_mode_for_rev (rev : int) : semantic_validation_mode =
+            let mode =
+              if rev mod didchange_semi_force_full_every = 0 then SemanticFull
+              else
+                match didchange_semi_range changes with
+                | Some r -> SemanticRangeSemi r
+                | None -> SemanticFull
+            in
+            (match mode with
+            | SemanticRangeSemi _ -> Perf_stats.tick "change.semantic_semi"
+            | SemanticFull -> Perf_stats.tick "change.semantic_full");
+            mode
+          in
+          (match existing_doc_fast with
+          | None ->
+              let file = Uri_path.file_path_of_uri uri in
+              let base = Document.make ~uri ~file ~text:"" in
+              let draft =
+                Perf_stats.time "apply.change_doc_fast" (fun () ->
+                    Document.apply_changes_no_reparse ~changes base)
+              in
+              if
+                is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
+                  ~text_len:(String.length draft.Document.text)
+              then (
+                let guarded =
+                  Document.with_parse_diags
+                    [
+                      diag_parse_guard ~file:draft.Document.file
+                        ~max_bytes:ws.parse_file_max_bytes
+                        ~actual_bytes:(String.length draft.Document.text);
+                    ]
+                    draft
+                in
+                Perf_stats.tick "parse.large_file_guard";
+                store_doc_fast ws uri guarded)
+              else
+                let doc =
+                  try
+                    Perf_stats.time "parse.change_doc" (fun () ->
+                        Document.apply_changes_and_reparse ~changes base)
+                  with exn ->
+                    with_internal_phase_diag base ~phase:"apply-changes" ~exn
+                in
+                let semantic_mode = semantic_mode_for_rev doc.rev in
+                store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc;
+                pump_index_background ws
+          | Some (doc, doc_fast) ->
+              let next_rev = doc_fast.Document.rev in
+              if
+                is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
+                  ~text_len:(String.length doc_fast.Document.text)
+              then (
+                let guarded =
+                  Document.with_parse_diags
+                    [
+                      diag_parse_guard ~file:doc_fast.Document.file
+                        ~max_bytes:ws.parse_file_max_bytes
+                        ~actual_bytes:(String.length doc_fast.Document.text);
+                    ]
+                    doc_fast
+                in
+                Perf_stats.tick "parse.large_file_guard";
+                store_doc_fast ws uri guarded;
+                pump_index_background ws)
+              else if should_defer_reparse_for_change doc ~changes ~next_rev
+              then (
+                Perf_stats.tick "change.parse_deferred";
+                store_doc_fast ws uri doc_fast;
+                pump_index_background ws)
+              else
+                let doc' =
+                  try
+                    Perf_stats.time "parse.change_doc" (fun () ->
+                        Document.apply_changes_and_reparse ~changes doc)
+                  with exn ->
+                    with_internal_phase_diag doc ~phase:"apply-changes" ~exn
+                in
+                let semantic_mode = semantic_mode_for_rev doc'.rev in
+                store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc';
+                pump_index_background ws);
+          (match Hashtbl.find_opt ws.docs uri with
+          | Some latest ->
+              if latest.Document.parse_rev = latest.Document.rev then
+                mark_open_doc_authoritative ws ~uri
+              else mark_open_doc_provisional ws ~uri;
+              ignore
+                (maybe_escalate_index_reconcile ws ~doc:(Some latest)
+                   ~reason:"didChange")
+          | None -> ());
+          update_startup_ready_state ws
 
 let close_doc (ws : t) ~(uri : T.DocumentUri.t) : unit =
   mark_graph_dirty ws;
@@ -471,9 +492,7 @@ let revalidate_all (ws : t) : T.DocumentUri.t list =
   let uris = Hashtbl.fold (fun uri _ acc -> uri :: acc) ws.docs [] in
   List.iter
     (fun uri ->
-      match Hashtbl.find_opt ws.docs uri with
-      | None -> ()
-      | Some doc -> store_doc ws uri doc)
+      ignore (refresh_open_doc_diags ~import_lookup_pump:true ws ~uri))
     uris;
   update_startup_ready_state ws;
   uris

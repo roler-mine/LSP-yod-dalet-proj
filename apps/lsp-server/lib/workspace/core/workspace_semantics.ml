@@ -230,6 +230,7 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
   out
 
 let sem_exports_of_doc (doc : Document.t) : sem_exports =
+  let doc = Document.ensure_parsed doc in
   match doc.Document.ast with
   | None -> sem_scope_empty ()
   | Some prog -> sem_exports_of_program prog
@@ -424,6 +425,7 @@ let rec sem_compatible (lhs : sem_ty) (rhs : sem_ty) : bool =
   | _ -> false
 
 let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
+  let doc = Document.ensure_parsed doc in
   match doc.Document.ast with
   | None -> []
   | Some prog ->

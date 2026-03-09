@@ -212,6 +212,7 @@ let proc_signature_for_def (ws : t) (d : def) : string option =
     match doc_opt with
     | None -> None
     | Some d0 -> (
+        let d0 = Document.ensure_parsed d0 in
         match d0.Document.ast with
         | None -> None
         | Some prog ->
@@ -530,6 +531,8 @@ let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
               Hashtbl.replace seen_paths key true;
               candidate_paths_rev := path :: !candidate_paths_rev)
           in
+          Workspace_index.source_paths_for_proc_hint idx ~name:key
+          |> List.iter push_path;
           Array.iter push_path ws.graph_root_closure_paths;
           Workspace_index.all_source_paths idx |> List.iter push_path;
           let candidate_paths = List.rev !candidate_paths_rev in

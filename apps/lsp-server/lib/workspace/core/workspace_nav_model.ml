@@ -269,6 +269,7 @@ and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
 
 let find_compool_loc_in_doc (doc : Document.t) (key : string) : Ast.Loc.t option
     =
+  let doc = Document.ensure_parsed doc in
   let match_directive (d : Ast.decl Ast.node) =
     match d.v with
     | Ast.DDirective { name; args = first :: _ } ->
@@ -290,6 +291,7 @@ let find_compool_loc_in_doc (doc : Document.t) (key : string) : Ast.Loc.t option
       go prog
 
 let collect_doc_defs (doc : Document.t) : def list =
+  let doc = Document.ensure_parsed doc in
   let uri = doc.Document.uri in
   let defs0 =
     match doc.Document.ast with
@@ -659,6 +661,7 @@ let docs_for_lookup (ws : t) (doc : Document.t) : Document.t list =
   List.rev !out
 
 let has_unscoped_fallback_context (doc : Document.t) : bool =
+  let doc = Document.ensure_parsed doc in
   doc.Document.ast = None
   || doc.Document.parse_diags <> []
   || Document.imports doc = []
@@ -889,6 +892,7 @@ let uniq_defs (xs : def list) : def list =
   List.rev !acc
 
 let exported_defs_for_import_scope (doc : Document.t) : def list =
+  let doc = Document.ensure_parsed doc in
   let block_containers =
     match doc.Document.ast with
     | None -> Hashtbl.create 1
@@ -933,6 +937,7 @@ let symbol_at_position_in_nav (nav : doc_nav) ~(uri : T.DocumentUri.t)
   match !best with None -> None | Some (sym_id, loc, _) -> Some (sym_id, loc)
 
 let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
+  let doc = Document.ensure_parsed doc in
   let nav = doc_nav_create () in
   let uri = doc.Document.uri in
   let root_scope = nav_scope_empty () in

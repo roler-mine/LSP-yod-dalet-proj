@@ -63,6 +63,22 @@
  (action (run %{exe:lsif_delta_test.exe})))
 
 (executable
+ (name lsif_noop_change_test)
+ (libraries jovial_lsp_lib yojson))
+
+(rule
+ (alias runtest-smoke)
+ (action (run %{exe:lsif_noop_change_test.exe})))
+
+(executable
+ (name workspace_index_proc_hint_test)
+ (libraries jovial_lsp_lib yojson unix))
+
+(rule
+ (alias runtest-smoke)
+ (action (run %{exe:workspace_index_proc_hint_test.exe})))
+
+(executable
  (name watched_file_invalidation_test)
  (libraries jovial_lsp_lib yojson unix))
 
@@ -484,6 +500,16 @@
    (run %{exe:lsp_open_diag_revalidate_on_compool_parse_test.exe} %{exe:../bin/Main.exe}))))
 
 (executable
+ (name lsp_open_diag_revalidate_steady_state_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (setenv JOVIAL_TEST_OPEN_DIAG_REVALIDATE_STEADY_HARD_TIMEOUT_S "180"
+   (run %{exe:lsp_open_diag_revalidate_steady_state_test.exe} %{exe:../bin/Main.exe}))))
+
+(executable
  (name lsp_open_diag_no_global_revalidate_stall_test)
  (libraries jovial_lsp_lib yojson unix))
 
@@ -526,6 +552,23 @@
    (setenv JOVIAL_TEST_EXTERNAL_NAV_CONVERGE_TIMEOUT_S "60"
     (setenv JOVIAL_TEST_EXTERNAL_NAV_HARD_TIMEOUT_S "900"
      (run %{exe:lsp_external_workspace_nav_convergence_test.exe} %{exe:../bin/Main.exe}))))))
+
+(executable
+ (name lsp_open_diag_preview_latency_test)
+ (libraries jovial_lsp_lib yojson unix threads))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (run %{exe:lsp_open_diag_preview_latency_test.exe} %{exe:../bin/Main.exe})))
+
+(executable
+ (name workspace_revalidate_all_fast_path_test)
+ (libraries jovial_lsp_lib yojson unix))
+
+(rule
+ (alias runtest-smoke)
+ (action (run %{exe:workspace_revalidate_all_fast_path_test.exe})))
 
 (alias
  (name runtest)

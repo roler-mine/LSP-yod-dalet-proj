@@ -208,6 +208,7 @@ let is_reserved_keyword (name : string) : bool =
   | _ -> false
 
 let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
+  let doc = Document.ensure_parsed doc in
   match doc.Document.ast with
   | None -> []
   | Some prog ->
@@ -294,6 +295,7 @@ and dep_info_add_decl (info : dep_info) (d : Ast.decl Ast.node) : unit =
       dep_info_add_stmt info p.v.body
 
 let dep_info_of_doc (doc : Document.t) : dep_info =
+  let doc = Document.ensure_parsed doc in
   let info = dep_info_create () in
   (match doc.Document.ast with
   | None -> ()

@@ -124,6 +124,7 @@ let semantic_mods_for_occurrence ~(decl : def) ~(occ_uri : T.DocumentUri.t)
   else mods
 
 let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
+  let doc = Document.ensure_parsed doc in
   let out = Hashtbl.create 32 in
   let add_define_args (args : Ast.ident list) : unit =
     match args with
@@ -374,6 +375,7 @@ let rec doc_symbol_json (s : doc_symbol) : Yojson.Safe.t =
   `Assoc fields
 
 let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
+  let doc = Document.ensure_parsed doc in
   let current_compool_key =
     match doc.Document.compool_def with
     | None -> None
@@ -665,6 +667,34 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
           ws.open_provisional_since_ms None
       in
 
+      let open_pending_docs =
+        Hashtbl.fold
+          (fun uri doc acc ->
+            if doc.Document.parse_rev = doc.Document.rev then acc
+            else
+              `Assoc
+                [
+                  ("uri", `String (Uri_path.docuri_to_string uri));
+                  ( "file",
+                    match doc.Document.file with
+                    | None -> `Null
+                    | Some path -> `String path );
+                  ("rev", `Int doc.Document.rev);
+                  ("parseRev", `Int doc.Document.parse_rev);
+                ]
+              :: acc)
+          ws.docs []
+        |> List.sort (fun a b ->
+            let file_of = function
+              | `Assoc fields -> (
+                  match List.assoc_opt "file" fields with
+                  | Some (`String path) -> path
+                  | _ -> "")
+              | _ -> ""
+            in
+            compare (file_of a) (file_of b))
+      in
+
       let background =
         let pressure_mode =
           workspace_pressure_mode ws |> pressure_mode_to_string
@@ -724,6 +754,7 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
               match oldest_open_unconverged_ms with
               | None -> `Null
               | Some ms -> `Int (int_of_float ms) );
+            ("openPendingDocs", `List open_pending_docs);
           ]
       in
 

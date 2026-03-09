@@ -12,6 +12,13 @@ let contains_substring ~(haystack : string) ~(needle : string) : bool =
     in
     loop 0
 
+let is_lsp_wait_timeout (exn : exn) : bool =
+  match exn with
+  | Failure msg ->
+      contains_substring ~haystack:msg
+        ~needle:"timed out waiting for LSP message"
+  | _ -> false
+
 let is_false_control_keyword_undefined (msg : string) : bool =
   contains_substring ~haystack:msg ~needle:"Undefined procedure \"EXIT\""
   || contains_substring ~haystack:msg ~needle:"Undefined procedure \"ABORT\""
@@ -92,7 +99,7 @@ let debug_report_assoc ~(srv : Lsp_test_helpers.server_proc) ~(id : int)
     `Assoc
       [
         ("command", `String "jovial.debugReport");
-        ("arguments", `List [ `String uri ]);
+        ("arguments", `List [ `String uri; `Int 0 ]);
       ]
   in
   let resp, _ =
@@ -276,27 +283,62 @@ let () =
           in
           let rec wait_ready req_id =
             if Unix.gettimeofday () >= ready_deadline then
+              let report =
+                try
+                  Some
+                    (debug_report_assoc ~srv ~id:req_id ~uri:first_uri
+                       ~timeout_s:8.0)
+                with exn ->
+                  prerr_endline
+                    (Printf.sprintf
+                       "lsp_external_workspace_open_diag_test: debugReport on \
+                        timeout failed: %s"
+                       (Printexc.to_string exn));
+                  None
+              in
+              let report_json =
+                match report with
+                | None -> "<unavailable>"
+                | Some fields -> Yojson.Safe.to_string (`Assoc fields)
+              in
               if require_ready_convergence then
                 failf
                   "timed out waiting for diagnostics-stage convergence in \
-                   debugReport"
+                   debugReport: %s"
+                  report_json
               else (
                 prerr_endline
-                  "lsp_external_workspace_open_diag_test: note - \
-                   diagnostics-stage convergence was not reached within \
-                   timeout";
-                debug_report_assoc ~srv ~id:req_id ~uri:first_uri ~timeout_s:4.0)
+                  (Printf.sprintf
+                     "lsp_external_workspace_open_diag_test: note - \
+                      diagnostics-stage convergence was not reached within \
+                      timeout: %s"
+                     report_json);
+                match report with Some fields -> fields | None -> [])
             else
-              let report =
-                debug_report_assoc ~srv ~id:req_id ~uri:first_uri ~timeout_s:4.0
+              let report_opt =
+                try
+                  Some
+                    (debug_report_assoc ~srv ~id:req_id ~uri:first_uri
+                       ~timeout_s:8.0)
+                with exn ->
+                  if is_lsp_wait_timeout exn then None else raise exn
               in
-              let pending = startup_open_docs_pending_parse_of_report report in
-              let xmodule_ready = startup_xmodule_diag_ready_of_report report in
-              let diag_ready = startup_diag_hover_ready_of_report report in
-              if pending = 0 && xmodule_ready && diag_ready then report
-              else (
-                Lsp_test_helpers.sleep_seconds 0.2;
-                wait_ready (req_id + 1))
+              match report_opt with
+              | None ->
+                  Lsp_test_helpers.sleep_seconds 0.2;
+                  wait_ready (req_id + 1)
+              | Some report ->
+                  let pending =
+                    startup_open_docs_pending_parse_of_report report
+                  in
+                  let xmodule_ready =
+                    startup_xmodule_diag_ready_of_report report
+                  in
+                  let diag_ready = startup_diag_hover_ready_of_report report in
+                  if pending = 0 && xmodule_ready && diag_ready then report
+                  else (
+                    Lsp_test_helpers.sleep_seconds 0.2;
+                    wait_ready (req_id + 1))
           in
           let report = wait_ready 9801 in
 

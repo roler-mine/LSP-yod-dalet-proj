@@ -621,37 +621,41 @@ let schedule_nav_miss_reconcile (ws : t) ~(doc : Document.t)
        match ws.index with
        | None -> ()
        | Some idx ->
-           let rec scan scanned scanned_bytes = function
-             | [] -> ()
-             | _ when scanned >= quick_scan_files_budget -> ()
-             | _ when scanned_bytes >= quick_scan_total_budget -> ()
-             | path :: tl -> (
-                 match
-                   read_prefix path ~max_bytes:nav_quick_scan_per_file_bytes
-                 with
-                 | None -> scan (scanned + 1) scanned_bytes tl
-                 | Some text ->
-                     let bytes = String.length text in
-                     let next_bytes = scanned_bytes + bytes in
-                     if next_bytes > quick_scan_total_budget then ()
-                     else
-                       let upper = String.uppercase_ascii text in
-                       if contains_pat upper then enqueue_path_once path;
-                       scan (scanned + 1) next_bytes tl)
-           in
-           scan 0 0 (Workspace_index.all_source_paths idx);
+           Workspace_index.source_paths_for_proc_hint idx ~name:key
+           |> List.iter enqueue_path_once;
            if Hashtbl.length scheduled_paths = 0 then (
-             ensure_graph_fresh ws;
-             let rec enqueue_closure i remaining =
-               if
-                 remaining <= 0 || i >= Array.length ws.graph_root_closure_paths
-               then ()
-               else (
-                 enqueue_path_once ws.graph_root_closure_paths.(i);
-                 enqueue_closure (i + 1) (remaining - 1))
+             let rec scan scanned scanned_bytes = function
+               | [] -> ()
+               | _ when scanned >= quick_scan_files_budget -> ()
+               | _ when scanned_bytes >= quick_scan_total_budget -> ()
+               | path :: tl -> (
+                   match
+                     read_prefix path ~max_bytes:nav_quick_scan_per_file_bytes
+                   with
+                   | None -> scan (scanned + 1) scanned_bytes tl
+                   | Some text ->
+                       let bytes = String.length text in
+                       let next_bytes = scanned_bytes + bytes in
+                       if next_bytes > quick_scan_total_budget then ()
+                       else
+                         let upper = String.uppercase_ascii text in
+                         if contains_pat upper then enqueue_path_once path;
+                         scan (scanned + 1) next_bytes tl)
              in
-             enqueue_closure 0
-               (min 48 (Array.length ws.graph_root_closure_paths))));
+             scan 0 0 (Workspace_index.all_source_paths idx);
+             if Hashtbl.length scheduled_paths = 0 then (
+               ensure_graph_fresh ws;
+               let rec enqueue_closure i remaining =
+                 if
+                   remaining <= 0
+                   || i >= Array.length ws.graph_root_closure_paths
+                 then ()
+                 else (
+                   enqueue_path_once ws.graph_root_closure_paths.(i);
+                   enqueue_closure (i + 1) (remaining - 1))
+               in
+               enqueue_closure 0
+                 (min 48 (Array.length ws.graph_root_closure_paths)))));
     ignore
       (maybe_escalate_index_reconcile ws ~doc:(Some doc) ~reason:"nav_miss"
          ~has_imports_override:(imports <> [])))

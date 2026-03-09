@@ -7,7 +7,6 @@ type t = {
   parse_rev : int;
   text : string;
   index : Text_index.t;
-  pre_text : string;
   imports : Preprocess.import list;
   compool_def : string option;
   defines : Preprocess.define list;
@@ -28,7 +27,6 @@ let reparse (doc : t) : t =
     {
       doc with
       parse_rev = doc.rev;
-      pre_text = pre.text;
       imports = pre.imports;
       compool_def = pre.compool_def;
       defines = pre.defines;
@@ -49,7 +47,6 @@ let make ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string) : t =
       parse_rev = 1;
       text;
       index = Text_index.of_string text;
-      pre_text = text;
       imports = [];
       compool_def = None;
       defines = [];
@@ -72,7 +69,6 @@ let make_unparsed ~(uri : T.DocumentUri.t) ~(file : string option)
       parse_rev = 0;
       text;
       index = Text_index.of_string text;
-      pre_text = text;
       imports = [];
       compool_def = None;
       defines = [];
@@ -89,8 +85,24 @@ let diagnostics (d : t) = d.diags
 let imports (d : t) = d.imports
 let text (d : t) = d.text
 
+let ensure_parsed (d : t) : t =
+  if d.parse_rev = d.rev && d.ast = None && d.parse_diags = [] then reparse d
+  else d
+
+let drop_ast (d : t) : t =
+  if d.ast = None || d.parse_rev <> d.rev || d.parse_diags <> [] then d
+  else { d with ast = None }
+
+let compare_pos (a : T.Position.t) (b : T.Position.t) : int =
+  if a.line <> b.line then compare a.line b.line
+  else compare a.character b.character
+
+let normalize_range (r : T.Range.t) : T.Range.t =
+  if compare_pos r.start r.end_ <= 0 then r
+  else { T.Range.start = r.end_; end_ = r.start }
+
 let ast_dump (d : t) =
-  match d.ast with
+  match (ensure_parsed d).ast with
   | None -> None
   | Some ast ->
       let opts = { Ast.Debug.default_opts with show_locs = true } in
@@ -125,23 +137,34 @@ let text_region_equals (text : string) ~(offset : int) ~(replacement : string) :
     in
     loop 0
 
-let apply_one_change (text : string) (idx : Text_index.t)
+let slice_of_range ~(text : string) ~(index : Text_index.t) (r : T.Range.t) :
+    string option =
+  let r = normalize_range r in
+  match (offset_of_pos index r.start, offset_of_pos index r.end_) with
+  | Some a, Some b ->
+      let a, b = if a <= b then (a, b) else (b, a) in
+      if a < 0 || b < a || b > String.length text then None
+      else Some (String.sub text a (b - a))
+  | _ -> None
+
+let apply_content_change ~(text : string) ~(index : Text_index.t)
     (c : T.TextDocumentContentChangeEvent.t) : string * Text_index.t =
   match c.range with
   | None ->
       let text' = c.text in
-      (text', Text_index.of_string text')
+      if text' = text then (text, index) else (text', Text_index.of_string text')
   | Some r -> (
+      let r = normalize_range r in
       let sp = r.start in
       let ep = r.end_ in
-      match (offset_of_pos idx sp, offset_of_pos idx ep) with
+      match (offset_of_pos index sp, offset_of_pos index ep) with
       | Some a, Some b ->
           let a, b = if a <= b then (a, b) else (b, a) in
           let replaced_len = b - a in
           if
             replaced_len = String.length c.text
             && text_region_equals text ~offset:a ~replacement:c.text
-          then (text, idx)
+          then (text, index)
           else
             let before = String.sub text 0 a in
             let after_len = String.length text - b in
@@ -149,19 +172,25 @@ let apply_one_change (text : string) (idx : Text_index.t)
               if after_len <= 0 then "" else String.sub text b after_len
             in
             let text' = before ^ c.text ^ after in
-            (text', Text_index.of_string text')
+            ( text',
+              Text_index.replace_range index ~start_off:a ~end_off:b
+                ~replacement:c.text ~text:text' )
       | _ ->
           (* Keep the current text on malformed ranges instead of replacing the whole document. *)
-          (text, idx))
+          (text, index))
 
 let apply_changes (doc : t) (changes : T.TextDocumentContentChangeEvent.t list)
     : t =
-  let text, index =
+  let text, index, changed =
     List.fold_left
-      (fun (t, idx) ch -> apply_one_change t idx ch)
-      (doc.text, doc.index) changes
+      (fun (t, idx, changed) ch ->
+        let t', idx' = apply_content_change ~text:t ~index:idx ch in
+        let changed' = changed || not (t' == t && idx' == idx) in
+        (t', idx', changed'))
+      (doc.text, doc.index, false)
+      changes
   in
-  { doc with rev = doc.rev + 1; text; index }
+  if not changed then doc else { doc with rev = doc.rev + 1; text; index }
 
 let apply_changes_no_reparse
     ~(changes : T.TextDocumentContentChangeEvent.t list) (doc : t) : t =

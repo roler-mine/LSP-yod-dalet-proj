@@ -38,12 +38,6 @@ let largest_file (files : string list) : string =
           if file_size_bytes path > file_size_bytes best then path else best)
         first rest
 
-let is_symbol_char (c : char) : bool =
-  (c >= 'A' && c <= 'Z')
-  || (c >= 'a' && c <= 'z')
-  || (c >= '0' && c <= '9')
-  || c = '_' || c = '\''
-
 let is_ident_char (c : char) : bool =
   (c >= 'A' && c <= 'Z')
   || (c >= 'a' && c <= 'z')
@@ -58,61 +52,161 @@ let is_reserved_like (tok : string) : bool =
       true
   | _ -> false
 
-let collect_call_like_tokens ~(limit : int) (text : string) : string list =
-  let n = String.length text in
-  let seen : (string, bool) Hashtbl.t = Hashtbl.create 64 in
-  let add acc tok =
-    if tok = "" || is_reserved_like tok || Hashtbl.mem seen tok then acc
+let starts_with ~(prefix : string) (s : string) : bool =
+  let n = String.length s in
+  let m = String.length prefix in
+  n >= m && String.sub s 0 m = prefix
+
+let normalize_path_for_compare (path : string) : string =
+  let path = String.map (fun c -> if c = '\\' then '/' else c) path in
+  if Sys.win32 then String.lowercase_ascii path else path
+
+let is_comment_line (line : string) : bool =
+  let trimmed = String.trim line in
+  trimmed <> "" && trimmed.[0] = '%'
+
+let is_ref_proc_line (line : string) : bool =
+  let trimmed = String.uppercase_ascii (String.trim line) in
+  starts_with ~prefix:"REF PROC " trimmed
+
+let is_executable_line (line : string) : bool =
+  let trimmed = String.trim line in
+  trimmed <> "" && (not (is_comment_line line)) && not (is_ref_proc_line line)
+
+let add_call_like_tokens ~(seen : (string, bool) Hashtbl.t) ~(limit : int)
+    (line : string) (acc : string list) : string list =
+  let n = String.length line in
+  let add line_tokens tok =
+    if tok = "" || is_reserved_like tok || Hashtbl.mem seen tok then line_tokens
     else (
       Hashtbl.replace seen tok true;
-      tok :: acc)
+      tok :: line_tokens)
   in
-  let rec scan i acc =
-    if i >= n || List.length acc >= limit then List.rev acc
-    else if is_ident_char text.[i] then (
+  let rec scan i line_tokens =
+    if i >= n || List.length acc + List.length line_tokens >= limit then
+      line_tokens
+    else if is_ident_char line.[i] then (
       let j = ref (i + 1) in
-      while !j < n && is_ident_char text.[!j] do
+      while !j < n && is_ident_char line.[!j] do
         incr j
       done;
-      let tok = String.sub text i (!j - i) in
+      let tok = String.sub line i (!j - i) in
       let k = ref !j in
-      while !k < n && (text.[!k] = ' ' || text.[!k] = '\t') do
+      while !k < n && (line.[!k] = ' ' || line.[!k] = '\t') do
         incr k
       done;
-      if !k < n && text.[!k] = '(' then scan (!j + 1) (add acc tok)
-      else scan (!j + 1) acc)
-    else scan (i + 1) acc
+      if !k < n && line.[!k] = '(' then scan (!j + 1) (add line_tokens tok)
+      else scan (!j + 1) line_tokens)
+    else scan (i + 1) line_tokens
   in
-  scan 0 []
+  let line_tokens = List.rev (scan 0 []) in
+  List.rev_append line_tokens acc
 
-let is_identifier_apostrophe_token (tok : string) : bool =
-  let n = String.length tok in
-  if n < 3 then false
+let collect_call_like_tokens_from_executable_lines ~(limit : int)
+    (text : string) : string list =
+  let seen : (string, bool) Hashtbl.t = Hashtbl.create 64 in
+  let rec loop acc = function
+    | [] -> List.rev acc
+    | _ when List.length acc >= limit -> List.rev acc
+    | line :: tl ->
+        let acc =
+          if is_executable_line line then
+            add_call_like_tokens ~seen ~limit:(limit - List.length acc) line acc
+          else acc
+        in
+        loop acc tl
+  in
+  loop [] (String.split_on_char '\n' text)
+
+let find_call_site_in_executable_lines (text : string) ~(needle : string) :
+    (int * int) option =
+  let needle_len = String.length needle in
+  if needle_len = 0 then None
   else
-    let rec first_quote i =
-      if i >= n then None
-      else if tok.[i] = '\'' then Some i
-      else first_quote (i + 1)
+    let rec find_in_line (line : string) start =
+      let line_len = String.length line in
+      if start + needle_len > line_len then None
+      else if
+        String.sub line start needle_len = needle
+        && (start = 0 || not (is_ident_char line.[start - 1]))
+        && (start + needle_len >= line_len
+           || not (is_ident_char line.[start + needle_len]))
+      then (
+        let next = ref (start + needle_len) in
+        while !next < line_len && (line.[!next] = ' ' || line.[!next] = '\t') do
+          incr next
+        done;
+        if !next < line_len && line.[!next] = '(' then Some start
+        else find_in_line line (start + 1))
+      else find_in_line line (start + 1)
     in
-    match first_quote 0 with
-    | None -> false
-    | Some i -> i > 0 && i < n - 1 && tok.[0] <> '\'' && tok.[n - 1] <> '\''
+    let rec loop line_no = function
+      | [] -> None
+      | line :: tl ->
+          if is_executable_line line then
+            match find_in_line line 0 with
+            | Some col -> Some (line_no, col)
+            | None -> loop (line_no + 1) tl
+          else loop (line_no + 1) tl
+    in
+    loop 0 (String.split_on_char '\n' text)
 
-let find_first_apostrophe_token (text : string) : string option =
-  let n = String.length text in
-  let rec next_token i =
-    if i >= n then None
-    else if is_symbol_char text.[i] then read_token i (i + 1) false
-    else next_token (i + 1)
-  and read_token start i has_quote =
-    if i >= n || not (is_symbol_char text.[i]) then
-      if has_quote then
-        let tok = String.sub text start (i - start) in
-        if is_identifier_apostrophe_token tok then Some tok else next_token i
-      else next_token i
-    else read_token start (i + 1) (has_quote || text.[i] = '\'')
+let def_proc_name_of_line (line : string) : string option =
+  let trimmed = String.uppercase_ascii (String.trim line) in
+  let prefix = "DEF PROC " in
+  if not (starts_with ~prefix trimmed) then None
+  else
+    let start = String.length prefix in
+    let j = ref start in
+    while !j < String.length trimmed && is_ident_char trimmed.[!j] do
+      incr j
+    done;
+    if !j = start then None else Some (String.sub trimmed start (!j - start))
+
+let choose_auto_needle ~(files : string list) ~(main_path : string)
+    ~(main_text : string) : string option =
+  let candidates =
+    collect_call_like_tokens_from_executable_lines ~limit:64 main_text
   in
-  next_token 0
+  if candidates = [] then None
+  else
+    let target_names : (string, string) Hashtbl.t = Hashtbl.create 64 in
+    let found_paths : (string, string) Hashtbl.t = Hashtbl.create 64 in
+    let remaining = ref 0 in
+    List.iter
+      (fun tok ->
+        let key = String.uppercase_ascii tok in
+        if key <> "" && not (Hashtbl.mem target_names key) then (
+          Hashtbl.replace target_names key tok;
+          incr remaining))
+      candidates;
+    let main_key = normalize_path_for_compare main_path in
+    List.iter
+      (fun path ->
+        if !remaining > 0 && normalize_path_for_compare path <> main_key then
+          let ic = open_in_bin path in
+          Fun.protect
+            ~finally:(fun () -> close_in_noerr ic)
+            (fun () ->
+              try
+                while !remaining > 0 do
+                  match def_proc_name_of_line (input_line ic) with
+                  | Some name
+                    when Hashtbl.mem target_names name
+                         && not (Hashtbl.mem found_paths name) ->
+                      Hashtbl.replace found_paths name path;
+                      decr remaining
+                  | _ -> ()
+                done
+              with End_of_file -> ()))
+      files;
+    let rec pick = function
+      | [] -> None
+      | tok :: tl ->
+          if Hashtbl.mem found_paths (String.uppercase_ascii tok) then Some tok
+          else pick tl
+    in
+    pick candidates
 
 let assoc_field (name : string) (fields : (string * Yojson.Safe.t) list) :
     Yojson.Safe.t option =
@@ -166,7 +260,7 @@ let warmup_responsive_probe ~(srv : Lsp_test_helpers.server_proc) ~(id : int)
     `Assoc
       [
         ("command", `String "jovial.debugReport");
-        ("arguments", `List [ `String uri; `Int 24 ]);
+        ("arguments", `List [ `String uri; `Int 0 ]);
       ]
   in
   ignore
@@ -250,26 +344,39 @@ let () =
       if not (Sys.file_exists main_path) then
         failf "selected nav source file does not exist: %s" main_path;
       let main_text = read_text main_path in
-      let needle =
+      let manual_needle =
         match Sys.getenv_opt "JOVIAL_TEST_EXTERNAL_NAV_NEEDLE" with
-        | Some raw when String.trim raw <> "" -> String.trim raw
-        | _ -> (
-            match collect_call_like_tokens ~limit:16 main_text with
-            | tok :: _ -> tok
-            | [] -> (
-                match find_first_apostrophe_token main_text with
-                | Some tok -> tok
-                | None ->
-                    print_endline
-                      "lsp_external_workspace_nav_convergence_test: skipped \
-                       (no call-like or apostrophe identifier token found; set \
-                       JOVIAL_TEST_EXTERNAL_NAV_NEEDLE)";
-                    exit 0))
+        | Some raw when String.trim raw <> "" -> Some (String.trim raw)
+        | _ -> None
+      in
+      let needle =
+        match manual_needle with
+        | Some needle -> needle
+        | None -> (
+            match choose_auto_needle ~files ~main_path ~main_text with
+            | Some tok -> tok
+            | None ->
+                print_endline
+                  "lsp_external_workspace_nav_convergence_test: skipped (no \
+                   executable call-like token with external DEF PROC found; \
+                   set JOVIAL_TEST_EXTERNAL_NAV_NEEDLE)";
+                exit 0)
       in
       let line, col =
-        try Lsp_test_helpers.line_col_of_first main_text ~needle
-        with _ ->
-          failf "needle %S not found in selected file %s" needle main_path
+        match find_call_site_in_executable_lines main_text ~needle with
+        | Some pos -> pos
+        | None -> (
+            match manual_needle with
+            | Some _ -> (
+                try Lsp_test_helpers.line_col_of_first main_text ~needle
+                with _ ->
+                  failf "needle %S not found in selected file %s" needle
+                    main_path)
+            | None ->
+                failf
+                  "auto-selected needle %S was not found on an executable call \
+                   site in %s"
+                  needle main_path)
       in
       let started = Unix.gettimeofday () in
       let remaining_budget () =

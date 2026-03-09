@@ -12,11 +12,20 @@ val compool_count : t -> int
 
 val open_doc :
   ?force_provisional:bool ->
+  ?inline_catch_up:bool ->
   t ->
   uri:T.DocumentUri.t ->
   file:string option ->
   text:string ->
   unit
+
+val preview_open_doc_diags :
+  ?force_provisional:bool ->
+  t ->
+  uri:T.DocumentUri.t ->
+  file:string option ->
+  text:string ->
+  T.Diagnostic.t list option
 
 val change_doc :
   t ->
@@ -43,9 +52,11 @@ val drain_pending_diag_updates :
   t -> max_items:int -> (T.DocumentUri.t * T.Diagnostic.t list) list
 
 val drain_open_diag_revalidate_uris : t -> max_items:int -> T.DocumentUri.t list
+val finish_last_open_doc_now_if_needed : t -> bool
 val startup_background_budget_ms : t -> base_budget_ms:int -> int
 val startup_diag_hover_ready_now : t -> bool
 val startup_is_ready_now : t -> bool
+val open_doc_count : t -> int
 val startup_readiness_json_for_report : t -> Yojson.Safe.t
 val workspace_ready_event_json : t -> Yojson.Safe.t option
 val startup_phase_event_json : t -> Yojson.Safe.t option

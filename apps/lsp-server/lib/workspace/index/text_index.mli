@@ -1,6 +1,10 @@
 type t
 
 val of_string : string -> t
+
+val replace_range :
+  t -> start_off:int -> end_off:int -> replacement:string -> text:string -> t
+
 val line_count : t -> int
 val line_start_offset : t -> line:int -> int option
 val line_length : t -> line:int -> int option

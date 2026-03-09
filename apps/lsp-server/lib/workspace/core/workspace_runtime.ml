@@ -169,20 +169,6 @@ let startup_queues_empty (ws : t) : bool =
   && Hashtbl.length ws.bg_pending_diag_payloads = 0
   && Hashtbl.length ws.parse_worker_inflight = 0
 
-let startup_hints_ready (ws : t) : bool =
-  ws.symbol_hints <> None
-  ||
-  match ws.index with
-  | Some idx ->
-      Workspace_index.is_complete idx
-      && Queue.is_empty ws.bg_high_small_queue
-      && Queue.is_empty ws.bg_root_small_queue
-      && Queue.is_empty ws.bg_norm_small_queue
-      && Queue.is_empty ws.bg_high_large_queue
-      && Queue.is_empty ws.bg_root_large_queue
-      && Queue.is_empty ws.bg_norm_large_queue
-  | None -> false
-
 let quick_nav_index_complete (ws : t) : bool =
   ws.quick_nav_index_total > 0
   && ws.quick_nav_index_done >= ws.quick_nav_index_total
@@ -195,6 +181,22 @@ let quick_nav_index_ready_for_startup (ws : t) : bool =
   else
     let goal = min ws.quick_nav_index_total 64 in
     ws.quick_nav_index_done >= goal
+
+let startup_hints_ready (ws : t) : bool =
+  ws.symbol_hints <> None
+  || ws.workspace_diag_mode = WorkspaceDiagsOff
+     && quick_nav_index_ready_for_startup ws
+  ||
+  match ws.index with
+  | Some idx ->
+      Workspace_index.is_complete idx
+      && Queue.is_empty ws.bg_high_small_queue
+      && Queue.is_empty ws.bg_root_small_queue
+      && Queue.is_empty ws.bg_norm_small_queue
+      && Queue.is_empty ws.bg_high_large_queue
+      && Queue.is_empty ws.bg_root_large_queue
+      && Queue.is_empty ws.bg_norm_large_queue
+  | None -> false
 
 let startup_nav_prereqs_ready (ws : t) : bool =
   ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
@@ -222,6 +224,8 @@ let startup_is_fully_navigable (ws : t) : bool =
 let startup_elapsed_ms_float (ws : t) : float =
   let now = Perf_stats.now_ms () in
   max 0.0 (now -. ws.startup_started_ms)
+
+let open_doc_count (ws : t) : int = Hashtbl.length ws.docs
 
 let startup_update_phase (ws : t) : unit =
   let next_phase =
@@ -310,7 +314,9 @@ let update_startup_ready_state (ws : t) : unit =
   if xmodule_ready_now && not ws.xmodule_diag_ready_prev then (
     ws.xmodule_diag_ready_prev <- true;
     Perf_stats.tick "diag.xmodule_ready_transition";
-    enqueue_all_open_diag_revalidate ws ~reason:"xmodule_ready")
+    if ws.workspace_diag_mode = WorkspaceDiagsOff then
+      Perf_stats.tick "diag.open.revalidate_skipped_mode_off"
+    else enqueue_all_open_diag_revalidate ws ~reason:"xmodule_ready")
   else if not xmodule_ready_now then ws.xmodule_diag_ready_prev <- false;
 
   (if startup_is_diag_hover_ready ws then
@@ -557,24 +563,10 @@ let workspace_source_bytes_estimate (ws : t) : int =
   match ws.index with
   | None -> 0
   | Some idx ->
-      let source_count = Workspace_index.source_count idx in
-      if ws.source_bytes_estimate_count = source_count then
-        match ws.source_bytes_estimate with
-        | Some bytes -> max 0 bytes
-        | None -> 0
-      else
-        let bytes =
-          Workspace_index.all_source_paths idx
-          |> List.fold_left
-               (fun acc path ->
-                 match file_size_bytes path with
-                 | Some n when n > 0 -> acc + n
-                 | _ -> acc)
-               0
-        in
-        ws.source_bytes_estimate <- Some bytes;
-        ws.source_bytes_estimate_count <- source_count;
-        max 0 bytes
+      let bytes = Workspace_index.source_total_bytes idx in
+      ws.source_bytes_estimate <- Some bytes;
+      ws.source_bytes_estimate_count <- Workspace_index.source_count idx;
+      max 0 bytes
 
 let workspace_profile_for_budget (ws : t) : workspace_profile =
   match ws.workspace_profile_mode with

@@ -9,11 +9,30 @@ open Workspace_tuning
 
 type semantic_validation_mode = SemanticFull | SemanticRangeSemi of T.Range.t
 
-let store_doc ?(import_lookup_pump : bool = true)
+type doc_store_diff = {
+  structural_changed : bool;
+  rev_changed : bool;
+  parse_rev_changed : bool;
+  imports_changed : bool;
+  compool_key_changed : bool;
+  file_changed : bool;
+  old_has_compool : bool;
+  new_has_compool : bool;
+}
+
+let has_compool_doc (doc : Document.t) : bool =
+  match doc.Document.compool_def with
+  | None -> false
+  | Some name -> normalize_name name <> ""
+
+let validated_doc_with_diags ?(import_lookup_pump : bool = true)
     ?(semantic_mode : semantic_validation_mode = SemanticFull) (ws : t)
-    (uri : T.DocumentUri.t) (doc : Document.t) : unit =
-  let old_doc = Hashtbl.find_opt ws.docs uri in
-  let old_compool_key = Option.bind old_doc compool_key_of_doc in
+    (doc : Document.t) : Document.t =
+  let doc =
+    match semantic_mode with
+    | SemanticFull -> Document.ensure_parsed doc
+    | SemanticRangeSemi _ -> doc
+  in
   let import_diags =
     try validate_imports ~pump_lookup:import_lookup_pump ws doc
     with exn -> [ diag_internal_phase_failure ~phase:"import" doc exn ]
@@ -28,52 +47,188 @@ let store_doc ?(import_lookup_pump : bool = true)
             [ diag_internal_phase_failure ~phase:"semantic" doc exn ])
       | SemanticRangeSemi _ -> []
   in
-  let doc = Document.with_import_diags (import_diags @ semantic_diags) doc in
-  mark_graph_dirty ws;
-  let new_compool_key = compool_key_of_doc doc in
-  let has_compool (d : Document.t) =
-    match d.Document.compool_def with
-    | None -> false
-    | Some name -> normalize_name name <> ""
-  in
-  if has_compool doc || Option.fold ~none:false ~some:has_compool old_doc then
-    invalidate_symbol_hints ws;
-  Hashtbl.replace ws.docs uri doc;
-  let revalidate_importers_for_compool (key : string option) : unit =
-    match key with
+  Document.with_import_diags (import_diags @ semantic_diags) doc
+
+let doc_store_diff ~(old_doc : Document.t option) ~(new_doc : Document.t) :
+    doc_store_diff =
+  match old_doc with
+  | None ->
+      {
+        structural_changed = true;
+        rev_changed = true;
+        parse_rev_changed = true;
+        imports_changed = true;
+        compool_key_changed = true;
+        file_changed = true;
+        old_has_compool = false;
+        new_has_compool = has_compool_doc new_doc;
+      }
+  | Some old_doc ->
+      let rev_changed = old_doc.Document.rev <> new_doc.Document.rev in
+      let parse_rev_changed =
+        old_doc.Document.parse_rev <> new_doc.Document.parse_rev
+      in
+      let imports_changed =
+        old_doc.Document.imports <> new_doc.Document.imports
+      in
+      let old_compool_key = compool_key_of_doc old_doc in
+      let new_compool_key = compool_key_of_doc new_doc in
+      let compool_key_changed = old_compool_key <> new_compool_key in
+      let file_changed = old_doc.Document.file <> new_doc.Document.file in
+      {
+        structural_changed =
+          rev_changed || parse_rev_changed || imports_changed
+          || compool_key_changed || file_changed;
+        rev_changed;
+        parse_rev_changed;
+        imports_changed;
+        compool_key_changed;
+        file_changed;
+        old_has_compool = has_compool_doc old_doc;
+        new_has_compool = has_compool_doc new_doc;
+      }
+
+let replace_doc_storage ?(touch_bg_parsed : bool = true)
+    ?(clear_closed_doc_touch : bool = true) (ws : t) ~(uri : T.DocumentUri.t)
+    ~(old_doc : Document.t option) (doc : Document.t) : unit =
+  let remove_old_path_entry () =
+    match old_doc with
     | None -> ()
-    | Some key ->
-        let importers = importer_uris_for_compool_key ws ~compool_key:key in
-        invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
-        List.iter
-          (fun importer_uri ->
-            enqueue_open_diag_revalidate ws ~uri:importer_uri
-              ~reason:"compool_change")
-          importers
+    | Some old_doc -> (
+        match old_doc.Document.file with
+        | None -> ()
+        | Some path when Some path <> doc.Document.file ->
+            let path_key = normalize_path_key path in
+            Hashtbl.remove ws.files path_key;
+            if touch_bg_parsed then Hashtbl.remove ws.bg_parsed path_key;
+            if clear_closed_doc_touch then
+              Hashtbl.remove ws.closed_doc_last_touch path_key
+        | Some _ -> ())
   in
-  revalidate_importers_for_compool old_compool_key;
-  revalidate_importers_for_compool new_compool_key;
-  if ws.sem_store_enabled then Semantic_store.remove_uri ws.semantic_store ~uri;
+  remove_old_path_entry ();
+  Hashtbl.replace ws.docs uri doc;
   match doc.Document.file with
   | None -> ()
   | Some f ->
       let path_key = normalize_path_key f in
       Hashtbl.replace ws.files path_key doc;
-      Hashtbl.replace ws.bg_parsed path_key true;
-      Hashtbl.remove ws.closed_doc_last_touch path_key
+      if touch_bg_parsed then Hashtbl.replace ws.bg_parsed path_key true;
+      if clear_closed_doc_touch then
+        Hashtbl.remove ws.closed_doc_last_touch path_key
+
+let maybe_shed_doc_ast (ws : t) ~(uri : T.DocumentUri.t) (doc : Document.t) :
+    bool =
+  let dropped = Document.drop_ast doc in
+  if dropped == doc then false
+  else (
+    replace_doc_storage ~touch_bg_parsed:false ~clear_closed_doc_touch:false ws
+      ~uri ~old_doc:(Some doc) dropped;
+    Perf_stats.tick "mem.doc_ast_shed";
+    true)
+
+let maybe_shed_open_doc_parse_state
+    ?(prefer_uri : T.DocumentUri.t option = None) (ws : t) : unit =
+  let budget =
+    match workspace_pressure_mode ws with
+    | PressureNormal -> 0
+    | PressureSoft -> 16
+    | PressureCritical -> max 64 (Hashtbl.length ws.docs)
+  in
+  if budget > 0 then (
+    let remaining = ref budget in
+    let preferred_key = Option.map Uri_path.docuri_to_string prefer_uri in
+    let try_uri (uri : T.DocumentUri.t) : unit =
+      if !remaining > 0 then
+        match Hashtbl.find_opt ws.docs uri with
+        | None -> ()
+        | Some doc -> if maybe_shed_doc_ast ws ~uri doc then decr remaining
+    in
+    (match prefer_uri with None -> () | Some uri -> try_uri uri);
+    if !remaining > 0 then
+      Hashtbl.iter
+        (fun uri doc ->
+          if !remaining > 0 then
+            let skip_preferred =
+              match preferred_key with
+              | Some key -> Uri_path.docuri_to_string uri = key
+              | None -> false
+            in
+            if (not skip_preferred) && maybe_shed_doc_ast ws ~uri doc then
+              decr remaining)
+        ws.docs)
+
+let revalidate_importers_for_doc_diff (ws : t) ~(old_doc : Document.t option)
+    ~(new_doc : Document.t) ~(diff : doc_store_diff) ~(enqueue_open_diag : bool)
+    : unit =
+  if diff.structural_changed && (diff.old_has_compool || diff.new_has_compool)
+  then (
+    let seen = Hashtbl.create 4 in
+    let revalidate_importers_for_compool (key_opt : string option) : unit =
+      match key_opt with
+      | None -> ()
+      | Some key ->
+          let key = normalize_name key in
+          if key = "" || Hashtbl.mem seen key then ()
+          else (
+            Hashtbl.replace seen key true;
+            let importers = importer_uris_for_compool_key ws ~compool_key:key in
+            invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
+            if enqueue_open_diag then
+              List.iter
+                (fun importer_uri ->
+                  enqueue_open_diag_revalidate ws ~uri:importer_uri
+                    ~reason:"compool_change")
+                importers)
+    in
+    revalidate_importers_for_compool (Option.bind old_doc compool_key_of_doc);
+    revalidate_importers_for_compool (compool_key_of_doc new_doc);
+    if enqueue_open_diag then
+      enqueue_all_open_diag_revalidate ws ~reason:"compool_change")
+
+let install_doc_surface ?(touch_bg_parsed : bool = true)
+    ?(clear_closed_doc_touch : bool = true)
+    ?(enqueue_importer_revalidate : bool = true) ?(allow_ast_shed : bool = true)
+    (ws : t) ~(uri : T.DocumentUri.t) ~(old_doc : Document.t option)
+    (doc : Document.t) : doc_store_diff =
+  let diff = doc_store_diff ~old_doc ~new_doc:doc in
+  if diff.structural_changed then mark_graph_dirty ws
+  else Perf_stats.tick "store_doc.side_effects_skipped";
+  if
+    diff.compool_key_changed
+    || (diff.rev_changed || diff.parse_rev_changed)
+       && (diff.old_has_compool || diff.new_has_compool)
+  then invalidate_symbol_hints ws;
+  replace_doc_storage ~touch_bg_parsed ~clear_closed_doc_touch ws ~uri ~old_doc
+    doc;
+  if allow_ast_shed then
+    maybe_shed_open_doc_parse_state ws ~prefer_uri:(Some uri);
+  revalidate_importers_for_doc_diff ws ~old_doc ~new_doc:doc ~diff
+    ~enqueue_open_diag:enqueue_importer_revalidate;
+  if ws.sem_store_enabled && (diff.rev_changed || diff.parse_rev_changed) then
+    Semantic_store.remove_uri ws.semantic_store ~uri;
+  diff
+
+let store_doc ?(import_lookup_pump : bool = true)
+    ?(semantic_mode : semantic_validation_mode = SemanticFull) (ws : t)
+    (uri : T.DocumentUri.t) (doc : Document.t) : unit =
+  let old_doc = Hashtbl.find_opt ws.docs uri in
+  let doc =
+    validated_doc_with_diags ~import_lookup_pump ~semantic_mode ws doc
+  in
+  ignore (install_doc_surface ws ~uri ~old_doc doc)
 
 let store_doc_fast (ws : t) (uri : T.DocumentUri.t) (doc : Document.t) : unit =
-  mark_graph_dirty ws;
-  Hashtbl.replace ws.docs uri doc;
+  let old_doc = Hashtbl.find_opt ws.docs uri in
+  ignore
+    (install_doc_surface ~touch_bg_parsed:false
+       ~enqueue_importer_revalidate:false ws ~uri ~old_doc doc);
   match doc.Document.file with
   | None -> ()
   | Some f ->
       let path_key = normalize_path_key f in
-      Hashtbl.replace ws.files path_key doc;
       if doc.Document.parse_rev = doc.Document.rev then
         Hashtbl.replace ws.bg_parsed path_key true
-      else Hashtbl.remove ws.bg_parsed path_key;
-      Hashtbl.remove ws.closed_doc_last_touch path_key
+      else Hashtbl.remove ws.bg_parsed path_key
 
 let direct_import_paths (ws : t) (doc : Document.t) : string list =
   let acc = Hashtbl.create 16 in
@@ -108,17 +263,20 @@ let enqueue_doc_imports_high (ws : t) (doc : Document.t) : unit =
       enqueue_bg_path ws ~lane:LaneOpen ~reason_group:"open_import" ~high:true p)
 
 let background_doc_with_diags (ws : t) (doc : Document.t) : Document.t =
-  let import_diags =
-    try validate_imports ~pump_lookup:false ws doc
-    with exn -> [ diag_internal_phase_failure ~phase:"import" doc exn ]
-  in
-  let semantic_diags =
-    if doc.Document.ast = None || doc.Document.parse_diags <> [] then []
-    else
-      try validate_semantics ws doc
-      with exn -> [ diag_internal_phase_failure ~phase:"semantic" doc exn ]
-  in
-  Document.with_import_diags (import_diags @ semantic_diags) doc
+  validated_doc_with_diags ~import_lookup_pump:false ws doc
+
+let refresh_open_doc_diags ?(import_lookup_pump : bool = false) (ws : t)
+    ~(uri : T.DocumentUri.t) : Document.t option =
+  match Hashtbl.find_opt ws.docs uri with
+  | None -> None
+  | Some doc ->
+      let refreshed = validated_doc_with_diags ~import_lookup_pump ws doc in
+      replace_doc_storage ~touch_bg_parsed:false ~clear_closed_doc_touch:false
+        ws ~uri ~old_doc:(Some doc) refreshed;
+      maybe_shed_open_doc_parse_state ws ~prefer_uri:(Some uri);
+      Perf_stats.tick "diag.open.revalidate_fast_path";
+      Perf_stats.tick "store_doc.side_effects_skipped";
+      Some refreshed
 
 let queue_workspace_diag_update_for_doc (ws : t) (doc : Document.t) : unit =
   match doc.Document.file with
@@ -474,17 +632,27 @@ let apply_parse_result_open (ws : t) ~(pr_kind : parse_job_kind)
       Perf_stats.tick "diag.open.stale_generation_drop"
     else (
       ignore pr_kind;
-      store_doc ~import_lookup_pump:false ws uri doc;
+      let old_doc = Hashtbl.find_opt ws.docs uri in
+      let finalize_diag_now =
+        doc.Document.parse_rev = doc.Document.rev
+        && Hashtbl.length ws.open_parse_generation <= 1
+        && xmodule_diag_prereqs_ready ws
+      in
+      ignore
+        (install_doc_surface ~enqueue_importer_revalidate:finalize_diag_now
+           ~allow_ast_shed:false ws ~uri ~old_doc doc);
       let uri_key = Uri_path.docuri_to_string uri in
       if doc.Document.parse_rev = doc.Document.rev then (
-        enqueue_open_diag_revalidate ws ~uri ~reason:"open_parse";
         (match Hashtbl.find_opt ws.open_provisional_since_ms uri_key with
         | None -> ()
         | Some t0 ->
             let lag = max 0.0 (Perf_stats.now_ms () -. t0) in
             Perf_stats.observe_ms "diag.open.authoritative_lag_ms" lag;
             Hashtbl.remove ws.open_provisional_since_ms uri_key);
-        Hashtbl.remove ws.open_parse_generation uri_key)
+        Hashtbl.remove ws.open_parse_generation uri_key;
+        if xmodule_diag_prereqs_ready ws then
+          enqueue_open_diag_revalidate ws ~uri ~reason:"open_parse"
+        else Perf_stats.tick "diag.open.revalidate_deferred_startup")
       else
         Hashtbl.replace ws.open_provisional_since_ms uri_key
           (Perf_stats.now_ms ());
@@ -501,11 +669,12 @@ let apply_parse_result_open (ws : t) ~(pr_kind : parse_job_kind)
       | Some key ->
           let importers = importer_uris_for_compool_key ws ~compool_key:key in
           invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
-          List.iter
-            (fun importer_uri ->
-              enqueue_open_diag_revalidate ws ~uri:importer_uri
-                ~reason:"compool_change")
-            importers);
+          if xmodule_diag_prereqs_ready ws then
+            List.iter
+              (fun importer_uri ->
+                enqueue_open_diag_revalidate ws ~uri:importer_uri
+                  ~reason:"compool_change")
+              importers);
       invalidate_lsif_snapshot ws)
 
 let apply_parse_result_path (ws : t) ~(pr_kind : parse_job_kind)
@@ -544,6 +713,43 @@ let apply_parse_result_path (ws : t) ~(pr_kind : parse_job_kind)
               importers);
         queue_workspace_diag_update_for_doc ws doc
 
+let finish_last_open_doc_now_if_needed (ws : t) : bool =
+  if Hashtbl.length ws.open_parse_generation > 1 then false
+  else
+    let pending =
+      Hashtbl.fold
+        (fun uri doc acc ->
+          if doc.Document.parse_rev = doc.Document.rev then acc
+          else (uri, doc) :: acc)
+        ws.docs []
+    in
+    match pending with
+    | [] -> false
+    | (uri, doc) :: _ -> (
+        match doc.Document.file with
+        | None -> false
+        | Some path ->
+            let generation =
+              match
+                Hashtbl.find_opt ws.open_parse_generation
+                  (Uri_path.docuri_to_string uri)
+              with
+              | Some g -> g
+              | None -> 0
+            in
+            let parsed_doc =
+              try
+                Perf_stats.time "parse.open_doc_forced" (fun () ->
+                    parse_guarded_document_make ws ~uri ~file:doc.Document.file
+                      ~text:doc.Document.text)
+              with exn ->
+                with_internal_phase_diag doc ~phase:"open-doc-forced" ~exn
+            in
+            apply_parse_result_open ws ~pr_kind:ParseJobHighLarge
+              ~pr_epoch:ws.parse_epoch ~path_key:(normalize_path_key path) ~uri
+              ~generation ~doc:parsed_doc;
+            true)
+
 let drain_parse_worker_results (ws : t) ~(max_items : int) : unit =
   if max_items <= 0 then ()
   else
@@ -575,7 +781,7 @@ let background_parse_path (ws : t) (path : string) : unit =
   if path_key = "" || Hashtbl.mem ws.bg_parsed path_key then ()
   else
     match find_open_doc_for_path ws ~path with
-    | Some open_doc ->
+    | Some open_doc -> (
         let uri = open_doc.Document.uri in
         let uri_key = Uri_path.docuri_to_string uri in
         if
@@ -608,18 +814,23 @@ let background_parse_path (ws : t) (path : string) : unit =
           in
           if latest_generation <> parse_generation then
             Perf_stats.tick "diag.open.stale_generation_drop"
-          else (
-            store_doc ~import_lookup_pump:false ws uri parsed_doc;
+          else
+            let old_doc = Hashtbl.find_opt ws.docs uri in
+            ignore
+              (install_doc_surface ~enqueue_importer_revalidate:false
+                 ~allow_ast_shed:false ws ~uri ~old_doc parsed_doc);
             if parsed_doc.Document.parse_rev = parsed_doc.Document.rev then (
               let key = Uri_path.docuri_to_string uri in
-              enqueue_open_diag_revalidate ws ~uri ~reason:"open_parse";
               (match Hashtbl.find_opt ws.open_provisional_since_ms key with
               | None -> ()
               | Some t0 ->
                   let lag = max 0.0 (Perf_stats.now_ms () -. t0) in
                   Perf_stats.observe_ms "diag.open.authoritative_lag_ms" lag;
                   Hashtbl.remove ws.open_provisional_since_ms key);
-              Hashtbl.remove ws.open_parse_generation key)
+              Hashtbl.remove ws.open_parse_generation key;
+              if xmodule_diag_prereqs_ready ws then
+                enqueue_open_diag_revalidate ws ~uri ~reason:"open_parse"
+              else Perf_stats.tick "diag.open.revalidate_deferred_startup")
             else
               Hashtbl.replace ws.open_provisional_since_ms
                 (Uri_path.docuri_to_string uri)
@@ -637,11 +848,12 @@ let background_parse_path (ws : t) (path : string) : unit =
                 in
                 invalidate_importer_nav_state_for_compool_key ws
                   ~compool_key:key;
-                List.iter
-                  (fun importer_uri ->
-                    enqueue_open_diag_revalidate ws ~uri:importer_uri
-                      ~reason:"compool_change")
-                  importers)
+                if xmodule_diag_prereqs_ready ws then
+                  List.iter
+                    (fun importer_uri ->
+                      enqueue_open_diag_revalidate ws ~uri:importer_uri
+                        ~reason:"compool_change")
+                    importers)
     | None -> (
         let uri =
           match Uri_path.docuri_of_path path with
@@ -743,6 +955,7 @@ let background_tick (ws : t) ~(budget_ms : int) ~(mode : bg_tick_mode)
     Perf_stats.tick "bg.tick";
     Perf_stats.tick "startup.phase_tick";
     update_pressure_state ws;
+    maybe_shed_open_doc_parse_state ws;
     pump_index_background ws;
     if workspace_pressure_mode ws <> PressureCritical then
       seed_bg_paths_from_index ws;
@@ -776,7 +989,8 @@ let background_tick (ws : t) ~(budget_ms : int) ~(mode : bg_tick_mode)
       | PressureCritical -> float_of_int (max 1 (budget_ms / 4))
     in
     let required_idle_quiet_ms =
-      max 0 (max idle_quiet_ms ws.bg_large_parse_idle_quiet_ms)
+      if diag_stage_pending then 0
+      else max 0 (max idle_quiet_ms ws.bg_large_parse_idle_quiet_ms)
     in
     let allow_normal_large =
       match mode with
@@ -913,10 +1127,9 @@ let drain_open_diag_revalidate_uris (ws : t) ~(max_items : int) :
         | None -> loop n acc
         | Some (uri, _reason) -> (
             Hashtbl.remove ws.open_diag_revalidate_payloads key;
-            match Hashtbl.find_opt ws.docs uri with
+            match refresh_open_doc_diags ~import_lookup_pump:false ws ~uri with
             | None -> loop n acc
-            | Some doc ->
-                store_doc ~import_lookup_pump:false ws uri doc;
+            | Some _ ->
                 Perf_stats.tick "diag.open.revalidate_drained";
                 loop (n - 1) (uri :: acc))
     in
