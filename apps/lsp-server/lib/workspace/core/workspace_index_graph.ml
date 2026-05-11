@@ -9,37 +9,33 @@ let is_network_root (ws : t) : bool =
 
 let allow_fallback_scan (ws : t) : bool = not (is_network_root ws)
 
-let lookup_scan_budget (ws : t) : int * int =
-  if is_network_root ws then
-    (index_lookup_dirs_network, index_lookup_files_network)
-  else (index_lookup_dirs, index_lookup_files)
-
 let ensure_index_started (ws : t) : unit =
   match (ws.root_path, ws.index) with
   | Some root, None ->
-      let idx = Workspace_index.start ~root in
-      if Workspace_index.checkpoint_loaded idx then
-        Perf_stats.tick "index.checkpoint_loaded";
+      let idx =
+        match
+          Workspace_persistent_index.load_workspace_index
+            ~source_extensions:ws.source_extensions ~root
+        with
+        | Some idx ->
+            ws.index_checkpoint_loaded <- true;
+            ignore
+              (Workspace_index.replace_source_files idx
+                 ~paths:ws.source_file_paths);
+            idx
+        | None ->
+            ws.index_checkpoint_loaded <- false;
+            Workspace_index.of_source_files ~source_extensions:ws.source_extensions
+              ~root ~paths:ws.source_file_paths
+      in
+      Workspace_persistent_index.save_workspace_index ~root idx;
       ws.index <- Some idx
   | _ -> ()
 
 let pump_index (ws : t) ~(max_dirs : int) ~(max_files : int) : unit =
   ensure_index_started ws;
-  match ws.index with
-  | None -> ()
-  | Some idx -> (
-      try
-        let was_reconciling = Workspace_index.reconcile_pending idx in
-        let stale_before = Workspace_index.reconcile_stale_pruned idx in
-        let _dirs, files = Workspace_index.scan_step idx ~max_dirs ~max_files in
-        if files > 0 then ws.bg_seed_needs_refresh <- true;
-        if was_reconciling && not (Workspace_index.reconcile_pending idx) then (
-          Perf_stats.tick "index.reconcile_completed";
-          if Workspace_index.reconcile_stale_pruned idx > stale_before then
-            Perf_stats.tick "index.reconcile_pruned_stale";
-          ws.bg_seed_needs_refresh <- true;
-          enqueue_all_open_diag_revalidate ws ~reason:"reconcile")
-      with _ -> ())
+  ignore max_dirs;
+  ignore max_files
 
 let pump_index_background (ws : t) : unit =
   if is_network_root ws then
@@ -50,38 +46,88 @@ let pump_index_background (ws : t) : unit =
       ~max_files:index_background_files
 
 let pump_index_lookup (ws : t) : unit =
-  let max_dirs, max_files = lookup_scan_budget ws in
-  pump_index ws ~max_dirs ~max_files
+  pump_index ws ~max_dirs:0 ~max_files:0
+
+let regular_source_path (ws : t) (path : string) : bool =
+  Source_file.has_extension ~extensions:ws.source_extensions
+    (Filename.basename path)
+  && Sys.file_exists path
+  && try not (Sys.is_directory path) with _ -> false
+
+let normalized_path_set (paths : string list) : string list =
+  paths
+  |> List.filter_map (fun path ->
+         let key = normalize_path_key path in
+         if key = "" then None else Some key)
+  |> List.sort_uniq String.compare
+
+let expected_index_source_paths (ws : t) : string list =
+  ws.source_file_paths |> List.filter (regular_source_path ws)
+
+let save_index_checkpoint_if_possible (ws : t) (idx : Workspace_index.t) : unit
+    =
+  match ws.root_path with
+  | None -> ()
+  | Some root -> Workspace_persistent_index.save_workspace_index ~root idx
+
+let note_index_health_repair (ws : t) : unit =
+  mark_graph_dirty ws;
+  ws.bg_seed_needs_refresh <- true;
+  invalidate_lsif_snapshot ws;
+  ws.symbol_hints <- None;
+  update_startup_ready_state ws
+
+let ensure_index_health (ws : t) : bool =
+  match ws.root_path with
+  | None -> false
+  | Some root ->
+      let was_missing = ws.index = None in
+      ensure_index_started ws;
+      (match ws.index with
+      | None -> false
+      | Some idx ->
+          let expected_paths = expected_index_source_paths ws in
+          let expected_keys = normalized_path_set expected_paths in
+          let current_keys =
+            Workspace_index.all_source_paths idx |> normalized_path_set
+          in
+          let incomplete = not (Workspace_index.is_complete idx) in
+          let changed =
+            if incomplete then (
+              let rebuilt =
+                Workspace_index.of_source_files
+                  ~source_extensions:ws.source_extensions
+                  ~root ~paths:expected_paths
+              in
+              ws.index <- Some rebuilt;
+              save_index_checkpoint_if_possible ws rebuilt;
+              Perf_stats.tick "index.health_rebuilt";
+              true)
+            else if current_keys <> expected_keys then (
+              let changed =
+                Workspace_index.replace_source_files idx ~paths:expected_paths
+              in
+              save_index_checkpoint_if_possible ws idx;
+              if changed then Perf_stats.tick "index.health_repaired";
+              changed)
+            else false
+          in
+          if was_missing then Perf_stats.tick "index.health_restored";
+          if was_missing || changed then note_index_health_repair ws;
+          was_missing || changed)
 
 let index_checkpoint_loaded_for_report (ws : t) : bool =
-  match ws.index with
-  | None -> false
-  | Some idx -> Workspace_index.checkpoint_loaded idx
+  ws.index_checkpoint_loaded
 
-let index_reconcile_pending_for_report (ws : t) : bool =
-  match ws.index with
-  | None -> false
-  | Some idx -> Workspace_index.reconcile_pending idx
+let index_reconcile_pending_for_report (_ws : t) : bool = false
 
-let index_reconcile_epoch_for_report (ws : t) : int =
-  match ws.index with
-  | None -> 0
-  | Some idx -> Workspace_index.reconcile_epoch idx
+let index_reconcile_epoch_for_report (_ws : t) : int = 0
 
-let index_reconcile_sources_before_for_report (ws : t) : int =
-  match ws.index with
-  | None -> 0
-  | Some idx -> Workspace_index.reconcile_sources_before idx
+let index_reconcile_sources_before_for_report (_ws : t) : int = 0
 
-let index_reconcile_sources_after_for_report (ws : t) : int =
-  match ws.index with
-  | None -> 0
-  | Some idx -> Workspace_index.reconcile_sources_after idx
+let index_reconcile_sources_after_for_report (_ws : t) : int = 0
 
-let index_reconcile_stale_pruned_for_report (ws : t) : int =
-  match ws.index with
-  | None -> 0
-  | Some idx -> Workspace_index.reconcile_stale_pruned idx
+let index_reconcile_stale_pruned_for_report (_ws : t) : int = 0
 
 let is_import_word_char = function
   | 'A' .. 'Z' | '0' .. '9' | '_' -> true
@@ -182,6 +228,100 @@ let graph_import_hints_for_path (ws : t) ~(path : string)
       | None -> []
       | Some idx -> Workspace_index.source_import_hints idx ~path)
 
+let read_file_prefix (path : string) ~(max_bytes : int) : string option =
+  try
+    let ic = open_in_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+        let size = try in_channel_length ic with _ -> max_bytes in
+        let n = max 0 (min max_bytes size) in
+        Some (really_input_string ic n))
+  with _ -> None
+
+let source_path_has_ext (ws : t) (path : string) : bool =
+  Source_file.has_extension ~extensions:ws.source_extensions
+    (Filename.basename path)
+
+let path_stem_key (path : string) : string =
+  let base = Filename.basename path in
+  let stem = try Filename.chop_extension base with Invalid_argument _ -> base in
+  normalize_name stem
+
+let path_base_key (path : string) : string =
+  Filename.basename path |> normalize_name
+
+let resolve_icopy_include_path (ws : t) ~(importer_path : string)
+    (target : string) : string option =
+  let target = normalize_include_target target in
+  if target = "" then None
+  else
+    let base =
+      if Filename.is_relative target then
+        Filename.concat (Filename.dirname importer_path) target
+      else target
+    in
+    let candidates =
+      if source_path_has_ext ws base then [ base ]
+      else
+        ws.source_extensions
+        |> List.map (fun ext ->
+               if String.starts_with ~prefix:"." ext then base ^ ext
+               else base ^ "." ^ ext)
+    in
+    match List.find_opt Sys.file_exists candidates with
+    | Some path -> Some path
+    | None -> (
+        let target_base = path_base_key target in
+        let target_stem = path_stem_key target in
+        match ws.index with
+        | None -> List.find_opt (fun p -> p <> "") candidates
+        | Some idx ->
+            Workspace_index.all_source_paths idx
+            |> List.find_opt (fun path ->
+                   path_base_key path = target_base
+                   || path_stem_key path = target_stem))
+
+let graph_icopy_include_paths_for_path (ws : t) ~(path : string)
+    ~(doc_opt : Document.t option) : string list =
+  let text =
+    match doc_opt with
+    | Some doc -> Some doc.Document.text
+    | None -> read_file_prefix path ~max_bytes:65536
+  in
+  match text with
+  | None -> []
+  | Some text ->
+      icopy_include_targets_of_text ~file:(Some path) ~text
+      |> List.filter_map (resolve_icopy_include_path ws ~importer_path:path)
+      |> List.sort_uniq String.compare
+
+let edge ?path_key (kind : dependency_edge_kind) ~(target : string) :
+    dependency_edge =
+  { de_kind = kind; de_target = target; de_path_key = path_key }
+
+let dependency_edges_for_doc (doc : Document.t) : dependency_edge list =
+  let define_edges =
+    doc.Document.defines
+    |> List.filter_map (fun (d : Preprocess.define) ->
+           let key = normalize_name d.key in
+           if key = "" then None
+           else Some (edge DefineUse ~target:key))
+  in
+  let symbol_edges =
+    match Document.current_parse doc with
+    | Some { Document.parsed_syntax = Some syntax; _ } ->
+        syntax.Syntax_cache.skeleton.symbols
+        |> List.filter_map (fun (symbol : Syntax_cache.skeleton_symbol) ->
+               let key = normalize_name symbol.sk_name in
+               if key = "" then None
+               else if symbol.sk_exported then Some (edge DefExport ~target:key)
+               else if symbol.sk_imported then Some (edge RefImport ~target:key)
+               else None)
+    | _ -> []
+  in
+  define_edges @ symbol_edges
+
 let graph_parse_quality_for_path (ws : t) ~(path_key : string)
     ~(doc_opt : Document.t option) : parse_quality =
   match doc_opt with
@@ -242,7 +382,12 @@ let graph_refresh (ws : t) : unit =
     let path_seen = Hashtbl.create 8192 in
     let add_path (acc : string list ref) (path : string) =
       let key = normalize_path_key path in
-      if key <> "" && not (Hashtbl.mem path_seen key) then (
+      if
+        key <> ""
+        && Source_file.has_extension ~extensions:ws.source_extensions
+             (Filename.basename path)
+        && not (Hashtbl.mem path_seen key)
+      then (
         Hashtbl.replace path_seen key true;
         acc := path :: !acc)
     in
@@ -273,13 +418,47 @@ let graph_refresh (ws : t) : unit =
             | None -> Hashtbl.find_opt ws.files path_key
           in
           let import_compools = graph_import_hints_for_path ws ~path ~doc_opt in
-          let import_paths =
+          let compool_import_paths =
             import_compools
             |> List.filter_map (fun compool ->
                 match ws.index with
                 | Some idx -> Workspace_index.find_compool idx ~name:compool
                 | None -> None)
             |> List.sort_uniq String.compare
+          in
+          let include_paths = graph_icopy_include_paths_for_path ws ~path ~doc_opt in
+          let import_paths =
+            (compool_import_paths @ include_paths) |> List.sort_uniq String.compare
+          in
+          let compool_edges =
+            import_compools
+            |> List.map (fun compool ->
+                   let path_key =
+                     match ws.index with
+                     | Some idx -> (
+                         match Workspace_index.find_compool idx ~name:compool with
+                         | Some p ->
+                             let key = normalize_path_key p in
+                             if key = "" then None else Some key
+                         | None -> None)
+                     | None -> None
+                   in
+                   edge ?path_key ICompoolImport ~target:compool)
+          in
+          let include_edges =
+            include_paths
+            |> List.filter_map (fun include_path ->
+                   let key = normalize_path_key include_path in
+                   if key = "" then None
+                   else
+                     Some
+                       (edge ~path_key:key ICopyInclude
+                          ~target:include_path))
+          in
+          let local_edges =
+            match doc_opt with
+            | Some doc -> dependency_edges_for_doc doc
+            | None -> []
           in
           let node =
             {
@@ -288,6 +467,7 @@ let graph_refresh (ws : t) : unit =
               gn_import_compools = import_compools;
               gn_import_paths = import_paths;
               gn_rev_importers = [];
+              gn_dependency_edges = compool_edges @ include_edges @ local_edges;
               gn_file_class = graph_file_class_for_path ws ~path ~doc_opt;
               gn_size_class = size_class_of_path ws path;
               gn_parse_quality =
@@ -488,37 +668,50 @@ let graph_refresh (ws : t) : unit =
 let ensure_graph_fresh (ws : t) : unit =
   if ws.graph_needs_refresh then graph_refresh ws
 
+let graph_reverse_dependency_closure_paths (ws : t) ~(path_keys : string list) :
+    string list =
+  ensure_graph_fresh ws;
+  let roots = Hashtbl.create (max 4 (List.length path_keys)) in
+  let seen = Hashtbl.create 32 in
+  let out = ref [] in
+  let q : string Queue.t = Queue.create () in
+  List.iter
+    (fun raw_key ->
+      let key = normalize_path_key raw_key in
+      if key <> "" && not (Hashtbl.mem roots key) then (
+        Hashtbl.replace roots key true;
+        Queue.add key q))
+    path_keys;
+  while not (Queue.is_empty q) do
+    let key = Queue.pop q in
+    match Hashtbl.find_opt ws.graph_nodes key with
+    | None -> ()
+    | Some node ->
+        List.iter
+          (fun importer_key ->
+            let importer_key = normalize_path_key importer_key in
+            if
+              importer_key <> ""
+              && not (Hashtbl.mem roots importer_key)
+              && not (Hashtbl.mem seen importer_key)
+            then (
+              Hashtbl.replace seen importer_key true;
+              (match graph_path_of_key ws importer_key with
+              | Some path -> out := path :: !out
+              | None -> ());
+              Queue.add importer_key q))
+          node.gn_rev_importers
+  done;
+  List.rev !out
+
 let maybe_escalate_index_reconcile ?(reason : string = "unknown")
     ?(has_imports_override : bool option) (ws : t) ~(doc : Document.t option) :
     bool =
-  let has_imports =
-    match (has_imports_override, doc) with
-    | Some b, _ -> b
-    | None, None -> false
-    | None, Some d -> best_effort_doc_imports_for_scheduling d <> []
-  in
-  match ws.index with
-  | None -> false
-  | Some idx ->
-      let compools = Workspace_index.compool_count idx in
-      let sources = Workspace_index.source_count idx in
-      if (not has_imports) || compools > 0 || sources <= 0 then false
-      else
-        let now = Perf_stats.now_ms () in
-        if
-          now -. ws.index_reconcile_escalate_last_ms
-          < float_of_int index_stale_reconcile_min_interval_ms
-        then false
-        else (
-          ws.index_reconcile_escalate_last_ms <- now;
-          ws.index_reconcile_escalations <- ws.index_reconcile_escalations + 1;
-          if Workspace_index.force_reconcile idx then
-            Perf_stats.tick "index.reconcile_started";
-          ws.bg_seed_needs_refresh <- true;
-          pump_index ws ~max_dirs:index_reconcile_escalate_dirs
-            ~max_files:index_reconcile_escalate_files;
-          ignore reason;
-          true)
+  ignore reason;
+  ignore has_imports_override;
+  ignore ws;
+  ignore doc;
+  false
 
 let schedule_nav_miss_reconcile (ws : t) ~(doc : Document.t)
     ~(symbol_key : string) : unit =
@@ -669,7 +862,6 @@ let rescan (ws : t) : unit =
   ws.parse_epoch <- ws.parse_epoch + 1;
   ws.lsif_snapshot_revision <- 0;
   Hashtbl.clear ws.files;
-  Hashtbl.clear ws.nav_response_cache;
   Hashtbl.clear ws.bg_enqueued;
   Hashtbl.clear ws.bg_parsed;
   Hashtbl.clear ws.closed_doc_last_touch;
@@ -716,15 +908,29 @@ let rescan (ws : t) : unit =
   if ws.sem_store_enabled then Semantic_store.reset ws.semantic_store;
   if ws.lsif_delta_enabled then Lsif_delta.reset ws.lsif_delta_state;
   match ws.root_path with
-  | None -> ws.index <- None
-  | Some root -> (
-      let idx = Workspace_index.start ~root in
-      ws.index <- Some idx;
-      let max_dirs, max_files =
-        startup_scan_budget_for_root ~network:(is_probably_network_path root)
+  | None ->
+      ws.index <- None;
+      ws.index_checkpoint_loaded <- false
+  | Some root ->
+      let idx =
+        match
+          Workspace_persistent_index.load_workspace_index
+            ~source_extensions:ws.source_extensions ~root
+        with
+        | Some idx ->
+            ws.index_checkpoint_loaded <- true;
+            ignore
+              (Workspace_index.replace_source_files idx
+                 ~paths:ws.source_file_paths);
+            idx
+        | None ->
+            ws.index_checkpoint_loaded <- false;
+            Workspace_index.of_source_files
+              ~source_extensions:ws.source_extensions ~root
+              ~paths:ws.source_file_paths
       in
-      try ignore (Workspace_index.scan_step idx ~max_dirs ~max_files)
-      with _ -> ())
+      Workspace_persistent_index.save_workspace_index ~root idx;
+      ws.index <- Some idx
 
 let compool_count (ws : t) : int =
   pump_index_background ws;

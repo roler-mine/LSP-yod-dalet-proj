@@ -12,8 +12,7 @@ This folder is organized by server responsibility.
 ## `syntax/` - Language Front-End
 
 - `ast.*`: core JOVIAL AST and location types
-- `lexer.mll` + `parser.mly`: tokenizer/parser
-- `parse.*`: parse pipeline and parse result conversion
+- `lexer.mll` + `parser.mly`: tokenizer/parser and parse pipeline
 - `parse_diags.*`: parser diagnostics shaping
 - `preprocess.*`: preprocessor directives/import extraction
 

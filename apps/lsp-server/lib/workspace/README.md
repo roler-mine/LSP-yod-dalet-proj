@@ -21,7 +21,9 @@ Supported typed groups:
 
 - `initializationOptions.jovial.workspace`
 - `initializationOptions.jovial.background`
+- `initializationOptions.jovial.features`
 - `initializationOptions.jovial.server`
+- `initializationOptions.jovial.startup`
 
 Current user-facing typed settings:
 
@@ -31,9 +33,38 @@ Current user-facing typed settings:
 - `workspace.manualRootFiles`
 - `background.indexBudgetMs`
 - `background.diagBatchSize`
+- Diagnostics are core language support and are not disabled by feature profiles.
+- `features.definition`
+- `features.declaration`
+- `features.typeDefinition`
+- `features.implementation`
+- `features.references`
+- `features.documentSymbols`
+- `features.workspaceSymbols`
+- `features.hover`
+- `features.signatureHelp`
+- `features.rename`
+- `features.completion`
+- `features.codeActions`
+- `features.inlayHints`
+- `features.semanticTokens`
 - `server.parseMaxFileBytes`
 - `server.pressureSoftMb`
 - `server.pressureCriticalMb`
+- `startup.priorityMode`
+
+## Settings Flow
+
+The startup and feature-toggle path is intentionally normalized:
+
+1. `lib/lsp/lsp_request.ml` parses `initialize` options from `initializationOptions.jovial`.
+2. `lib/config/lsp_runtime_settings.ml` keeps loop/runtime scheduling overrides separate from workspace semantics.
+3. `lib/config/workspace_settings.ml` merges environment defaults with client feature flags and startup priority.
+4. `lib/workspace/core/workspace_state.ml` snapshots the normalized settings into workspace state during initialization.
+5. `lib/lsp/lsp_response.ml` advertises only the capabilities enabled by the normalized feature flags.
+6. `lib/lsp/lsp_server.ml` gates request handlers with the same feature flags and defers diagnostics when `startup.priorityMode = infoFirst`.
+
+`infoFirst` keeps hover, goto, references, symbols, and related navigation responsive first, while diagnostics wait until navigation startup readiness is reached. `balanced` keeps the previous mixed startup behavior.
 
 Normal LSP features now flow through typed workspace APIs and the transport
 layer serializes them in `lib/lsp/lsp_response.ml`. Standard requests should no

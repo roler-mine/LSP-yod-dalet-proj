@@ -1,6 +1,12 @@
 .vs/**
+.vscode-test/**
+out-test/**
 src/**
+test/**
 tsconfig.json
+tsconfig.test.json
+eslint.config.mjs
+*.vsix
 runtime/server/**/.gitkeep
 runtime/server/**/*.pending-*
 server/**

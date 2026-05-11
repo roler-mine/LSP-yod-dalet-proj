@@ -70,11 +70,13 @@ let workspace_pressure_live_mb (ws : t) : int =
   ws.pressure_live_mb
 
 let bg_diag_allowed (ws : t) : bool =
-  match workspace_pressure_mode ws with
-  | PressureCritical ->
-      Perf_stats.tick "bg.diag_paused_critical";
-      false
-  | PressureNormal | PressureSoft -> true
+  if not ws.feature_flags.diagnostics then false
+  else
+    match workspace_pressure_mode ws with
+    | PressureCritical ->
+        Perf_stats.tick "bg.diag_paused_critical";
+        false
+    | PressureNormal | PressureSoft -> true
 
 let lsif_doc_load_budget_for_pressure (ws : t) : int =
   match workspace_pressure_mode ws with
@@ -139,10 +141,7 @@ let startup_index_complete (ws : t) : bool =
   | None -> false
   | Some idx -> Workspace_index.is_complete idx
 
-let startup_index_reconcile_pending (ws : t) : bool =
-  match ws.index with
-  | None -> false
-  | Some idx -> Workspace_index.reconcile_pending idx
+let startup_index_reconcile_pending (_ws : t) : bool = false
 
 let startup_seed_complete (ws : t) : bool =
   ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
@@ -161,19 +160,32 @@ let startup_high_queues_empty (ws : t) : bool =
             acc || kind = ParseJobHighLarge || kind = ParseJobRootLarge)
           ws.parse_worker_inflight false)
 
+let parse_worker_queues_empty (ws : t) : bool =
+  Queue.is_empty ws.parse_worker_jobs
+  && Queue.is_empty ws.parse_worker_results
+  && Hashtbl.length ws.parse_worker_inflight = 0
+
 let startup_queues_empty (ws : t) : bool =
   startup_high_queues_empty ws
   && Queue.is_empty ws.bg_norm_small_queue
   && Queue.is_empty ws.bg_norm_large_queue
   && Queue.is_empty ws.bg_pending_diag_updates
   && Hashtbl.length ws.bg_pending_diag_payloads = 0
-  && Hashtbl.length ws.parse_worker_inflight = 0
+  && parse_worker_queues_empty ws
 
 let quick_nav_index_complete (ws : t) : bool =
-  ws.quick_nav_index_total > 0
-  && ws.quick_nav_index_done >= ws.quick_nav_index_total
-  && Queue.is_empty ws.quick_nav_pending_paths
-  && Hashtbl.length ws.quick_nav_pending_set = 0
+  let no_pending =
+    Queue.is_empty ws.quick_nav_pending_paths
+    && Hashtbl.length ws.quick_nav_pending_set = 0
+  in
+  no_pending
+  &&
+  match ws.index with
+  | Some idx when Workspace_index.source_count idx = 0 ->
+      ws.quick_nav_index_total = 0 && ws.quick_nav_index_done = 0
+  | _ ->
+      ws.quick_nav_index_total > 0
+      && ws.quick_nav_index_done >= ws.quick_nav_index_total
 
 let quick_nav_index_ready_for_startup (ws : t) : bool =
   if quick_nav_index_complete ws then true
@@ -215,8 +227,17 @@ let xmodule_diag_prereqs_ready (ws : t) : bool =
   && startup_hints_ready ws
   && startup_open_docs_authoritative ws
 
+let startup_navigation_prereqs_ready_now (ws : t) : bool =
+  xmodule_diag_prereqs_ready ws
+
+let diagnostics_deferred_for_startup (ws : t) : bool =
+  ws.feature_flags.diagnostics
+  && ws.startup_priority_mode = StartupPriorityInfoFirst
+  && not (startup_navigation_prereqs_ready_now ws)
+
 let startup_is_diag_hover_ready (ws : t) : bool =
-  xmodule_diag_prereqs_ready ws && startup_open_diag_revalidate_empty ws
+  (not ws.feature_flags.diagnostics)
+  || (xmodule_diag_prereqs_ready ws && startup_open_diag_revalidate_empty ws)
 
 let startup_is_fully_navigable (ws : t) : bool =
   startup_nav_prereqs_ready ws && startup_is_diag_hover_ready ws
@@ -281,7 +302,7 @@ let startup_is_ready (ws : t) : bool =
         queues_empty,
         hints_ready,
         nav_prereqs_ready,
-        _quick_nav_index_complete,
+        quick_nav_index_complete,
         open_docs_converged,
         open_docs_authoritative,
         xmodule_ready,
@@ -289,8 +310,9 @@ let startup_is_ready (ws : t) : bool =
     startup_ready_components ws
   in
   index_complete && index_reconcile_clear && seed_complete && queues_empty
-  && hints_ready && nav_prereqs_ready && open_docs_converged
-  && open_docs_authoritative && xmodule_ready && open_diag_revalidate_empty
+  && hints_ready && nav_prereqs_ready && quick_nav_index_complete
+  && open_docs_converged && open_docs_authoritative && xmodule_ready
+  && open_diag_revalidate_empty
 
 let startup_elapsed_ms (ws : t) : int =
   max 0 (int_of_float (startup_elapsed_ms_float ws))
@@ -314,8 +336,8 @@ let update_startup_ready_state (ws : t) : unit =
   if xmodule_ready_now && not ws.xmodule_diag_ready_prev then (
     ws.xmodule_diag_ready_prev <- true;
     Perf_stats.tick "diag.xmodule_ready_transition";
-    if ws.workspace_diag_mode = WorkspaceDiagsOff then
-      Perf_stats.tick "diag.open.revalidate_skipped_mode_off"
+    if not ws.feature_flags.diagnostics then
+      Perf_stats.tick "diag.open.revalidate_skipped_feature_off"
     else enqueue_all_open_diag_revalidate ws ~reason:"xmodule_ready")
   else if not xmodule_ready_now then ws.xmodule_diag_ready_prev <- false;
 
@@ -332,7 +354,7 @@ let update_startup_ready_state (ws : t) : unit =
          ws.startup_diag_hover_ready_ms <- None;
          ws.startup_diag_hover_notified <- false);
 
-  (if startup_is_fully_navigable ws then (
+  (if startup_is_ready ws then (
      match ws.startup_fully_nav_ready_ms with
      | Some _ -> ()
      | None ->
@@ -437,6 +459,16 @@ let startup_readiness_json (ws : t) : Yojson.Safe.t =
             ("hintsReady", `Bool hints_ready);
             ("navPrereqsReady", `Bool nav_prereqs_ready);
             ("quickNavIndexReady", `Bool quick_nav_ready);
+            ("quickNavIndexComplete", `Bool (quick_nav_index_complete ws));
+            ("quickNavIndexed", `Int ws.quick_nav_index_done);
+            ("quickNavTotal", `Int ws.quick_nav_index_total);
+            ("quickNavPending", `Int (Queue.length ws.quick_nav_pending_paths));
+            ( "quickNavPendingSet",
+              `Int (Hashtbl.length ws.quick_nav_pending_set) );
+            ("parseWorkerJobs", `Int (Queue.length ws.parse_worker_jobs));
+            ("parseWorkerResults", `Int (Queue.length ws.parse_worker_results));
+            ( "parseWorkerInflight",
+              `Int (Hashtbl.length ws.parse_worker_inflight) );
             ("openDocsConverged", `Bool open_docs_converged);
             ("openDocsAuthoritative", `Bool open_docs_authoritative);
             ("openDocsPendingParse", `Int pending_open_docs);
@@ -585,6 +617,15 @@ let effective_bg_tick_budget_ms (ws : t) ~(base_budget_ms : int) : int =
   | ProfileSmall -> base
   | ProfileMedium -> max base 16
   | ProfileLarge -> max base 24
+
+let feature_flags (ws : t) : Workspace_settings.feature_flags = ws.feature_flags
+
+let startup_priority_mode (ws : t) : Workspace_settings.startup_priority_mode =
+  ws.startup_priority_mode
+
+let startup_navigation_ready_now (ws : t) : bool =
+  update_startup_ready_state ws;
+  startup_navigation_prereqs_ready_now ws
 
 let startup_diag_hover_ready_now (ws : t) : bool =
   update_startup_ready_state ws;

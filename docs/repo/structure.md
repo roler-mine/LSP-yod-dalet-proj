@@ -16,7 +16,7 @@ This repository follows a source-first layout: hand-written source files are tra
 ## `apps/vscode-extension/` (VS Code Client)
 
 - `src/`: TypeScript extension source
-- `src/extension.ts`: bootstrap + wiring entrypoint
+- `src/extension.ts`: extension bootstrap, runtime resolution, client lifecycle, and process launch flow
 - `src/jovial_config.ts`: typed config reader + `initialize` payload builder
 - `src/commands.ts`: command registration + restart-on-config-change listeners
 - `src/startup_status.ts`: startup-phase notifications and status-bar rendering
@@ -26,6 +26,8 @@ This repository follows a source-first layout: hand-written source files are tra
 - `syntaxes/`: TextMate grammar definition
 - `runtime/server/win32-x64/`: bundled runtime server location for Windows x64
 - `runtime/server/win32-arm64/`: bundled runtime server location for Windows arm64
+- `runtime/server/linux-x64/`: bundled runtime server location for Linux x64
+- `runtime/server/linux-arm64/`: bundled runtime server location for Linux arm64
 - `package.json`: extension metadata, commands, and settings
 - `out/`: compiled JavaScript output (generated, not tracked)
 
@@ -46,8 +48,8 @@ This repository follows a source-first layout: hand-written source files are tra
 
 ## `tools/scripts/`
 
-- `build-server.js`: builds server with `opam exec -- dune build @install` and copies to runtime path
-- `verify-runtime-binaries.js`: validates required bundled binaries for release packaging
+- `build-server.js`: builds the server for Windows or Linux targets, including Linux builds via WSL on Windows hosts
+- `verify-runtime-binaries.js`: validates required bundled binaries and checks PE/ELF architecture before release packaging
 - `check-ocamlformat.mjs`: cross-platform OCaml format check entrypoint used by root scripts and CI
 - `clean-generated.ps1`: removes local build/package artifacts
 

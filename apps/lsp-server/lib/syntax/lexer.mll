@@ -13,104 +13,45 @@
      Rule: the FIRST quoted string after DEFINE is meaningful; later quoted
      strings on the same DEFINE statement are comments.
   ---------------------------------------------------------------------- *)
-  let define_active     = ref false
-  let define_got_string = ref false
-  let compool_active     = ref false
-  let compool_got_string = ref false
-  let lexer_lock = Mutex.create ()
+  type session = {
+    mutable define_active : bool;
+    mutable define_got_string : bool;
+    mutable compool_active : bool;
+    mutable compool_got_string : bool;
+  }
 
-  let define_enter () =
-    define_active := true;
-    define_got_string := false
+  let create_session () =
+    {
+      define_active = false;
+      define_got_string = false;
+      compool_active = false;
+      compool_got_string = false;
+    }
 
-  let define_reset () =
-    define_active := false;
-    define_got_string := false
+  let define_enter session =
+    session.define_active <- true;
+    session.define_got_string <- false
 
-  let compool_enter () =
-    compool_active := true;
-    compool_got_string := false
+  let define_reset session =
+    session.define_active <- false;
+    session.define_got_string <- false
 
-  let compool_reset () =
-    compool_active := false;
-    compool_got_string := false
+  let compool_enter session =
+    session.compool_active <- true;
+    session.compool_got_string <- false
 
-  let reset_session_state () =
-    define_reset ();
-    compool_reset ()
+  let compool_reset session =
+    session.compool_active <- false;
+    session.compool_got_string <- false
 
-  let with_lock (f: unit -> 'a) : 'a =
-    Mutex.lock lexer_lock;
-    try
-      let out = f () in
-      Mutex.unlock lexer_lock;
-      out
-    with exn ->
-      Mutex.unlock lexer_lock;
-      raise exn
+  let with_session_state (f: session -> 'a) : 'a =
+    f (create_session ())
 
-  let with_session_state (f: unit -> 'a) : 'a =
-    with_lock (fun () ->
-      reset_session_state ();
-      f ()
-    )
-
-  let kw s : Parser.token option =
-    match String.uppercase_ascii s with
-    | "START"   -> Some START
-    | "TERM"    -> Some TERM
-    | "BEGIN"   -> Some BEGIN
-    | "END"     -> Some END
-
-    | "DEF"     -> Some DEF
-    | "REF"     -> Some REF
-    | "PROC"    -> Some PROC
-    | "ITEM"    -> Some ITEM
-    | "TABLE"   -> Some TABLE
-    | "STATIC"  -> Some STATIC
-    | "CONSTANT"-> Some CONSTANT
-
-    | "IF"      -> Some IF
-    | "ELSE"    -> Some ELSE
-    | "WHILE"   -> Some WHILE
-    | "FOR"     -> Some FOR
-    | "BY"      -> Some BY
-    | "THEN"    -> Some THEN
-    | "CASE"    -> Some CASE
-    | "DEFAULT" -> Some DEFAULT
-    | "FALLTHRU"-> Some FALLTHRU
-
-    | "EXIT"    -> Some EXIT
-    | "GOTO"    -> Some GOTO
-    | "RETURN"  -> Some RETURN
-    | "ABORT"   -> Some ABORT
-    | "STOP"    -> Some STOP
-
-    | "TRUE"    -> Some TRUE
-    | "FALSE"   -> Some FALSE
-
-    | "NOT"     -> Some NOT
-    | "AND"     -> Some AND
-    | "OR"      -> Some OR
-    | "XOR"     -> Some XOR
-    | "EQV"     -> Some EQV
-    | "MOD"     -> Some MOD
-
-    (* JOVIAL-ish extras; safe even if you parse them as directives *)
-    | "PROGRAM" -> Some PROGRAM
-    | "COMPOOL" -> Some COMPOOL
-    | "ICOMPOOL"-> Some ICOMPOOL
-    | "DEFINE"  -> Some DEFINE
-    | "TYPE"    -> Some TYPE
-    | "BLOCK"   -> Some BLOCK
-
-    | _         -> None
-
-  let mk_id s =
-    match kw s with
-    | Some DEFINE -> define_enter (); compool_reset (); DEFINE
-    | Some COMPOOL -> compool_enter (); COMPOOL
-    | Some ICOMPOOL -> compool_enter (); ICOMPOOL
+  let mk_id session s =
+    match Keyword.classify s with
+    | Some DEFINE -> define_enter session; compool_reset session; DEFINE
+    | Some COMPOOL -> compool_enter session; COMPOOL
+    | Some ICOMPOOL -> compool_enter session; ICOMPOOL
     | Some t -> t
     | None -> ID s
 }
@@ -131,15 +72,12 @@ let float2 = '.' digit+ exp?
 let float3 = digit+ exp
 let based_int = digit+ ['A'-'Z''a'-'z'] '\'' [^ '\'' '\n']+ '\''
 
-rule token = parse
-  | ws+                 { token lexbuf }
-  | nl                  { Lexing.new_line lexbuf; compool_reset (); token lexbuf }
+rule token session = parse
+  | ws+                 { token session lexbuf }
+  | nl                  { Lexing.new_line lexbuf; compool_reset session; token session lexbuf }
 
   (* %...% comments (JOVIAL style) *)
-  | '%'                 { pct_comment lexbuf; token lexbuf }
-
-  (* C-style comments are useful in test inputs; keep them. *)
-  | "/*"                { c_comment 1 lexbuf; token lexbuf }
+  | '%'                 { pct_comment lexbuf; token session lexbuf }
 
   (* JOVIAL conversion brackets: (* ... *) are NOT comments. *)
   | "(*"                { CONV_L }
@@ -147,23 +85,23 @@ rule token = parse
 
   (* Double-quote: DEFINE-string / COMPOOL-string (first one only) OR a comment. *)
   | '"'                 {
-                          if !define_active && not !define_got_string then (
-                            define_got_string := true;
+                          if session.define_active && not session.define_got_string then (
+                            session.define_got_string <- true;
                             STRINGLIT (read_dquoted (Buffer.create 64) lexbuf)
-                          ) else if !compool_active && not !compool_got_string then (
-                            compool_got_string := true;
+                          ) else if session.compool_active && not session.compool_got_string then (
+                            session.compool_got_string <- true;
                             STRINGLIT (read_dquoted (Buffer.create 64) lexbuf)
                           ) else (
                             dq_comment lexbuf;
-                            token lexbuf
+                            token session lexbuf
                           )
                         }
 
   (* punctuation / terminators *)
   | '('                 { LPAREN }
-  | ')'                 { compool_reset (); RPAREN }
+  | ')'                 { compool_reset session; RPAREN }
   | ','                 { COMMA }
-  | ';'                 { define_reset (); compool_reset (); SEMI }
+  | ';'                 { define_reset session; compool_reset session; SEMI }
   | ':'                 { COLON }
   | '.'                 { DOT }
   | '!'                 { BANG }
@@ -196,7 +134,7 @@ rule token = parse
   | '\''                { STRINGLIT (read_squoted (Buffer.create 64) lexbuf) }
 
   (* identifiers / keywords *)
-  | name_start name_char* as s { mk_id s }
+  | name_start name_char* as s { mk_id session s }
 
   | eof                 { EOF }
   | _ as c              { error lexbuf (Printf.sprintf "unexpected character: %C" c) }
@@ -212,13 +150,6 @@ and pct_comment = parse
   | nl                  { Lexing.new_line lexbuf; pct_comment lexbuf }
   | eof                 { error lexbuf "unterminated %...% comment" }
   | _                   { pct_comment lexbuf }
-
-and c_comment depth = parse
-  | "/*"                { c_comment (depth + 1) lexbuf }
-  | "*/"                { if depth = 1 then () else c_comment (depth - 1) lexbuf }
-  | nl                  { Lexing.new_line lexbuf; c_comment depth lexbuf }
-  | eof                 { error lexbuf "unterminated /*...*/ comment" }
-  | _                   { c_comment depth lexbuf }
 
 and read_squoted buf = parse
   | "''"                { Buffer.add_char buf '\''; read_squoted buf lexbuf }

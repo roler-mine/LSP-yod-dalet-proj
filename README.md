@@ -57,21 +57,26 @@ cd apps/vscode-extension
 npm run package:vsix:dev
 ```
 
-Release/universal packaging (requires both runtime binaries present):
+Release/universal packaging (requires all bundled runtime binaries present):
 ```powershell
 cd C:\path\to\repo
 npm run build:server:win-x64
 npm run build:server:win-arm64
+npm run build:server:linux-x64
+npm run build:server:linux-arm64
 npm run package:vsix:release
 ```
 
 Notes:
 - `build:server:win-arm64` must run on a Windows ARM64 host/runner to produce a real ARM64 binary.
+- `build:server:linux-x64` and `build:server:linux-arm64` run natively on Linux, or from Windows through WSL when a Linux OCaml toolchain is installed.
 - `package:vsix:release` validates binary architecture and will fail if `win32-arm64` is actually x64.
 
 Bundled runtime locations:
 - `apps/vscode-extension/runtime/server/win32-x64/jovial-lsp.exe`
 - `apps/vscode-extension/runtime/server/win32-arm64/jovial-lsp.exe`
+- `apps/vscode-extension/runtime/server/linux-x64/jovial-lsp`
+- `apps/vscode-extension/runtime/server/linux-arm64/jovial-lsp`
 
 Install packaged VSIX:
 ```powershell
@@ -102,6 +107,7 @@ code --install-extension .\apps\vscode-extension\jovial-lsp-client-0.0.1.vsix
 - `jovial.trace`: LSP trace level (`off`, `messages`, `verbose`)
 - `jovial.lsif.fastPath`: optional LSIF-like cache for non-open-file nav (default: off to avoid indexing stalls)
 - `jovial.workspaceDiagnostics.mode`: typed workspace diagnostics mode sent through `initialize`
+- `jovial.startup.priorityMode`: startup scheduling mode (`balanced` or `infoFirst`)
 - `jovial.workspace.profileMode`: workspace sizing profile sent through `initialize`
 - `jovial.workspace.rootModel`: root selection mode sent through `initialize`
 - `jovial.workspace.manualRootFiles`: manual root-file list for `rootModel=manual`
@@ -110,17 +116,25 @@ code --install-extension .\apps\vscode-extension\jovial-lsp-client-0.0.1.vsix
 - `jovial.server.parseMaxFileBytes`: parse-size guard sent through `initialize`
 - `jovial.server.pressureSoftMb`: soft memory pressure threshold sent through `initialize`
 - `jovial.server.pressureCriticalMb`: critical memory pressure threshold sent through `initialize`
+- `jovial.features.*`: per-feature booleans for diagnostics, nav, hover, symbols, completion, code actions, inlay hints, and semantic tokens
 - `Jovial: Refresh LSIF Cache`: manual command to rebuild LSIF cache when `jovial.lsif.fastPath` is enabled
 
 The supported runtime config path is now `initializationOptions.jovial` with
-three fixed groups:
+five fixed groups:
 
 - `jovial.workspace`
 - `jovial.background`
+- `jovial.features`
 - `jovial.server`
+- `jovial.startup`
 
 Environment variables remain as fallbacks and advanced escape hatches for
 manual runs, tests, and low-level tuning.
+
+Startup behavior:
+
+- `balanced`: diagnostics and navigation warm together.
+- `infoFirst`: hover, goto, references, and other navigation features are prioritized first; diagnostics publish after navigation readiness is reached.
 
 ## Testing And CI
 

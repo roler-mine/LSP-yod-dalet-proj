@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "compile",
+      "path": "apps/vscode-extension",
+      "label": "npm: compile (vscode-extension)",
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "dune: build (lsp-server)",
+      "type": "shell",
+      "command": "opam exec -- dune build",
+      "options": {
+        "cwd": "${workspaceFolder}/apps/lsp-server"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "build: debug",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "dune: build (lsp-server)",
+        "npm: compile (vscode-extension)"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

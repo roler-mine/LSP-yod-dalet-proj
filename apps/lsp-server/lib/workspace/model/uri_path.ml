@@ -64,6 +64,13 @@ let docuri_to_string (u : T.DocumentUri.t) : string =
 let docuri_of_string (s : string) : T.DocumentUri.t option =
   try Some (T.DocumentUri.t_of_yojson (`String s)) with _ -> None
 
+let normalize_path_key (p : string) : string =
+  let p = String.map (fun c -> if c = '\\' then '/' else c) p in
+  if Sys.win32 then String.lowercase_ascii p else p
+
+let same_path (a : string) (b : string) : bool =
+  normalize_path_key a = normalize_path_key b
+
 let is_drive_path (s : string) : bool =
   String.length s >= 2
   && ((s.[0] >= 'A' && s.[0] <= 'Z') || (s.[0] >= 'a' && s.[0] <= 'z'))

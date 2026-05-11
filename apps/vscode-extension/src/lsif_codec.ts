@@ -1,3 +1,5 @@
+import { asRecord } from "./unknown_utils";
+
 export type LsifLocationData = {
   uri: string;
   startLine: number;
@@ -15,9 +17,15 @@ export type LsifSymbolEntryData = {
   id: string;
   key: string;
   kind: number;
+  classification?: string;
+  externalKind?: string;
+  declarationRole?: string;
+  typeDisplay?: string;
+  resolvedTypeDisplay?: string;
   definitions: LsifLocationData[];
   implementations: LsifLocationData[];
   references: LsifReferenceData[];
+  importReferences: LsifLocationData[];
 };
 
 export type LsifKeyIndexEntryData = {
@@ -40,12 +48,6 @@ export type ParsedLsifDelta = {
   deletes: string[];
   upserts: LsifSymbolEntryData[];
 };
-
-function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return v !== null && typeof v === "object"
-    ? (v as Record<string, unknown>)
-    : undefined;
-}
 
 function normalizeCount(v: unknown, fallback = 0): number {
   if (typeof v !== "number") return fallback;
@@ -128,8 +130,25 @@ function parseLsifSymbolEntry(v: unknown): LsifSymbolEntryData | undefined {
   if (!id || !key) return undefined;
 
   const kind = typeof rec["kind"] === "number" ? Math.trunc(rec["kind"]) : 0;
+  const classification =
+    typeof rec["classification"] === "string"
+      ? rec["classification"]
+      : undefined;
+  const externalKind =
+    typeof rec["externalKind"] === "string" ? rec["externalKind"] : undefined;
+  const declarationRole =
+    typeof rec["declarationRole"] === "string"
+      ? rec["declarationRole"]
+      : undefined;
+  const typeDisplay =
+    typeof rec["typeDisplay"] === "string" ? rec["typeDisplay"] : undefined;
+  const resolvedTypeDisplay =
+    typeof rec["resolvedTypeDisplay"] === "string"
+      ? rec["resolvedTypeDisplay"]
+      : undefined;
   const definitions = parseLocArray(rec["definitions"]);
   const implementations = parseLocArray(rec["implementations"]);
+  const importReferences = parseLocArray(rec["importReferences"]);
 
   const references: LsifReferenceData[] = [];
   const seenRefs = new Set<string>();
@@ -157,9 +176,15 @@ function parseLsifSymbolEntry(v: unknown): LsifSymbolEntryData | undefined {
     id,
     key,
     kind,
+    classification,
+    externalKind,
+    declarationRole,
+    typeDisplay,
+    resolvedTypeDisplay,
     definitions,
     implementations,
     references,
+    importReferences,
   };
 }
 

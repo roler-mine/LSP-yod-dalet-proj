@@ -5,6 +5,7 @@ open Workspace_state
 open Workspace_index_graph
 open Workspace_imports
 open Workspace_tuning
+module Metadata = Workspace_symbol_metadata
 
 type sem_ty =
   | TyUnknown
@@ -93,10 +94,7 @@ let sem_find_record_field (fields : (string * sem_ty) list) (name : string) :
   |> List.find_opt (fun (nm, _) -> normalize_name nm = key)
   |> Option.map snd
 
-let sem_is_builtin_type (k : string) : bool =
-  match k with
-  | "A" | "B" | "U" | "S" | "F" | "C" | "P" | "W" | "V" | "STATUS" -> true
-  | _ -> false
+let sem_is_builtin_type (k : string) : bool = Keyword.is_builtin_type_name k
 
 let is_single_letter_loop_control (name : string) : bool =
   String.length name = 1
@@ -190,7 +188,7 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
   in
   let rec collect_types_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit =
     match d.v with
-    | Ast.DType { name; defn } -> sem_add_type out name.v defn
+    | Ast.DType { name; defn; _ } -> sem_add_type out name.v defn
     | Ast.DProc p ->
         if in_block || is_block_proc p then
           List.iter (collect_types_decl ~in_block:true) p.v.locals
@@ -201,7 +199,7 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
     match d.v with
     | Ast.DVar { name; dtype; _ } ->
         sem_add_value out name.v (SVVar (sem_ty_of_type_expr out.types dtype))
-    | Ast.DConst { name; dtype; value = _ } ->
+    | Ast.DConst { name; dtype; value = _; _ } ->
         let ty =
           match dtype with
           | Some t -> sem_ty_of_type_expr out.types t
@@ -231,9 +229,9 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
 
 let sem_exports_of_doc (doc : Document.t) : sem_exports =
   let doc = Document.ensure_parsed doc in
-  match doc.Document.ast with
-  | None -> sem_scope_empty ()
-  | Some prog -> sem_exports_of_program prog
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } -> sem_exports_of_program prog
+  | _ -> sem_scope_empty ()
 
 let add_compool_hint (tbl : (string, string list) Hashtbl.t)
     ~(symbol_key : string) ~(compool_key : string) : unit =
@@ -266,7 +264,10 @@ let build_symbol_hint_index (ws : t) :
         match doc.Document.file with
         | None -> None
         | Some path -> (
-            match source_stem_of_filename (Filename.basename path) with
+            match
+              source_stem_of_filename ~source_extensions:ws.source_extensions
+                (Filename.basename path)
+            with
             | None -> None
             | Some stem ->
                 let k = normalize_name stem in
@@ -279,15 +280,32 @@ let build_symbol_hint_index (ws : t) :
     | Some compool ->
         let exp = sem_exports_of_doc doc in
         Hashtbl.iter
-          (fun sym v ->
-            match v with
-            | SVProc _ -> ()
-            | _ -> add_compool_hint values ~symbol_key:sym ~compool_key:compool)
+          (fun sym _v ->
+            add_compool_hint values ~symbol_key:sym ~compool_key:compool)
           exp.values;
         Hashtbl.iter
           (fun sym _ ->
             add_compool_hint types ~symbol_key:sym ~compool_key:compool)
-          exp.types
+          exp.types;
+        (match Skeleton_index.of_document doc with
+        | None -> ()
+        | Some sk ->
+            Skeleton_index.symbols sk
+            |> List.iter (fun (sym : Skeleton_index.symbol_decl) ->
+                   match sym.metadata.Metadata.jovial_kind with
+                   | Metadata.JovialType | Metadata.JovialBuiltinType ->
+                       add_compool_hint types
+                         ~symbol_key:sym.normalized_name
+                         ~compool_key:compool
+                   | Metadata.JovialItem | Metadata.JovialTable
+                   | Metadata.JovialBlock | Metadata.JovialProcedure
+                   | Metadata.JovialFunction | Metadata.JovialConstantItem
+                   | Metadata.JovialConstantTable
+                   | Metadata.JovialStatusConstant ->
+                       add_compool_hint values
+                         ~symbol_key:sym.normalized_name
+                         ~compool_key:compool
+                   | _ -> ()))
   in
 
   let add_path_hints (p : string) : unit =
@@ -406,6 +424,9 @@ let rec sem_scalarize = function
   | TyArray inner when sem_is_primitive inner -> sem_scalarize inner
   | t -> t
 
+let sem_ty_to_mismatch_string (t : sem_ty) : string =
+  sem_ty_to_string (sem_scalarize t)
+
 let rec sem_compatible (lhs : sem_ty) (rhs : sem_ty) : bool =
   let lhs = sem_scalarize lhs in
   let rhs = sem_scalarize rhs in
@@ -426,9 +447,8 @@ let rec sem_compatible (lhs : sem_ty) (rhs : sem_ty) : bool =
 
 let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
   let doc = Document.ensure_parsed doc in
-  match doc.Document.ast with
-  | None -> []
-  | Some prog ->
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } ->
       let seen = Hashtbl.create 128 in
       let out = ref [] in
       let emit (loc : Ast.Loc.t) (msg : string) =
@@ -488,6 +508,24 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
           ref =
         ref ws.symbol_hints
       in
+      let raw_hint_compools_for ~(is_type : bool) (name : string) :
+          string list =
+        let key = normalize_name name in
+        if key = "" then []
+        else
+          let hint_values, hint_types =
+            match !hint_tables with
+            | Some idx -> idx
+            | None ->
+                let idx = symbol_hint_index ws in
+                hint_tables := Some idx;
+                idx
+          in
+          let tbl = if is_type then hint_types else hint_values in
+          match Hashtbl.find_opt tbl key with
+          | None -> []
+          | Some xs -> List.map normalize_name xs
+      in
       let hint_compools_for ~(is_type : bool) (name : string) : string list =
         let key = normalize_name name in
         if key = "" then []
@@ -546,6 +584,35 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
             in
             Hashtbl.replace exports_cache key x;
             x
+      in
+
+      let selected_import_contains (imp : compool_import_dir) (key : string) :
+          bool =
+        List.exists (fun (nm, _loc) -> normalize_name nm = key) imp.selected
+      in
+
+      let maybe_visible_through_import ~(is_type : bool) ~(name : string) :
+          bool =
+        let key = normalize_name name in
+        key <> ""
+        &&
+        let hinted_compools = lazy (raw_hint_compools_for ~is_type name) in
+        List.exists
+          (fun imp ->
+               let selected = selected_import_contains imp key in
+               let hinted =
+                 List.mem (normalize_name imp.compool) (Lazy.force hinted_compools)
+               in
+               match get_exports_for_compool imp.compool with
+               | None -> imp.selected = [] || selected
+               | Some exp ->
+                   let exported =
+                     if is_type then Hashtbl.mem exp.types key
+                     else Hashtbl.mem exp.values key
+                   in
+                   let visible = exported || hinted in
+                   if imp.selected = [] then visible else selected && visible)
+          import_dirs
       in
 
       let should_suppress_cross_module_unresolved ~(is_type : bool)
@@ -648,8 +715,10 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
               && (not (sem_is_builtin_type k))
               && not (Hashtbl.mem scp.types k)
             then
-              suggest_missing_import ~loc:id.loc ~kind:"Type" ~is_type:true
-                ~symbol:id.v
+              if maybe_visible_through_import ~is_type:true ~name:id.v then ()
+              else
+                suggest_missing_import ~loc:id.loc ~kind:"Type" ~is_type:true
+                  ~symbol:id.v
         | Ast.TPointer inner -> check_type_import_hints scp inner
         | Ast.TArray { elem; _ } -> check_type_import_hints scp elem
         | Ast.TRecord fields ->
@@ -703,12 +772,25 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         | TyArray inner -> (
             match inner with
             | TyRecord fields -> sem_find_record_field fields field_name
-            | _ -> None)
+        | _ -> None)
         | _ -> None
       in
 
+      let emit_function_result_mismatch ~(loc : Ast.Loc.t)
+          ~(proc_name : string) ~(expected : sem_ty) ~(provided : sem_ty) : unit
+          =
+        if not (sem_compatible expected provided) then
+          emit loc
+            (Printf.sprintf
+               "Function %S result type mismatch: expected %s, provided %s."
+               proc_name
+               (sem_ty_to_mismatch_string expected)
+               (sem_ty_to_mismatch_string provided))
+      in
+
       let rec ty_of_expr (scp : sem_scope) (current_proc : sem_proc_ctx option)
-          ?(status_atom = false) (e : Ast.expr Ast.node) : sem_ty =
+          ?(status_atom = false) ?(value_context = true)
+          (e : Ast.expr Ast.node) : sem_ty =
         match e.v with
         | Ast.ELit lit -> sem_ty_of_literal lit
         | Ast.EName id -> (
@@ -728,14 +810,16 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                                 value."
                                id.v);
                           TyUnknown)
-                  | _ ->
-                      emit id.loc
-                        (Printf.sprintf
-                           "%S is a procedure and cannot be used as a value."
-                           id.v);
-                      TyUnknown)
+              | _ ->
+                  emit id.loc
+                    (Printf.sprintf
+                       "%S is a procedure and cannot be used as a value."
+                       id.v);
+                  TyUnknown)
               | None ->
-                  if
+                  if maybe_visible_through_import ~is_type:false ~name:id.v
+                  then ()
+                  else if
                     should_suppress_cross_module_unresolved ~is_type:false
                       ~name:id.v
                   then ()
@@ -807,9 +891,10 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                               emit arg.loc
                                 (Printf.sprintf
                                    "Argument type mismatch in call to %S: \
-                                    expected %s, got %s."
-                                   callee.v (sem_ty_to_string pty)
-                                   (sem_ty_to_string aty));
+                                    expected %s, provided %s."
+                                   callee.v
+                                   (sem_ty_to_mismatch_string pty)
+                                   (sem_ty_to_mismatch_string aty));
                             check_pairs pst xst
                         | _, [] -> ()
                         | [], _ :: xst ->
@@ -819,7 +904,15 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                               xst
                       in
                       check_pairs pts args);
-                  match sig_.ret_ty with Some rt -> rt | None -> TyUnknown)
+                  (match sig_.ret_ty with
+                  | Some rt -> rt
+                  | None ->
+                      if value_context then
+                        emit callee.loc
+                          (Printf.sprintf
+                             "%S is a procedure and cannot be used as a value."
+                             callee.v);
+                      TyUnknown))
               | Some (SVVar ty) | Some (SVConst ty) ->
                   List.iter
                     (fun a -> ignore (ty_of_expr scp current_proc a))
@@ -836,11 +929,16 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                       TyUnknown)
                     else out_ty
               | None ->
-                  if
-                    not
-                      (should_suppress_cross_module_unresolved ~is_type:false
-                         ~name:callee.v)
-                  then
+                  if maybe_visible_through_import ~is_type:false ~name:callee.v
+                  then ()
+                  else if
+                    should_suppress_cross_module_unresolved ~is_type:false
+                      ~name:callee.v
+                  then ()
+                  else if has_import_hint ~is_type:false callee.v then
+                    suggest_missing_import ~loc:callee.loc ~kind:"Procedure"
+                      ~is_type:false ~symbol:callee.v
+                  else
                     emit callee.loc
                       (Printf.sprintf
                          "Undefined procedure %S. Declare it with REF PROC %S \
@@ -870,6 +968,17 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                     emit field.loc (Printf.sprintf "Unknown field %S." field.v);
                     TyUnknown)
             | _ -> TyUnknown)
+        | Ast.EConvert { ty; expr } ->
+            ignore (ty_of_expr scp current_proc expr);
+            sem_ty_of_type_expr scp.types ty
+        | Ast.EPreset { base; items } ->
+            ignore (ty_of_expr scp current_proc base);
+            List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) items;
+            TyUnknown
+        | Ast.ERange { lo; hi } ->
+            ignore (ty_of_expr scp current_proc lo);
+            ignore (ty_of_expr scp current_proc hi);
+            TyUnknown
         | Ast.EAt { field; ptr } -> (
             let pt = ty_of_expr scp current_proc ptr in
             let target_ty = sem_deref_target ~ptr_loc:ptr.loc pt in
@@ -925,7 +1034,9 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                       (Printf.sprintf "Cannot assign to procedure %S." id.v);
                     None)
             | None ->
-                if
+                if maybe_visible_through_import ~is_type:false ~name:id.v then
+                  ()
+                else if
                   should_suppress_cross_module_unresolved ~is_type:false
                     ~name:id.v
                 then ()
@@ -943,7 +1054,7 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
 
       let add_decl_symbol (scp : sem_scope) (d : Ast.decl Ast.node) : unit =
         match d.v with
-        | Ast.DType { name; defn } -> sem_add_type scp name.v defn
+        | Ast.DType { name; defn; _ } -> sem_add_type scp name.v defn
         | Ast.DVar { name; dtype; _ } ->
             sem_add_value scp name.v
               (SVVar (sem_ty_of_type_expr scp.types dtype))
@@ -1027,11 +1138,25 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
             match lhs_ty with
             | None -> ()
             | Some lt ->
-                if not (sem_compatible lt rhs_ty) then
+                let is_current_function_result =
+                  match (lhs.v, current_proc) with
+                  | Ast.EName id, Some cp ->
+                      normalize_name id.v = cp.proc_key
+                      && Option.is_some cp.proc_ret_ty
+                  | _ -> false
+                in
+                if is_current_function_result then
+                  match current_proc with
+                  | Some cp ->
+                      emit_function_result_mismatch ~loc:rhs.loc
+                        ~proc_name:cp.proc_name ~expected:lt ~provided:rhs_ty
+                  | None -> ()
+                else if not (sem_compatible lt rhs_ty) then
                   emit rhs.loc
                     (Printf.sprintf
                        "Type mismatch in assignment: left is %s, right is %s."
-                       (sem_ty_to_string lt) (sem_ty_to_string rhs_ty)))
+                       (sem_ty_to_mismatch_string lt)
+                       (sem_ty_to_mismatch_string rhs_ty)))
         | Ast.SCallStmt { callee; args; abort_label } -> (
             let ck = normalize_name callee.v in
             (if is_control_stmt_keyword ck then (
@@ -1050,6 +1175,7 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                let diag_count_before = List.length !out in
                ignore
                  (ty_of_expr scp current_proc
+                    ~value_context:false
                     (Ast.node ~loc:s.loc (Ast.ECall { callee; args })));
                let diag_count_after = List.length !out in
                if diag_count_after = diag_count_before then
@@ -1059,14 +1185,21 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                      if
                        (not (sem_is_builtin_call callee.v))
                        && not
+                            (maybe_visible_through_import ~is_type:false
+                               ~name:callee.v)
+                       && not
                             (should_suppress_cross_module_unresolved
                                ~is_type:false ~name:callee.v)
                      then
-                       emit callee.loc
-                         (Printf.sprintf
-                            "Undefined procedure %S. Declare it with REF PROC \
-                             %S in scope."
-                            callee.v callee.v));
+                       if has_import_hint ~is_type:false callee.v then
+                         suggest_missing_import ~loc:callee.loc
+                           ~kind:"Procedure" ~is_type:false ~symbol:callee.v
+                       else
+                         emit callee.loc
+                           (Printf.sprintf
+                              "Undefined procedure %S. Declare it with REF \
+                               PROC %S in scope."
+                              callee.v callee.v));
             match abort_label with
             | None -> ()
             | Some lab ->
@@ -1117,9 +1250,16 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         | Ast.SReturn eo -> (
             if current_proc = None then
               emit s.loc "RETURN is only valid inside a procedure.";
-            match eo with
-            | None -> ()
-            | Some e -> ignore (ty_of_expr scp current_proc e))
+            match (current_proc, eo) with
+            | _, None -> ()
+            | None, Some e -> ignore (ty_of_expr scp current_proc e)
+            | Some cp, Some e -> (
+                let provided = ty_of_expr scp current_proc e in
+                match cp.proc_ret_ty with
+                | Some expected ->
+                    emit_function_result_mismatch ~loc:e.loc
+                      ~proc_name:cp.proc_name ~expected ~provided
+                | None -> ()))
         | Ast.SLabel { body; _ } ->
             check_stmt scp current_proc ~loop_depth ~label_depths body
         | Ast.SGoto id -> (
@@ -1151,7 +1291,8 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                   emit rhs.loc
                     (Printf.sprintf
                        "Type mismatch in initializer: expected %s, got %s."
-                       (sem_ty_to_string lty) (sem_ty_to_string rty)))
+                       (sem_ty_to_mismatch_string lty)
+                       (sem_ty_to_mismatch_string rty)))
         | Ast.DConst { dtype; value; _ } ->
             (match dtype with
             | None -> ()
@@ -1230,3 +1371,4 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                 ~label_depths:top_level_label_depths s)
         prog;
       List.rev !out
+  | _ -> []

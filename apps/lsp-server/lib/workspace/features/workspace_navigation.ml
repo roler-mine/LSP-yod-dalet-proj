@@ -1,12 +1,15 @@
 module T = Lsp.Types
-open Ast
 open Workspace_state
 open Workspace_runtime
 open Workspace_index_graph
-open Workspace_doc_lifecycle
+open Workspace_imports
 open Workspace_nav_model
 open Workspace_nav_lookup
+open Workspace_hover_markdown
 open Workspace_tuning
+module Metadata = Workspace_symbol_metadata
+
+module Perf_stats = Workspace_foundation.Perf_stats
 
 let symbol_key_at_position (doc : Document.t) (pos : T.Position.t) :
     string option =
@@ -16,24 +19,10 @@ let symbol_key_at_position (doc : Document.t) (pos : T.Position.t) :
       let key = normalize_name nm in
       if key = "" then None else Some key
 
-let is_nonempty_location_list_json (j : Yojson.Safe.t) : bool =
-  match j with `List (_ :: _) -> true | _ -> false
-
-let is_empty_location_list_json (j : Yojson.Safe.t) : bool =
-  match j with `List [] -> true | _ -> false
-
-let is_nav_lookup_miss_json (j : Yojson.Safe.t) : bool =
-  match j with `Null -> true | _ -> is_empty_location_list_json j
-
-let is_nonempty_hover_json (j : Yojson.Safe.t) : bool =
-  match j with `Null -> false | _ -> true
-
-let request_pos_suffix (pos : T.Position.t) : string =
-  Printf.sprintf "@%d:%d" pos.line pos.character
-
 let adjust_nav_position (doc : Document.t) (pos : T.Position.t) : T.Position.t =
   match nav_word_at_position doc pos with
   | Some _ -> pos
+  | None when word_at_position doc pos <> None -> pos
   | None when pos.character > 0 -> (
       let prev = { pos with T.Position.character = pos.character - 1 } in
       match nav_word_at_position doc prev with Some _ -> prev | None -> pos)
@@ -71,301 +60,37 @@ let nav_budget_check (budget : nav_budget) : bool =
     true)
   else false
 
-let nav_compute_with_budget (budget : nav_budget) (f : unit -> Yojson.Safe.t) :
-    Yojson.Safe.t =
-  let out = f () in
-  ignore (nav_budget_check budget);
-  out
-
-let nav_cache_write_allowed_for_request (ws : t) ~(uri : T.DocumentUri.t) : bool
-    =
-  (not (index_reconcile_pending_for_report ws))
-  && open_doc_converged ws ~uri
-  && Hashtbl.length ws.open_parse_generation = 0
-  && Queue.is_empty ws.open_diag_revalidate_updates
-  && ws.startup_fully_nav_ready_ms <> None
-  && Queue.is_empty ws.bg_high_large_queue
-
 let allow_fallback_for_ws (ws : t) (doc : Document.t) : bool =
   allow_unscoped_fallback doc || ws.startup_fully_nav_ready_ms = None
 
-type nav_cache_hit =
-  | CacheExact of Yojson.Safe.t
-  | CacheSymbol of Yojson.Safe.t
-
-let has_unique_semantic_symbol_for_key (ws : t) ~(key : string) : bool =
-  ws.sem_store_enabled
-  &&
-  match Semantic_store.sym_ids_for_key ws.semantic_store ~key with
-  | [ _ ] -> true
-  | _ -> false
-
-let nav_cache_get (ws : t) ~(kind_exact : string) ~(kind_symbol : string)
-    ~(uri : T.DocumentUri.t) ~(symbol_key : string) : nav_cache_hit option =
-  match nav_response_cache_get ws ~kind:kind_exact ~uri ~symbol_key with
-  | Some payload -> Some (CacheExact payload)
-  | None -> (
-      if not (has_unique_semantic_symbol_for_key ws ~key:symbol_key) then None
-      else
-        match nav_response_cache_get ws ~kind:kind_symbol ~uri ~symbol_key with
-        | Some payload -> Some (CacheSymbol payload)
-        | None -> None)
-
-let nav_cache_put (ws : t) ~(kind_exact : string) ~(kind_symbol : string)
-    ~(uri : T.DocumentUri.t) ~(symbol_key : string) ~(payload : Yojson.Safe.t) :
-    unit =
-  nav_response_cache_put ws ~kind:kind_exact ~uri ~symbol_key ~payload;
-  if has_unique_semantic_symbol_for_key ws ~key:symbol_key then
-    nav_response_cache_put ws ~kind:kind_symbol ~uri ~symbol_key ~payload
-
-let definition_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
-    : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc ->
-      let definition_for_pos (pos : T.Position.t) : Yojson.Safe.t =
-        let pos = adjust_nav_position doc pos in
-        let budget = nav_budget_start ws in
-        let compute () =
-          if nav_budget_check budget then `Null
-          else
-            match import_under_cursor doc pos with
-            | Some imp ->
-                let hits = defs_for_import_cursor ws imp in
-                if hits = [] then `Null
-                else `List (List.map def_to_loc_json hits)
-            | None -> (
-                let startup_quick_hits =
-                  match nav_word_at_position doc pos with
-                  | None -> []
-                  | Some (nm, _) ->
-                      let key = normalize_name nm in
-                      if key = "" then [] else proc_impl_defs_by_key ws doc ~key
-                in
-                if startup_quick_hits <> [] then
-                  `List (List.map def_to_loc_json startup_quick_hits)
-                else
-                  let allow_fallback = allow_fallback_for_ws ws doc in
-                  match define_under_cursor doc pos with
-                  | Some (dm, _) ->
-                      let d = def_of_preprocess_define doc dm in
-                      `List [ def_to_loc_json d ]
-                  | None -> (
-                      let cache : (string, doc_nav) Hashtbl.t =
-                        Hashtbl.create 32
-                      in
-                      let nav = nav_for_doc_cached ws cache doc in
-                      let docs_cache : Document.t list option ref = ref None in
-                      let docs_for_symbol () =
-                        match !docs_cache with
-                        | Some xs -> xs
-                        | None ->
-                            let xs = docs_for_lookup ws doc in
-                            docs_cache := Some xs;
-                            xs
-                      in
-                      let hit =
-                        match
-                          symbol_at_position_in_nav nav ~uri:doc.Document.uri
-                            ~pos
-                        with
-                        | None -> None
-                        | Some (sym_id, _) -> (
-                            match Hashtbl.find_opt nav.defs_by_id sym_id with
-                            | Some _ as d0 -> d0
-                            | None ->
-                                if ws.sem_store_enabled then
-                                  match
-                                    Semantic_store.defs_for_sym_id
-                                      ws.semantic_store sym_id
-                                  with
-                                  | d0 :: _ -> Some (def_of_snapshot_def d0)
-                                  | [] ->
-                                      if nav_budget_check budget then None
-                                      else
-                                        find_def_for_sym_id ws cache
-                                          ~docs:(docs_for_symbol ()) ~sym_id
-                                else if nav_budget_check budget then None
-                                else
-                                  find_def_for_sym_id ws cache
-                                    ~docs:(docs_for_symbol ()) ~sym_id)
-                      in
-                      match hit with
-                      | Some d ->
-                          let defs =
-                            if
-                              d.kind = sym_kind_func
-                              && not (is_likely_proc_implementation ws d)
-                            then
-                              let impls =
-                                proc_impl_defs_by_key ws doc ~key:d.key
-                              in
-                              if impls = [] then [ d ] else impls
-                            else [ d ]
-                          in
-                          `List (List.map def_to_loc_json defs)
-                      | None ->
-                          if nav_budget_check budget then `Null
-                          else
-                            let proc_by_name =
-                              if not allow_fallback then []
-                              else
-                                match nav_word_at_position doc pos with
-                                | None -> []
-                                | Some (nm, _) ->
-                                    let key = normalize_name nm in
-                                    if key = "" then []
-                                    else proc_impl_defs_by_key ws doc ~key
-                            in
-                            if proc_by_name <> [] then
-                              `List (List.map def_to_loc_json proc_by_name)
-                            else if
-                              (not allow_fallback) || nav_budget_check budget
-                            then `Null
-                            else
-                              let by_name =
-                                match nav_word_at_position doc pos with
-                                | None -> []
-                                | Some (nm, _) ->
-                                    fallback_defs_by_name ws doc
-                                      (normalize_name nm)
-                              in
-                              if by_name = [] then `Null
-                              else `List (List.map def_to_loc_json by_name)))
-        in
-        match symbol_key_at_position doc pos with
-        | None -> nav_compute_with_budget budget compute
-        | Some key -> (
-            let kind_exact = "definition" ^ request_pos_suffix pos in
-            let kind_symbol = "definition:symbol" in
-            match
-              nav_cache_get ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-            with
-            | Some (CacheExact cached) ->
-                Perf_stats.tick "nav.response_cache_hit";
-                cached
-            | Some (CacheSymbol cached) ->
-                Perf_stats.tick "nav.response_cache_symbol_hit";
-                cached
-            | None ->
-                Perf_stats.tick "nav.response_cache_miss";
-                let computed = nav_compute_with_budget budget compute in
-                if is_nav_lookup_miss_json computed then
-                  schedule_nav_miss_reconcile ws ~doc ~symbol_key:key;
+let prefer_local_defs_before_position (doc : Document.t) (pos : T.Position.t)
+    (defs : def list) : def list =
+  match
+    Text_index.offset_of_line_col doc.Document.index ~line:pos.T.Position.line
+      ~col:pos.T.Position.character
+  with
+  | None -> defs
+  | Some cursor_off -> (
+      let local_before =
+        defs
+        |> List.filter (fun d ->
+            same_uri d.uri doc.Document.uri
+            && d.loc.Ast.Loc.start_pos.offset <= cursor_off)
+      in
+      match local_before with
+      | [] -> defs
+      | d :: rest ->
+          let best =
+            List.fold_left
+              (fun best cand ->
                 if
-                  (not budget.exceeded)
-                  && nav_cache_write_allowed_for_request ws ~uri
-                  && is_nonempty_location_list_json computed
-                then
-                  nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-                    ~payload:computed;
-                computed)
-      in
-      let primary = definition_for_pos pos in
-      if is_nav_lookup_miss_json primary && pos.character > 0 then
-        definition_for_pos { pos with T.Position.character = pos.character - 1 }
-      else primary
-
-let implementation_json_for (ws : t) ~(uri : T.DocumentUri.t)
-    ~(pos : T.Position.t) : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc -> (
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          match import_under_cursor doc pos with
-          | Some _ -> definition_json_for ws ~uri ~pos
-          | None ->
-              let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
-              let nav = nav_for_doc_cached ws cache doc in
-              let docs_cache : Document.t list option ref = ref None in
-              let docs_for_symbol () =
-                match !docs_cache with
-                | Some xs -> xs
-                | None ->
-                    let xs = docs_for_lookup ws doc in
-                    docs_cache := Some xs;
-                    xs
-              in
-              let defs =
-                match
-                  symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
-                with
-                | None -> []
-                | Some (sym_id, _) ->
-                    if ws.sem_store_enabled then
-                      Semantic_store.defs_for_sym_id ws.semantic_store sym_id
-                      |> List.map def_of_snapshot_def
-                      |> uniq_defs
-                    else
-                      docs_for_symbol ()
-                      |> List.filter_map (fun d ->
-                          let dnav = nav_for_doc_cached ws cache d in
-                          Hashtbl.find_opt dnav.defs_by_id sym_id)
-                      |> uniq_defs
-              in
-              let defs =
-                if defs = [] then defs
-                else
-                  let impls =
-                    List.filter (is_likely_proc_implementation ws) defs
-                  in
-                  if impls = [] then [] else impls
-              in
-              let key_opt =
-                match defs with
-                | d :: _ when d.key <> "" -> Some d.key
-                | _ -> (
-                    match nav_word_at_position doc pos with
-                    | Some (nm, _) ->
-                        let key = normalize_name nm in
-                        if key = "" then None else Some key
-                    | None -> None)
-              in
-              let defs =
-                if defs <> [] then defs
-                else
-                  match key_opt with
-                  | None -> []
-                  | Some key ->
-                      if
-                        allow_fallback_for_ws ws doc
-                        && not (nav_budget_check budget)
-                      then proc_impl_defs_by_key ws doc ~key
-                      else []
-              in
-              if defs = [] then definition_json_for ws ~uri ~pos
-              else `List (List.map def_to_loc_json defs)
-      in
-      match symbol_key_at_position doc pos with
-      | None -> nav_compute_with_budget budget compute
-      | Some key -> (
-          let kind_exact = "implementation" ^ request_pos_suffix pos in
-          let kind_symbol = "implementation:symbol" in
-          match
-            nav_cache_get ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-          with
-          | Some (CacheExact cached) ->
-              Perf_stats.tick "nav.response_cache_hit";
-              cached
-          | Some (CacheSymbol cached) ->
-              Perf_stats.tick "nav.response_cache_symbol_hit";
-              cached
-          | None ->
-              Perf_stats.tick "nav.response_cache_miss";
-              let computed = nav_compute_with_budget budget compute in
-              if is_nav_lookup_miss_json computed then
-                schedule_nav_miss_reconcile ws ~doc ~symbol_key:key;
-              if
-                (not budget.exceeded)
-                && nav_cache_write_allowed_for_request ws ~uri
-                && is_nonempty_location_list_json computed
-              then
-                nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-                  ~payload:computed;
-              computed))
+                  cand.loc.Ast.Loc.start_pos.offset
+                  > best.loc.Ast.Loc.start_pos.offset
+                then cand
+                else best)
+              d rest
+          in
+          [ best ])
 
 let occurrences_in_doc_fallback (doc : Document.t) ~(key : string) :
     (T.DocumentUri.t * Ast.Loc.t) list =
@@ -397,14 +122,14 @@ let occurrences_in_doc_fallback (doc : Document.t) ~(key : string) :
 let occurrences_in_doc (doc : Document.t) ~(key : string) :
     (T.DocumentUri.t * Ast.Loc.t) list =
   try
-    Lexer.with_session_state (fun () ->
+    Lexer.with_session_state (fun lexer ->
         let lexbuf = Lexing.from_string doc.Document.text in
         (match doc.Document.file with
         | None -> ()
         | Some f ->
             lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
         let rec loop acc =
-          let tok = Lexer.token lexbuf in
+          let tok = Lexer.token lexer lexbuf in
           let sp = Lexing.lexeme_start_p lexbuf in
           let ep = Lexing.lexeme_end_p lexbuf in
           match tok with
@@ -430,611 +155,651 @@ let occurrences_for_docs_with_budget (budget : nav_budget)
     docs;
   List.rev !acc
 
-let locations_json_with_budget (budget : nav_budget)
-    (occs : (T.DocumentUri.t * Ast.Loc.t) list) : Yojson.Safe.t list =
-  let seen = Hashtbl.create 256 in
-  let out = ref [] in
-  List.iter
-    (fun (u, loc) ->
-      if not (nav_budget_check budget) then
-        let k = loc_key ~uri:u loc in
-        if not (Hashtbl.mem seen k) then (
-          Hashtbl.add seen k true;
-          out := location_json ~uri:u loc :: !out))
-    occs;
-  List.rev !out
+let hover_current_file_fact (doc : Document.t) : string =
+  match doc.Document.file with
+  | Some p -> Printf.sprintf "Current file: `%s`" p
+  | None ->
+      Printf.sprintf "Current file: `%s`"
+        (Uri_path.docuri_to_string doc.Document.uri)
 
-let references_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
-    ~(include_decl : bool) : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `List []
-  | Some doc -> (
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `List []
-        else
-          match import_under_cursor doc pos with
-          | Some imp ->
-              let key = normalize_name imp.name in
-              if key = "" then `List []
-              else
-                let docs = docs_for_lookup ws doc in
-                let defs =
-                  docs
-                  |> List.concat_map collect_doc_defs
-                  |> List.filter (fun d -> d.key = key)
-                in
-                let def_keys =
-                  let h = Hashtbl.create 32 in
-                  List.iter
-                    (fun d -> Hashtbl.replace h (loc_key ~uri:d.uri d.loc) true)
-                    defs;
-                  h
-                in
-                let occs = occurrences_for_docs_with_budget budget docs ~key in
-                let occs =
-                  if include_decl then occs
-                  else
-                    List.filter
-                      (fun (u, loc) ->
-                        not (Hashtbl.mem def_keys (loc_key ~uri:u loc)))
-                      occs
-                in
-                `List (locations_json_with_budget budget occs)
-          | None -> (
-              let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 64 in
-              let nav = nav_for_doc_cached ws cache doc in
-              let resolved =
-                symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
+let builtin_type_hover_at (doc : Document.t) (pos : T.Position.t) :
+    T.Hover.t option =
+  match word_at_position doc pos with
+  | None -> None
+  | Some (name, loc) ->
+      if
+        (not (Metadata.is_builtin_type_name name))
+        || not (is_builtin_type_context_at_loc doc name loc)
+      then None
+      else
+        let line1 = loc.Ast.Loc.start_pos.line in
+        let display, dims =
+          match line_text_in_doc doc ~line1 with
+          | None -> (name, [])
+          | Some line ->
+              let col = loc.Ast.Loc.start_pos.col in
+              let tokens = tokenize_ident_words line in
+              let rec after_current = function
+                | [] -> []
+                | (tok, s, e) :: rest ->
+                    if s <= col && col < e then (tok, s, e) :: rest
+                    else after_current rest
               in
-              match resolved with
-              | Some (sym_id, _) ->
-                  let docs_cache : Document.t list option ref = ref None in
-                  let docs_for_symbol () =
-                    match !docs_cache with
-                    | Some xs -> xs
-                    | None ->
-                        let xs = docs_for_rename ws doc in
-                        docs_cache := Some xs;
-                        xs
-                  in
-                  let sym_defs, base_occs =
-                    if ws.sem_store_enabled then
-                      ( Semantic_store.defs_for_sym_id ws.semantic_store sym_id
-                        |> List.map def_of_snapshot_def
-                        |> uniq_defs,
-                        Semantic_store.refs_for_sym_id ws.semantic_store sym_id
-                      )
-                    else
-                      let docs = docs_for_symbol () in
-                      ( docs
-                        |> List.filter_map (fun d ->
-                            let dnav = nav_for_doc_cached ws cache d in
-                            Hashtbl.find_opt dnav.defs_by_id sym_id)
-                        |> uniq_defs,
-                        docs
-                        |> List.concat_map (fun d ->
-                            let dnav = nav_for_doc_cached ws cache d in
-                            match Hashtbl.find_opt dnav.occs_by_id sym_id with
-                            | None -> []
-                            | Some xs -> xs) )
-                  in
-                  let decl_keys = Hashtbl.create 8 in
-                  List.iter
-                    (fun defn ->
-                      Hashtbl.replace decl_keys
-                        (loc_key ~uri:defn.uri defn.loc)
-                        true)
-                    sym_defs;
-                  let occs =
-                    if include_decl then base_occs
-                    else
-                      List.filter
-                        (fun (u, loc) ->
-                          not (Hashtbl.mem decl_keys (loc_key ~uri:u loc)))
-                        base_occs
-                  in
-                  `List (locations_json_with_budget budget occs)
-              | None -> (
-                  match nav_word_at_position doc pos with
-                  | None -> `List []
-                  | Some (nm, _) ->
-                      let key = normalize_name nm in
-                      if key = "" then `List []
-                      else
-                        let docs = docs_for_rename ws doc in
-                        let proc_defs =
-                          if allow_fallback_for_ws ws doc then
-                            proc_defs_by_key ws doc ~key
-                          else []
-                        in
-                        let defs =
-                          if proc_defs <> [] then proc_defs
-                          else if allow_fallback_for_ws ws doc then
-                            docs
-                            |> List.concat_map collect_doc_defs
-                            |> List.filter (fun d -> d.key = key)
-                          else []
-                        in
-                        if defs = [] then `List []
-                        else
-                          let def_keys =
-                            let h = Hashtbl.create 32 in
-                            List.iter
-                              (fun d ->
-                                Hashtbl.replace h (loc_key ~uri:d.uri d.loc)
-                                  true)
-                              defs;
-                            h
-                          in
-                          let occs =
-                            occurrences_for_docs_with_budget budget docs ~key
-                          in
-                          let occs =
-                            if include_decl then occs
-                            else
-                              List.filter
-                                (fun (u, loc) ->
-                                  not
-                                    (Hashtbl.mem def_keys (loc_key ~uri:u loc)))
-                                occs
-                          in
-                          `List (locations_json_with_budget budget occs)))
-      in
-      match symbol_key_at_position doc pos with
-      | None -> nav_compute_with_budget budget compute
-      | Some key -> (
-          let kind_exact =
-            (if include_decl then "references:withDecl" else "references:noDecl")
-            ^ request_pos_suffix pos
-          in
-          let kind_symbol =
-            if include_decl then "references:withDecl:symbol"
-            else "references:noDecl:symbol"
-          in
-          match
-            nav_cache_get ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-          with
-          | Some (CacheExact cached) ->
-              Perf_stats.tick "nav.response_cache_hit";
-              cached
-          | Some (CacheSymbol cached) ->
-              Perf_stats.tick "nav.response_cache_symbol_hit";
-              cached
-          | None ->
-              Perf_stats.tick "nav.response_cache_miss";
-              let computed = nav_compute_with_budget budget compute in
-              if is_nav_lookup_miss_json computed then
-                schedule_nav_miss_reconcile ws ~doc ~symbol_key:key;
-              if
-                (not budget.exceeded)
-                && nav_cache_write_allowed_for_request ws ~uri
-                && is_nonempty_location_list_json computed
-              then
-                nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-                  ~payload:computed;
-              computed))
-
-let hover_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
-    Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc -> (
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          let import_text =
-            match import_under_cursor doc pos with
-            | None -> None
-            | Some imp ->
-                let resolved =
-                  match ws.index with
-                  | None -> None
-                  | Some idx -> Workspace_index.find_compool idx ~name:imp.name
-                in
-                Some
-                  (match resolved with
-                  | None ->
-                      Printf.sprintf
-                        "COMPOOL `%s` (unresolved in workspace index)." imp.name
-                  | Some p ->
-                      Printf.sprintf "COMPOOL `%s` -> `%s`" imp.name
-                        (Filename.basename p))
-          in
-          match define_under_cursor doc pos with
-          | Some (dm, word_loc) ->
-              let d = def_of_preprocess_define doc dm in
-              let primary_decl =
-                match source_line_for_def ws d with
-                | Some line when String.trim line <> "" -> line
-                | _ ->
-                    if dm.requires_call then
-                      Printf.sprintf "DEFINE %s(%s) \"%s\";" dm.name
-                        (String.concat "," dm.formals)
-                        dm.body
-                    else Printf.sprintf "DEFINE %s \"%s\";" dm.name dm.body
+              let toks = after_current tokens in
+              let max_dims =
+                match normalize_name name with "A" -> 2 | "P" -> 1 | _ -> 1
               in
-              let head =
-                Printf.sprintf "### define `%s`\nDefined at `%s`" d.name
-                  (file_line_of_def d)
-              in
-              let decl_block =
-                let line = truncate_text 280 primary_decl in
-                if String.trim line = "" then ""
-                else Printf.sprintf "\n```jovial\n%s\n```" line
-              in
-              let expansion =
-                if dm.formals = [] then
-                  Printf.sprintf "\nExpands to: `%s`"
-                    (truncate_text 180 dm.body)
+              let rec take n xs =
+                if n <= 0 then []
                 else
-                  Printf.sprintf "\nFormals: `%s`\nExpansion template: `%s`"
-                    (String.concat ", " dm.formals)
-                    (truncate_text 180 dm.body)
+                  match xs with [] -> [] | x :: tl -> x :: take (n - 1) tl
               in
-              let body = head ^ decl_block ^ expansion in
-              `Assoc
-                [
-                  ( "contents",
-                    `Assoc
-                      [ ("kind", `String "markdown"); ("value", `String body) ]
-                  );
-                  ("range", range_json_of_loc word_loc);
-                ]
-          | None ->
-              let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
-              let nav = nav_for_doc_cached ws cache doc in
-              let word = nav_word_at_position doc pos in
+              let rest = match toks with [] -> [] | _ :: tl -> tl in
+              let dims =
+                rest
+                |> List.filter_map (fun (tok, _, _) ->
+                       let k = normalize_name tok in
+                       if
+                         k = "" || is_reserved_keyword k
+                         || Metadata.is_builtin_type_name k
+                       then None
+                       else Some tok)
+                |> take max_dims
+              in
+              let sep = if normalize_name name = "A" then "," else " " in
+              let display =
+                match dims with
+                | [] -> name
+                | _ -> name ^ " " ^ String.concat sep dims
+              in
+              (display, dims)
+        in
+        let cls, meaning =
+          match normalize_name name with
+          | "U" ->
+              ( "unsigned integer",
+                match dims with
+                | n :: _ -> "unsigned integer, " ^ n ^ " bits"
+                | [] -> "unsigned integer" )
+          | "S" ->
+              ( "signed integer",
+                match dims with
+                | n :: _ -> "signed integer, " ^ n ^ " magnitude bits plus sign"
+                | [] -> "signed integer" )
+          | "F" ->
+              ( "floating",
+                match dims with
+                | n :: _ -> "floating value with mantissa precision " ^ n
+                | [] -> "floating value" )
+          | "A" ->
+              ( "fixed",
+                match dims with
+                | scale :: fraction :: _ ->
+                    "fixed value, scale " ^ scale ^ ", fraction " ^ fraction
+                | _ -> "fixed value" )
+          | "B" ->
+              ( "bit string",
+                match dims with
+                | n :: _ -> "bit string, " ^ n ^ " bits"
+                | [] -> "bit string" )
+          | "C" ->
+              ( "character string",
+                match dims with
+                | n :: _ -> "character string, " ^ n ^ " characters"
+                | [] -> "character string" )
+          | "STATUS" -> ("status", "status enumeration/list")
+          | "P" -> (
+              match dims with
+              | target :: _ -> ("pointer", "typed pointer to " ^ target)
+              | [] -> ("pointer", "pointer type"))
+          | _ -> ("built-in", "built-in type")
+        in
+        let facts =
+          [
+            Printf.sprintf "Type class: %s" cls;
+            Printf.sprintf "Meaning: %s" meaning;
+          ]
+        in
+        let facts =
+          match (normalize_name name, dims) with
+          | ("U" | "S" | "B"), n :: _ ->
+              (Printf.sprintf "Size: %s bits" n) :: facts
+          | "C", n :: _ -> (Printf.sprintf "Size: %s characters" n) :: facts
+          | "F", n :: _ -> (Printf.sprintf "Precision: %s" n) :: facts
+          | "A", scale :: fraction :: _ ->
+              Printf.sprintf "Scale: %s" scale
+              :: Printf.sprintf "Fraction: %s" fraction
+              :: facts
+          | _ -> facts
+        in
+        Some
+          (hover_markdown ~range:(Lsp_conv.range_of_loc loc)
+             (hover_panel ~name:display
+                ~summary:(Printf.sprintf "JOVIAL built-in %s type" cls)
+                ~facts:(List.rev facts) ~sections:[]))
+
+let type_origin_label = function
+  | Metadata.BuiltinType -> "built-in type"
+  | Metadata.UserDefinedType _ -> "user-defined type"
+  | Metadata.InferredType -> "inferred type"
+  | Metadata.UnknownType -> "unknown type"
+
+let type_decl_location_fact (ti : Metadata.jovial_type_info) : string option =
+  match (ti.Metadata.type_decl_uri, ti.Metadata.type_decl_loc) with
+  | Some uri, Some loc ->
+      let file =
+        match loc.Ast.Loc.file with
+        | Some p -> Filename.basename p
+        | None -> (
+            match Uri_path.file_path_of_uri uri with
+            | Some p -> Filename.basename p
+            | None -> Uri_path.docuri_to_string uri)
+      in
+      Some
+        (Printf.sprintf "Type declared at: `%s:%d:%d`" file
+           loc.Ast.Loc.start_pos.line
+           (loc.Ast.Loc.start_pos.col + 1))
+  | _, Some loc ->
+      let file = match loc.Ast.Loc.file with Some p -> Filename.basename p | None -> "<unknown>" in
+      Some
+        (Printf.sprintf "Type declared at: `%s:%d:%d`" file
+           loc.Ast.Loc.start_pos.line
+           (loc.Ast.Loc.start_pos.col + 1))
+  | _ -> None
+
+let type_resolution_facts ws doc (ti : Metadata.jovial_type_info) =
+  let base = [ Printf.sprintf "Type origin: %s" (type_origin_label ti.origin) ] in
+  match ti.origin with
+  | Metadata.UserDefinedType name ->
+      let key = normalize_name name in
+      let resolved_fact (resolved : Metadata.jovial_type_info) =
+        let detail =
+          match resolved.explanation with Some e -> " - " ^ e | None -> ""
+        in
+        Printf.sprintf "Resolved type: `%s`%s" resolved.display detail
+      in
+      let from_metadata =
+        match ti.resolved_display with
+        | None -> None
+        | Some display ->
+            let detail =
+              match ti.explanation with Some e -> " - " ^ e | None -> ""
+            in
+            Some (Printf.sprintf "Resolved type: `%s`%s" display detail)
+      in
+      let declared = type_decl_location_fact ti in
+      let from_decl_uri () =
+        match ti.type_decl_uri with
+        | None -> None
+        | Some uri -> (
+            match doc_of_uri ws uri with
+            | None -> None
+            | Some type_doc ->
+                collect_doc_defs type_doc
+                |> List.find_map (fun target ->
+                       if target.kind = sym_kind_type && target.key = key then
+                         Option.map resolved_fact
+                           target.metadata.Metadata.type_info
+                       else None))
+      in
+      (match (from_metadata, declared) with
+      | Some resolved, Some declared -> base @ [ resolved; declared ]
+      | Some resolved, None -> base @ [ resolved ]
+      | None, _ ->
+          let find_type_defs docs =
+            docs
+            |> List.concat_map collect_doc_defs
+            |> List.filter (fun d -> d.kind = sym_kind_type && d.key = key)
+            |> uniq_defs
+          in
+          let type_defs =
+            let scoped = find_type_defs (docs_for_lookup ws doc) in
+            if scoped <> [] then scoped else find_type_defs (docs_for_rename ws doc)
+          in
+          (match type_defs with
+          | target :: _ ->
               let resolved =
-                symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
+                match target.metadata.Metadata.type_info with
+                | Some resolved ->
+                    [ resolved_fact resolved ]
+                | None -> (
+                    match from_decl_uri () with
+                    | Some resolved -> [ resolved ]
+                    | None -> [ "Resolved type: pending semantic index" ])
               in
-              let defs, hover_loc =
-                match resolved with
-                | Some (sym_id, loc) -> (
-                    let docs_cache : Document.t list option ref = ref None in
-                    let docs_for_symbol () =
-                      match !docs_cache with
-                      | Some xs -> xs
-                      | None ->
-                          let xs = docs_for_lookup ws doc in
-                          docs_cache := Some xs;
-                          xs
-                    in
-                    let defn =
-                      match Hashtbl.find_opt nav.defs_by_id sym_id with
-                      | Some _ as d0 -> d0
-                      | None ->
-                          if ws.sem_store_enabled then
-                            match
-                              Semantic_store.defs_for_sym_id ws.semantic_store
-                                sym_id
-                            with
-                            | d0 :: _ -> Some (def_of_snapshot_def d0)
-                            | [] ->
-                                if nav_budget_check budget then None
-                                else
-                                  find_def_for_sym_id ws cache
-                                    ~docs:(docs_for_symbol ()) ~sym_id
-                          else if nav_budget_check budget then None
-                          else
-                            find_def_for_sym_id ws cache
-                              ~docs:(docs_for_symbol ()) ~sym_id
-                    in
-                    match defn with
-                    | Some d -> ([ d ], Some loc)
-                    | None -> (
-                        match word with
-                        | None -> ([], Some loc)
-                        | Some (nm, wloc) ->
-                            let defs0 =
-                              if
-                                allow_fallback_for_ws ws doc
-                                && not (nav_budget_check budget)
-                              then
-                                fallback_defs_by_name ws doc (normalize_name nm)
-                              else []
-                            in
-                            (defs0, Some wloc)))
+              base @ resolved
+              @ [ Printf.sprintf "Type declared at: `%s`" (file_line_of_def target) ]
+          | [] -> (
+              match from_decl_uri () with
+              | Some resolved -> (
+                  match declared with
+                  | Some declared -> base @ [ resolved; declared ]
+                  | None -> base @ [ resolved ])
+              | None -> base @ [ "Resolved type: pending semantic index" ])))
+  | Metadata.BuiltinType -> (
+      match ti.explanation with
+      | Some e -> base @ [ Printf.sprintf "Resolved type: `%s` - %s" ti.display e ]
+      | None -> base)
+  | Metadata.InferredType | Metadata.UnknownType -> base
+
+let hover_def_facts ws doc d =
+  let kind = jovial_kind_for_def ws d in
+  let metadata = d.metadata in
+  let facts =
+    [
+      Printf.sprintf "Classification: %s" kind;
+      Printf.sprintf "Declaration role: %s"
+        (Metadata.decl_role_label metadata.decl_role);
+    ]
+  in
+  let facts =
+    match metadata.type_info with
+    | None -> facts
+    | Some ti ->
+        facts
+        @ [ Printf.sprintf "Type: `%s`" ti.Metadata.display ]
+        @ type_resolution_facts ws doc ti
+  in
+  let facts =
+    facts
+    @ [
+        Printf.sprintf "Constant: %s"
+          (if metadata.is_constant then "yes" else "no");
+      ]
+  in
+  let facts =
+    match metadata.storage with
+    | None -> facts
+    | Some storage ->
+        facts @ [ Printf.sprintf "Storage: %s" (Metadata.storage_label storage) ]
+  in
+  let facts =
+    match d.container with
+    | None -> facts
+    | Some c -> facts @ [ Printf.sprintf "Scope: `%s`" c ]
+  in
+  facts
+  @ [
+      source_path_fact_for_def d;
+      declaration_location_fact_for_def d;
+      Printf.sprintf "Symbol key: `%s`" d.key;
+      Printf.sprintf "Role: %s" (semantic_role_for_def ws d);
+    ]
+
+let hover_summary_for_def ws d =
+  let kind = jovial_kind_for_def ws d in
+  match d.metadata.Metadata.external_kind with
+  | Metadata.ExternalDef -> Printf.sprintf "JOVIAL external DEF %s" kind
+  | Metadata.ExternalRef ->
+      Printf.sprintf "JOVIAL external REF %s import" kind
+  | Metadata.ExternalSystem -> Printf.sprintf "JOVIAL system %s" kind
+  | Metadata.ExternalLocal -> Metadata.metadata_summary d.metadata
+
+let change_impact_for_def ws d =
+  match d.metadata.Metadata.external_kind with
+  | Metadata.ExternalRef ->
+      "Changing this REF can break module linkage or calls in this file, but \
+       the actual implementation is controlled by the matching DEF."
+  | Metadata.ExternalDef ->
+      "Callers, parameter bindings, return type, external DEF/REF \
+       declarations, and COMPOOL or module users may be affected. Run Find \
+       References before changing this declaration."
+  | _ -> (
+      match d.metadata.Metadata.jovial_kind with
+      | Metadata.JovialProcedure | Metadata.JovialFunction ->
+          "Callers, parameter bindings, return type, external DEF/REF \
+           declarations, and COMPOOL or module users may be affected. Run Find \
+           References before changing this declaration."
+      | Metadata.JovialDefine ->
+          "Macro expansion changes can affect every use site, including code \
+           that only sees the DEFINE through imported or included declarations. \
+           Run Find References before changing this declaration."
+      | Metadata.JovialTable | Metadata.JovialBlock
+      | Metadata.JovialConstantTable ->
+          "Type, size, layout, or name changes can affect assignments, \
+           formulas, table/block layout, COMPOOL users, and external DEF/REF \
+           users. Run Find References before changing this declaration."
+      | _ -> (
+          match jovial_kind_for_def ws d with
+  | "define" ->
+      "Macro expansion changes can affect every use site, including code that \
+       only sees the DEFINE through imported or included declarations. Run Find \
+       References before changing this declaration."
+  | "table" | "block" ->
+      "Type, size, layout, or name changes can affect assignments, formulas, \
+       table/block layout, COMPOOL users, and external DEF/REF users. Run Find \
+       References before changing this declaration."
+  | _ ->
+      "Type, size, layout, or name changes can affect assignments, formulas, \
+       table entries, COMPOOL users, and external DEF/REF users. Run Find \
+       References before changing this declaration."))
+
+let hover_body_for_def ws doc d =
+  let sig_line = proc_signature_for_def ws d in
+  let src_line = source_line_for_def ws d in
+  let navigation_section =
+    if d.kind = sym_kind_func then
+      let targets =
+        proc_real_defs_by_key ws doc ~key:d.key
+      in
+      match
+        targets
+        |> List.filter (fun target ->
+               loc_key ~uri:target.uri target.loc
+               <> loc_key ~uri:d.uri d.loc)
+      with
+      | target :: _ ->
+          hover_inline_section "Navigation"
+            (Printf.sprintf "Definition resolves to `%s` in `%s`."
+               (String.trim
+                  (match source_line_for_def ws target with
+                  | Some line when String.trim line <> "" -> line
+                  | _ -> target.name))
+               (file_line_of_def target))
+      | [] when Metadata.is_external_ref d.metadata ->
+          hover_inline_section "Navigation"
+            "Target DEF/implementation: not found yet."
+      | [] -> ""
+    else ""
+  in
+  let primary_decl =
+    match sig_line with Some sig_line -> Some sig_line | None -> src_line
+  in
+  let decl_block =
+    match primary_decl with
+    | None -> ""
+    | Some line ->
+        let line = truncate_text 600 line in
+        if String.trim line = "" then ""
+        else hover_code_section "Declaration" line
+  in
+  let source_block =
+    match src_line with
+    | None -> ""
+    | Some line ->
+        let line = truncate_text 600 line in
+        if String.trim line = "" then ""
+        else hover_code_section "Source declaration" line
+  in
+  let preview_block =
+    match implementation_preview_for_def ws d ~max_lines:12 with
+    | None -> ""
+    | Some preview ->
+        let preview = truncate_text 2000 preview in
+        if String.trim preview = "" then ""
+        else hover_code_section "Implementation preview" preview
+  in
+  let impact =
+    hover_inline_section "Change impact" (change_impact_for_def ws d)
+  in
+  let meaning =
+    match d.metadata.Metadata.external_kind with
+    | Metadata.ExternalRef ->
+        hover_inline_section "Meaning"
+          "This REF makes the external symbol visible in this module. It is \
+           not the real definition or implementation. Navigation from calls \
+           should resolve to the matching DEF/implementation when available."
+    | Metadata.ExternalDef ->
+        hover_inline_section "Meaning"
+          "This DEF is the exported external declaration. Calls and matching \
+           REFs may resolve here; an implementation preview appears when a \
+           body is available."
+    | _ -> ""
+  in
+  let sections =
+    List.filter
+      (fun section -> String.trim section <> "")
+      [ decl_block; source_block; preview_block; navigation_section; meaning; impact ]
+  in
+  hover_panel ~name:d.name
+    ~summary:(hover_summary_for_def ws d)
+    ~facts:(hover_def_facts ws doc d) ~sections
+
+let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
+    T.Hover.t option =
+  let budget = nav_budget_start ws in
+  let compute () =
+    if nav_budget_check budget then None
+    else
+      let import_text =
+        match import_under_cursor doc pos with
+        | None -> None
+        | Some imp ->
+            let resolved =
+              match ws.index with
+              | None -> None
+              | Some idx -> Workspace_index.find_compool idx ~name:imp.name
+            in
+            Some
+              (match resolved with
+              | None ->
+                  hover_panel ~name:("COMPOOL " ^ imp.name)
+                    ~summary:"JOVIAL COMPOOL import"
+                    ~facts:
+                      [
+                        "Classification: COMPOOL import";
+                        "Declaration role: COMPOOL import";
+                        Printf.sprintf "Imported COMPOOL: `%s`" imp.name;
+                        "Status: unresolved";
+                        hover_current_file_fact doc;
+                      ]
+                    ~sections:
+                      [
+                        hover_inline_section "Next check"
+                          "No matching compool declaration was found in the \
+                           current workspace. Confirm the COMPOOL is declared \
+                           in the source roots or imported through the \
+                           expected external DEF/REF pair.";
+                      ]
+              | Some p ->
+                  hover_panel ~name:("COMPOOL " ^ imp.name)
+                    ~summary:"JOVIAL COMPOOL import"
+                    ~facts:
+                      [
+                        "Classification: COMPOOL import";
+                        "Declaration role: COMPOOL import";
+                        Printf.sprintf "Imported COMPOOL: `%s`" imp.name;
+                        Printf.sprintf "Resolved COMPOOL file: `%s`" p;
+                      ]
+                    ~sections:
+                      [
+                        hover_inline_section "Change impact"
+                          "Changing declarations in this COMPOOL can affect \
+                           every module that imports it. Run Find References \
+                           before changing shared names, types, layout, or \
+                           external DEF/REF declarations.";
+                      ])
+      in
+      match builtin_type_hover_at doc pos with
+      | Some hover -> Some hover
+      | None -> (
+      match define_under_cursor doc pos with
+      | Some (dm, word_loc) ->
+          let d = def_of_preprocess_define doc dm in
+          let primary_decl =
+            match source_line_for_def ws d with
+            | Some line when String.trim line <> "" -> line
+            | _ ->
+                if dm.requires_call then
+                  Printf.sprintf "DEFINE %s(%s) \"%s\";" dm.name
+                    (String.concat "," dm.formals)
+                    dm.body
+                else Printf.sprintf "DEFINE %s \"%s\";" dm.name dm.body
+          in
+          let decl_block =
+            let line = truncate_text 280 primary_decl in
+            if String.trim line = "" then ""
+            else hover_code_section "Declaration" line
+          in
+          let sections =
+            (if decl_block = "" then [] else [ decl_block ])
+            @
+            (match source_line_for_def ws d with
+            | Some line when String.trim line <> "" ->
+                [ hover_code_section "Source declaration" line ]
+            | _ -> [])
+            @
+            (if dm.formals = [] then
+               [
+                 hover_inline_section "Expansion"
+                   (Printf.sprintf "`%s`" (truncate_text 180 dm.body));
+               ]
+             else
+               [
+                 hover_inline_section "Formals"
+                   (Printf.sprintf "`%s`" (String.concat ", " dm.formals));
+                 hover_inline_section "Expansion template"
+                   (Printf.sprintf "`%s`" (truncate_text 180 dm.body));
+               ])
+            @ [ hover_inline_section "Change impact" (change_impact_for_def ws d) ]
+          in
+            Some
+              (hover_markdown ~range:(Lsp_conv.range_of_loc word_loc)
+                 (hover_panel ~name:d.name ~summary:"JOVIAL define"
+                  ~facts:(hover_def_facts ws doc d) ~sections))
+      | None ->
+          let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
+          let nav = nav_for_doc_cached ws cache doc in
+          let word = nav_word_at_position doc pos in
+          let resolved =
+            symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
+          in
+          let defs, hover_loc =
+            match resolved with
+            | Some (sym_id, loc) -> (
+                let docs_cache : Document.t list option ref = ref None in
+                let docs_for_symbol () =
+                  match !docs_cache with
+                  | Some xs -> xs
+                  | None ->
+                      let xs = docs_for_lookup ws doc in
+                      docs_cache := Some xs;
+                      xs
+                in
+                let defn =
+                  match Hashtbl.find_opt nav.defs_by_id sym_id with
+                  | Some _ as d0 -> d0
+                  | None ->
+                      if ws.sem_store_enabled then
+                        match
+                          Semantic_store.defs_for_sym_id ws.semantic_store
+                            sym_id
+                        with
+                        | d0 :: _ -> Some (def_of_snapshot_def d0)
+                        | [] ->
+                            if nav_budget_check budget then None
+                            else
+                              find_def_for_sym_id ws cache
+                                ~docs:(docs_for_symbol ()) ~sym_id
+                      else if nav_budget_check budget then None
+                      else
+                        find_def_for_sym_id ws cache ~docs:(docs_for_symbol ())
+                          ~sym_id
+                in
+                match defn with
+                | Some d -> ([ d ], Some loc)
                 | None -> (
                     match word with
-                    | None -> ([], None)
+                    | None -> ([], Some loc)
                     | Some (nm, wloc) ->
                         let defs0 =
                           if
                             allow_fallback_for_ws ws doc
                             && not (nav_budget_check budget)
-                          then fallback_defs_by_name ws doc (normalize_name nm)
+                          then
+                            fallback_defs_by_name ws doc (normalize_name nm)
+                            |> prefer_local_defs_before_position doc pos
                           else []
                         in
-                        (defs0, Some wloc))
-              in
-              let defs =
-                match defs with
-                | d :: _
-                  when d.kind = sym_kind_func
-                       && not (is_likely_proc_implementation ws d) ->
-                    let impls = proc_impl_defs_by_key ws doc ~key:d.key in
-                    if impls = [] then defs else impls
-                | [] -> (
-                    match word with
-                    | None -> []
-                    | Some (nm, _) ->
-                        let key = normalize_name nm in
-                        if
-                          key = ""
-                          || (not (allow_fallback_for_ws ws doc))
-                          || nav_budget_check budget
-                        then []
-                        else proc_impl_defs_by_key ws doc ~key)
-                | _ -> defs
-              in
-              if defs = [] then
-                match import_text with
-                | None -> (
-                    match word with
-                    | None -> `Null
-                    | Some (nm, word_loc) ->
-                        `Assoc
-                          [
-                            ( "contents",
-                              `Assoc
-                                [
-                                  ("kind", `String "markdown");
-                                  ( "value",
-                                    `String
-                                      (Printf.sprintf
-                                         "No definition found for `%s` in \
-                                          current workspace scope."
-                                         nm) );
-                                ] );
-                            ("range", range_json_of_loc word_loc);
-                          ])
-                | Some txt ->
-                    `Assoc
-                      [
-                        ( "contents",
-                          `Assoc
-                            [
-                              ("kind", `String "markdown");
-                              ("value", `String txt);
-                            ] );
-                      ]
-              else
-                let rec top_lines acc = function
-                  | [] -> List.rev acc
-                  | _ when nav_budget_check budget -> List.rev acc
-                  | d :: tl ->
-                      let head =
-                        Printf.sprintf "### %s `%s`\nDefined at `%s`"
-                          (kind_name d.kind) d.name (file_line_of_def d)
-                      in
-                      let sig_line = proc_signature_for_def ws d in
-                      let src_line = source_line_for_def ws d in
-                      let primary_decl =
-                        match sig_line with
-                        | Some sig_line -> Some sig_line
-                        | None -> src_line
-                      in
-                      let decl_block =
-                        match primary_decl with
-                        | None -> ""
-                        | Some line ->
-                            let line = truncate_text 280 line in
-                            if String.trim line = "" then ""
-                            else Printf.sprintf "\n```jovial\n%s\n```" line
-                      in
-                      let extra =
-                        match (src_line, sig_line) with
-                        | Some src, Some sig_line
-                          when String.trim src <> String.trim sig_line ->
-                            let src = truncate_text 280 src in
-                            if String.trim src = "" then ""
-                            else
-                              Printf.sprintf
-                                "\nDeclaration:\n```jovial\n%s\n```" src
-                        | _ -> ""
-                      in
-                      top_lines ((head ^ decl_block ^ extra) :: acc) tl
-                in
-                let top_lines = top_lines [] defs in
-                let lines =
-                  match import_text with
-                  | None -> top_lines
-                  | Some imp -> imp :: "" :: top_lines
-                in
-                let body = String.concat "\n" lines in
-                let base =
-                  [
-                    ( "contents",
-                      `Assoc
-                        [
-                          ("kind", `String "markdown"); ("value", `String body);
-                        ] );
-                  ]
-                in
-                let with_range =
-                  match hover_loc with
-                  | None -> base
-                  | Some loc -> ("range", range_json_of_loc loc) :: base
-                in
-                `Assoc with_range
-      in
-      match symbol_key_at_position doc pos with
-      | None -> nav_compute_with_budget budget compute
-      | Some key -> (
-          let kind_exact = "hover" ^ request_pos_suffix pos in
-          let kind_symbol = "hover:symbol" in
-          match
-            nav_cache_get ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-          with
-          | Some (CacheExact cached) ->
-              Perf_stats.tick "nav.response_cache_hit";
-              cached
-          | Some (CacheSymbol cached) ->
-              Perf_stats.tick "nav.response_cache_symbol_hit";
-              cached
-          | None ->
-              Perf_stats.tick "nav.response_cache_miss";
-              let computed = nav_compute_with_budget budget compute in
-              if
-                (not budget.exceeded)
-                && nav_cache_write_allowed_for_request ws ~uri
-                && is_nonempty_hover_json computed
-              then
-                nav_cache_put ws ~kind_exact ~kind_symbol ~uri ~symbol_key:key
-                  ~payload:computed;
-              computed))
-
-let prepare_rename_json_for (ws : t) ~(uri : T.DocumentUri.t)
-    ~(pos : T.Position.t) : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 64 in
-          let nav = nav_for_doc_cached ws cache doc in
-          match symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos with
-          | Some (sym_id, sym_loc) ->
-              let docs = docs_for_rename ws doc in
-              let has_any =
-                docs
-                |> List.exists (fun d ->
-                    if nav_budget_check budget then false
-                    else
-                      let dnav = nav_for_doc_cached ws cache d in
-                      match Hashtbl.find_opt dnav.occs_by_id sym_id with
-                      | None -> false
-                      | Some xs -> xs <> [])
-              in
-              if nav_budget_check budget || not has_any then `Null
-              else
-                let placeholder =
-                  match word_at_position doc pos with
-                  | Some (nm, _) -> nm
-                  | None -> (
-                      match Hashtbl.find_opt nav.defs_by_id sym_id with
-                      | Some d -> d.name
-                      | None -> "name")
-                in
-                `Assoc
-                  [
-                    ("range", range_json_of_loc sym_loc);
-                    ("placeholder", `String placeholder);
-                  ]
-          | None -> (
-              match nav_word_at_position doc pos with
-              | None -> `Null
-              | Some (nm, word_loc) ->
-                  let key = normalize_name nm in
-                  if key = "" || not (allow_fallback_for_ws ws doc) then `Null
-                  else
-                    let has_any =
-                      docs_for_rename ws doc
-                      |> List.exists (fun d ->
-                          if nav_budget_check budget then false
-                          else occurrences_in_doc d ~key <> [])
-                    in
-                    if nav_budget_check budget || not has_any then `Null
-                    else
-                      `Assoc
-                        [
-                          ("range", range_json_of_loc word_loc);
-                          ("placeholder", `String nm);
-                        ])
-      in
-      let computed = nav_compute_with_budget budget compute in
-      if budget.exceeded then `Null else computed
-
-let rename_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
-    ~(new_name : string) : Yojson.Safe.t =
-  if not (is_valid_rename_name new_name) then `Null
-  else
-    match doc_of_uri ws uri with
-    | None -> `Null
-    | Some doc ->
-        let budget = nav_budget_start ws in
-        let compute () =
-          if nav_budget_check budget then `Null
-          else
-            let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 64 in
-            let nav = nav_for_doc_cached ws cache doc in
-            let docs = docs_for_rename ws doc in
-            let seen = Hashtbl.create 1024 in
-            let edits_by_uri : (string, Yojson.Safe.t list) Hashtbl.t =
-              Hashtbl.create 128
-            in
-            let add_edit (u : T.DocumentUri.t) (loc : Ast.Loc.t) =
-              if nav_budget_check budget then ()
-              else
-                let lk = loc_key ~uri:u loc in
-                if not (Hashtbl.mem seen lk) then (
-                  Hashtbl.add seen lk true;
-                  let uri_s = Uri_path.docuri_to_string u in
-                  let edit =
-                    `Assoc
-                      [
-                        ("range", range_json_of_loc loc);
-                        ("newText", `String new_name);
-                      ]
-                  in
-                  let prev =
-                    match Hashtbl.find_opt edits_by_uri uri_s with
-                    | None -> []
-                    | Some xs -> xs
-                  in
-                  Hashtbl.replace edits_by_uri uri_s (edit :: prev))
-            in
-            let apply_changes () =
-              let changes =
-                Hashtbl.fold
-                  (fun uri_s edits acc ->
-                    (uri_s, `List (List.rev edits)) :: acc)
-                  edits_by_uri []
-              in
-              if changes = [] then `Null
-              else `Assoc [ ("changes", `Assoc changes) ]
-            in
-            match symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos with
-            | Some (sym_id, _) ->
-                List.iter
-                  (fun d ->
-                    if not (nav_budget_check budget) then
-                      let dnav = nav_for_doc_cached ws cache d in
-                      match Hashtbl.find_opt dnav.occs_by_id sym_id with
-                      | None -> ()
-                      | Some xs ->
-                          List.iter
-                            (fun (u, loc) ->
-                              if not (nav_budget_check budget) then
-                                add_edit u loc)
-                            xs)
-                  docs;
-                if nav_budget_check budget then `Null else apply_changes ()
+                        (defs0, Some wloc)))
             | None -> (
-                match nav_word_at_position doc pos with
-                | None -> `Null
+                match word with
+                | None -> ([], None)
+                | Some (nm, wloc) ->
+                    let defs0 =
+                      if
+                        allow_fallback_for_ws ws doc
+                        && not (nav_budget_check budget)
+                      then
+                        fallback_defs_by_name ws doc (normalize_name nm)
+                        |> prefer_local_defs_before_position doc pos
+                      else []
+                    in
+                    (defs0, Some wloc))
+          in
+          let defs =
+            match defs with
+            | d :: _
+              when d.kind = sym_kind_func
+                   && not (is_likely_proc_implementation ws d) ->
+                let hovering_decl =
+                  match hover_loc with
+                  | None -> false
+                  | Some loc ->
+                      same_uri d.uri doc.Document.uri
+                      && loc_key ~uri:d.uri loc = loc_key ~uri:d.uri d.loc
+                in
+                if hovering_decl then defs
+                else
+                  let real_defs = proc_real_defs_by_key ws doc ~key:d.key in
+                  if real_defs = [] then defs else real_defs
+            | [] -> (
+                match word with
+                | None -> []
                 | Some (nm, _) ->
                     let key = normalize_name nm in
-                    if key = "" || not (allow_fallback_for_ws ws doc) then `Null
-                    else (
-                      List.iter
-                        (fun d ->
-                          if not (nav_budget_check budget) then
-                            occurrences_in_doc d ~key
-                            |> List.iter (fun (u, loc) ->
-                                if not (nav_budget_check budget) then
-                                  add_edit u loc))
-                        docs;
-                      if nav_budget_check budget then `Null
-                      else apply_changes ()))
-        in
-        let computed = nav_compute_with_budget budget compute in
-        if budget.exceeded then `Null else computed
-
+                    if
+                      key = "" || (not (allow_fallback_for_ws ws doc))
+                      || nav_budget_check budget
+                    then []
+                    else proc_real_defs_by_key ws doc ~key)
+            | _ -> defs
+          in
+          if defs = [] then
+            match import_text with
+            | Some txt -> Some (hover_markdown txt)
+            | None -> (
+                match word with
+                | None -> None
+                | Some (nm, word_loc) ->
+                    Some
+                      (hover_markdown ~range:(Lsp_conv.range_of_loc word_loc)
+                         (hover_panel ~name:nm
+                            ~summary:"Unresolved JOVIAL symbol"
+                            ~facts:
+                              [
+                                "Status: no visible declaration was found for \
+                                 this reference.";
+                                hover_current_file_fact doc;
+                                Printf.sprintf "Position: line %d, column %d"
+                                  word_loc.Ast.Loc.start_pos.line
+                                  (word_loc.Ast.Loc.start_pos.col + 1);
+                              ]
+                            ~sections:
+                              [
+                                hover_inline_section "Next check"
+                                  "Confirm the symbol is declared in scope, \
+                                   imported from the expected COMPOOL, or \
+                                   available through the expected external \
+                                   DEF/REF pair.";
+                              ])))
+          else
+            let rec top_lines acc = function
+              | [] -> List.rev acc
+              | _ when nav_budget_check budget -> List.rev acc
+              | d :: tl -> top_lines (hover_body_for_def ws doc d :: acc) tl
+            in
+            let top_lines = top_lines [] defs in
+            let lines =
+              match import_text with None -> top_lines | Some imp -> imp :: top_lines
+            in
+            let body = String.concat "\n\n---\n\n" lines in
+            let range = Option.map Lsp_conv.range_of_loc hover_loc in
+            Some (hover_markdown ?range body))
+  in
+  let out = compute () in
+  ignore (nav_budget_check budget);
+  out
 let starts_with_ci ~(prefix : string) (s : string) : bool =
   let p = normalize_name prefix in
   if p = "" then true
@@ -1051,25 +816,18 @@ let completion_item_kind_of_def_kind (k : int) : int =
   else if k = sym_kind_const then 21
   else 6
 
-let completion_item_json ~(label : string) ~(kind : int) ?detail ?insert_text
-    ?sort_text () : Yojson.Safe.t =
-  let fields = [ ("label", `String label); ("kind", `Int kind) ] in
-  let fields =
-    match detail with
-    | Some d when String.trim d <> "" -> ("detail", `String d) :: fields
-    | _ -> fields
-  in
-  let fields =
-    match insert_text with
-    | Some txt when txt <> "" -> ("insertText", `String txt) :: fields
-    | _ -> fields
-  in
-  let fields =
-    match sort_text with
-    | Some st when st <> "" -> ("sortText", `String st) :: fields
-    | _ -> fields
-  in
-  `Assoc fields
+let completion_item_kind_of_metadata (d : def) : int =
+  match d.metadata.Metadata.jovial_kind with
+  | Metadata.JovialProgram | Metadata.JovialModule | Metadata.JovialCompool
+  | Metadata.JovialCompoolImport | Metadata.JovialBlock ->
+      9
+  | Metadata.JovialType | Metadata.JovialBuiltinType -> 7
+  | Metadata.JovialField -> 10
+  | Metadata.JovialProcedure | Metadata.JovialFunction -> 3
+  | Metadata.JovialDefine | Metadata.JovialConstantItem
+  | Metadata.JovialConstantTable | Metadata.JovialStatusConstant ->
+      21
+  | _ -> completion_item_kind_of_def_kind d.kind
 
 let completion_keywords : (string * int * string option) list =
   [
@@ -1187,235 +945,6 @@ let completion_snippets : (string * string * int * string option) list =
     ("!ICOMPOOL", "!ICOMPOOL(\"COMP\");", 15, Some "import compool");
   ]
 
-let completion_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
-    : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `List []
-  | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        let prefix =
-          match word_at_position doc pos with None -> "" | Some (nm, _) -> nm
-        in
-        let seen = Hashtbl.create 512 in
-        let out = ref [] in
-        let count = ref 0 in
-        let max_items = 500 in
-        let add_item ~(uniq_key : string) (item : Yojson.Safe.t) : unit =
-          if nav_budget_check budget then ()
-          else if !count < max_items && not (Hashtbl.mem seen uniq_key) then (
-            Hashtbl.replace seen uniq_key true;
-            out := item :: !out;
-            incr count)
-        in
-
-        let add_symbol_item (d : def) : unit =
-          if starts_with_ci ~prefix d.name then
-            let detail =
-              match d.container with
-              | None -> Some (kind_name d.kind)
-              | Some c -> Some (Printf.sprintf "%s in %s" (kind_name d.kind) c)
-            in
-            let kind = completion_item_kind_of_def_kind d.kind in
-            let uniq_key =
-              Printf.sprintf "sym|%s|%d" (normalize_name d.name) kind
-            in
-            let sort_text =
-              if same_uri d.uri doc.Document.uri then
-                Some ("0_" ^ normalize_name d.name)
-              else Some ("1_" ^ normalize_name d.name)
-            in
-            add_item ~uniq_key
-              (completion_item_json ~label:d.name ~kind ?detail ?sort_text ())
-        in
-
-        let add_keyword (label : string) (kind : int) (detail : string option) :
-            unit =
-          if starts_with_ci ~prefix label then
-            let uniq_key = "kw|" ^ normalize_name label in
-            add_item ~uniq_key
-              (completion_item_json ~label ~kind ?detail
-                 ~sort_text:("2_" ^ normalize_name label)
-                 ())
-        in
-
-        let add_builtin_function (label : string) (kind : int)
-            (detail : string option) : unit =
-          if starts_with_ci ~prefix label then
-            let uniq_key = "fn|" ^ normalize_name label in
-            add_item ~uniq_key
-              (completion_item_json ~label ~kind ?detail
-                 ~sort_text:("3_" ^ normalize_name label)
-                 ())
-        in
-
-        let add_snippet (label : string) (insert_text : string) (kind : int)
-            (detail : string option) : unit =
-          if starts_with_ci ~prefix label || starts_with_ci ~prefix insert_text
-          then
-            let uniq_key = "snip|" ^ normalize_name label in
-            add_item ~uniq_key
-              (completion_item_json ~label ~kind ?detail ~insert_text
-                 ~sort_text:("4_" ^ normalize_name label)
-                 ())
-        in
-
-        docs_for_lookup ws doc
-        |> List.iter (fun d ->
-            if not (nav_budget_check budget) then
-              collect_doc_defs d
-              |> List.iter (fun defn ->
-                  if not (nav_budget_check budget) then add_symbol_item defn));
-
-        List.iter
-          (fun (label, kind, detail) ->
-            if not (nav_budget_check budget) then add_keyword label kind detail)
-          completion_keywords;
-        List.iter
-          (fun (label, kind, detail) ->
-            if not (nav_budget_check budget) then add_keyword label kind detail)
-          completion_types_builtin;
-        List.iter
-          (fun (label, kind, detail) ->
-            if not (nav_budget_check budget) then
-              add_builtin_function label kind detail)
-          completion_functions_builtin;
-        List.iter
-          (fun (label, insert_text, kind, detail) ->
-            if not (nav_budget_check budget) then
-              add_snippet label insert_text kind detail)
-          completion_snippets;
-
-        `List (List.rev !out)
-      in
-      nav_compute_with_budget budget compute
-
-let declaration_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
-    : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          match nav_word_at_position doc pos with
-          | Some (nm, _) ->
-              let key = normalize_name nm in
-              if key = "" then definition_json_for ws ~uri ~pos
-              else
-                let decls =
-                  proc_defs_by_key ws doc ~key
-                  |> List.filter (fun d ->
-                      not (is_likely_proc_implementation ws d))
-                in
-                if decls = [] then definition_json_for ws ~uri ~pos
-                else `List (List.map def_to_loc_json (uniq_defs decls))
-          | None -> definition_json_for ws ~uri ~pos
-      in
-      nav_compute_with_budget budget compute
-
-let type_definition_json_for (ws : t) ~(uri : T.DocumentUri.t)
-    ~(pos : T.Position.t) : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          let key_opt =
-            match nav_word_at_position doc pos with
-            | None -> None
-            | Some (nm, _) ->
-                let key = normalize_name nm in
-                if key = "" then None else Some key
-          in
-          match key_opt with
-          | None -> `Null
-          | Some key ->
-              let docs = docs_for_lookup ws doc in
-              let defs =
-                docs
-                |> List.concat_map collect_doc_defs
-                |> List.filter (fun d -> d.kind = sym_kind_type && d.key = key)
-                |> uniq_defs
-              in
-              if defs = [] then `Null else `List (List.map def_to_loc_json defs)
-      in
-      nav_compute_with_budget budget compute
-
-let doc_sort_key (doc : Document.t) : string =
-  Uri_path.docuri_to_string doc.Document.uri
-
-let workspace_symbols_json_for (ws : t) ~(query : string) : Yojson.Safe.t =
-  let budget = nav_budget_start ws in
-  let max_items = 512 in
-  let prefix = String.trim query in
-  let compute () =
-    if nav_budget_check budget then `List []
-    else
-      let docs_seen = Hashtbl.create 512 in
-      let docs = ref [] in
-      let add_doc (d : Document.t) : unit =
-        if nav_budget_check budget then ()
-        else
-          let k = Uri_path.docuri_to_string d.Document.uri in
-          if not (Hashtbl.mem docs_seen k) then (
-            Hashtbl.replace docs_seen k true;
-            docs := d :: !docs)
-      in
-      Hashtbl.iter (fun _ d -> add_doc d) ws.docs;
-      Hashtbl.iter (fun _ d -> add_doc d) ws.files;
-      let docs =
-        !docs
-        |> List.sort (fun a b ->
-            String.compare (doc_sort_key a) (doc_sort_key b))
-      in
-      let symbol_seen = Hashtbl.create 2048 in
-      let out = ref [] in
-      let count = ref 0 in
-      let add_symbol (d : def) : unit =
-        if nav_budget_check budget || !count >= max_items then ()
-        else if starts_with_ci ~prefix d.name || starts_with_ci ~prefix d.key
-        then
-          let key =
-            Printf.sprintf "%s|%d|%d|%d" (loc_key ~uri:d.uri d.loc) d.kind
-              d.loc.start_pos.line d.loc.start_pos.col
-          in
-          if not (Hashtbl.mem symbol_seen key) then (
-            Hashtbl.replace symbol_seen key true;
-            out := d :: !out;
-            incr count)
-      in
-      List.iter
-        (fun d ->
-          if not (nav_budget_check budget) then
-            collect_doc_defs d |> List.iter add_symbol)
-        docs;
-      let sorted =
-        List.rev !out
-        |> List.sort (fun a b ->
-            let ka = normalize_name a.name in
-            let kb = normalize_name b.name in
-            let c0 = String.compare ka kb in
-            if c0 <> 0 then c0
-            else
-              let c1 =
-                String.compare
-                  (Uri_path.docuri_to_string a.uri)
-                  (Uri_path.docuri_to_string b.uri)
-              in
-              if c1 <> 0 then c1
-              else
-                let c2 = compare a.loc.start_pos.line b.loc.start_pos.line in
-                if c2 <> 0 then c2
-                else compare a.loc.start_pos.col b.loc.start_pos.col)
-      in
-      `List (List.map symbol_json sorted)
-  in
-  nav_compute_with_budget budget compute
-
 let split_signature_params (label : string) : string list =
   match String.index_opt label '(' with
   | None -> []
@@ -1522,96 +1051,8 @@ let call_context_at_position (doc : Document.t) (pos : T.Position.t) :
                 done;
                 Some (key, max 0 !commas))
 
-let signature_help_json_for (ws : t) ~(uri : T.DocumentUri.t)
-    ~(pos : T.Position.t) : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Null
-  | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then `Null
-        else
-          match call_context_at_position doc pos with
-          | None -> `Null
-          | Some (key, active_param) ->
-              let defs =
-                if nav_budget_check budget then []
-                else
-                  let docs = docs_for_lookup ws doc in
-                  let from_docs =
-                    docs
-                    |> List.concat_map collect_doc_defs
-                    |> List.filter (fun d ->
-                        d.kind = sym_kind_func && d.key = key)
-                    |> uniq_defs
-                  in
-                  if from_docs <> [] then from_docs
-                  else if allow_fallback_for_ws ws doc then
-                    proc_defs_by_key ws doc ~key
-                  else []
-              in
-              if defs = [] then `Null
-              else
-                let signatures =
-                  defs
-                  |> List.filter_map (fun d ->
-                      if nav_budget_check budget then None
-                      else
-                        match proc_signature_for_def ws d with
-                        | Some label ->
-                            Some
-                              (`Assoc
-                                 [
-                                   ("label", `String label);
-                                   ("parameters", signature_params_json label);
-                                 ])
-                        | None ->
-                            Some
-                              (`Assoc
-                                 [
-                                   ("label", `String d.name);
-                                   ("parameters", `List []);
-                                 ]))
-                in
-                if signatures = [] then `Null
-                else
-                  `Assoc
-                    [
-                      ("signatures", `List signatures);
-                      ("activeSignature", `Int 0);
-                      ("activeParameter", `Int active_param);
-                    ]
-      in
-      nav_compute_with_budget budget compute
-
 let range_intersects (a : T.Range.t) (b : T.Range.t) : bool =
   compare_pos a.start b.end_ <= 0 && compare_pos b.start a.end_ <= 0
-
-let range_pos_json (p : T.Position.t) : Yojson.Safe.t =
-  `Assoc [ ("line", `Int p.line); ("character", `Int p.character) ]
-
-let range_zero_json (p : T.Position.t) : Yojson.Safe.t =
-  `Assoc [ ("start", range_pos_json p); ("end", range_pos_json p) ]
-
-let workspace_single_edit_json ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
-    ~(new_text : string) : Yojson.Safe.t =
-  let uri_s = Uri_path.docuri_to_string uri in
-  `Assoc
-    [
-      ( "changes",
-        `Assoc
-          [
-            ( uri_s,
-              `List
-                [
-                  `Assoc
-                    [
-                      ("range", range_zero_json pos);
-                      ("newText", `String new_text);
-                    ];
-                ] );
-          ] );
-    ]
 
 let parse_missing_compool_name (msg : string) : string option =
   let prefix = "Missing COMPOOL:" in
@@ -1690,232 +1131,6 @@ let has_import_for_compool (doc : Document.t) (name : string) : bool =
   |> List.exists (fun (imp : Preprocess.import) ->
       normalize_name imp.name = key)
 
-let quickfix_add_import_action ~(doc : Document.t) ~(diag : T.Diagnostic.t)
-    ~(compool : string) : Yojson.Safe.t option =
-  let key = normalize_name compool in
-  if key = "" || has_import_for_compool doc key then None
-  else
-    let pos, append_after_line = import_insert_position doc in
-    let text =
-      if append_after_line then Printf.sprintf "\n!COMPOOL(\"%s\");" key
-      else Printf.sprintf "!COMPOOL(\"%s\");\n" key
-    in
-    Some
-      (`Assoc
-         [
-           ("title", `String (Printf.sprintf "Import COMPOOL %s" key));
-           ("kind", `String "quickfix");
-           ("isPreferred", `Bool true);
-           ("diagnostics", `List [ T.Diagnostic.yojson_of_t diag ]);
-           ("edit", workspace_single_edit_json ~uri:doc.uri ~pos ~new_text:text);
-         ])
-
-let code_actions_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t)
-    : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `List []
-  | Some doc ->
-      let diag_in_range (d : T.Diagnostic.t) : bool =
-        range_intersects d.range range
-      in
-      let seen = Hashtbl.create 32 in
-      let actions = ref [] in
-      let add_action (key : string) (action : Yojson.Safe.t option) =
-        if not (Hashtbl.mem seen key) then
-          match action with
-          | None -> ()
-          | Some a ->
-              Hashtbl.replace seen key true;
-              actions := a :: !actions
-      in
-      Document.diagnostics doc |> List.filter diag_in_range
-      |> List.iter (fun (d : T.Diagnostic.t) ->
-          let msg =
-            match d.message with
-            | `String s -> s
-            | `MarkupContent mc -> mc.value
-          in
-          let compool_opt =
-            match parse_missing_compool_name msg with
-            | Some c -> Some c
-            | None -> parse_compool_name_from_hint msg
-          in
-          match compool_opt with
-          | None -> ()
-          | Some c ->
-              add_action
-                ("import|" ^ normalize_name c)
-                (quickfix_add_import_action ~doc ~diag:d ~compool:c));
-      `List (List.rev !actions)
-
-let collect_proc_param_map (doc : Document.t)
-    (out : (string, string list) Hashtbl.t) : unit =
-  let doc = Document.ensure_parsed doc in
-  let rec add_expr (e : Ast.expr Ast.node) : unit =
-    match e.v with
-    | Ast.EName _ | Ast.ELit _ -> ()
-    | Ast.EUnop { rhs; _ } -> add_expr rhs
-    | Ast.EBinop { lhs; rhs; _ } ->
-        add_expr lhs;
-        add_expr rhs
-    | Ast.ECall { args; _ } -> List.iter add_expr args
-    | Ast.EIndex { base; index } ->
-        add_expr base;
-        List.iter add_expr index
-    | Ast.EField { base; _ } -> add_expr base
-    | Ast.EAt { field; ptr } ->
-        add_expr field;
-        add_expr ptr
-    | Ast.EDeref { ptr } -> add_expr ptr
-    | Ast.EParen x -> add_expr x
-  in
-  let rec add_stmt (s : Ast.stmt Ast.node) : unit =
-    match s.v with
-    | Ast.SEmpty | Ast.SGoto _ -> ()
-    | Ast.SDecl d -> add_decl d
-    | Ast.SBlock xs -> List.iter add_stmt xs
-    | Ast.SAssign { lhs; rhs } ->
-        add_expr lhs;
-        add_expr rhs
-    | Ast.SCallStmt { args; _ } -> List.iter add_expr args
-    | Ast.SIf { cond; then_; else_ } -> (
-        add_expr cond;
-        add_stmt then_;
-        match else_ with None -> () | Some e -> add_stmt e)
-    | Ast.SWhile { cond; body } ->
-        add_expr cond;
-        add_stmt body
-    | Ast.SFor { init; cond; step; body } ->
-        (match init with None -> () | Some i -> add_stmt i);
-        (match cond with None -> () | Some c -> add_expr c);
-        (match step with None -> () | Some st -> add_stmt st);
-        add_stmt body
-    | Ast.SReturn eo -> ( match eo with None -> () | Some e -> add_expr e)
-    | Ast.SLabel { body; _ } -> add_stmt body
-  and add_decl (d : Ast.decl Ast.node) : unit =
-    match d.v with
-    | Ast.DVar { init; _ } -> (
-        match init with None -> () | Some e -> add_expr e)
-    | Ast.DConst { value; _ } -> add_expr value
-    | Ast.DType _ | Ast.DDirective _ -> ()
-    | Ast.DProc p ->
-        let key = normalize_name p.v.name.v in
-        if key <> "" && not (Hashtbl.mem out key) then
-          Hashtbl.add out key (List.map (fun prm -> prm.v.pname.v) p.v.params);
-        List.iter add_decl p.v.locals;
-        add_stmt p.v.body
-  in
-  match doc.Document.ast with
-  | None -> ()
-  | Some prog ->
-      List.iter
-        (function Ast.TopDecl d -> add_decl d | Ast.TopStmt s -> add_stmt s)
-        prog
-
-let inlay_hints_json_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t)
-    : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `List []
-  | Some doc ->
-      let doc = Document.ensure_parsed doc in
-      let proc_params : (string, string list) Hashtbl.t = Hashtbl.create 128 in
-      docs_for_lookup ws doc
-      |> List.iter (fun d -> collect_proc_param_map d proc_params);
-      let seen = Hashtbl.create 256 in
-      let hints = ref [] in
-      let add_call_hints (callee : Ast.ident) (args : Ast.expr Ast.node list) =
-        let key = normalize_name callee.v in
-        match Hashtbl.find_opt proc_params key with
-        | None -> ()
-        | Some params ->
-            List.iteri
-              (fun i (arg : Ast.expr Ast.node) ->
-                match nth_opt params i with
-                | None -> ()
-                | Some pname ->
-                    let pos = Lsp_conv.position_of_ast_pos arg.loc.start_pos in
-                    if pos_in_range pos range then
-                      let hk =
-                        Printf.sprintf "%d|%d|%s" pos.line pos.character pname
-                      in
-                      if not (Hashtbl.mem seen hk) then (
-                        Hashtbl.add seen hk true;
-                        hints :=
-                          `Assoc
-                            [
-                              ("position", T.Position.yojson_of_t pos);
-                              ("label", `String (pname ^ ":"));
-                              ("kind", `Int 2);
-                              ("paddingRight", `Bool true);
-                            ]
-                          :: !hints))
-              args
-      in
-      let rec walk_expr (e : Ast.expr Ast.node) : unit =
-        match e.v with
-        | Ast.EName _ | Ast.ELit _ -> ()
-        | Ast.EUnop { rhs; _ } -> walk_expr rhs
-        | Ast.EBinop { lhs; rhs; _ } ->
-            walk_expr lhs;
-            walk_expr rhs
-        | Ast.ECall { callee; args } ->
-            add_call_hints callee args;
-            List.iter walk_expr args
-        | Ast.EIndex { base; index } ->
-            walk_expr base;
-            List.iter walk_expr index
-        | Ast.EField { base; _ } -> walk_expr base
-        | Ast.EAt { field; ptr } ->
-            walk_expr field;
-            walk_expr ptr
-        | Ast.EDeref { ptr } -> walk_expr ptr
-        | Ast.EParen x -> walk_expr x
-      in
-      let rec walk_stmt (s : Ast.stmt Ast.node) : unit =
-        match s.v with
-        | Ast.SEmpty | Ast.SGoto _ -> ()
-        | Ast.SDecl d -> walk_decl d
-        | Ast.SBlock xs -> List.iter walk_stmt xs
-        | Ast.SAssign { lhs; rhs } ->
-            walk_expr lhs;
-            walk_expr rhs
-        | Ast.SCallStmt { callee; args; _ } ->
-            add_call_hints callee args;
-            List.iter walk_expr args
-        | Ast.SIf { cond; then_; else_ } -> (
-            walk_expr cond;
-            walk_stmt then_;
-            match else_ with None -> () | Some e -> walk_stmt e)
-        | Ast.SWhile { cond; body } ->
-            walk_expr cond;
-            walk_stmt body
-        | Ast.SFor { init; cond; step; body } ->
-            (match init with None -> () | Some i -> walk_stmt i);
-            (match cond with None -> () | Some c -> walk_expr c);
-            (match step with None -> () | Some st -> walk_stmt st);
-            walk_stmt body
-        | Ast.SReturn eo -> (
-            match eo with None -> () | Some e -> walk_expr e)
-        | Ast.SLabel { body; _ } -> walk_stmt body
-      and walk_decl (d : Ast.decl Ast.node) : unit =
-        match d.v with
-        | Ast.DVar { init; _ } -> (
-            match init with None -> () | Some e -> walk_expr e)
-        | Ast.DConst { value; _ } -> walk_expr value
-        | Ast.DType _ | Ast.DDirective _ -> ()
-        | Ast.DProc p ->
-            List.iter walk_decl p.v.locals;
-            walk_stmt p.v.body
-      in
-      (match doc.Document.ast with
-      | None -> ()
-      | Some prog ->
-          List.iter
-            (function
-              | Ast.TopDecl d -> walk_decl d | Ast.TopStmt s -> walk_stmt s)
-            prog);
-      `List (List.rev !hints)
-
 let nav_compute_with_budget_value (budget : nav_budget) (f : unit -> 'a) : 'a =
   let out = f () in
   ignore (nav_budget_check budget);
@@ -1942,11 +1157,91 @@ let locations_with_budget (budget : nav_budget)
     occs;
   List.rev !out
 
-let hover_markdown ?range (value : string) : T.Hover.t =
-  let contents =
-    `MarkupContent (T.MarkupContent.create ~kind:T.MarkupKind.Markdown ~value)
+let uri_key (uri : T.DocumentUri.t) : string = Uri_path.docuri_to_string uri
+
+let doc_key (doc : Document.t) : string = uri_key doc.Document.uri
+
+let add_doc_once (seen : (string, bool) Hashtbl.t) (out : Document.t list ref)
+    (doc : Document.t) : unit =
+  let key = doc_key doc in
+  if not (Hashtbl.mem seen key) then (
+    Hashtbl.replace seen key true;
+    out := doc :: !out)
+
+let docs_except_seen (seen : (string, bool) Hashtbl.t) (docs : Document.t list)
+    : Document.t list =
+  let out = ref [] in
+  List.iter
+    (fun doc ->
+      let key = doc_key doc in
+      if not (Hashtbl.mem seen key) then (
+        Hashtbl.replace seen key true;
+        out := doc :: !out))
+    docs;
+  List.rev !out
+
+let reference_doc_stages (ws : t) (doc : Document.t) :
+    Document.t list * Document.t list * Document.t list =
+  let seen = Hashtbl.create 64 in
+  let current = [ doc ] in
+  Hashtbl.replace seen (doc_key doc) true;
+  let imported = docs_for_lookup ws doc |> docs_except_seen seen in
+  let workspace = docs_for_rename ws doc |> docs_except_seen seen in
+  (current, imported, workspace)
+
+let def_keys_for_defs (defs : def list) : (string, bool) Hashtbl.t =
+  let keys = Hashtbl.create 32 in
+  List.iter
+    (fun d ->
+      if not (is_ref_import_def d) then
+        Hashtbl.replace keys (loc_key ~uri:d.uri d.loc) true)
+    defs;
+  keys
+
+let filter_declarations ~(include_decl : bool) ~(def_keys : (string, bool) Hashtbl.t)
+    (occs : (T.DocumentUri.t * Ast.Loc.t) list) :
+    (T.DocumentUri.t * Ast.Loc.t) list =
+  if include_decl then occs
+  else
+    List.filter
+      (fun (u, loc) -> not (Hashtbl.mem def_keys (loc_key ~uri:u loc)))
+      occs
+
+let emit_locations_stage (budget : nav_budget)
+    (seen : (string, bool) Hashtbl.t) ~(emit : T.Location.t list -> unit)
+    (occs : (T.DocumentUri.t * Ast.Loc.t) list) : T.Location.t list =
+  let out = ref [] in
+  List.iter
+    (fun (u, loc) ->
+      if not (nav_budget_check budget) then
+        let key = loc_key ~uri:u loc in
+        if not (Hashtbl.mem seen key) then (
+          Hashtbl.replace seen key true;
+          out := Lsp_conv.location_of_loc ~uri:u loc :: !out))
+    occs;
+  let batch = List.rev !out in
+  if batch <> [] then emit batch;
+  batch
+
+let emit_reference_doc_stages (budget : nav_budget)
+    ~(emit : T.Location.t list -> unit)
+    ~(include_decl : bool) ~(def_keys : (string, bool) Hashtbl.t)
+    ~(key : string) (current : Document.t list) (imported : Document.t list)
+    (workspace : Document.t list) : T.Location.t list =
+  let seen = Hashtbl.create 256 in
+  let acc = ref [] in
+  let emit_docs docs =
+    let occs =
+      docs |> List.concat_map (fun d -> occurrences_in_doc d ~key)
+      |> filter_declarations ~include_decl ~def_keys
+    in
+    let batch = emit_locations_stage budget seen ~emit occs in
+    acc := !acc @ batch
   in
-  T.Hover.create ~contents ?range ()
+  emit_docs current;
+  emit_docs imported;
+  emit_docs workspace;
+  !acc
 
 let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Location.t list =
@@ -1963,12 +1258,13 @@ let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
             | Some imp ->
                 defs_for_import_cursor ws imp |> List.map location_of_def
             | None -> (
+                let word = nav_word_at_position doc pos in
                 let startup_quick_hits =
-                  match nav_word_at_position doc pos with
+                  match word with
                   | None -> []
                   | Some (nm, _) ->
                       let key = normalize_name nm in
-                      if key = "" then [] else proc_impl_defs_by_key ws doc ~key
+                      if key = "" then [] else proc_real_defs_by_key ws doc ~key
                 in
                 if startup_quick_hits <> [] then
                   List.map location_of_def startup_quick_hits
@@ -1978,93 +1274,108 @@ let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                   | Some (dm, _) ->
                       [ location_of_def (def_of_preprocess_define doc dm) ]
                   | None -> (
-                      let cache : (string, doc_nav) Hashtbl.t =
-                        Hashtbl.create 32
-                      in
-                      let nav = nav_for_doc_cached ws cache doc in
-                      let docs_cache : Document.t list option ref = ref None in
-                      let docs_for_symbol () =
-                        match !docs_cache with
-                        | Some xs -> xs
-                        | None ->
-                            let xs = docs_for_lookup ws doc in
-                            docs_cache := Some xs;
-                            xs
-                      in
-                      let hit =
-                        match
-                          symbol_at_position_in_nav nav ~uri:doc.Document.uri
-                            ~pos
-                        with
-                        | None -> None
-                        | Some (sym_id, _) -> (
-                            match Hashtbl.find_opt nav.defs_by_id sym_id with
-                            | Some _ as d0 -> d0
-                            | None ->
-                                if ws.sem_store_enabled then
-                                  match
-                                    Semantic_store.defs_for_sym_id
-                                      ws.semantic_store sym_id
-                                  with
-                                  | d0 :: _ -> Some (def_of_snapshot_def d0)
-                                  | [] ->
-                                      if nav_budget_check budget then None
-                                      else
-                                        find_def_for_sym_id ws cache
-                                          ~docs:(docs_for_symbol ()) ~sym_id
-                                else if nav_budget_check budget then None
-                                else
-                                  find_def_for_sym_id ws cache
-                                    ~docs:(docs_for_symbol ()) ~sym_id)
-                      in
-                      match hit with
-                      | Some d ->
-                          let defs =
-                            if
-                              d.kind = sym_kind_func
-                              && not (is_likely_proc_implementation ws d)
-                            then
-                              let impls =
-                                proc_impl_defs_by_key ws doc ~key:d.key
-                              in
-                              if impls = [] then [ d ] else impls
-                            else [ d ]
+                      match word with
+                      | None -> []
+                      | Some _ ->
+                          let cache : (string, doc_nav) Hashtbl.t =
+                            Hashtbl.create 32
                           in
-                          List.map location_of_def defs
-                      | None ->
-                          if nav_budget_check budget then []
-                          else
-                            let proc_by_name =
-                              if not allow_fallback then []
-                              else
-                                match nav_word_at_position doc pos with
-                                | None -> []
-                                | Some (nm, _) ->
-                                    let key = normalize_name nm in
-                                    if key = "" then []
-                                    else proc_impl_defs_by_key ws doc ~key
-                            in
-                            if proc_by_name <> [] then
-                              List.map location_of_def proc_by_name
-                            else if
-                              (not allow_fallback) || nav_budget_check budget
-                            then []
-                            else
-                              let by_name =
-                                match nav_word_at_position doc pos with
-                                | None -> []
-                                | Some (nm, _) ->
-                                    fallback_defs_by_name ws doc
-                                      (normalize_name nm)
+                          let nav = nav_for_doc_cached ws cache doc in
+                          let docs_cache : Document.t list option ref =
+                            ref None
+                          in
+                          let docs_for_symbol () =
+                            match !docs_cache with
+                            | Some xs -> xs
+                            | None ->
+                                let xs = docs_for_lookup ws doc in
+                                docs_cache := Some xs;
+                                xs
+                          in
+                          let hit =
+                            match
+                              symbol_at_position_in_nav nav
+                                ~uri:doc.Document.uri ~pos
+                            with
+                            | None -> None
+                            | Some (sym_id, _) -> (
+                                match
+                                  Hashtbl.find_opt nav.defs_by_id sym_id
+                                with
+                                | Some _ as d0 -> d0
+                                | None ->
+                                    if ws.sem_store_enabled then
+                                      match
+                                        Semantic_store.defs_for_sym_id
+                                          ws.semantic_store sym_id
+                                      with
+                                      | d0 :: _ -> Some (def_of_snapshot_def d0)
+                                      | [] ->
+                                          if nav_budget_check budget then None
+                                          else
+                                            find_def_for_sym_id ws cache
+                                              ~docs:(docs_for_symbol ()) ~sym_id
+                                    else if nav_budget_check budget then None
+                                    else
+                                      find_def_for_sym_id ws cache
+                                        ~docs:(docs_for_symbol ()) ~sym_id)
+                          in
+                          match hit with
+                          | Some d ->
+                              let defs =
+                                if
+                                  d.kind = sym_kind_func
+                                  && not (is_likely_proc_implementation ws d)
+                                then
+                                  let impls =
+                                    proc_real_defs_by_key ws doc ~key:d.key
+                                  in
+                                  if impls = [] then [ d ] else impls
+                                else [ d ]
                               in
-                              List.map location_of_def by_name))
+                              List.map location_of_def defs
+                          | None ->
+                              if nav_budget_check budget then []
+                              else
+                                let proc_by_name =
+                                  if not allow_fallback then []
+                                  else
+                                    match word with
+                                    | None -> []
+                                    | Some (nm, _) ->
+                                        let key = normalize_name nm in
+                                        if key = "" then []
+                                        else proc_real_defs_by_key ws doc ~key
+                                in
+                                if proc_by_name <> [] then
+                                  List.map location_of_def proc_by_name
+                                else if
+                                  (not allow_fallback)
+                                  || nav_budget_check budget
+                                then []
+                                else
+                                  let by_name =
+                                    match word with
+                                    | None -> []
+                                    | Some (nm, _) ->
+                                        fallback_defs_by_name ws doc
+                                          (normalize_name nm)
+                                        |> prefer_local_defs_before_position doc
+                                             pos
+                                  in
+                                  List.map location_of_def by_name))
         in
         let result = nav_compute_with_budget_value budget compute in
         schedule_nav_miss_for_result ws doc pos ~empty:(result = []);
         result
       in
       let primary = definition_for_pos pos in
-      if primary = [] && pos.character > 0 then
+      let original_was_filtered =
+        match (word_at_position doc pos, nav_word_at_position doc pos) with
+        | Some _, None -> true
+        | _ -> false
+      in
+      if primary = [] && pos.character > 0 && not original_was_filtered then
         definition_for_pos { pos with T.Position.character = pos.character - 1 }
       else primary
 
@@ -2079,7 +1390,11 @@ let implementation_locations_for (ws : t) ~(uri : T.DocumentUri.t)
         else
           match import_under_cursor doc pos with
           | Some _ -> definition_locations_for ws ~uri ~pos
-          | None ->
+          | None -> (
+              let word = nav_word_at_position doc pos in
+              match word with
+              | None -> []
+              | Some _ ->
               let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
               let nav = nav_for_doc_cached ws cache doc in
               let docs_cache : Document.t list option ref = ref None in
@@ -2120,7 +1435,7 @@ let implementation_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                 match defs with
                 | d :: _ when d.key <> "" -> Some d.key
                 | _ -> (
-                    match nav_word_at_position doc pos with
+                    match word with
                     | Some (nm, _) ->
                         let key = normalize_name nm in
                         if key = "" then None else Some key
@@ -2138,8 +1453,7 @@ let implementation_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                       then proc_impl_defs_by_key ws doc ~key
                       else []
               in
-              if defs = [] then definition_locations_for ws ~uri ~pos
-              else List.map location_of_def defs
+              if defs = [] then [] else List.map location_of_def defs)
       in
       let result = nav_compute_with_budget_value budget compute in
       schedule_nav_miss_for_result ws doc pos ~empty:(result = []);
@@ -2165,11 +1479,7 @@ let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                   |> List.concat_map collect_doc_defs
                   |> List.filter (fun d -> d.key = key)
                 in
-                let def_keys = Hashtbl.create 32 in
-                List.iter
-                  (fun d ->
-                    Hashtbl.replace def_keys (loc_key ~uri:d.uri d.loc) true)
-                  defs;
+                let def_keys = def_keys_for_defs defs in
                 let occs = occurrences_for_docs_with_budget budget docs ~key in
                 let occs =
                   if include_decl then occs
@@ -2181,12 +1491,18 @@ let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                 in
                 locations_with_budget budget occs
           | None -> (
-              let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 64 in
-              let nav = nav_for_doc_cached ws cache doc in
-              let resolved =
-                symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
-              in
-              match resolved with
+              let word = nav_word_at_position doc pos in
+              match word with
+              | None -> []
+              | Some _ ->
+                  let cache : (string, doc_nav) Hashtbl.t =
+                    Hashtbl.create 64
+                  in
+                  let nav = nav_for_doc_cached ws cache doc in
+                  let resolved =
+                    symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
+                  in
+                  match resolved with
               | Some (sym_id, _) ->
                   let docs_cache : Document.t list option ref = ref None in
                   let docs_for_symbol () =
@@ -2235,7 +1551,7 @@ let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                   in
                   locations_with_budget budget occs
               | None -> (
-                  match nav_word_at_position doc pos with
+                  match word with
                   | None -> []
                   | Some (nm, _) ->
                       let key = normalize_name nm in
@@ -2257,12 +1573,7 @@ let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                         in
                         if defs = [] then []
                         else
-                          let def_keys = Hashtbl.create 32 in
-                          List.iter
-                            (fun d ->
-                              Hashtbl.replace def_keys
-                                (loc_key ~uri:d.uri d.loc) true)
-                            defs;
+                          let def_keys = def_keys_for_defs defs in
                           let occs =
                             occurrences_for_docs_with_budget budget docs ~key
                           in
@@ -2281,218 +1592,294 @@ let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
       schedule_nav_miss_for_result ws doc pos ~empty:(result = []);
       result
 
+let references_locations_stream (ws : t) ~(uri : T.DocumentUri.t)
+    ~(pos : T.Position.t) ~(include_decl : bool)
+    ~(emit : T.Location.t list -> unit) : T.Location.t list =
+  match doc_of_uri ws uri with
+  | None -> []
+  | Some doc ->
+      let budget = nav_budget_start ws in
+      let compute () =
+        if nav_budget_check budget then []
+        else
+          let current, imported, workspace = reference_doc_stages ws doc in
+          match import_under_cursor doc pos with
+          | Some imp ->
+              let key = normalize_name imp.name in
+              if key = "" then []
+              else
+                let all_docs = current @ imported @ workspace in
+                let defs =
+                  all_docs |> List.concat_map collect_doc_defs
+                  |> List.filter (fun d -> d.key = key)
+                in
+                emit_reference_doc_stages budget ~emit ~include_decl
+                  ~def_keys:(def_keys_for_defs defs) ~key current imported
+                  workspace
+          | None -> (
+              match nav_word_at_position doc pos with
+              | None -> []
+              | Some (nm, _) ->
+                  let cache : (string, doc_nav) Hashtbl.t =
+                    Hashtbl.create 64
+                  in
+                  let nav = nav_for_doc_cached ws cache doc in
+                  match
+                    symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
+                  with
+                  | Some (sym_id, _) ->
+                      let def_keys, staged_occs =
+                        if ws.sem_store_enabled then
+                          let defs =
+                            Semantic_store.defs_for_sym_id ws.semantic_store
+                              sym_id
+                            |> List.map def_of_snapshot_def
+                            |> uniq_defs
+                          in
+                          let imported_keys =
+                            let keys = Hashtbl.create 32 in
+                            List.iter
+                              (fun d ->
+                                Hashtbl.replace keys
+                                  (uri_key d.Document.uri)
+                                  true)
+                              imported;
+                            keys
+                          in
+                          let current_rev = ref [] in
+                          let imported_rev = ref [] in
+                          let workspace_rev = ref [] in
+                          Semantic_store.refs_for_sym_id ws.semantic_store
+                            sym_id
+                          |> List.iter (fun ((u, _) as occ) ->
+                                 if same_uri u doc.Document.uri then
+                                   current_rev := occ :: !current_rev
+                                 else if Hashtbl.mem imported_keys (uri_key u)
+                                 then imported_rev := occ :: !imported_rev
+                                 else workspace_rev := occ :: !workspace_rev);
+                          ( def_keys_for_defs defs,
+                            ( List.rev !current_rev,
+                              List.rev !imported_rev,
+                              List.rev !workspace_rev ) )
+                        else
+                          let defs_and_occs docs =
+                            let defs_rev = ref [] in
+                            let occs_rev = ref [] in
+                            List.iter
+                              (fun d ->
+                                let dnav = nav_for_doc_cached ws cache d in
+                                (match
+                                   Hashtbl.find_opt dnav.defs_by_id sym_id
+                                 with
+                                | None -> ()
+                                | Some def -> defs_rev := def :: !defs_rev);
+                                match
+                                  Hashtbl.find_opt dnav.occs_by_id sym_id
+                                with
+                                | None -> ()
+                                | Some xs ->
+                                    occs_rev := List.rev_append xs !occs_rev)
+                              docs;
+                            (List.rev !defs_rev, List.rev !occs_rev)
+                          in
+                          let defs_current, occs_current =
+                            defs_and_occs current
+                          in
+                          let defs_imported, occs_imported =
+                            defs_and_occs imported
+                          in
+                          let defs_workspace, occs_workspace =
+                            defs_and_occs workspace
+                          in
+                          ( def_keys_for_defs
+                              (uniq_defs
+                                 (defs_current @ defs_imported
+                                @ defs_workspace)),
+                            (occs_current, occs_imported, occs_workspace) )
+                      in
+                      let seen = Hashtbl.create 256 in
+                      let acc = ref [] in
+                      let emit_occs occs =
+                        let batch =
+                          occs
+                          |> filter_declarations ~include_decl ~def_keys
+                          |> emit_locations_stage budget seen ~emit
+                        in
+                        acc := !acc @ batch
+                      in
+                      let occs_current, occs_imported, occs_workspace =
+                        staged_occs
+                      in
+                      emit_occs occs_current;
+                      emit_occs occs_imported;
+                      emit_occs occs_workspace;
+                      !acc
+                  | None ->
+                      let key = normalize_name nm in
+                      if key = "" then []
+                      else
+                        let all_docs = current @ imported @ workspace in
+                        let proc_defs =
+                          if allow_fallback_for_ws ws doc then
+                            proc_defs_by_key ws doc ~key
+                          else []
+                        in
+                        let defs =
+                          if proc_defs <> [] then proc_defs
+                          else if allow_fallback_for_ws ws doc then
+                            all_docs
+                            |> List.concat_map collect_doc_defs
+                            |> List.filter (fun d -> d.key = key)
+                          else []
+                        in
+                        if defs = [] then []
+                        else
+                          emit_reference_doc_stages budget ~emit ~include_decl
+                            ~def_keys:(def_keys_for_defs defs) ~key current
+                            imported workspace)
+      in
+      let result = nav_compute_with_budget_value budget compute in
+      schedule_nav_miss_for_result ws doc pos ~empty:(result = []);
+      result
+
+let background_queue_length (ws : t) : int =
+  Queue.length ws.bg_high_small_queue
+  + Queue.length ws.bg_norm_small_queue
+  + Queue.length ws.bg_root_small_queue
+  + Queue.length ws.bg_high_large_queue
+  + Queue.length ws.bg_root_large_queue
+  + Queue.length ws.bg_norm_large_queue
+  + Queue.length ws.parse_worker_jobs
+
+let schedule_open_doc_parse_fallback (ws : t) (doc : Document.t)
+    ~(reason_group : string) : unit =
+  if enqueue_open_doc_parse_if_pending ~reason_group ws doc then (
+    Perf_stats.tick ("sched." ^ reason_group);
+    Perf_log.log_event ("background_scheduled_" ^ reason_group)
+      ~uri:(Uri_path.docuri_to_string doc.Document.uri)
+      ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev
+      ~queue:(background_queue_length ws))
+
+let skeleton_kind_label = function
+  | Syntax_cache.SkModule -> "module"
+  | Syntax_cache.SkCompool -> "compool"
+  | Syntax_cache.SkProcedure -> "procedure"
+  | Syntax_cache.SkFunction -> "function"
+  | Syntax_cache.SkItem -> "item"
+  | Syntax_cache.SkTable -> "table"
+  | Syntax_cache.SkBlock -> "block"
+  | Syntax_cache.SkType -> "type"
+  | Syntax_cache.SkLabel -> "label"
+  | Syntax_cache.SkDefineMacro -> "define"
+
+let skeleton_symbol_at_position (doc : Document.t) (pos : T.Position.t) :
+    Syntax_cache.skeleton_symbol option =
+  match Document.current_parse doc with
+  | Some { Document.parsed_syntax = Some syntax; _ } ->
+      let symbols = syntax.Syntax_cache.skeleton.symbols in
+      let by_position =
+        symbols
+        |> List.find_opt (fun (sym : Syntax_cache.skeleton_symbol) ->
+               position_in_loc pos sym.sk_loc)
+      in
+      (match by_position with
+      | Some _ as hit -> hit
+      | None -> (
+          match word_at_position doc pos with
+          | None -> None
+          | Some (word, _) ->
+              let key = normalize_name word in
+              symbols
+              |> List.find_opt (fun (sym : Syntax_cache.skeleton_symbol) ->
+                     normalize_name sym.sk_name = key)))
+  | _ -> None
+
+let fast_hover_fallback (ws : t) (doc : Document.t) (pos : T.Position.t) :
+    T.Hover.t option =
+  schedule_open_doc_parse_fallback ws doc ~reason_group:"hover_fallback";
+  match skeleton_symbol_at_position doc pos with
+  | Some sym ->
+      let body =
+        let kind = skeleton_kind_label sym.sk_kind in
+        let role =
+          if sym.sk_imported then "external REF import"
+          else if sym.sk_exported then "external DEF"
+          else "local"
+        in
+        let scope =
+          match sym.sk_container with None -> "<global>" | Some c -> c
+        in
+        hover_panel ~name:sym.sk_name
+          ~summary:(Printf.sprintf "JOVIAL %s - syntax snapshot" kind)
+          ~facts:
+            [
+              Printf.sprintf "Classification: %s" kind;
+              Printf.sprintf "Declaration role: %s" role;
+              Printf.sprintf "Exported: %s"
+                (if sym.sk_exported then "yes" else "no");
+              Printf.sprintf "Imported: %s"
+                (if sym.sk_imported then "yes" else "no");
+              Printf.sprintf "Scope: `%s`" scope;
+              Printf.sprintf "Location: line %d, column %d"
+                sym.sk_loc.Ast.Loc.start_pos.line
+                (sym.sk_loc.Ast.Loc.start_pos.col + 1);
+              "Status: semantic analysis pending";
+            ]
+          ~sections:
+            [
+              hover_inline_section "Details"
+                "The open document has changed and semantic analysis is still \
+                 catching up. Full declaration text, implementation preview, \
+                 references, and cross-file details will appear when workspace \
+                 indexing catches up.";
+            ]
+      in
+      Some (hover_markdown ~range:(Lsp_conv.range_of_loc sym.sk_loc) body)
+  | None -> (
+      match word_at_position doc pos with
+      | None -> None
+      | Some (name, loc) ->
+          let body =
+            hover_panel ~name ~summary:"Unresolved JOVIAL symbol"
+              ~facts:
+                [
+                  "Status: semantic analysis pending";
+                  "Status: no visible declaration was found for this reference.";
+                  hover_current_file_fact doc;
+                  Printf.sprintf "Position: line %d, column %d"
+                    loc.Ast.Loc.start_pos.line
+                    (loc.Ast.Loc.start_pos.col + 1);
+                ]
+              ~sections:
+                [
+                  hover_inline_section "Next check"
+                    "Confirm the symbol is declared in scope, imported from \
+                     the expected COMPOOL, or available through the expected \
+                     external DEF/REF pair.";
+                ]
+          in
+          Some (hover_markdown ~range:(Lsp_conv.range_of_loc loc) body))
+
 let hover_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
     T.Hover.t option =
   match doc_of_uri ws uri with
   | None -> None
   | Some doc ->
-      let budget = nav_budget_start ws in
-      let compute () =
-        if nav_budget_check budget then None
-        else
-          let import_text =
-            match import_under_cursor doc pos with
-            | None -> None
-            | Some imp ->
-                let resolved =
-                  match ws.index with
-                  | None -> None
-                  | Some idx -> Workspace_index.find_compool idx ~name:imp.name
-                in
-                Some
-                  (match resolved with
-                  | None ->
-                      Printf.sprintf
-                        "COMPOOL `%s` (unresolved in workspace index)." imp.name
-                  | Some p ->
-                      Printf.sprintf "COMPOOL `%s` -> `%s`" imp.name
-                        (Filename.basename p))
-          in
-          match define_under_cursor doc pos with
-          | Some (dm, word_loc) ->
-              let d = def_of_preprocess_define doc dm in
-              let primary_decl =
-                match source_line_for_def ws d with
-                | Some line when String.trim line <> "" -> line
-                | _ ->
-                    if dm.requires_call then
-                      Printf.sprintf "DEFINE %s(%s) \"%s\";" dm.name
-                        (String.concat "," dm.formals)
-                        dm.body
-                    else Printf.sprintf "DEFINE %s \"%s\";" dm.name dm.body
-              in
-              let head =
-                Printf.sprintf "### define `%s`\nDefined at `%s`" d.name
-                  (file_line_of_def d)
-              in
-              let decl_block =
-                let line = truncate_text 280 primary_decl in
-                if String.trim line = "" then ""
-                else Printf.sprintf "\n```jovial\n%s\n```" line
-              in
-              let expansion =
-                if dm.formals = [] then
-                  Printf.sprintf "\nExpands to: `%s`"
-                    (truncate_text 180 dm.body)
-                else
-                  Printf.sprintf "\nFormals: `%s`\nExpansion template: `%s`"
-                    (String.concat ", " dm.formals)
-                    (truncate_text 180 dm.body)
-              in
-              Some
-                (hover_markdown
-                   ~range:(Lsp_conv.range_of_loc word_loc)
-                   (head ^ decl_block ^ expansion))
-          | None ->
-              let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
-              let nav = nav_for_doc_cached ws cache doc in
-              let word = nav_word_at_position doc pos in
-              let resolved =
-                symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
-              in
-              let defs, hover_loc =
-                match resolved with
-                | Some (sym_id, loc) -> (
-                    let docs_cache : Document.t list option ref = ref None in
-                    let docs_for_symbol () =
-                      match !docs_cache with
-                      | Some xs -> xs
-                      | None ->
-                          let xs = docs_for_lookup ws doc in
-                          docs_cache := Some xs;
-                          xs
-                    in
-                    let defn =
-                      match Hashtbl.find_opt nav.defs_by_id sym_id with
-                      | Some _ as d0 -> d0
-                      | None ->
-                          if ws.sem_store_enabled then
-                            match
-                              Semantic_store.defs_for_sym_id ws.semantic_store
-                                sym_id
-                            with
-                            | d0 :: _ -> Some (def_of_snapshot_def d0)
-                            | [] ->
-                                if nav_budget_check budget then None
-                                else
-                                  find_def_for_sym_id ws cache
-                                    ~docs:(docs_for_symbol ()) ~sym_id
-                          else if nav_budget_check budget then None
-                          else
-                            find_def_for_sym_id ws cache
-                              ~docs:(docs_for_symbol ()) ~sym_id
-                    in
-                    match defn with
-                    | Some d -> ([ d ], Some loc)
-                    | None -> (
-                        match word with
-                        | None -> ([], Some loc)
-                        | Some (nm, wloc) ->
-                            let defs0 =
-                              if
-                                allow_fallback_for_ws ws doc
-                                && not (nav_budget_check budget)
-                              then
-                                fallback_defs_by_name ws doc (normalize_name nm)
-                              else []
-                            in
-                            (defs0, Some wloc)))
-                | None -> (
-                    match word with
-                    | None -> ([], None)
-                    | Some (nm, wloc) ->
-                        let defs0 =
-                          if
-                            allow_fallback_for_ws ws doc
-                            && not (nav_budget_check budget)
-                          then fallback_defs_by_name ws doc (normalize_name nm)
-                          else []
-                        in
-                        (defs0, Some wloc))
-              in
-              let defs =
-                match defs with
-                | d :: _
-                  when d.kind = sym_kind_func
-                       && not (is_likely_proc_implementation ws d) ->
-                    let impls = proc_impl_defs_by_key ws doc ~key:d.key in
-                    if impls = [] then defs else impls
-                | [] -> (
-                    match word with
-                    | None -> []
-                    | Some (nm, _) ->
-                        let key = normalize_name nm in
-                        if
-                          key = ""
-                          || (not (allow_fallback_for_ws ws doc))
-                          || nav_budget_check budget
-                        then []
-                        else proc_impl_defs_by_key ws doc ~key)
-                | _ -> defs
-              in
-              if defs = [] then
-                match import_text with
-                | None -> (
-                    match word with
-                    | None -> None
-                    | Some (nm, word_loc) ->
-                        Some
-                          (hover_markdown
-                             ~range:(Lsp_conv.range_of_loc word_loc)
-                             (Printf.sprintf
-                                "No definition found for `%s` in current \
-                                 workspace scope."
-                                nm)))
-                | Some txt -> Some (hover_markdown txt)
-              else
-                let rec top_lines acc = function
-                  | [] -> List.rev acc
-                  | _ when nav_budget_check budget -> List.rev acc
-                  | d :: tl ->
-                      let head =
-                        Printf.sprintf "### %s `%s`\nDefined at `%s`"
-                          (kind_name d.kind) d.name (file_line_of_def d)
-                      in
-                      let sig_line = proc_signature_for_def ws d in
-                      let src_line = source_line_for_def ws d in
-                      let primary_decl =
-                        match sig_line with
-                        | Some sig_line -> Some sig_line
-                        | None -> src_line
-                      in
-                      let decl_block =
-                        match primary_decl with
-                        | None -> ""
-                        | Some line ->
-                            let line = truncate_text 280 line in
-                            if String.trim line = "" then ""
-                            else Printf.sprintf "\n```jovial\n%s\n```" line
-                      in
-                      let extra =
-                        match (src_line, sig_line) with
-                        | Some src, Some sig_line
-                          when String.trim src <> String.trim sig_line ->
-                            let src = truncate_text 280 src in
-                            if String.trim src = "" then ""
-                            else
-                              Printf.sprintf
-                                "\nDeclaration:\n```jovial\n%s\n```" src
-                        | _ -> ""
-                      in
-                      top_lines ((head ^ decl_block ^ extra) :: acc) tl
-                in
-                let top_lines = top_lines [] defs in
-                let lines =
-                  match import_text with
-                  | None -> top_lines
-                  | Some imp -> imp :: "" :: top_lines
-                in
-                Some
-                  (hover_markdown
-                     ?range:(Option.map Lsp_conv.range_of_loc hover_loc)
-                     (String.concat "\n" lines))
+      let hover_t0 = Perf_log.now_ms () in
+      Perf_log.log_event "hover_received"
+        ~uri:(Uri_path.docuri_to_string uri)
+        ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev;
+      let finish result =
+        Perf_log.log_event "hover_responded"
+          ~uri:(Uri_path.docuri_to_string uri)
+          ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev
+          ~ms:(max 0.0 (Perf_log.now_ms () -. hover_t0))
+          ~queue:(background_queue_length ws);
+        result
       in
-      nav_compute_with_budget_value budget compute
+      if doc.Document.parse_rev <> doc.Document.rev then
+        finish (fast_hover_fallback ws doc pos)
+      else finish (hover_semantic_for ws doc ~pos)
 
 let prepare_rename_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
     [ `Range of T.Range.t | `RangeWithPlaceholder of T.Range.t * string ] option
@@ -2677,12 +2064,13 @@ let completion_items_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
           if starts_with_ci ~prefix d.name then
             let detail =
               match d.container with
-              | None -> Some (kind_name d.kind)
-              | Some c -> Some (Printf.sprintf "%s in %s" (kind_name d.kind) c)
+              | None -> Some (kind_name_of_def d)
+              | Some c ->
+                  Some (Printf.sprintf "%s in %s" (kind_name_of_def d) c)
             in
             let kind =
               completion_item_kind_of_lsp_int
-                (completion_item_kind_of_def_kind d.kind)
+                (completion_item_kind_of_metadata d)
             in
             let uniq_key =
               Printf.sprintf "sym|%s|%d" (normalize_name d.name) d.kind
@@ -2771,13 +2159,25 @@ let declaration_locations_for (ws : t) ~(uri : T.DocumentUri.t)
               let key = normalize_name nm in
               if key = "" then definition_locations_for ws ~uri ~pos
               else
+                let proc_defs = proc_defs_by_key ws doc ~key |> uniq_defs in
                 let decls =
-                  proc_defs_by_key ws doc ~key
+                  proc_defs
                   |> List.filter (fun d ->
-                      not (is_likely_proc_implementation ws d))
-                  |> uniq_defs
+                         (not (is_likely_proc_implementation ws d))
+                         && not (is_ref_import_def d))
                 in
-                if decls = [] then definition_locations_for ws ~uri ~pos
+                if decls = [] then
+                  let real_fallback =
+                    proc_defs |> List.filter (fun d -> not (is_ref_import_def d))
+                  in
+                  if real_fallback <> [] then
+                    List.map location_of_def real_fallback
+                  else
+                    let ref_fallback =
+                      proc_defs |> List.filter is_ref_import_def
+                    in
+                    if ref_fallback = [] then definition_locations_for ws ~uri ~pos
+                    else List.map location_of_def ref_fallback
                 else List.map location_of_def decls
           | None -> definition_locations_for ws ~uri ~pos
       in
@@ -2812,70 +2212,88 @@ let type_definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
       in
       nav_compute_with_budget_value budget compute
 
-let workspace_symbols_for (ws : t) ~(query : string) :
-    T.SymbolInformation.t list =
+let compare_symbol_defs (a : def) (b : def) : int =
+  let ka = normalize_name a.name in
+  let kb = normalize_name b.name in
+  let c0 = String.compare ka kb in
+  if c0 <> 0 then c0
+  else
+    let c1 =
+      String.compare
+        (Uri_path.docuri_to_string a.uri)
+        (Uri_path.docuri_to_string b.uri)
+    in
+    if c1 <> 0 then c1
+    else
+      let c2 = compare a.loc.start_pos.line b.loc.start_pos.line in
+      if c2 <> 0 then c2 else compare a.loc.start_pos.col b.loc.start_pos.col
+
+let doc_sort_key (doc : Document.t) : string =
+  Uri_path.docuri_to_string doc.Document.uri
+
+let workspace_symbol_doc_stages (ws : t) : Document.t list * Document.t list =
+  let seen = Hashtbl.create 512 in
+  let open_docs = ref [] in
+  Hashtbl.iter (fun _ doc -> add_doc_once seen open_docs doc) ws.docs;
+  let workspace_docs = ref [] in
+  Hashtbl.iter (fun _ doc -> add_doc_once seen workspace_docs doc) ws.files;
+  let sort_docs docs =
+    List.sort (fun a b -> String.compare (doc_sort_key a) (doc_sort_key b)) docs
+  in
+  (sort_docs (List.rev !open_docs), sort_docs (List.rev !workspace_docs))
+
+let workspace_symbols_stream (ws : t) ~(query : string)
+    ~(emit : T.SymbolInformation.t list -> unit) : T.SymbolInformation.t list =
   let budget = nav_budget_start ws in
   let max_items = 512 in
   let prefix = String.trim query in
   let compute () =
     if nav_budget_check budget then []
     else
-      let docs_seen = Hashtbl.create 512 in
-      let docs = ref [] in
-      let add_doc (doc : Document.t) =
-        let key = doc_sort_key doc in
-        if not (Hashtbl.mem docs_seen key) then (
-          Hashtbl.add docs_seen key true;
-          docs := doc :: !docs)
-      in
-      Hashtbl.iter (fun _ d -> add_doc d) ws.docs;
-      Hashtbl.iter (fun _ d -> add_doc d) ws.files;
-      let docs =
-        !docs
-        |> List.sort (fun a b ->
-            String.compare (doc_sort_key a) (doc_sort_key b))
-      in
+      let open_docs, workspace_docs = workspace_symbol_doc_stages ws in
       let symbol_seen = Hashtbl.create 2048 in
-      let out = ref [] in
       let count = ref 0 in
-      let add_symbol (d : def) : unit =
-        if nav_budget_check budget || !count >= max_items then ()
-        else if starts_with_ci ~prefix d.name || starts_with_ci ~prefix d.key
-        then
-          let key =
-            Printf.sprintf "%s|%d|%d|%d" (loc_key ~uri:d.uri d.loc) d.kind
-              d.loc.start_pos.line d.loc.start_pos.col
-          in
-          if not (Hashtbl.mem symbol_seen key) then (
-            Hashtbl.replace symbol_seen key true;
-            out := d :: !out;
-            incr count)
+      let acc = ref [] in
+      let collect_stage docs =
+        let defs_rev = ref [] in
+        List.iter
+          (fun doc ->
+            if not (nav_budget_check budget) then
+              collect_doc_defs doc
+              |> List.iter (fun d ->
+                     if
+                       (not (nav_budget_check budget))
+                       && !count < max_items
+                       && (starts_with_ci ~prefix d.name
+                          || starts_with_ci ~prefix d.key)
+                     then
+                       let key =
+                         Printf.sprintf "%s|%d|%d|%d"
+                           (loc_key ~uri:d.uri d.loc)
+                           d.kind d.loc.start_pos.line d.loc.start_pos.col
+                       in
+                       if not (Hashtbl.mem symbol_seen key) then (
+                         Hashtbl.replace symbol_seen key true;
+                         defs_rev := d :: !defs_rev;
+                         incr count)))
+          docs;
+        let batch =
+          List.rev !defs_rev |> List.sort compare_symbol_defs
+          |> List.map symbol_info_of_def
+        in
+        if batch <> [] then (
+          emit batch;
+          acc := !acc @ batch)
       in
-      List.iter
-        (fun d ->
-          if not (nav_budget_check budget) then
-            collect_doc_defs d |> List.iter add_symbol)
-        docs;
-      List.rev !out
-      |> List.sort (fun a b ->
-          let ka = normalize_name a.name in
-          let kb = normalize_name b.name in
-          let c0 = String.compare ka kb in
-          if c0 <> 0 then c0
-          else
-            let c1 =
-              String.compare
-                (Uri_path.docuri_to_string a.uri)
-                (Uri_path.docuri_to_string b.uri)
-            in
-            if c1 <> 0 then c1
-            else
-              let c2 = compare a.loc.start_pos.line b.loc.start_pos.line in
-              if c2 <> 0 then c2
-              else compare a.loc.start_pos.col b.loc.start_pos.col)
-      |> List.map symbol_info_of_def
+      collect_stage open_docs;
+      collect_stage workspace_docs;
+      !acc
   in
   nav_compute_with_budget_value budget compute
+
+let workspace_symbols_for (ws : t) ~(query : string) :
+    T.SymbolInformation.t list =
+  workspace_symbols_stream ws ~query ~emit:(fun _ -> ())
 
 let signature_help_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
     T.SignatureHelp.t option =
@@ -2997,103 +2415,3 @@ let code_actions_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t) :
                 ("import|" ^ normalize_name c)
                 (quickfix_add_import_code_action ~doc ~diag:d ~compool:c));
       List.rev !actions
-
-let inlay_hints_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t) :
-    T.InlayHint.t list =
-  match doc_of_uri ws uri with
-  | None -> []
-  | Some doc ->
-      let proc_params : (string, string list) Hashtbl.t = Hashtbl.create 128 in
-      docs_for_lookup ws doc
-      |> List.iter (fun d -> collect_proc_param_map d proc_params);
-      let seen = Hashtbl.create 256 in
-      let hints = ref [] in
-      let add_call_hints (callee : Ast.ident) (args : Ast.expr Ast.node list) =
-        let key = normalize_name callee.v in
-        match Hashtbl.find_opt proc_params key with
-        | None -> ()
-        | Some params ->
-            List.iteri
-              (fun i (arg : Ast.expr Ast.node) ->
-                match nth_opt params i with
-                | None -> ()
-                | Some pname ->
-                    let pos = Lsp_conv.position_of_ast_pos arg.loc.start_pos in
-                    if pos_in_range pos range then
-                      let hk =
-                        Printf.sprintf "%d|%d|%s" pos.line pos.character pname
-                      in
-                      if not (Hashtbl.mem seen hk) then (
-                        Hashtbl.add seen hk true;
-                        hints :=
-                          T.InlayHint.create ~position:pos
-                            ~label:(`String (pname ^ ":"))
-                            ~kind:T.InlayHintKind.Parameter ~paddingRight:true
-                            ()
-                          :: !hints))
-              args
-      in
-      let rec walk_expr (e : Ast.expr Ast.node) : unit =
-        match e.v with
-        | Ast.EName _ | Ast.ELit _ -> ()
-        | Ast.EUnop { rhs; _ } -> walk_expr rhs
-        | Ast.EBinop { lhs; rhs; _ } ->
-            walk_expr lhs;
-            walk_expr rhs
-        | Ast.ECall { callee; args } ->
-            add_call_hints callee args;
-            List.iter walk_expr args
-        | Ast.EIndex { base; index } ->
-            walk_expr base;
-            List.iter walk_expr index
-        | Ast.EField { base; _ } -> walk_expr base
-        | Ast.EAt { field; ptr } ->
-            walk_expr field;
-            walk_expr ptr
-        | Ast.EDeref { ptr } -> walk_expr ptr
-        | Ast.EParen x -> walk_expr x
-      in
-      let rec walk_stmt (s : Ast.stmt Ast.node) : unit =
-        match s.v with
-        | Ast.SEmpty | Ast.SGoto _ -> ()
-        | Ast.SDecl d -> walk_decl d
-        | Ast.SBlock xs -> List.iter walk_stmt xs
-        | Ast.SAssign { lhs; rhs } ->
-            walk_expr lhs;
-            walk_expr rhs
-        | Ast.SCallStmt { callee; args; _ } ->
-            add_call_hints callee args;
-            List.iter walk_expr args
-        | Ast.SIf { cond; then_; else_ } -> (
-            walk_expr cond;
-            walk_stmt then_;
-            match else_ with None -> () | Some e -> walk_stmt e)
-        | Ast.SWhile { cond; body } ->
-            walk_expr cond;
-            walk_stmt body
-        | Ast.SFor { init; cond; step; body } ->
-            (match init with None -> () | Some i -> walk_stmt i);
-            (match cond with None -> () | Some c -> walk_expr c);
-            (match step with None -> () | Some st -> walk_stmt st);
-            walk_stmt body
-        | Ast.SReturn eo -> (
-            match eo with None -> () | Some e -> walk_expr e)
-        | Ast.SLabel { body; _ } -> walk_stmt body
-      and walk_decl (d : Ast.decl Ast.node) : unit =
-        match d.v with
-        | Ast.DVar { init; _ } -> (
-            match init with None -> () | Some e -> walk_expr e)
-        | Ast.DConst { value; _ } -> walk_expr value
-        | Ast.DType _ | Ast.DDirective _ -> ()
-        | Ast.DProc p ->
-            List.iter walk_decl p.v.locals;
-            walk_stmt p.v.body
-      in
-      (match doc.Document.ast with
-      | None -> ()
-      | Some prog ->
-          List.iter
-            (function
-              | Ast.TopDecl d -> walk_decl d | Ast.TopStmt s -> walk_stmt s)
-            prog);
-      List.rev !hints

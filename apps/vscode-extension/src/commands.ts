@@ -40,6 +40,101 @@ type CommandDeps = {
   showSyntaxTreesUi: () => Promise<void>;
 };
 
+const serverRestartConfigKeys = [
+  "jovial.server",
+  "jovial.server.path",
+  "jovial.server.preferBundled",
+  "jovial.server.args",
+  "jovial.server.inlayHints",
+  "jovial.server.inlayhints",
+  "jovial.server.InlayHint",
+  "jovial.server.parseMaxFileBytes",
+  "jovial.server.pressureSoftMb",
+  "jovial.server.pressureCriticalMb",
+  "jovial.workspaceDiagnostics",
+  "jovial.workspaceDiagnostics.mode",
+  "jovial.workspace",
+  "jovial.workspace.profileMode",
+  "jovial.workspace.rootModel",
+  "jovial.workspace.manualRootFiles",
+  "jovial.workspace.maxStartupFiles",
+  "jovial.workspace.extraSourceFileExtensions",
+  "jovial.background",
+  "jovial.background.indexBudgetMs",
+  "jovial.background.diagBatchSize",
+  "jovial.features.profile",
+  "jovial.features.custom",
+  "jovial.features.custom.enabledFeatures",
+  "jovial.features.overrides.documentSymbols",
+  "jovial.features.overrides.workspaceSymbols",
+  "jovial.features.overrides.hover",
+  "jovial.features.overrides.signatureHelp",
+  "jovial.features.overrides.completion",
+  "jovial.features.overrides.codeActions",
+  "jovial.features.overrides.inlayHints",
+  "jovial.features.overrides.semanticTokens",
+  "jovial.features.definition",
+  "jovial.features.declaration",
+  "jovial.features.typeDefinition",
+  "jovial.features.implementation",
+  "jovial.features.references",
+  "jovial.features.documentSymbols",
+  "jovial.features.workspaceSymbols",
+  "jovial.features.hover",
+  "jovial.features.signatureHelp",
+  "jovial.features.rename",
+  "jovial.features.completion",
+  "jovial.features.codeActions",
+  "jovial.features.inlayHints",
+  "jovial.features.semanticTokens",
+  "jovial.startup",
+  "jovial.startup.priorityMode",
+  "jovial.performance",
+  "jovial.performance.priorityMode",
+  "jovial.performance.largeFileThresholdBytes",
+  "jovial.performance.hugeFileThresholdBytes",
+  "jovial.performance.fullSemanticTokensMaxBytes",
+  "jovial.performance.fullParseMaxBytes",
+  "jovial.performance.enableHugeFileFullParse",
+  "jovial.performance.backgroundParseWorkerCount",
+] as const;
+
+const inlayHintConfigKeys = [
+  "jovial.features.profile",
+  "jovial.features.custom",
+  "jovial.features.custom.enabledFeatures",
+  "jovial.features.overrides.inlayHints",
+  "jovial.features.inlayHints",
+  "jovial.server.inlayHints",
+  "jovial.server.inlayhints",
+  "jovial.server.InlayHint",
+] as const;
+
+const liveConfigKeys = [
+  "jovial",
+  "jovial.trace",
+  "jovial.lsif.fastPath",
+  "jovial.autostart",
+  ...serverRestartConfigKeys,
+] as const;
+
+function configurationAffectsAny(
+  event: vscode.ConfigurationChangeEvent,
+  sections: readonly string[],
+): boolean {
+  return sections.some((section) => event.affectsConfiguration(section));
+}
+
+async function refreshEditorInlayHints(
+  output: vscode.OutputChannel,
+): Promise<void> {
+  try {
+    await vscode.commands.executeCommand("editor.action.inlayHints.refresh");
+  } catch (e) {
+    output.appendLine(`refresh inlay hints failed: ${String(e)}`);
+  }
+}
+
 export function registerExtensionHooks({
   context,
   output,
@@ -127,7 +222,7 @@ export function registerExtensionHooks({
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (event) => {
-      if (!event.affectsConfiguration("jovial")) return;
+      if (!configurationAffectsAny(event, liveConfigKeys)) return;
       const cfg = getConfig();
 
       if (event.affectsConfiguration("jovial.trace")) {
@@ -143,28 +238,28 @@ export function registerExtensionHooks({
         }
       }
 
-      const serverConfigChanged =
-        event.affectsConfiguration("jovial.server.path") ||
-        event.affectsConfiguration("jovial.server.preferBundled") ||
-        event.affectsConfiguration("jovial.server.args") ||
-        event.affectsConfiguration("jovial.server.parseMaxFileBytes") ||
-        event.affectsConfiguration("jovial.server.pressureSoftMb") ||
-        event.affectsConfiguration("jovial.server.pressureCriticalMb") ||
-        event.affectsConfiguration("jovial.workspaceDiagnostics.mode") ||
-        event.affectsConfiguration("jovial.workspace.profileMode") ||
-        event.affectsConfiguration("jovial.workspace.rootModel") ||
-        event.affectsConfiguration("jovial.workspace.manualRootFiles") ||
-        event.affectsConfiguration("jovial.background.indexBudgetMs") ||
-        event.affectsConfiguration("jovial.background.diagBatchSize");
+      const serverConfigChanged = configurationAffectsAny(
+        event,
+        serverRestartConfigKeys,
+      );
+      const inlayHintConfigChanged = configurationAffectsAny(
+        event,
+        inlayHintConfigKeys,
+      );
 
       if (serverConfigChanged) {
         output.appendLine(
-          "Jovial server configuration changed; restarting server.",
+          "Jovial server configuration changed; stopping client/server before restart.",
         );
+        if (inlayHintConfigChanged) {
+          await refreshEditorInlayHints(output);
+        }
+        await stopClient(status);
         if (cfg.autostart) {
           await startClient(context, output, status, "config-change");
-        } else {
-          await stopClient(status);
+        }
+        if (inlayHintConfigChanged) {
+          await refreshEditorInlayHints(output);
         }
         return;
       }

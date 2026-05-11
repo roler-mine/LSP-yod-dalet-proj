@@ -83,9 +83,16 @@ async function main(): Promise<void> {
     "jovial.workspace.profileMode": "medium",
     "jovial.workspace.rootModel": "manual",
     "jovial.workspace.manualRootFiles": ["sample.jov"],
+    "jovial.workspace.maxStartupFiles": 25,
+    "jovial.performance.largeFileThresholdBytes": 131072,
+    "jovial.performance.hugeFileThresholdBytes": 20971520,
+    "jovial.performance.fullSemanticTokensMaxBytes": 1048576,
+    "jovial.performance.fullParseMaxBytes": 5242880,
+    "jovial.performance.backgroundParseWorkerCount": 2,
     "jovial.server.parseMaxFileBytes": 123456,
     "jovial.server.pressureSoftMb": 256,
     "jovial.server.pressureCriticalMb": 384,
+    "editor.inlayHints.enabled": "on",
   });
   fs.writeFileSync(logPath, "", "utf8");
 

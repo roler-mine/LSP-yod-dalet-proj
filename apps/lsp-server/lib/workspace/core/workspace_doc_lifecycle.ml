@@ -196,7 +196,7 @@ type open_doc_install_result = {
   workspace_forces_provisional : bool;
 }
 
-let open_doc_install ?(force_provisional : bool = false) (ws : t)
+let open_doc_install ?lsp_version ?(force_provisional : bool = false) (ws : t)
     ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string) :
     open_doc_install_result =
   invalidate_lsif_snapshot ws;
@@ -207,7 +207,6 @@ let open_doc_install ?(force_provisional : bool = false) (ws : t)
       set_root_path ws (Some (Filename.dirname f));
       rescan ws
   | _ -> ());
-  clear_nav_response_cache_for_uri ws ~uri;
   let open_doc_count = Hashtbl.length ws.docs in
   let workspace_forces_provisional = open_doc_count >= 8 in
   let should_defer_parse = should_defer_open_doc ~force_provisional ws ~text in
@@ -221,15 +220,17 @@ let open_doc_install ?(force_provisional : bool = false) (ws : t)
         is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
           ~text_len:(String.length text)
       then
-        make_doc_with_parse_guard ws ~uri ~file ~text
+        make_doc_with_parse_guard ?lsp_version ws ~uri ~file ~text
           ~actual_bytes:(String.length text)
-      else Document.make_unparsed ~uri ~file ~text ~parse_diags:[]
+      else
+        Document.make_unparsed_versioned ~lsp_version ~uri ~file ~text
+          ~parse_diags:[]
     else
       try
         Perf_stats.time "parse.open_doc" (fun () ->
-            parse_guarded_document_make ws ~uri ~file ~text)
+            parse_guarded_document_make ?lsp_version ws ~uri ~file ~text)
       with exn ->
-        let fallback = Document.make ~uri ~file ~text:"" in
+        let fallback = Document.make_versioned ~lsp_version ~uri ~file ~text:"" in
         with_internal_phase_diag fallback ~phase:"open-doc" ~exn
   in
   if should_defer_parse then store_doc_fast ws uri doc else store_doc ws uri doc;
@@ -246,11 +247,11 @@ let open_doc_install ?(force_provisional : bool = false) (ws : t)
   update_startup_ready_state ws;
   { doc; should_defer_parse; workspace_forces_provisional }
 
-let open_doc ?(force_provisional : bool = false)
+let open_doc ?lsp_version ?(force_provisional : bool = false)
     ?(inline_catch_up : bool = true) (ws : t) ~(uri : T.DocumentUri.t)
     ~(file : string option) ~(text : string) : unit =
   let { doc; should_defer_parse; workspace_forces_provisional } =
-    open_doc_install ~force_provisional ws ~uri ~file ~text
+    open_doc_install ?lsp_version ~force_provisional ws ~uri ~file ~text
   in
   if not inline_catch_up then Perf_stats.tick "diag.open.inline_work_deferred"
   else (
@@ -271,7 +272,7 @@ let open_doc ?(force_provisional : bool = false)
     if allow_inline_index_work && not should_defer_parse then
       update_startup_ready_state ws)
 
-let change_doc (ws : t) ~(uri : T.DocumentUri.t)
+let change_doc ?lsp_version (ws : t) ~(uri : T.DocumentUri.t)
     ~(changes : T.TextDocumentContentChangeEvent.t list) : unit =
   if changes = [] then ()
   else
@@ -282,26 +283,15 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
           Some
             ( doc,
               Perf_stats.time "apply.change_doc_fast" (fun () ->
-                  Document.apply_changes_no_reparse ~changes doc) )
+                  Document.apply_changes_no_reparse ?lsp_version ~changes doc) )
       | None -> None
     in
     match existing_doc_fast with
     | Some (doc, doc_fast) when doc_fast == doc -> Perf_stats.tick "change.noop"
     | _ ->
-        mark_graph_dirty ws;
         invalidate_lsif_snapshot ws;
         ignore (bump_open_parse_generation ws ~uri);
-        let clear_cache_for_full_sync =
-          List.exists
-            (fun (ch : T.TextDocumentContentChangeEvent.t) -> ch.range = None)
-            changes
-        in
-        if clear_cache_for_full_sync then
-          clear_nav_response_cache_for_uri ws ~uri
-        else
-          let touched = touched_ident_keys_for_changes ~old_doc ~changes in
-          invalidate_nav_response_cache_for_keys ws ~uri ~keys:touched;
-          let semantic_mode_for_rev (rev : int) : semantic_validation_mode =
+        let semantic_mode_for_rev (rev : int) : semantic_validation_mode =
             let mode =
               if rev mod didchange_semi_force_full_every = 0 then SemanticFull
               else
@@ -317,17 +307,17 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
           (match existing_doc_fast with
           | None ->
               let file = Uri_path.file_path_of_uri uri in
-              let base = Document.make ~uri ~file ~text:"" in
+              let base = Document.make_versioned ~lsp_version ~uri ~file ~text:"" in
               let draft =
                 Perf_stats.time "apply.change_doc_fast" (fun () ->
-                    Document.apply_changes_no_reparse ~changes base)
+                    Document.apply_changes_no_reparse ?lsp_version ~changes base)
               in
               if
                 is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
                   ~text_len:(String.length draft.Document.text)
               then (
                 let guarded =
-                  Document.with_parse_diags
+                  Document.with_parse_skipped
                     [
                       diag_parse_guard ~file:draft.Document.file
                         ~max_bytes:ws.parse_file_max_bytes
@@ -341,7 +331,8 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
                 let doc =
                   try
                     Perf_stats.time "parse.change_doc" (fun () ->
-                        Document.apply_changes_and_reparse ~changes base)
+                        Document.apply_changes_and_reparse ?lsp_version ~changes
+                          base)
                   with exn ->
                     with_internal_phase_diag base ~phase:"apply-changes" ~exn
                 in
@@ -355,7 +346,7 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
                   ~text_len:(String.length doc_fast.Document.text)
               then (
                 let guarded =
-                  Document.with_parse_diags
+                  Document.with_parse_skipped
                     [
                       diag_parse_guard ~file:doc_fast.Document.file
                         ~max_bytes:ws.parse_file_max_bytes
@@ -375,7 +366,8 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
                 let doc' =
                   try
                     Perf_stats.time "parse.change_doc" (fun () ->
-                        Document.apply_changes_and_reparse ~changes doc)
+                        Document.apply_changes_and_reparse ?lsp_version ~changes
+                          doc)
                   with exn ->
                     with_internal_phase_diag doc ~phase:"apply-changes" ~exn
                 in
@@ -384,6 +376,9 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
                 pump_index_background ws);
           (match Hashtbl.find_opt ws.docs uri with
           | Some latest ->
+              ignore
+                (enqueue_open_doc_parse_if_pending
+                   ~reason_group:"did_change_deferred" ws latest);
               if latest.Document.parse_rev = latest.Document.rev then
                 mark_open_doc_authoritative ws ~uri
               else mark_open_doc_provisional ws ~uri;
@@ -396,10 +391,13 @@ let change_doc (ws : t) ~(uri : T.DocumentUri.t)
 let close_doc (ws : t) ~(uri : T.DocumentUri.t) : unit =
   mark_graph_dirty ws;
   invalidate_lsif_snapshot ws;
-  clear_nav_response_cache_for_uri ws ~uri;
   let closed_path_key : string option ref = ref None in
   (match Hashtbl.find_opt ws.docs uri with
   | Some d ->
+      let uri_s = Uri_path.docuri_to_string uri in
+      let diags = Document.diagnostics d in
+      if diags = [] then Hashtbl.remove ws.bg_closed_diags uri_s
+      else Hashtbl.replace ws.bg_closed_diags uri_s diags;
       (match d.Document.file with
       | Some p -> closed_path_key := Some (normalize_path_key p)
       | None -> ());
@@ -420,16 +418,63 @@ let close_doc (ws : t) ~(uri : T.DocumentUri.t) : unit =
   | None -> ());
   (if ws.sem_store_enabled then
      match Semantic_store.snapshot_for_uri ws.semantic_store ~uri with
-     | Some snap when snap.Doc_snapshot.path_key <> None -> ()
+     | Some snap when snap.Semantic_store.Snapshot.path_key <> None -> ()
      | _ -> Semantic_store.remove_uri ws.semantic_store ~uri);
   pump_index_background ws;
   update_startup_ready_state ws
 
+let sync_source_file_paths_from_watch (ws : t)
+    (changes : (string * [ `Created | `Changed | `Deleted ]) list) : bool =
+  let paths = Hashtbl.create (max 16 (List.length ws.source_file_paths)) in
+  List.iter
+    (fun path ->
+      let key = normalize_path_key path in
+      if key <> "" then Hashtbl.replace paths key path)
+    ws.source_file_paths;
+  let changed = ref false in
+  List.iter
+    (fun (path, kind) ->
+      let key = normalize_path_key path in
+      if key <> "" then
+        match kind with
+        | `Deleted ->
+            if Hashtbl.mem paths key then (
+              Hashtbl.remove paths key;
+              changed := true)
+        | `Created | `Changed ->
+            if not (Hashtbl.mem paths key) then (
+              Hashtbl.replace paths key path;
+              changed := true))
+    changes;
+  if !changed then
+    ws.source_file_paths <-
+      Hashtbl.fold (fun _ path acc -> path :: acc) paths []
+      |> List.sort (fun a b ->
+             compare (normalize_path_key a) (normalize_path_key b));
+  !changed
+
 let apply_watched_file_changes (ws : t)
     ~(changes : (string * [ `Created | `Changed | `Deleted ]) list) : unit =
+  let changes =
+    changes
+    |> List.filter (fun (path, _kind) ->
+           Source_file.has_extension ~extensions:ws.source_extensions
+             (Filename.basename path))
+  in
+  let source_set_changed = sync_source_file_paths_from_watch ws changes in
+  let changed_path_keys =
+    changes
+    |> List.filter_map (fun (path, _kind) ->
+           let key = normalize_path_key path in
+           if key = "" then None else Some key)
+    |> List.sort_uniq String.compare
+  in
+  let dependent_paths =
+    if changed_path_keys = [] then []
+    else graph_reverse_dependency_closure_paths ws ~path_keys:changed_path_keys
+  in
   if changes <> [] then mark_graph_dirty ws;
   if changes <> [] then invalidate_lsif_snapshot ws;
-  if changes <> [] then Hashtbl.clear ws.nav_response_cache;
   ensure_index_started ws;
   let hints_dirty = ref false in
   let sem_dirty = ref false in
@@ -463,14 +508,16 @@ let apply_watched_file_changes (ws : t)
                 enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"watch_change"
                   ~high:true path
           with _ -> ())
-        changes;
-      let max_dirs, max_files =
-        if is_network_root ws then
-          (index_background_dirs_network, index_background_files_network)
-        else (index_background_dirs, index_bootstrap_files)
-      in
-      try ignore (Workspace_index.scan_step idx ~max_dirs ~max_files)
-      with _ -> ()));
+        changes));
+  if dependent_paths <> [] then (
+    Perf_stats.tick "dep.invalidate.file_reverse";
+    Perf_stats.observe_ms "dep.invalidate.file_reverse_paths"
+      (float_of_int (List.length dependent_paths));
+    List.iter
+      (fun path ->
+        enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"dep_file_change"
+          ~high:true path)
+      dependent_paths);
   if ws.sem_store_enabled then
     List.iter
       (fun (path, _kind) ->
@@ -483,7 +530,7 @@ let apply_watched_file_changes (ws : t)
           if removed <> [] then sem_dirty := true)
       changes;
   ws.bg_seed_cursor <- 0;
-  ws.bg_seed_needs_refresh <- true;
+  if changes <> [] || source_set_changed then ws.bg_seed_needs_refresh <- true;
   if !hints_dirty then invalidate_symbol_hints ws
   else if !sem_dirty then invalidate_symbol_hints ws;
   update_startup_ready_state ws

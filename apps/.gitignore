@@ -1,0 +1,18 @@
+# Node / VS Code extension build artifacts
+vscode-extension/node_modules/
+vscode-extension/out-test/
+vscode-extension/.vs/
+vscode-extension/.vscode-test/
+vscode-extension/*.vsix
+
+# OCaml / dune build artifacts
+lsp-server/_build/
+lsp-server/_build-*/
+
+# Workspace/runtime caches
+.jovial-lsp/
+**/.jovial-lsp/
+
+# Generic local noise
+.DS_Store
+Thumbs.db

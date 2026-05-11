@@ -63,5 +63,19 @@ export function run(): void {
     shouldIgnoreWatchedPath("/repo/node_modules/pkg/file.j73"),
     true,
   );
+  assert.equal(shouldIgnoreWatchedPath("/repo/build/file.j73"), true);
+  assert.equal(shouldIgnoreWatchedPath("/repo/dist/file.j73"), true);
+  assert.equal(shouldIgnoreWatchedPath("/repo/out/file.j73"), true);
+  assert.equal(shouldIgnoreWatchedPath("/repo/.vscode-test/file.j73"), true);
   assert.equal(shouldIgnoreWatchedPath("/repo/src/file.j73"), false);
+  assert.equal(shouldIgnoreWatchedPath("/repo/src/file.j"), true);
+  assert.equal(
+    shouldIgnoreWatchedPath("/repo/src/file.j", "linux", [
+      ".jov",
+      ".j73",
+      ".jvl",
+      ".j",
+    ]),
+    false,
+  );
 }

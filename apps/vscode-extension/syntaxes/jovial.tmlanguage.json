@@ -179,8 +179,8 @@
     "identifiers": {
       "patterns": [
         {
-          "name": "variable.other.identifier.jovial",
-          "match": "\\b[A-Za-z_$][A-Za-z0-9_$']*\\b"
+          "name": "variable",
+          "match": "[A-Za-z_$][A-Za-z0-9_$']*"
         }
       ]
     }

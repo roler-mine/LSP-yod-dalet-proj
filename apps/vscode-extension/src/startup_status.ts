@@ -2,10 +2,15 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import type { LanguageClient } from "vscode-languageclient/node";
+import { asFiniteInt, asRecord } from "./unknown_utils";
 
 export type StatusKind = "starting" | "running" | "stopped" | "error";
 
-type StartupStage = "diagHoverReady" | "fullyNavigable";
+type StartupStage =
+  | "ServerReady"
+  | "InteractiveReady"
+  | "WorkspaceSkeletonReady"
+  | "WorkspaceSemanticReady";
 type RootStartupStatus = {
   phase?: string;
   phaseElapsedMs?: number;
@@ -24,17 +29,6 @@ export const STARTUP_DIAG_TARGET_DEFAULT_MS = 15000;
 export const STARTUP_NAV_TARGET_DEFAULT_MS = 30000;
 
 const startupStatusByRoot = new Map<string, RootStartupStatus>();
-
-function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return v !== null && typeof v === "object"
-    ? (v as Record<string, unknown>)
-    : undefined;
-}
-
-function asFiniteInt(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  return Math.max(0, Math.trunc(value));
-}
 
 function normalizeRootUri(value: unknown): string | undefined {
   if (typeof value !== "string" || value.trim() === "") return undefined;
@@ -84,6 +78,47 @@ function startupPhaseLabel(phase: string | undefined): string {
   return phase.toLowerCase();
 }
 
+function normalizeStartupStage(value: unknown): StartupStage {
+  switch (value) {
+    case "ServerReady":
+      return "ServerReady";
+    case "InteractiveReady":
+    case "diagHoverReady":
+      return "InteractiveReady";
+    case "WorkspaceSkeletonReady":
+      return "WorkspaceSkeletonReady";
+    case "WorkspaceSemanticReady":
+    case "fullyNavigable":
+      return "WorkspaceSemanticReady";
+    default:
+      return "WorkspaceSemanticReady";
+  }
+}
+
+function legacyStartupStageKey(stage: StartupStage): string {
+  switch (stage) {
+    case "InteractiveReady":
+      return "diagHoverReady";
+    case "WorkspaceSemanticReady":
+      return "fullyNavigable";
+    default:
+      return stage;
+  }
+}
+
+function startupStageLabel(stage: StartupStage): string {
+  switch (stage) {
+    case "ServerReady":
+      return "ServerReady";
+    case "InteractiveReady":
+      return "InteractiveReady";
+    case "WorkspaceSkeletonReady":
+      return "WorkspaceSkeletonReady";
+    case "WorkspaceSemanticReady":
+      return "WorkspaceSemanticReady";
+  }
+}
+
 export function setStatus(
   status: vscode.StatusBarItem,
   kind: StatusKind,
@@ -129,7 +164,7 @@ export function refreshStartupStatusBar(status: vscode.StatusBarItem): void {
     setStatus(
       status,
       "running",
-      `Fully navigable in ${state.navReadyElapsedMs}ms (${label}, target ${target}ms)`,
+      `${startupStageLabel("WorkspaceSemanticReady")} in ${state.navReadyElapsedMs}ms (${label}, target ${target}ms)`,
     );
     return;
   }
@@ -142,7 +177,7 @@ export function refreshStartupStatusBar(status: vscode.StatusBarItem): void {
     setStatus(
       status,
       "error",
-      `Startup miss (fully navigable): ${elapsed}ms > ${target}ms (${label})`,
+      `Startup miss (${startupStageLabel("WorkspaceSemanticReady")}): ${elapsed}ms > ${target}ms (${label})`,
     );
     return;
   }
@@ -151,7 +186,7 @@ export function refreshStartupStatusBar(status: vscode.StatusBarItem): void {
     setStatus(
       status,
       "running",
-      `Diag/Hover ready in ${state.diagReadyElapsedMs}ms (${label}, target ${target}ms); warming full nav`,
+      `${startupStageLabel("InteractiveReady")} in ${state.diagReadyElapsedMs}ms (${label}, target ${target}ms); warming ${startupStageLabel("WorkspaceSemanticReady")}`,
     );
     return;
   }
@@ -164,7 +199,7 @@ export function refreshStartupStatusBar(status: vscode.StatusBarItem): void {
     setStatus(
       status,
       "error",
-      `Startup miss (diag/hover): ${elapsed}ms > ${target}ms (${label})`,
+      `Startup miss (${startupStageLabel("InteractiveReady")}): ${elapsed}ms > ${target}ms (${label})`,
     );
     return;
   }
@@ -222,15 +257,12 @@ export function bindStartupNotifications({
     const rootUri = normalizeRootUri(obj?.["rootUri"]);
     if (!rootUri) return;
     const state = rootStartupState(rootUri);
-    const stage =
-      obj?.["stage"] === "diagHoverReady" || obj?.["stage"] === "fullyNavigable"
-        ? (obj["stage"] as StartupStage)
-        : "fullyNavigable";
+    const stage = normalizeStartupStage(obj?.["stage"]);
     const elapsedMs = asFiniteInt(obj?.["elapsedMs"]);
     const targetMs =
       asFiniteInt(obj?.["targetMs"]) ??
-      (stage === "diagHoverReady" ? startupDiagTargetMs : startupNavTargetMs);
-    if (stage === "diagHoverReady") {
+      (stage === "InteractiveReady" ? startupDiagTargetMs : startupNavTargetMs);
+    if (stage === "InteractiveReady") {
       state.diagMissElapsedMs = elapsedMs;
       state.diagMissTargetMs = targetMs;
     } else {
@@ -239,8 +271,8 @@ export function bindStartupNotifications({
     }
     const detail =
       elapsedMs === undefined
-        ? `Startup missed ${stage} target (${targetMs}ms, ${rootLabel(rootUri)})`
-        : `Startup missed ${stage} target: ${elapsedMs}ms > ${targetMs}ms (${rootLabel(rootUri)})`;
+        ? `Startup missed ${startupStageLabel(stage)} target (${targetMs}ms, ${rootLabel(rootUri)})`
+        : `Startup missed ${startupStageLabel(stage)} target: ${elapsedMs}ms > ${targetMs}ms (${rootLabel(rootUri)})`;
     output.appendLine(`workspaceStartupMiss: ${detail}`);
     refreshStartupStatusBar(status);
   });
@@ -250,21 +282,20 @@ export function bindStartupNotifications({
     const rootUri = normalizeRootUri(obj?.["rootUri"]);
     if (!rootUri) return;
     const state = rootStartupState(rootUri);
-    const stage =
-      obj?.["stage"] === "diagHoverReady" || obj?.["stage"] === "fullyNavigable"
-        ? (obj["stage"] as StartupStage)
-        : "fullyNavigable";
+    const stage = normalizeStartupStage(obj?.["stage"]);
     const readiness = asRecord(obj?.["readiness"]);
     const stages = asRecord(readiness?.["stages"]);
-    const stagePayload = asRecord(stages?.[stage]);
+    const stagePayload =
+      asRecord(stages?.[stage]) ??
+      asRecord(stages?.[legacyStartupStageKey(stage)]);
     const elapsedMs = asFiniteInt(
       stagePayload?.["elapsedMs"] ?? readiness?.["elapsedMs"],
     );
     const targetMs =
       asFiniteInt(stagePayload?.["targetMs"] ?? readiness?.["targetMs"]) ??
-      (stage === "diagHoverReady" ? startupDiagTargetMs : startupNavTargetMs);
+      (stage === "InteractiveReady" ? startupDiagTargetMs : startupNavTargetMs);
     const readyWithinTarget = stagePayload?.["readyWithinTarget"] === true;
-    if (stage === "diagHoverReady") {
+    if (stage === "InteractiveReady") {
       state.diagReadyElapsedMs = elapsedMs;
       state.diagReadyTargetMs = targetMs;
       state.diagMissElapsedMs = undefined;
@@ -277,8 +308,8 @@ export function bindStartupNotifications({
     }
     const detail =
       elapsedMs === undefined
-        ? `Startup ready (${stage}, ${rootLabel(rootUri)})`
-        : `${stage} ready in ${elapsedMs}ms (${readyWithinTarget ? "within" : "over"} ${targetMs}ms, ${rootLabel(rootUri)})`;
+        ? `Startup ready (${startupStageLabel(stage)}, ${rootLabel(rootUri)})`
+        : `${startupStageLabel(stage)} ready in ${elapsedMs}ms (${readyWithinTarget ? "within" : "over"} ${targetMs}ms, ${rootLabel(rootUri)})`;
     output.appendLine(`workspaceReady: ${detail}`);
     refreshStartupStatusBar(status);
   });

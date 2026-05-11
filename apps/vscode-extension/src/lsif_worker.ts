@@ -1,5 +1,6 @@
 import { parentPort } from "worker_threads";
 import { parseLsifDeltaPayload, parseLsifIndexPayload } from "./lsif_codec";
+import { asRecord } from "./unknown_utils";
 
 type WorkerRequestKind = "parseIndex" | "parseDelta";
 
@@ -20,12 +21,6 @@ type WorkerErrorResponse = {
   ok: false;
   error: string;
 };
-
-function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return v !== null && typeof v === "object"
-    ? (v as Record<string, unknown>)
-    : undefined;
-}
 
 function parseRequest(value: unknown): WorkerRequest | undefined {
   const rec = asRecord(value);

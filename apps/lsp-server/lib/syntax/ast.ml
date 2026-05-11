@@ -1,5 +1,7 @@
 (* lib/ast.ml *)
 
+module T = Lsp.Types
+
 module Loc = struct
   type pos = {
     line : int; (* 1-based *)
@@ -40,12 +42,53 @@ module Loc = struct
   let to_string t = Format.asprintf "%a" pp t
 end
 
-type 'a node = { loc : Loc.t; v : 'a }
+type node_id = int
 
-let node ?(loc = Loc.none) v = { loc; v }
+type token_range = {
+  first_token : int;
+  last_token : int;
+}
+
+type recovery =
+  | Complete
+  | Missing of { expected : string list; message : string }
+  | Invalid of { diagnostics : T.Diagnostic.t list }
+
+type 'a node = {
+  id : node_id;
+  loc : Loc.t;
+  tokens : token_range option;
+  hash : int64 option;
+  recovery : recovery;
+  v : 'a;
+}
+
+let node_id_counter = ref 0
+let node_id_mtx = Mutex.create ()
+
+let fresh_node_id () =
+  Mutex.lock node_id_mtx;
+  incr node_id_counter;
+  let id = !node_id_counter in
+  Mutex.unlock node_id_mtx;
+  id
+
+let node ?(loc = Loc.none) ?tokens ?hash ?(recovery = Complete) v =
+  { id = fresh_node_id (); loc; tokens; hash; recovery; v }
+
+let missing_node ?(loc = Loc.none) ?tokens ~expected ~message v =
+  node ~loc ?tokens ~recovery:(Missing { expected; message }) v
+
+let invalid_node ?(loc = Loc.none) ?tokens ~diagnostics v =
+  node ~loc ?tokens ~recovery:(Invalid { diagnostics }) v
+
 let map f n = { n with v = f n.v }
 let value n = n.v
 let loc n = n.loc
+let id n = n.id
+let recovery n = n.recovery
+let token_range n = n.tokens
+let is_recovered n = match n.recovery with Complete -> false | _ -> true
 
 type ident = string node
 
@@ -64,11 +107,13 @@ type binop =
   | BMul
   | BDiv
   | BMod
+  | BPow
   | BAnd
   | BOr
   | BBitAnd
   | BBitOr
   | BBitXor
+  | BEqv
   | BShl
   | BShr
   | BEq
@@ -97,6 +142,9 @@ and expr =
   | ECall of { callee : ident; args : expr node list }
   | EIndex of { base : expr node; index : expr node list }
   | EField of { base : expr node; field : ident }
+  | EConvert of { ty : type_expr node; expr : expr node }
+  | EPreset of { base : expr node; items : expr node list }
+  | ERange of { lo : expr node; hi : expr node }
   | EAt of { field : expr node; ptr : expr node }
   | EDeref of { ptr : expr node }
   | EParen of expr node
@@ -125,16 +173,29 @@ and stmt =
 
 and storage = Automatic | Static | External
 and proc_use = UseNormal | UseRec | UseRent
-
+and external_modifier = LocalDecl | DefDecl | RefDecl
+and data_decl_kind = DataItem | DataTable | DataBlock | DataUnknown
 and decl =
   | DVar of {
       name : ident;
       dtype : type_expr node;
       init : expr node option;
       storage : storage;
+      external_modifier : external_modifier;
+      data_decl_kind : data_decl_kind;
     }
-  | DConst of { name : ident; dtype : type_expr node option; value : expr node }
-  | DType of { name : ident; defn : type_expr node }
+  | DConst of {
+      name : ident;
+      dtype : type_expr node option;
+      value : expr node;
+      external_modifier : external_modifier;
+      data_decl_kind : data_decl_kind;
+    }
+  | DType of {
+      name : ident;
+      defn : type_expr node;
+      external_modifier : external_modifier;
+    }
   | DProc of proc node
   | DDirective of { name : ident; args : string node list }
 
@@ -145,6 +206,8 @@ and proc = {
   use_attr : proc_use;
   locals : decl node list;
   body : stmt node;
+  external_modifier : external_modifier;
+  has_body : bool;
 }
 
 type toplevel = TopDecl of decl node | TopStmt of stmt node
@@ -213,11 +276,13 @@ module Debug = struct
     | BMul -> Format.pp_print_string fmt "BMul"
     | BDiv -> Format.pp_print_string fmt "BDiv"
     | BMod -> Format.pp_print_string fmt "BMod"
+    | BPow -> Format.pp_print_string fmt "BPow"
     | BAnd -> Format.pp_print_string fmt "BAnd"
     | BOr -> Format.pp_print_string fmt "BOr"
     | BBitAnd -> Format.pp_print_string fmt "BBitAnd"
     | BBitOr -> Format.pp_print_string fmt "BBitOr"
     | BBitXor -> Format.pp_print_string fmt "BBitXor"
+    | BEqv -> Format.pp_print_string fmt "BEqv"
     | BShl -> Format.pp_print_string fmt "BShl"
     | BShr -> Format.pp_print_string fmt "BShr"
     | BEq -> Format.pp_print_string fmt "BEq"
@@ -312,6 +377,24 @@ module Debug = struct
           Format.fprintf fmt "@[EField(%a.%a)@]%a"
             (pp_expr opts b (depth + 1))
             base pp_ident field (pp_loc_if opts) e.loc
+      | EConvert { ty; expr } ->
+          Format.fprintf fmt "@[EConvert(%a, %a)@]%a"
+            (pp_type_expr opts b (depth + 1))
+            ty
+            (pp_expr opts b (depth + 1))
+            expr (pp_loc_if opts) e.loc
+      | EPreset { base; items } ->
+          Format.fprintf fmt "@[EPreset(base=%a; items=[%a])@]%a"
+            (pp_expr opts b (depth + 1))
+            base
+            (pp_list (pp_expr opts b (depth + 1)))
+            items (pp_loc_if opts) e.loc
+      | ERange { lo; hi } ->
+          Format.fprintf fmt "@[ERange(%a, %a)@]%a"
+            (pp_expr opts b (depth + 1))
+            lo
+            (pp_expr opts b (depth + 1))
+            hi (pp_loc_if opts) e.loc
       | EAt { field; ptr } ->
           Format.fprintf fmt "@[EAt(%a @ %a)@]%a"
             (pp_expr opts b (depth + 1))
@@ -398,29 +481,46 @@ module Debug = struct
     | UseRec -> Format.pp_print_string fmt "REC"
     | UseRent -> Format.pp_print_string fmt "RENT"
 
+  and pp_external_modifier fmt = function
+    | LocalDecl -> Format.pp_print_string fmt "Local"
+    | DefDecl -> Format.pp_print_string fmt "DEF"
+    | RefDecl -> Format.pp_print_string fmt "REF"
+
+  and pp_data_decl_kind fmt = function
+    | DataItem -> Format.pp_print_string fmt "ITEM"
+    | DataTable -> Format.pp_print_string fmt "TABLE"
+    | DataBlock -> Format.pp_print_string fmt "BLOCK"
+    | DataUnknown -> Format.pp_print_string fmt "UNKNOWN"
+
   and pp_string_node fmt (s : string node) = Format.fprintf fmt "%S" s.v
 
   and pp_decl opts b depth fmt (d : decl node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       match d.v with
-      | DVar { name; dtype; init; storage } ->
-          Format.fprintf fmt "@[DVar(%a : %a; storage=%a; init=%a)@]%a" pp_ident
-            name
+      | DVar
+          { name; dtype; init; storage; external_modifier; data_decl_kind } ->
+          Format.fprintf fmt
+            "@[DVar(%a : %a; storage=%a; external=%a; data_kind=%a; init=%a)@]%a"
+            pp_ident name
             (pp_type_expr opts b (depth + 1))
-            dtype pp_storage storage
+            dtype pp_storage storage pp_external_modifier external_modifier
+            pp_data_decl_kind data_decl_kind
             (pp_opt (pp_expr opts b (depth + 1)))
             init (pp_loc_if opts) d.loc
-      | DConst { name; dtype; value } ->
-          Format.fprintf fmt "@[DConst(%a : %a; value=%a)@]%a" pp_ident name
+      | DConst { name; dtype; value; external_modifier; data_decl_kind } ->
+          Format.fprintf fmt
+            "@[DConst(%a : %a; external=%a; data_kind=%a; value=%a)@]%a"
+            pp_ident name
             (pp_opt (pp_type_expr opts b (depth + 1)))
-            dtype
+            dtype pp_external_modifier external_modifier pp_data_decl_kind
+            data_decl_kind
             (pp_expr opts b (depth + 1))
             value (pp_loc_if opts) d.loc
-      | DType { name; defn } ->
-          Format.fprintf fmt "@[DType(%a = %a)@]%a" pp_ident name
+      | DType { name; defn; external_modifier } ->
+          Format.fprintf fmt "@[DType(%a = %a; external=%a)@]%a" pp_ident name
             (pp_type_expr opts b (depth + 1))
-            defn (pp_loc_if opts) d.loc
+            defn pp_external_modifier external_modifier (pp_loc_if opts) d.loc
       | DProc p -> pp_proc opts b (depth + 1) fmt p
       | DDirective { name; args } ->
           Format.fprintf fmt "@[DDirective(%a, [%a])@]%a" pp_ident name
@@ -431,9 +531,10 @@ module Debug = struct
     else
       let x = p.v in
       Format.fprintf fmt
-        "@[DProc(name=%a; use=%a; params=[%a]; returns=%a; locals=[%a]; \
-         body=%a)@]%a"
+        "@[DProc(name=%a; use=%a; external=%a; has_body=%b; params=[%a]; \
+         returns=%a; locals=[%a]; body=%a)@]%a"
         pp_ident x.name pp_proc_use x.use_attr
+        pp_external_modifier x.external_modifier x.has_body
         (pp_list (pp_param opts b (depth + 1)))
         x.params
         (pp_opt (pp_type_expr opts b (depth + 1)))

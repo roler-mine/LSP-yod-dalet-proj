@@ -1,11 +1,72 @@
 module T = Lsp.Types
 
+module Snapshot = struct
+  type nav_def = {
+    sym_id : string;
+    uri : T.DocumentUri.t;
+    name : string;
+    key : string;
+    loc : Ast.Loc.t;
+    kind : int;
+    container : string option;
+    metadata : Workspace_symbol_metadata.jovial_symbol_metadata;
+  }
+
+  type nav_occ = T.DocumentUri.t * Ast.Loc.t
+  type token = { line : int; start : int; len : int; typ : int; mods : int }
+
+  type t = {
+    uri : T.DocumentUri.t;
+    path_key : string option;
+    doc_rev : int;
+    text_hash : string;
+    imports : Preprocess.import list;
+    defines : Preprocess.define list;
+    compool_def : string option;
+    nav_defs : (string * nav_def) list;
+    nav_occs : (string * nav_occ list) list;
+    proc_param_map : (string * string list) list;
+    mutable semantic_lex_tokens : token list option;
+    mutable semantic_tokens_full : token list option;
+    symbol_keys_touched : string list;
+  }
+
+  let build ~(uri : T.DocumentUri.t) ~(path_key : string option)
+      ~(doc_rev : int) ~(text : string) ~(imports : Preprocess.import list)
+      ~(defines : Preprocess.define list) ~(compool_def : string option)
+      ~(nav_defs : (string * nav_def) list)
+      ~(nav_occs : (string * nav_occ list) list)
+      ~(proc_param_map : (string * string list) list)
+      ~(symbol_keys_touched : string list) : t =
+    {
+      uri;
+      path_key;
+      doc_rev;
+      text_hash = Digest.to_hex (Digest.string text);
+      imports;
+      defines;
+      compool_def;
+      nav_defs;
+      nav_occs;
+      proc_param_map;
+      semantic_lex_tokens = None;
+      semantic_tokens_full = None;
+      symbol_keys_touched;
+    }
+
+  let set_semantic_lex_tokens (snap : t) (tokens : token list) : unit =
+    snap.semantic_lex_tokens <- Some tokens
+
+  let set_semantic_tokens_full (snap : t) (tokens : token list) : unit =
+    snap.semantic_tokens_full <- Some tokens
+end
+
 type str_set = (string, bool) Hashtbl.t
 
 type t = {
-  snapshot_by_uri : (string, Doc_snapshot.t) Hashtbl.t;
-  defs_by_sym_id : (string, Doc_snapshot.nav_def list) Hashtbl.t;
-  occs_by_sym_id : (string, Doc_snapshot.nav_occ list) Hashtbl.t;
+  snapshot_by_uri : (string, Snapshot.t) Hashtbl.t;
+  defs_by_sym_id : (string, Snapshot.nav_def list) Hashtbl.t;
+  occs_by_sym_id : (string, Snapshot.nav_occ list) Hashtbl.t;
   sym_ids_by_key : (string, str_set) Hashtbl.t;
   reverse_imports_by_compool : (string, str_set) Hashtbl.t;
   doc_set_by_path_key : (string, str_set) Hashtbl.t;
@@ -47,16 +108,16 @@ let set_for_key (tbl : (string, str_set) Hashtbl.t) (k : string) : str_set =
       Hashtbl.add tbl k s;
       s
 
-let nav_def_key (d : Doc_snapshot.nav_def) : string =
+let nav_def_key (d : Snapshot.nav_def) : string =
   Printf.sprintf "%s|%d|%d|%d|%d|%s" (uri_key d.uri)
     d.loc.Ast.Loc.start_pos.line d.loc.Ast.Loc.start_pos.col
     d.loc.Ast.Loc.end_pos.line d.loc.Ast.Loc.end_pos.col d.key
 
-let nav_occ_key ((uri, loc) : Doc_snapshot.nav_occ) : string =
+let nav_occ_key ((uri, loc) : Snapshot.nav_occ) : string =
   Printf.sprintf "%s|%d|%d|%d|%d" (uri_key uri) loc.Ast.Loc.start_pos.line
     loc.Ast.Loc.start_pos.col loc.Ast.Loc.end_pos.line loc.Ast.Loc.end_pos.col
 
-let dedupe_defs (xs : Doc_snapshot.nav_def list) : Doc_snapshot.nav_def list =
+let dedupe_defs (xs : Snapshot.nav_def list) : Snapshot.nav_def list =
   let seen = Hashtbl.create (List.length xs + 1) in
   let acc = ref [] in
   List.iter
@@ -68,7 +129,7 @@ let dedupe_defs (xs : Doc_snapshot.nav_def list) : Doc_snapshot.nav_def list =
     xs;
   List.rev !acc
 
-let dedupe_occs (xs : Doc_snapshot.nav_occ list) : Doc_snapshot.nav_occ list =
+let dedupe_occs (xs : Snapshot.nav_occ list) : Snapshot.nav_occ list =
   let seen = Hashtbl.create (List.length xs + 1) in
   let acc = ref [] in
   List.iter
@@ -80,12 +141,12 @@ let dedupe_occs (xs : Doc_snapshot.nav_occ list) : Doc_snapshot.nav_occ list =
     xs;
   List.rev !acc
 
-let merge_defs (a : Doc_snapshot.nav_def list) (b : Doc_snapshot.nav_def list) :
-    Doc_snapshot.nav_def list =
+let merge_defs (a : Snapshot.nav_def list) (b : Snapshot.nav_def list) :
+    Snapshot.nav_def list =
   dedupe_defs (a @ b)
 
-let merge_occs (a : Doc_snapshot.nav_occ list) (b : Doc_snapshot.nav_occ list) :
-    Doc_snapshot.nav_occ list =
+let merge_occs (a : Snapshot.nav_occ list) (b : Snapshot.nav_occ list) :
+    Snapshot.nav_occ list =
   dedupe_occs (a @ b)
 
 let rebuild_key_set (s : t) (key : string) : unit =
@@ -97,7 +158,7 @@ let rebuild_key_set (s : t) (key : string) : unit =
       (fun sym_id defs ->
         if
           List.exists
-            (fun (d : Doc_snapshot.nav_def) -> normalize_key d.key = key)
+            (fun (d : Snapshot.nav_def) -> normalize_key d.key = key)
             defs
         then Hashtbl.replace set sym_id true)
       s.defs_by_sym_id;
@@ -144,7 +205,7 @@ let remove_uri_key (s : t) (uk : string) : unit =
           | Some defs ->
               let defs' =
                 List.filter
-                  (fun (d : Doc_snapshot.nav_def) -> uri_key d.uri <> uk)
+                  (fun (d : Snapshot.nav_def) -> uri_key d.uri <> uk)
                   defs
               in
               if defs' = [] then Hashtbl.remove s.defs_by_sym_id sym_id
@@ -158,7 +219,7 @@ let remove_uri_key (s : t) (uk : string) : unit =
           | Some occs ->
               let occs' =
                 List.filter
-                  (fun ((u, _) : Doc_snapshot.nav_occ) -> uri_key u <> uk)
+                  (fun ((u, _) : Snapshot.nav_occ) -> uri_key u <> uk)
                   occs
               in
               if occs' = [] then Hashtbl.remove s.occs_by_sym_id sym_id
@@ -171,7 +232,7 @@ let remove_uri_key (s : t) (uk : string) : unit =
 let remove_uri (s : t) ~(uri : T.DocumentUri.t) : unit =
   remove_uri_key s (uri_key uri)
 
-let upsert_snapshot (s : t) (snap : Doc_snapshot.t) : unit =
+let upsert_snapshot (s : t) (snap : Snapshot.t) : unit =
   let uk = uri_key snap.uri in
   remove_uri_key s uk;
   Hashtbl.replace s.snapshot_by_uri uk snap;
@@ -219,10 +280,10 @@ let upsert_snapshot (s : t) (snap : Doc_snapshot.t) : unit =
   List.iter (rebuild_key_set s) snap.symbol_keys_touched;
   s.global_rev <- s.global_rev + 1
 
-let snapshot_for_uri (s : t) ~(uri : T.DocumentUri.t) : Doc_snapshot.t option =
+let snapshot_for_uri (s : t) ~(uri : T.DocumentUri.t) : Snapshot.t option =
   Hashtbl.find_opt s.snapshot_by_uri (uri_key uri)
 
-let iter_snapshots (s : t) (f : Doc_snapshot.t -> unit) : unit =
+let iter_snapshots (s : t) (f : Snapshot.t -> unit) : unit =
   Hashtbl.iter (fun _ snap -> f snap) s.snapshot_by_uri
 
 let compare_pos (a : T.Position.t) (b : T.Position.t) : int =
@@ -256,7 +317,7 @@ let resolve_symbol_at (s : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
       List.iter
         (fun (sym_id, occs) ->
           List.iter
-            (fun ((u, loc) : Doc_snapshot.nav_occ) ->
+            (fun ((u, loc) : Snapshot.nav_occ) ->
               if uri_key u = uri_key uri && position_in_loc pos loc then
                 let w = loc_span_weight loc in
                 match !best with
@@ -267,12 +328,12 @@ let resolve_symbol_at (s : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
         snap.nav_occs;
       match !best with None -> None | Some (sym_id, _) -> Some sym_id)
 
-let defs_for_sym_id (s : t) (sym_id : string) : Doc_snapshot.nav_def list =
+let defs_for_sym_id (s : t) (sym_id : string) : Snapshot.nav_def list =
   match Hashtbl.find_opt s.defs_by_sym_id sym_id with
   | None -> []
   | Some xs -> xs
 
-let refs_for_sym_id (s : t) (sym_id : string) : Doc_snapshot.nav_occ list =
+let refs_for_sym_id (s : t) (sym_id : string) : Snapshot.nav_occ list =
   match Hashtbl.find_opt s.occs_by_sym_id sym_id with
   | None -> []
   | Some xs -> xs

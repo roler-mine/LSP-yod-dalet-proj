@@ -2,8 +2,11 @@
   "name": "jovial-monorepo",
   "private": true,
   "scripts": {
+    "build:server:host": "node ./tools/scripts/build-server.js",
     "build:server:win-x64": "node ./tools/scripts/build-server.js --target win32-x64",
     "build:server:win-arm64": "node ./tools/scripts/build-server.js --target win32-arm64",
+    "build:server:linux-x64": "node ./tools/scripts/build-server.js --target linux-x64",
+    "build:server:linux-arm64": "node ./tools/scripts/build-server.js --target linux-arm64",
     "test:server": "npm run test:server:smoke && npm run test:server:stability",
     "test:server:smoke": "opam exec -- dune build --root ./apps/lsp-server @runtest-smoke --force --verbose",
     "test:server:stability": "opam exec -- dune build --root ./apps/lsp-server @runtest-stability --force --verbose",

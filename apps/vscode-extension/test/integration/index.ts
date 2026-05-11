@@ -115,12 +115,30 @@ function initializeCount(): number {
   return readEvents().filter((event) => event.method === "initialize").length;
 }
 
+function shutdownCount(): number {
+  return readEvents().filter((event) => event.method === "shutdown").length;
+}
+
 function lsifRefreshCount(): number {
   return readEvents().filter(
     (event) =>
       event.type === "executeCommand" &&
       event.command === "jovial.dumpLsifIndex",
   ).length;
+}
+
+function inlayHintRequestCount(): number {
+  return readEvents().filter(
+    (event) => event.method === "textDocument/inlayHint",
+  ).length;
+}
+
+async function refreshEditorInlayHints(): Promise<void> {
+  try {
+    await vscode.commands.executeCommand("editor.action.inlayHints.refresh");
+  } catch {
+    // Older VS Code builds may not expose this command to tests.
+  }
 }
 
 async function setConfig<T>(key: string, value: T): Promise<void> {
@@ -138,6 +156,7 @@ async function testAutostartAndInitializePayload(): Promise<void> {
         workspace?: Record<string, unknown>;
         background?: Record<string, unknown>;
         server?: Record<string, unknown>;
+        performance?: Record<string, unknown>;
       }
     | undefined;
   assert.ok(
@@ -148,11 +167,18 @@ async function testAutostartAndInitializePayload(): Promise<void> {
   assert.equal(jovial?.workspace?.["profileMode"], "medium");
   assert.equal(jovial?.workspace?.["rootModel"], "manual");
   assert.deepEqual(jovial?.workspace?.["manualRootFiles"], ["sample.jov"]);
+  assert.equal(jovial?.workspace?.["maxStartupFiles"], 25);
   assert.equal(jovial?.background?.["indexBudgetMs"], 11);
   assert.equal(jovial?.background?.["diagBatchSize"], 7);
+  assert.equal(jovial?.performance?.["fullParseMaxBytes"], 5242880);
+  assert.equal(jovial?.performance?.["backgroundParseWorkerCount"], 2);
   assert.equal(jovial?.server?.["parseMaxFileBytes"], 123456);
   assert.equal(jovial?.server?.["pressureSoftMb"], 256);
   assert.equal(jovial?.server?.["pressureCriticalMb"], 384);
+  await waitFor("initial inlay hint request", () => {
+    const count = inlayHintRequestCount();
+    return count > 0 ? count : undefined;
+  });
 }
 
 async function testConfigRestartResendsSettings(): Promise<void> {
@@ -166,6 +192,225 @@ async function testConfigRestartResendsSettings(): Promise<void> {
       }
     | undefined;
   assert.equal(jovial?.workspace?.["profileMode"], "large");
+}
+
+async function testFeatureToggleRestartResendsSettings(): Promise<void> {
+  const samplePath = requireEnv("JOVIAL_INTEGRATION_SAMPLE", SAMPLE_PATH);
+  const document = await vscode.workspace.openTextDocument(
+    vscode.Uri.file(samplePath),
+  );
+  await vscode.window.showTextDocument(document);
+
+  const before = await waitForCountStable("initialize events", initializeCount);
+  await setConfig("features.hover", false);
+  const initializes = await waitForInitializeCount(before + 1);
+  const last = initializes[initializes.length - 1];
+  const jovial = last.params?.initializationOptions?.jovial as
+    | {
+        features?: Record<string, unknown>;
+        startup?: Record<string, unknown>;
+      }
+    | undefined;
+  assert.equal(jovial?.features?.["hover"], false);
+  const disabledHovers =
+    (await vscode.commands.executeCommand<readonly vscode.Hover[]>(
+      "vscode.executeHoverProvider",
+      document.uri,
+      new vscode.Position(0, 0),
+    )) ?? [];
+  assert.equal(
+    disabledHovers.length,
+    0,
+    "Hover provider should be disabled after client restart",
+  );
+
+  const beforeStartup = await waitForCountStable(
+    "initialize events after feature toggle",
+    initializeCount,
+  );
+  await setConfig("startup.priorityMode", "infoFirst");
+  const afterStartup = await waitForInitializeCount(beforeStartup + 1);
+  const startupPayload = afterStartup[afterStartup.length - 1].params
+    ?.initializationOptions?.jovial as
+    | {
+        startup?: Record<string, unknown>;
+      }
+    | undefined;
+  assert.equal(startupPayload?.startup?.["priorityMode"], "infoFirst");
+
+  const beforeDisableInlayHints = await waitForCountStable(
+    "initialize events before inlay-hint disable",
+    initializeCount,
+  );
+  const beforeDisableShutdowns = shutdownCount();
+  await setConfig("features.inlayHints", false);
+  const afterDisableInlayHints = await waitForInitializeCount(
+    beforeDisableInlayHints + 1,
+  );
+  await waitFor("shutdown before inlay-hint restart", () => {
+    const count = shutdownCount();
+    return count > beforeDisableShutdowns ? count : undefined;
+  });
+  const disabledPayload = afterDisableInlayHints[
+    afterDisableInlayHints.length - 1
+  ].params?.initializationOptions?.jovial as
+    | {
+        features?: Record<string, unknown>;
+      }
+    | undefined;
+  assert.equal(disabledPayload?.features?.["inlayHints"], false);
+  const beforeDisabledFetchInlayHintRequests = inlayHintRequestCount();
+  const disabledInlayHints = await fetchInlayHints(document);
+  assert.equal(
+    disabledInlayHints.length,
+    0,
+    "Inlay hints should be disabled after client restart",
+  );
+  assert.equal(
+    inlayHintRequestCount(),
+    beforeDisabledFetchInlayHintRequests,
+    "Disabled inlay hints should not reach the server or any LSIF fallback",
+  );
+
+  const beforeRestoreHover = await waitForCountStable(
+    "initialize events before hover restore",
+    initializeCount,
+  );
+  await setConfig("features.hover", true);
+  await waitForInitializeCount(beforeRestoreHover + 1);
+
+  const beforeRestoreStartup = await waitForCountStable(
+    "initialize events before startup restore",
+    initializeCount,
+  );
+  await setConfig("startup.priorityMode", "balanced");
+  await waitForInitializeCount(beforeRestoreStartup + 1);
+
+  const beforeRestoreInlayHints = await waitForCountStable(
+    "initialize events before inlay-hint restore",
+    initializeCount,
+  );
+  const beforeRestoreInlayHintRequests = inlayHintRequestCount();
+  await setConfig("features.inlayHints", true);
+  const afterRestoreInlayHints = await waitForInitializeCount(
+    beforeRestoreInlayHints + 1,
+  );
+  const restoredPayload = afterRestoreInlayHints[
+    afterRestoreInlayHints.length - 1
+  ].params?.initializationOptions?.jovial as
+    | {
+        features?: Record<string, unknown>;
+      }
+    | undefined;
+  assert.equal(restoredPayload?.features?.["inlayHints"], true);
+  await refreshEditorInlayHints();
+  await waitFor("restored inlay hint request", () => {
+    const count = inlayHintRequestCount();
+    return count > beforeRestoreInlayHintRequests ? count : undefined;
+  });
+}
+
+async function testDiagnosticsFeatureSettingDoesNotRestartHints(): Promise<void> {
+  const beforeInitializes = await waitForCountStable(
+    "initialize events before ignored diagnostics toggle",
+    initializeCount,
+  );
+  const beforeInlayHintRequests = await waitForCountStable(
+    "inlay hint requests before ignored diagnostics toggle",
+    inlayHintRequestCount,
+  );
+
+  await setConfig("features.diagnostics", false);
+
+  const afterInitializes = await waitForCountStable(
+    "initialize events after ignored diagnostics toggle",
+    initializeCount,
+  );
+  const afterInlayHintRequests = await waitForCountStable(
+    "inlay hint requests after ignored diagnostics toggle",
+    inlayHintRequestCount,
+  );
+  assert.equal(
+    afterInitializes,
+    beforeInitializes,
+    "Ignored diagnostics feature setting should not restart the server",
+  );
+  assert.equal(
+    afterInlayHintRequests,
+    beforeInlayHintRequests,
+    "Diagnostics feature setting should not refresh or request inlay hints",
+  );
+
+  await setConfig("features.diagnostics", true);
+  const restoredInitializes = await waitForCountStable(
+    "initialize events after restoring ignored diagnostics toggle",
+    initializeCount,
+  );
+  assert.equal(
+    restoredInitializes,
+    beforeInitializes,
+    "Restoring ignored diagnostics feature setting should not restart the server",
+  );
+}
+
+async function testCustomFeatureProfileRestartResendsSettings(): Promise<void> {
+  const samplePath = requireEnv("JOVIAL_INTEGRATION_SAMPLE", SAMPLE_PATH);
+  const document = await vscode.workspace.openTextDocument(
+    vscode.Uri.file(samplePath),
+  );
+  await vscode.window.showTextDocument(document);
+
+  const beforeCustomFeatures = await waitForCountStable(
+    "initialize events before custom feature list",
+    initializeCount,
+  );
+  await setConfig("features.custom.enabledFeatures", ["inlayHints"]);
+  await waitForInitializeCount(beforeCustomFeatures + 1);
+
+  const beforeCustomProfile = await waitForCountStable(
+    "initialize events before custom feature profile",
+    initializeCount,
+  );
+  const beforeCustomInlayHintRequests = inlayHintRequestCount();
+  await setConfig("features.profile", "custom");
+  const initializes = await waitForInitializeCount(beforeCustomProfile + 1);
+  const jovial = initializes[initializes.length - 1].params
+    ?.initializationOptions?.jovial as
+    | {
+        features?: Record<string, unknown>;
+      }
+    | undefined;
+  assert.equal(jovial?.features?.["profile"], "custom");
+  assert.equal(jovial?.features?.["diagnostics"], true);
+  assert.equal(jovial?.features?.["hover"], false);
+  assert.equal(jovial?.features?.["completion"], false);
+  assert.equal(jovial?.features?.["inlayHints"], true);
+  assert.equal(jovial?.features?.["semanticTokens"], false);
+
+  const disabledHovers =
+    (await vscode.commands.executeCommand<readonly vscode.Hover[]>(
+      "vscode.executeHoverProvider",
+      document.uri,
+      new vscode.Position(0, 0),
+    )) ?? [];
+  assert.equal(
+    disabledHovers.length,
+    0,
+    "Custom feature profile should disable hover when hover is not selected",
+  );
+
+  await refreshEditorInlayHints();
+  await waitFor("custom profile inlay hint request", () => {
+    const count = inlayHintRequestCount();
+    return count > beforeCustomInlayHintRequests ? count : undefined;
+  });
+
+  const beforeRestoreProfile = await waitForCountStable(
+    "initialize events before feature profile restore",
+    initializeCount,
+  );
+  await setConfig("features.profile", "full");
+  await waitForInitializeCount(beforeRestoreProfile + 1);
 }
 
 async function testRestartCommand(): Promise<void> {
@@ -255,6 +500,21 @@ function hoverText(hovers: readonly vscode.Hover[]): string {
     .join("\n");
 }
 
+async function fetchInlayHints(
+  document: vscode.TextDocument,
+): Promise<readonly vscode.InlayHint[]> {
+  return (
+    (await vscode.commands.executeCommand<readonly vscode.InlayHint[]>(
+      "vscode.executeInlayHintProvider",
+      document.uri,
+      new vscode.Range(
+        new vscode.Position(0, 0),
+        new vscode.Position(0, Math.max(1, document.lineAt(0).text.length)),
+      ),
+    )) ?? []
+  );
+}
+
 async function testMiddlewareLsifFallback(): Promise<void> {
   await setConfig("lsif.fastPath", true);
   await activateExtension();
@@ -292,7 +552,12 @@ async function testMiddlewareLsifFallback(): Promise<void> {
       position,
     )) ?? [];
   assert.ok(hovers.length > 0, "Hover fallback returned no hover");
-  assert.match(hoverText(hovers), /FOO|Cached definitions/);
+  const text = hoverText(hovers);
+  assert.match(text, /FOO/);
+  assert.doesNotMatch(
+    text,
+    /cached definitions|place of origin|workspace index/i,
+  );
 }
 
 export async function run(): Promise<void> {
@@ -302,6 +567,9 @@ export async function run(): Promise<void> {
 
   await testAutostartAndInitializePayload();
   await testConfigRestartResendsSettings();
+  await testFeatureToggleRestartResendsSettings();
+  await testDiagnosticsFeatureSettingDoesNotRestartHints();
+  await testCustomFeatureProfileRestartResendsSettings();
   await testRestartCommand();
   await testWatchedFileNotifications();
   await testLsifRefreshCommand();

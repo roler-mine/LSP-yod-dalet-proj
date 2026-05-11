@@ -1,4 +1,6 @@
 import { watchPathKey } from "./workspace_paths";
+import { DEFAULT_JOVIAL_SOURCE_EXTENSIONS } from "./source_extensions";
+import { shouldIgnoreSourcePath } from "./ignored_paths";
 
 export type WatchedFileChangeType = 1 | 2 | 3;
 export type PendingWatchedFileChange = {
@@ -13,14 +15,9 @@ export const WATCH_CHANGE_DELETED: WatchedFileChangeType = 3;
 export function shouldIgnoreWatchedPath(
   fsPath: string,
   platform: NodeJS.Platform = process.platform,
+  sourceExtensions: readonly string[] = DEFAULT_JOVIAL_SOURCE_EXTENSIONS,
 ): boolean {
-  const norm = watchPathKey(fsPath, platform).replace(/\\/g, "/");
-  return (
-    norm.includes("/.git/") ||
-    norm.includes("/_build/") ||
-    norm.includes("/node_modules/") ||
-    norm.includes("/.vscode/")
-  );
+  return shouldIgnoreSourcePath(fsPath, platform, sourceExtensions);
 }
 
 export function mergeWatchedChangeType(
@@ -41,6 +38,7 @@ export function mergeWatchedChangeType(
 type QueueOptions = {
   isOpenFilePath?: (fsPath: string) => boolean;
   platform?: NodeJS.Platform;
+  sourceExtensions?: readonly string[];
 };
 
 export function queueWatchedFileChange(
@@ -48,9 +46,14 @@ export function queueWatchedFileChange(
   change: PendingWatchedFileChange,
   options: QueueOptions = {},
 ): void {
-  const { isOpenFilePath, platform = process.platform } = options;
+  const {
+    isOpenFilePath,
+    platform = process.platform,
+    sourceExtensions = DEFAULT_JOVIAL_SOURCE_EXTENSIONS,
+  } = options;
   const fsPath = change.fsPath;
-  if (!fsPath || shouldIgnoreWatchedPath(fsPath, platform)) return;
+  if (!fsPath || shouldIgnoreWatchedPath(fsPath, platform, sourceExtensions))
+    return;
   if (change.type === WATCH_CHANGE_CHANGED && isOpenFilePath?.(fsPath)) return;
 
   const key = watchPathKey(fsPath, platform);

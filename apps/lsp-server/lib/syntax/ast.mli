@@ -18,12 +18,57 @@ module Loc : sig
   val to_string : t -> string
 end
 
-type 'a node = { loc : Loc.t; v : 'a }
+type node_id = int
 
-val node : ?loc:Loc.t -> 'a -> 'a node
+type token_range = {
+  first_token : int;
+  last_token : int;
+}
+
+type recovery =
+  | Complete
+  | Missing of { expected : string list; message : string }
+  | Invalid of { diagnostics : Lsp.Types.Diagnostic.t list }
+
+type 'a node = {
+  id : node_id;
+  loc : Loc.t;
+  tokens : token_range option;
+  hash : int64 option;
+  recovery : recovery;
+  v : 'a;
+}
+
+val node :
+  ?loc:Loc.t ->
+  ?tokens:token_range ->
+  ?hash:int64 ->
+  ?recovery:recovery ->
+  'a ->
+  'a node
+
+val missing_node :
+  ?loc:Loc.t ->
+  ?tokens:token_range ->
+  expected:string list ->
+  message:string ->
+  'a ->
+  'a node
+
+val invalid_node :
+  ?loc:Loc.t ->
+  ?tokens:token_range ->
+  diagnostics:Lsp.Types.Diagnostic.t list ->
+  'a ->
+  'a node
+
 val map : ('a -> 'b) -> 'a node -> 'b node
 val value : 'a node -> 'a
 val loc : 'a node -> Loc.t
+val id : 'a node -> node_id
+val recovery : 'a node -> recovery
+val token_range : 'a node -> token_range option
+val is_recovered : 'a node -> bool
 
 type ident = string node
 
@@ -42,11 +87,13 @@ type binop =
   | BMul
   | BDiv
   | BMod
+  | BPow
   | BAnd
   | BOr
   | BBitAnd
   | BBitOr
   | BBitXor
+  | BEqv
   | BShl
   | BShr
   | BEq
@@ -75,6 +122,9 @@ and expr =
   | ECall of { callee : ident; args : expr node list }
   | EIndex of { base : expr node; index : expr node list }
   | EField of { base : expr node; field : ident }
+  | EConvert of { ty : type_expr node; expr : expr node }
+  | EPreset of { base : expr node; items : expr node list }
+  | ERange of { lo : expr node; hi : expr node }
   | EAt of { field : expr node; ptr : expr node }
   | EDeref of { ptr : expr node }
   | EParen of expr node
@@ -103,16 +153,29 @@ and stmt =
 
 and storage = Automatic | Static | External
 and proc_use = UseNormal | UseRec | UseRent
-
+and external_modifier = LocalDecl | DefDecl | RefDecl
+and data_decl_kind = DataItem | DataTable | DataBlock | DataUnknown
 and decl =
   | DVar of {
       name : ident;
       dtype : type_expr node;
       init : expr node option;
       storage : storage;
+      external_modifier : external_modifier;
+      data_decl_kind : data_decl_kind;
     }
-  | DConst of { name : ident; dtype : type_expr node option; value : expr node }
-  | DType of { name : ident; defn : type_expr node }
+  | DConst of {
+      name : ident;
+      dtype : type_expr node option;
+      value : expr node;
+      external_modifier : external_modifier;
+      data_decl_kind : data_decl_kind;
+    }
+  | DType of {
+      name : ident;
+      defn : type_expr node;
+      external_modifier : external_modifier;
+    }
   | DProc of proc node
   | DDirective of { name : ident; args : string node list }
 
@@ -123,6 +186,8 @@ and proc = {
   use_attr : proc_use;
   locals : decl node list;
   body : stmt node;
+  external_modifier : external_modifier;
+  has_body : bool;
 }
 
 type toplevel = TopDecl of decl node | TopStmt of stmt node

@@ -4,6 +4,10 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 $dirsToRemove = @(
   (Join-Path $repoRoot "apps\\lsp-server\\_build"),
+  (Join-Path $repoRoot "apps\\lsp-server\\_build-linux-x64"),
+  (Join-Path $repoRoot "apps\\lsp-server\\_build-linux-arm64"),
+  (Join-Path $repoRoot "apps\\lsp-server\\_build-win32-x64"),
+  (Join-Path $repoRoot "apps\\lsp-server\\_build-win32-arm64"),
   (Join-Path $repoRoot "apps\\vscode-extension\\out")
 )
 
@@ -29,7 +33,7 @@ if (Test-Path $legacyArchiveRoot) {
 
 $runtimeServerDir = Join-Path $repoRoot "apps\\vscode-extension\\runtime\\server"
 if (Test-Path $runtimeServerDir) {
-  $filesToRemove += Get-ChildItem $runtimeServerDir -Recurse -Filter "jovial-lsp*.exe*" -File -ErrorAction SilentlyContinue
+  $filesToRemove += Get-ChildItem $runtimeServerDir -Recurse -Filter "jovial-lsp*" -File -ErrorAction SilentlyContinue
 }
 
 $legacyBundleDir = Join-Path $repoRoot "apps\\vscode-extension\\server"

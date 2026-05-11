@@ -1,7 +1,7 @@
 module T = Lsp.Types
 
 let position_of_ast_pos (p : Ast.Loc.pos) : T.Position.t =
-  { T.Position.line = max 0 (p.line - 1); character = max 0 p.col }
+  { T.Position.line = max 0 (p.line-1); character = max 0 (p.col) }
 
 let range_of_loc (l : Ast.Loc.t) : T.Range.t =
   let start = position_of_ast_pos l.start_pos in

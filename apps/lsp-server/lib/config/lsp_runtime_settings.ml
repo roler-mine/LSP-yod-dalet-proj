@@ -16,9 +16,19 @@ type client_overrides = {
   workspace_profile_mode : Workspace_settings.workspace_profile_mode option;
   root_model : Workspace_settings.root_model option;
   root_manual_files : string list option;
+  source_extensions : string list option;
+  feature_profile : Workspace_settings.feature_profile option;
+  feature_flags : Workspace_settings.feature_overrides;
   parse_file_max_bytes : int option;
+  large_file_threshold_bytes : int option;
+  huge_file_threshold_bytes : int option;
+  full_semantic_tokens_max_bytes : int option;
+  full_parse_max_bytes : int option;
+  enable_huge_file_full_parse : bool option;
+  background_parse_worker_count : int option;
   pressure_soft_mb : int option;
   pressure_critical_mb : int option;
+  startup_priority_mode : Workspace_settings.startup_priority_mode option;
   bg_tick_budget_ms : int option;
   bg_diag_batch_size : int option;
 }
@@ -29,9 +39,19 @@ let empty_client_overrides : client_overrides =
     workspace_profile_mode = None;
     root_model = None;
     root_manual_files = None;
+    source_extensions = None;
+    feature_profile = None;
+    feature_flags = Workspace_settings.empty_feature_overrides;
     parse_file_max_bytes = None;
+    large_file_threshold_bytes = None;
+    huge_file_threshold_bytes = None;
+    full_semantic_tokens_max_bytes = None;
+    full_parse_max_bytes = None;
+    enable_huge_file_full_parse = None;
+    background_parse_worker_count = None;
     pressure_soft_mb = None;
     pressure_critical_mb = None;
+    startup_priority_mode = None;
     bg_tick_budget_ms = None;
     bg_diag_batch_size = None;
   }

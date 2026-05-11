@@ -2,8 +2,9 @@
   "name": "jovial-lsp-client",
   "displayName": "Jovial Language Support",
   "description": "VS Code client for the Jovial OCaml LSP server",
-  "version": "0.0.5",
+  "version": "0.0.10",
   "publisher": "roler-mine",
+  "repository": "https://google.com",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -111,6 +112,278 @@
           ],
           "description": "Background diagnostics for unopened files: off, errors-only, or all diagnostics."
         },
+        "jovial.startup.priorityMode": {
+          "type": "string",
+          "default": "navigationFirst",
+          "enum": [
+            "balanced",
+            "navigationFirst",
+            "infoFirst"
+          ],
+          "description": "Legacy alias for jovial.performance.priorityMode."
+        },
+        "jovial.performance.priorityMode": {
+          "type": "string",
+          "default": "navigationFirst",
+          "enum": [
+            "navigationFirst",
+            "balanced"
+          ],
+          "description": "Choose whether the server prioritizes hover/goto/navigation before diagnostics."
+        },
+        "jovial.performance.largeFileThresholdBytes": {
+          "type": "number",
+          "default": 131072,
+          "minimum": 1,
+          "description": "File size where the server switches from small-file foreground parsing to normal staged indexing."
+        },
+        "jovial.performance.hugeFileThresholdBytes": {
+          "type": "number",
+          "default": 20971520,
+          "minimum": 1,
+          "description": "File size where the server enters huge-file mode and disables full parsing by default."
+        },
+        "jovial.performance.fullSemanticTokensMaxBytes": {
+          "type": "number",
+          "default": 1048576,
+          "minimum": 1,
+          "description": "Maximum file size for full semantic-token responses before the server uses capped lexical/range fallbacks."
+        },
+        "jovial.performance.fullParseMaxBytes": {
+          "type": "number",
+          "default": 5242880,
+          "minimum": 1,
+          "description": "Maximum file size the server will fully parse by default."
+        },
+        "jovial.performance.enableHugeFileFullParse": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow full parsing for huge files when the full-parse byte limit also permits it."
+        },
+        "jovial.performance.backgroundParseWorkerCount": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "description": "Number of background parse workers used for staged indexing."
+        },
+        "jovial.features.profile": {
+          "type": "string",
+          "default": "full",
+          "enum": [
+            "full",
+            "responsive",
+            "minimal",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "Enable every passive LSP feature.",
+            "Disable heavier passive work while keeping common editor help responsive.",
+            "Keep only the lightest passive editor help enabled.",
+            "Use jovial.features.custom.enabledFeatures to choose the passive features to enable."
+          ],
+          "description": "Passive LSP feature profile. Choose custom to pick individual passive features from jovial.features.custom.enabledFeatures."
+        },
+        "jovial.features.custom.enabledFeatures": {
+          "type": "array",
+          "default": [
+            "documentSymbols",
+            "workspaceSymbols",
+            "hover",
+            "signatureHelp",
+            "completion",
+            "codeActions",
+            "inlayHints",
+            "semanticTokens"
+          ],
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "documentSymbols",
+              "workspaceSymbols",
+              "hover",
+              "signatureHelp",
+              "completion",
+              "codeActions",
+              "inlayHints",
+              "semanticTokens"
+            ],
+            "enumDescriptions": [
+              "Provide document symbols.",
+              "Provide workspace symbols.",
+              "Provide hover information.",
+              "Provide signature help.",
+              "Provide completion items.",
+              "Provide code actions.",
+              "Provide inlay hints.",
+              "Provide semantic tokens."
+            ]
+          },
+          "description": "Passive LSP features enabled when jovial.features.profile is custom. Add items from the dropdown to choose the features this server should expose."
+        },
+        "jovial.features.overrides.diagnostics": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "deprecationMessage": "Diagnostics are always enabled as core language support; use jovial.workspaceDiagnostics.mode to tune unopened-file diagnostics.",
+          "description": "Legacy diagnostics override; ignored by the current server."
+        },
+        "jovial.features.diagnostics": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Diagnostics are always enabled as core language support; use jovial.workspaceDiagnostics.mode to tune unopened-file diagnostics.",
+          "description": "Legacy diagnostics override; ignored by the current server."
+        },
+        "jovial.features.definition": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "User-triggered navigation is always available; omit invoking it to avoid using it.",
+          "description": "Legacy setting; ignored by the current server."
+        },
+        "jovial.features.declaration": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "User-triggered navigation is always available; omit invoking it to avoid using it.",
+          "description": "Legacy setting; ignored by the current server."
+        },
+        "jovial.features.typeDefinition": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "User-triggered navigation is always available; omit invoking it to avoid using it.",
+          "description": "Legacy setting; ignored by the current server."
+        },
+        "jovial.features.implementation": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "User-triggered navigation is always available; omit invoking it to avoid using it.",
+          "description": "Legacy setting; ignored by the current server."
+        },
+        "jovial.features.references": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "User-triggered references are always available; omit invoking them to avoid using them.",
+          "description": "Legacy setting; ignored by the current server."
+        },
+        "jovial.features.documentSymbols": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.documentSymbols.",
+          "description": "Legacy document symbol override."
+        },
+        "jovial.features.overrides.documentSymbols": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override document symbols for the selected feature profile."
+        },
+        "jovial.features.workspaceSymbols": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.workspaceSymbols.",
+          "description": "Legacy workspace symbol override."
+        },
+        "jovial.features.overrides.workspaceSymbols": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override workspace symbols for the selected feature profile."
+        },
+        "jovial.features.hover": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.hover.",
+          "description": "Legacy hover override."
+        },
+        "jovial.features.overrides.hover": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override hover for the selected feature profile."
+        },
+        "jovial.features.signatureHelp": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.signatureHelp.",
+          "description": "Legacy signature help override."
+        },
+        "jovial.features.overrides.signatureHelp": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override signature help for the selected feature profile."
+        },
+        "jovial.features.rename": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "User-triggered rename is always available; omit invoking it to avoid using it.",
+          "description": "Legacy setting; ignored by the current server."
+        },
+        "jovial.features.completion": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.completion.",
+          "description": "Legacy completion override."
+        },
+        "jovial.features.overrides.completion": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override completion for the selected feature profile."
+        },
+        "jovial.features.codeActions": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.codeActions.",
+          "description": "Legacy code action override."
+        },
+        "jovial.features.overrides.codeActions": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override code actions for the selected feature profile."
+        },
+        "jovial.features.inlayHints": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.inlayHints.",
+          "description": "Legacy inlay hint override."
+        },
+        "jovial.features.overrides.inlayHints": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override inlay hints for the selected feature profile."
+        },
+        "jovial.features.semanticTokens": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.semanticTokens.",
+          "description": "Legacy semantic token override."
+        },
+        "jovial.features.overrides.semanticTokens": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override semantic tokens for the selected feature profile."
+        },
         "jovial.background.indexBudgetMs": {
           "type": "number",
           "default": 8,
@@ -152,11 +425,25 @@
           },
           "description": "Manual root files used when jovial.workspace.rootModel is set to manual."
         },
+        "jovial.workspace.maxStartupFiles": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 1,
+          "description": "Maximum number of Jovial source files discovered per workspace folder during startup indexing."
+        },
+        "jovial.workspace.extraSourceFileExtensions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional JOVIAL source file extensions to scan and watch, for example .j for projects that use it."
+        },
         "jovial.server.parseMaxFileBytes": {
           "type": "number",
-          "default": 16777216,
+          "default": 5242880,
           "minimum": 1,
-          "description": "Maximum file size the server will parse fully before applying file-size guards."
+          "description": "Legacy alias for jovial.performance.fullParseMaxBytes."
         },
         "jovial.server.pressureSoftMb": {
           "type": "number",
@@ -182,7 +469,9 @@
     "build:server:host": "node ../../tools/scripts/build-server.js",
     "build:server:win-x64": "node ../../tools/scripts/build-server.js --target win32-x64 --out runtime/server/win32-x64/jovial-lsp.exe",
     "build:server:win-arm64": "node ../../tools/scripts/build-server.js --target win32-arm64 --out runtime/server/win32-arm64/jovial-lsp.exe",
-    "verify:runtime": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64",
+    "build:server:linux-x64": "node ../../tools/scripts/build-server.js --target linux-x64 --out runtime/server/linux-x64/jovial-lsp",
+    "build:server:linux-arm64": "node ../../tools/scripts/build-server.js --target linux-arm64 --out runtime/server/linux-arm64/jovial-lsp",
+    "verify:runtime": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64,linux-x64,linux-arm64",
     "verify:runtime:host": "node ../../tools/scripts/verify-runtime-binaries.js --targets host",
     "check": "tsc -p . --noEmit && tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint src test --ext .ts",
@@ -194,7 +483,7 @@
     "test": "npm run test:unit && npm run test:integration",
     "watch": "tsc -p . -w",
     "vscode:prepublish": "npm run compile",
-    "package:vsix:dev": "npm run build:server:host && npx @vscode/vsce package",
+    "package:vsix:dev": "npm run build:server:host && npm run verify:runtime:host && npx @vscode/vsce package",
     "package:vsix:host": "npm run build:server:host && npm run verify:runtime:host && npx @vscode/vsce package",
     "package:vsix:release": "npm run verify:runtime && npx @vscode/vsce package",
     "package:vsix": "npm run package:vsix:dev"

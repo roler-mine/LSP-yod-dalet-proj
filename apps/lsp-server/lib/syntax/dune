@@ -1,5 +1,9 @@
 (ocamllex lexer)
 
-(menhir
- (modules parser)
- (flags (--table --inspection --explain)))
+(rule
+ (targets parser.ml)
+ (deps parser.mly ../../build-tools/remove_files.ml)
+ (action
+  (progn
+   (run menhir --table --explain --base parser_tmp parser.mly)
+   (run ocaml %{dep:../../build-tools/remove_files.ml} parser_tmp.ml parser.ml parser_tmp.mli parser_tmp.conflicts))))

@@ -1,3 +1,49 @@
+type parse_policy = Perf_log.parse_policy =
+  | Forbid_sync_parse
+  | Allow_sync_parse_if_small
+  | Force_background
+
+type request_kind = Perf_log.request_kind =
+  | Hover
+  | Completion
+  | Definition
+  | References
+  | DocumentSymbol
+  | SemanticTokensRange
+  | SemanticTokensFull
+  | Diagnostics
+  | BackgroundIndex
+
+let request_allows_sync_parse = Perf_log.request_allows_sync_parse
+let has_current_parse = Document.has_current_parse
+
+type file_mode = Small | Normal | Large | Huge
+
+let file_mode_of_size (ws : Workspace_foundation.t) ~(bytes : int) : file_mode =
+  if bytes >= ws.Workspace_foundation.huge_file_threshold_bytes then Huge
+  else if bytes >= ws.Workspace_foundation.full_semantic_tokens_max_bytes then
+    Large
+  else if bytes >= ws.Workspace_foundation.large_file_threshold_bytes then
+    Normal
+  else Small
+
+let file_mode_of_doc (doc : Document.t) (ws : Workspace_foundation.t) :
+    file_mode =
+  file_mode_of_size ws ~bytes:(String.length doc.Document.text)
+
+let is_large_doc (doc : Document.t) (ws : Workspace_foundation.t) : bool =
+  match file_mode_of_doc doc ws with Large | Huge -> true | Small | Normal -> false
+
+let is_huge_doc (doc : Document.t) (ws : Workspace_foundation.t) : bool =
+  match file_mode_of_doc doc ws with Huge -> true | Small | Normal | Large -> false
+
+let full_parse_allowed_for_size (ws : Workspace_foundation.t) ~(bytes : int) :
+    bool =
+  bytes <= ws.Workspace_foundation.full_parse_max_bytes
+  &&
+  (ws.Workspace_foundation.enable_huge_file_full_parse
+  || bytes < ws.Workspace_foundation.huge_file_threshold_bytes)
+
 let index_bootstrap_dirs = 64
 let index_bootstrap_files = 6000
 let index_background_dirs = 4

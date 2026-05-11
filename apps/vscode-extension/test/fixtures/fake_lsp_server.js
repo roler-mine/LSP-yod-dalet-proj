@@ -16,6 +16,11 @@ function parseArgs(argv) {
 }
 
 const { logPath } = parseArgs(process.argv.slice(2));
+let inlayHintsEnabled = true;
+
+function featureEnabled(features, key) {
+  return features?.[key] !== false;
+}
 
 function appendEvent(event) {
   if (!logPath) return;
@@ -60,6 +65,15 @@ function makeLsifIndex(uri) {
   };
 }
 
+function makeInlayHint() {
+  return {
+    position: { line: 0, character: 0 },
+    label: "FAKE_PARAM:",
+    kind: 2,
+    paddingRight: true,
+  };
+}
+
 function send(message) {
   const body = JSON.stringify(message);
   process.stdout.write(
@@ -94,15 +108,49 @@ function handleRequest(message) {
 
   switch (method) {
     case "initialize":
+      const features = params?.initializationOptions?.jovial?.features ?? {};
+      inlayHintsEnabled = featureEnabled(features, "inlayHints");
       respond(message.id, {
         capabilities: {
           textDocumentSync: 2,
-          definitionProvider: true,
-          declarationProvider: true,
-          typeDefinitionProvider: true,
-          implementationProvider: true,
-          referencesProvider: true,
-          hoverProvider: true,
+          ...(featureEnabled(features, "definition")
+            ? { definitionProvider: true }
+            : {}),
+          ...(featureEnabled(features, "declaration")
+            ? { declarationProvider: true }
+            : {}),
+          ...(featureEnabled(features, "typeDefinition")
+            ? { typeDefinitionProvider: true }
+            : {}),
+          ...(featureEnabled(features, "implementation")
+            ? { implementationProvider: true }
+            : {}),
+          ...(featureEnabled(features, "references")
+            ? { referencesProvider: true }
+            : {}),
+          ...(featureEnabled(features, "hover") ? { hoverProvider: true } : {}),
+          ...(featureEnabled(features, "signatureHelp")
+            ? { signatureHelpProvider: { triggerCharacters: ["(", ","] } }
+            : {}),
+          ...(featureEnabled(features, "rename")
+            ? { renameProvider: { prepareProvider: true } }
+            : {}),
+          ...(featureEnabled(features, "completion")
+            ? { completionProvider: { triggerCharacters: ["."] } }
+            : {}),
+          ...(featureEnabled(features, "codeActions")
+            ? { codeActionProvider: true }
+            : {}),
+          ...(inlayHintsEnabled ? { inlayHintProvider: true } : {}),
+          ...(featureEnabled(features, "semanticTokens")
+            ? {
+                semanticTokensProvider: {
+                  legend: { tokenTypes: [], tokenModifiers: [] },
+                  full: true,
+                  range: true,
+                },
+              }
+            : {}),
           executeCommandProvider: {
             commands: [
               "jovial.dumpLsifIndex",
@@ -164,6 +212,9 @@ function handleRequest(message) {
     case "textDocument/references":
     case "textDocument/hover":
       respond(message.id, null);
+      return;
+    case "textDocument/inlayHint":
+      respond(message.id, inlayHintsEnabled ? [makeInlayHint()] : []);
       return;
     default:
       respond(message.id, null);

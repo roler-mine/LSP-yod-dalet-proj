@@ -50,6 +50,7 @@ extension_proj/pnpm-debug.log*
 
 # OCaml / Dune / opam artifacts
 **/_build/
+**/_build-*/
 **/_opam/
 **/.merlin
 **/.ocamlinit

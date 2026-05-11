@@ -14,42 +14,39 @@ let diag_parse_guard ~(file : string option) ~(max_bytes : int)
          actual_bytes max_bytes)
     loc
 
-let make_doc_with_parse_guard (ws : t) ~(uri : T.DocumentUri.t)
-    ~(file : string option) ~(text : string) ~(actual_bytes : int) : Document.t
-    =
+let make_doc_with_parse_guard ?lsp_version (ws : t)
+    ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string)
+    ~(actual_bytes : int) : Document.t =
   Perf_stats.tick "parse.large_file_guard";
-  Document.make_unparsed ~uri ~file ~text
+  Document.make_parse_skipped_versioned ~lsp_version ~uri ~file ~text
     ~parse_diags:
       [
         diag_parse_guard ~file ~max_bytes:ws.parse_file_max_bytes ~actual_bytes;
       ]
 
-let parse_guarded_document_make (ws : t) ~(uri : T.DocumentUri.t)
+let parse_guarded_document_make ?lsp_version
+    ?(profile = Parser.Interactive) (ws : t) ~(uri : T.DocumentUri.t)
     ~(file : string option) ~(text : string) : Document.t =
   if
     is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
       ~text_len:(String.length text)
   then
-    make_doc_with_parse_guard ws ~uri ~file ~text
+    make_doc_with_parse_guard ?lsp_version ws ~uri ~file ~text
       ~actual_bytes:(String.length text)
-  else Document.make ~uri ~file ~text
+  else Document.make_with_profile_versioned ~lsp_version ~profile ~uri ~file ~text
 
 let diag_missing_compool (loc : Ast.Loc.t) (name : string) : T.Diagnostic.t =
   Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"import"
     ~message:("Missing COMPOOL: " ^ name)
     loc
 
-let has_known_source_ext_name (name : string) : bool =
-  let lower = String.lowercase_ascii name in
-  let ends_with ext =
-    let n = String.length lower in
-    let m = String.length ext in
-    n >= m && String.sub lower (n - m) m = ext
-  in
-  ends_with ".jov" || ends_with ".j73" || ends_with ".jvl" || ends_with ".j"
+let has_known_source_ext_name ~(source_extensions : string list) (name : string)
+    : bool =
+  Source_file.has_extension ~extensions:source_extensions name
 
-let source_stem_of_filename (name : string) : string option =
-  if not (has_known_source_ext_name name) then None
+let source_stem_of_filename ~(source_extensions : string list) (name : string) :
+    string option =
+  if not (has_known_source_ext_name ~source_extensions name) then None
   else
     let n = String.length name in
     let rec find_dot i =
@@ -60,54 +57,17 @@ let source_stem_of_filename (name : string) : string option =
     | Some i when i <= 0 -> None
     | Some i -> Some (String.sub name 0 i)
 
-let is_ignored_lookup_dir (name : string) : bool =
-  name = ".git" || name = "_build" || name = "node_modules" || name = ".vscode"
-
-let find_compool_in_dir_tree ~(key : string) ~(root : string) : string option =
-  let rec walk (dir : string) : string option =
-    let entries = try Sys.readdir dir |> Array.to_list with _ -> [] in
-    let rec loop = function
-      | [] -> None
-      | name :: tl -> (
-          let full = Filename.concat dir name in
-          try
-            if Sys.is_directory full then
-              if is_ignored_lookup_dir name then loop tl
-              else match walk full with Some _ as hit -> hit | None -> loop tl
-            else
-              match source_stem_of_filename name with
-              | Some stem when normalize_name stem = key -> Some full
-              | _ -> loop tl
-          with _ -> loop tl)
-    in
-    loop entries
-  in
-  walk root
-
 let find_compool_path_fallback (ws : t) ~(key : string) : string option =
   if key = "" then None
   else
-    let dirs = Hashtbl.create 16 in
-    let add_dir (d : string) =
-      let k = normalize_path_key d in
-      if k <> "" then Hashtbl.replace dirs k d
-    in
-    (match ws.root_path with None -> () | Some root -> add_dir root);
-    Hashtbl.iter
-      (fun _ doc ->
-        match doc.Document.file with
-        | None -> ()
-        | Some p -> add_dir (Filename.dirname p))
-      ws.docs;
-    let roots = Hashtbl.fold (fun _ d acc -> d :: acc) dirs [] in
-    let rec loop = function
-      | [] -> None
-      | root :: tl -> (
-          match find_compool_in_dir_tree ~key ~root with
-          | Some _ as hit -> hit
-          | None -> loop tl)
-    in
-    loop roots
+    ws.source_file_paths
+    |> List.find_opt (fun path ->
+           match
+             source_stem_of_filename ~source_extensions:ws.source_extensions
+               (Filename.basename path)
+           with
+           | Some stem -> normalize_name stem = key
+           | None -> false)
 
 let find_open_compool_doc_by_key (ws : t) (key : string) : Document.t option =
   let found = ref None in
@@ -148,14 +108,6 @@ type compool_import_dir = {
   selected : (string * Ast.Loc.t) list; (* imported element name + location *)
 }
 
-let diag_missing_imported_type ~(loc : Ast.Loc.t) ~(item : string)
-    ~(typ : string) : T.Diagnostic.t =
-  Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"import"
-    ~message:
-      (Printf.sprintf "Imported item %S requires explicit import of type %S."
-         item typ)
-    loc
-
 let diag_missing_import_hint ~(loc : Ast.Loc.t) ~(kind : string)
     ~(symbol : string) ~(compools : string list) : T.Diagnostic.t =
   let targets =
@@ -173,10 +125,7 @@ let diag_missing_import_hint ~(loc : Ast.Loc.t) ~(kind : string)
   Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Warning ~source:"import"
     ~message:msg loc
 
-let is_builtin_type (k : string) : bool =
-  match k with
-  | "A" | "B" | "U" | "S" | "F" | "C" | "P" | "W" | "V" | "STATUS" -> true
-  | _ -> false
+let is_builtin_type (k : string) : bool = Keyword.is_builtin_type_name k
 
 let is_builtin_function_name (name : string) : bool =
   match normalize_name name with
@@ -204,14 +153,12 @@ let is_reserved_keyword (name : string) : bool =
   | "RENT" | "LISTEXP" | "LISTINV" | "LISTBOTH" | "INLINE" | "INSTANCE"
   | "LABEL" | "LIKE" | "OVERLAY" | "PARALLEL" | "POS" | "NULL" ->
       true
-  | x when is_builtin_function_name x -> true
   | _ -> false
 
 let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
   let doc = Document.ensure_parsed doc in
-  match doc.Document.ast with
-  | None -> []
-  | Some prog ->
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } ->
       let from_decl (d : Ast.decl Ast.node) : compool_import_dir option =
         match d.v with
         | Ast.DDirective { name; args = first :: rest } ->
@@ -234,85 +181,17 @@ let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
       |> List.filter_map (function
         | Ast.TopDecl d -> from_decl d
         | Ast.TopStmt _ -> None)
-
-type dep_info = {
-  types : (string, bool) Hashtbl.t; (* explicit type declarations *)
-  item_deps : (string, string list) Hashtbl.t;
-      (* item/table name -> required type keys *)
-}
-
-let dep_info_create () : dep_info =
-  { types = Hashtbl.create 64; item_deps = Hashtbl.create 128 }
-
-let rec type_keys_of_type_expr (t : Ast.type_expr Ast.node)
-    (acc : (string, bool) Hashtbl.t) : unit =
-  match t.v with
-  | Ast.TName id ->
-      let k = normalize_name id.v in
-      if k <> "" && not (is_builtin_type k) then Hashtbl.replace acc k true
-  | Ast.TPointer inner -> type_keys_of_type_expr inner acc
-  | Ast.TArray { elem; _ } -> type_keys_of_type_expr elem acc
-  | Ast.TRecord fields ->
-      List.iter (fun f -> type_keys_of_type_expr f.v.ftype acc) fields
-  | Ast.TFunc { params; returns } -> (
-      List.iter (fun p -> type_keys_of_type_expr p.v.Ast.ptype acc) params;
-      match returns with None -> () | Some r -> type_keys_of_type_expr r acc)
-
-let keys_of_type_expr (t : Ast.type_expr Ast.node) : string list =
-  let h = Hashtbl.create 8 in
-  type_keys_of_type_expr t h;
-  Hashtbl.fold (fun k _ xs -> k :: xs) h []
-
-let rec dep_info_add_stmt (info : dep_info) (s : Ast.stmt Ast.node) : unit =
-  match s.v with
-  | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _
-    ->
-      ()
-  | Ast.SDecl d -> dep_info_add_decl info d
-  | Ast.SBlock xs -> List.iter (dep_info_add_stmt info) xs
-  | Ast.SIf { then_; else_; _ } -> (
-      dep_info_add_stmt info then_;
-      match else_ with None -> () | Some e -> dep_info_add_stmt info e)
-  | Ast.SWhile { body; _ } -> dep_info_add_stmt info body
-  | Ast.SFor { init; step; body; _ } ->
-      (match init with None -> () | Some i -> dep_info_add_stmt info i);
-      (match step with None -> () | Some st -> dep_info_add_stmt info st);
-      dep_info_add_stmt info body
-  | Ast.SLabel { body; _ } -> dep_info_add_stmt info body
-
-and dep_info_add_decl (info : dep_info) (d : Ast.decl Ast.node) : unit =
-  match d.v with
-  | Ast.DType { name; defn = _ } ->
-      let k = normalize_name name.v in
-      if k <> "" then Hashtbl.replace info.types k true
-  | Ast.DVar { name; dtype; _ } ->
-      let n = normalize_name name.v in
-      if n <> "" then Hashtbl.replace info.item_deps n (keys_of_type_expr dtype)
-  | Ast.DConst _ -> ()
-  | Ast.DDirective _ -> ()
-  | Ast.DProc p ->
-      List.iter (dep_info_add_decl info) p.v.locals;
-      dep_info_add_stmt info p.v.body
-
-let dep_info_of_doc (doc : Document.t) : dep_info =
-  let doc = Document.ensure_parsed doc in
-  let info = dep_info_create () in
-  (match doc.Document.ast with
-  | None -> ()
-  | Some prog ->
-      List.iter
-        (function
-          | Ast.TopDecl d -> dep_info_add_decl info d
-          | Ast.TopStmt s -> dep_info_add_stmt info s)
-        prog);
-  info
+  | _ -> []
 
 let read_file_text (path : string) : string option =
   try
+    let t0 = Perf_log.now_ms () in
     let ic = open_in_bin path in
     let len = in_channel_length ic in
     let txt = really_input_string ic len in
     close_in_noerr ic;
+    Perf_log.log_event "file_text_load" ~uri:path ~bytes:len
+      ~ms:(max 0.0 (Perf_log.now_ms () -. t0));
     Some txt
   with _ -> None
 
@@ -320,11 +199,14 @@ let read_file_prefix_text (path : string) ~(max_bytes : int) : string option =
   if max_bytes <= 0 then None
   else
     try
+      let t0 = Perf_log.now_ms () in
       let ic = open_in_bin path in
       let len = in_channel_length ic in
       let take = min len max_bytes in
       let txt = really_input_string ic take in
       close_in_noerr ic;
+      Perf_log.log_event "file_text_load" ~uri:path ~bytes:take
+        ~ms:(max 0.0 (Perf_log.now_ms () -. t0));
       Some txt
     with _ -> None
 
@@ -393,11 +275,13 @@ let doc_from_path_cached (ws : t) (path : string) : Document.t option =
             | Some txt ->
                 let d =
                   try
-                    parse_guarded_document_make ws ~uri ~file:(Some path)
+                    parse_guarded_document_make ~profile:Parser.Background ws
+                      ~uri ~file:(Some path)
                       ~text:txt
                   with exn ->
                     ignore exn;
-                    Document.make ~uri ~file:(Some path) ~text:""
+                    Document.make_with_profile ~profile:Parser.Background ~uri
+                      ~file:(Some path) ~text:""
                 in
                 Some d)
       in
@@ -444,112 +328,4 @@ let validate_imports ?(pump_lookup : bool = true) (ws : t) (doc : Document.t) :
             if has_compool_target ws imp.name then None
             else Some (diag_missing_compool imp.loc imp.name))
   in
-  let imports = extract_compool_import_dirs doc in
-  let missing_type_imports =
-    if imports = [] then []
-    else
-      let doc_cache : (string, Document.t option) Hashtbl.t =
-        Hashtbl.create 16
-      in
-      let info_cache : (string, dep_info option) Hashtbl.t =
-        Hashtbl.create 16
-      in
-
-      let get_doc_for_compool (name : string) : Document.t option =
-        let key = normalize_name name in
-        match Hashtbl.find_opt doc_cache key with
-        | Some x -> x
-        | None ->
-            let x = resolve_compool_doc_uncached ws ~name:key in
-            Hashtbl.replace doc_cache key x;
-            x
-      in
-
-      let get_info_for_compool (name : string) : dep_info option =
-        let key = normalize_name name in
-        match Hashtbl.find_opt info_cache key with
-        | Some x -> x
-        | None ->
-            let x =
-              match get_doc_for_compool key with
-              | None -> None
-              | Some d -> Some (dep_info_of_doc d)
-            in
-            Hashtbl.replace info_cache key x;
-            x
-      in
-
-      let available_types : (string, bool) Hashtbl.t = Hashtbl.create 64 in
-      let add_available_type k =
-        if k <> "" then Hashtbl.replace available_types (normalize_name k) true
-      in
-
-      let self_info = dep_info_of_doc doc in
-      Hashtbl.iter (fun tk _ -> add_available_type tk) self_info.types;
-
-      (* Pass 1: collect explicitly imported type names. *)
-      List.iter
-        (fun imp ->
-          match get_info_for_compool imp.compool with
-          | None -> ()
-          | Some info ->
-              if imp.selected = [] then
-                Hashtbl.iter (fun tk _ -> add_available_type tk) info.types
-              else
-                List.iter
-                  (fun (nm, _loc) ->
-                    if Hashtbl.mem info.types nm then add_available_type nm)
-                  imp.selected)
-        imports;
-
-      (* Pass 2: for selectively imported items, require explicit import of their types. *)
-      let seen : (string, bool) Hashtbl.t = Hashtbl.create 64 in
-      let hint_seen : (string, bool) Hashtbl.t = Hashtbl.create 64 in
-      let out = ref [] in
-      let add_diag_once (loc : Ast.Loc.t) ~(item : string) ~(typ : string) =
-        let k =
-          Printf.sprintf "%s|%d|%d|%s|%s"
-            (match loc.file with Some f -> f | None -> "")
-            loc.start_pos.line loc.start_pos.col item typ
-        in
-        if not (Hashtbl.mem seen k) then (
-          Hashtbl.replace seen k true;
-          out := diag_missing_imported_type ~loc ~item ~typ :: !out)
-      in
-      let add_type_hint_once (loc : Ast.Loc.t) ~(typ : string) =
-        let k =
-          Printf.sprintf "%s|%d|%d|type-hint|%s"
-            (match loc.file with Some f -> f | None -> "")
-            loc.start_pos.line loc.start_pos.col typ
-        in
-        if not (Hashtbl.mem hint_seen k) then (
-          Hashtbl.replace hint_seen k true;
-          out :=
-            diag_missing_import_hint ~loc ~kind:"Type" ~symbol:typ ~compools:[]
-            :: !out)
-      in
-      List.iter
-        (fun imp ->
-          if imp.selected <> [] then
-            match get_info_for_compool imp.compool with
-            | None -> ()
-            | Some info ->
-                List.iter
-                  (fun (sel_name, sel_loc) ->
-                    match Hashtbl.find_opt info.item_deps sel_name with
-                    | None -> ()
-                    | Some deps ->
-                        List.iter
-                          (fun dep ->
-                            let dep = normalize_name dep in
-                            if
-                              dep <> "" && not (Hashtbl.mem available_types dep)
-                            then (
-                              add_diag_once sel_loc ~item:sel_name ~typ:dep;
-                              add_type_hint_once sel_loc ~typ:dep))
-                          deps)
-                  imp.selected)
-        imports;
-      List.rev !out
-  in
-  missing_compools @ missing_type_imports
+  missing_compools

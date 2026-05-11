@@ -7,7 +7,11 @@ open Workspace_imports
 open Workspace_background
 open Workspace_nav_model
 open Workspace_nav_lookup
+open Workspace_symbol_kinds
 open Workspace_tuning
+
+module Lsif_delta = Workspace_foundation.Lsif_delta
+module Perf_stats = Workspace_foundation.Perf_stats
 
 type semantic_token = {
   st_line : int;
@@ -41,7 +45,7 @@ let semantic_token_compare (a : semantic_token) (b : semantic_token) : int =
 let semantic_token_key (t : semantic_token) : string =
   Printf.sprintf "%d|%d|%d" t.st_line t.st_start t.st_len
 
-let snapshot_token_of_semantic (t : semantic_token) : Doc_snapshot.token =
+let snapshot_token_of_semantic (t : semantic_token) : Semantic_store.Snapshot.token =
   {
     line = t.st_line;
     start = t.st_start;
@@ -50,7 +54,7 @@ let snapshot_token_of_semantic (t : semantic_token) : Doc_snapshot.token =
     mods = t.st_mods;
   }
 
-let semantic_token_of_snapshot (t : Doc_snapshot.token) : semantic_token =
+let semantic_token_of_snapshot (t : Semantic_store.Snapshot.token) : semantic_token =
   {
     st_line = t.line;
     st_start = t.start;
@@ -108,24 +112,60 @@ let loc_same_span (a : Ast.Loc.t) (b : Ast.Loc.t) : bool =
   && a.end_pos.line = b.end_pos.line
   && a.end_pos.col = b.end_pos.col
 
-let semantic_type_of_def_kind (k : int) : int option =
-  if k = sym_kind_module then Some sem_tt_namespace
-  else if k = sym_kind_type then Some sem_tt_type
-  else if k = sym_kind_func then Some sem_tt_function
-  else if k = sym_kind_field then Some sem_tt_property
-  else if k = sym_kind_var || k = sym_kind_const then Some sem_tt_variable
-  else None
+let semantic_type_of_metadata (m : Workspace_symbol_metadata.jovial_symbol_metadata)
+    (k : int) : int option =
+  match m.jovial_kind with
+  | Workspace_symbol_metadata.JovialCompool
+  | Workspace_symbol_metadata.JovialCompoolImport
+  | Workspace_symbol_metadata.JovialModule
+  | Workspace_symbol_metadata.JovialProgram ->
+      Some sem_tt_namespace
+  | Workspace_symbol_metadata.JovialBlock -> Some sem_tt_variable
+  | Workspace_symbol_metadata.JovialType
+  | Workspace_symbol_metadata.JovialBuiltinType ->
+      Some sem_tt_type
+  | Workspace_symbol_metadata.JovialProcedure
+  | Workspace_symbol_metadata.JovialFunction ->
+      Some sem_tt_function
+  | Workspace_symbol_metadata.JovialField -> Some sem_tt_property
+  | Workspace_symbol_metadata.JovialDefine -> Some sem_tt_macro
+  | Workspace_symbol_metadata.JovialItem
+  | Workspace_symbol_metadata.JovialTable
+  | Workspace_symbol_metadata.JovialConstantItem
+  | Workspace_symbol_metadata.JovialConstantTable
+  | Workspace_symbol_metadata.JovialStatusConstant
+  | Workspace_symbol_metadata.JovialParameter
+  | Workspace_symbol_metadata.JovialLabel ->
+      Some sem_tt_variable
+  | Workspace_symbol_metadata.JovialUnknownSymbol ->
+      if k = sym_kind_module then Some sem_tt_namespace
+      else if k = sym_kind_type then Some sem_tt_type
+      else if k = sym_kind_func then Some sem_tt_function
+      else if k = sym_kind_field then Some sem_tt_property
+      else if k = sym_kind_var || k = sym_kind_const then Some sem_tt_variable
+      else None
 
 let semantic_mods_for_occurrence ~(decl : def) ~(occ_uri : T.DocumentUri.t)
     ~(occ_loc : Ast.Loc.t) : int =
-  let mods = if decl.kind = sym_kind_const then sem_mod_readonly else 0 in
-  if same_uri occ_uri decl.uri && loc_same_span occ_loc decl.loc then
+  let mods =
+    if decl.kind = sym_kind_const || decl.metadata.is_constant then
+      sem_mod_readonly
+    else 0
+  in
+  if
+    same_uri occ_uri decl.uri && loc_same_span occ_loc decl.loc
+    && not (Workspace_symbol_metadata.is_external_ref decl.metadata)
+  then
     mods lor sem_mod_declaration
   else mods
 
 let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
-  let doc = Document.ensure_parsed doc in
   let out = Hashtbl.create 32 in
+  List.iter
+    (fun (d : Preprocess.define) ->
+      let k = normalize_name d.key in
+      if k <> "" then Hashtbl.replace out k true)
+    doc.Document.defines;
   let add_define_args (args : Ast.ident list) : unit =
     match args with
     | [] -> ()
@@ -158,12 +198,12 @@ let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
         walk_stmt body
     | Ast.SLabel { body; _ } -> walk_stmt body
   in
-  (match doc.Document.ast with
-  | None -> ()
-  | Some prog ->
+  (match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } ->
       List.iter
         (function Ast.TopDecl d -> walk_decl d | Ast.TopStmt s -> walk_stmt s)
-        prog);
+        prog
+  | _ -> ());
   out
 
 let semantic_symbol_tokens_for_doc (ws : t) (doc : Document.t) :
@@ -176,7 +216,7 @@ let semantic_symbol_tokens_for_doc (ws : t) (doc : Document.t) :
       match Hashtbl.find_opt nav.defs_by_id sym_id with
       | None -> ()
       | Some decl -> (
-          match semantic_type_of_def_kind decl.kind with
+          match semantic_type_of_metadata decl.metadata decl.kind with
           | None -> ()
           | Some typ ->
               List.iter
@@ -193,14 +233,16 @@ let semantic_symbol_tokens_for_doc (ws : t) (doc : Document.t) :
   List.rev !out
 
 let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
+    ~(builtin_type_context : string -> bool)
     (tok : Parser.token) : (int * int) option =
   match tok with
   | Parser.ID s ->
       let k = normalize_name s in
       if k = "" then None
       else if Hashtbl.mem macro_keys k then Some (sem_tt_macro, 0)
+      else if is_builtin_type k && builtin_type_context k then
+        Some (sem_tt_keyword, 0)
       else if is_builtin_function_name k then Some (sem_tt_function, 0)
-      else if is_builtin_type k then Some (sem_tt_type, 0)
       else if is_reserved_keyword k then Some (sem_tt_keyword, 0)
       else Some (sem_tt_variable, 0)
   | Parser.INTLIT _ | Parser.FLOATLIT _ -> Some (sem_tt_number, 0)
@@ -224,59 +266,112 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
 
 let semantic_lex_tokens_for_doc (doc : Document.t)
     ~(macro_keys : (string, bool) Hashtbl.t) : semantic_token list =
-  Lexer.with_session_state (fun () ->
-      let lexbuf = Lexing.from_string doc.Document.text in
-      (match doc.Document.file with
+  let tokens =
+    match Document.current_parse doc with
+    | Some { Document.parsed_syntax = Some syntax; _ }
+      when syntax.Syntax_cache.raw_hash = Digest.to_hex (Digest.string doc.Document.text) -> (
+        match syntax.Syntax_cache.raw_tokens with
+        | Some toks -> toks
+        | None ->
+            Preprocess.lex_all_tokens ~file:doc.Document.file
+              ~text:doc.Document.text)
+    | _ ->
+        Preprocess.lex_all_tokens ~file:doc.Document.file ~text:doc.Document.text
+  in
+  let out = ref [] in
+  Array.iter
+    (fun (span : Preprocess.lex_tok) ->
+      let tok = span.Parser.tok in
+      let line0 = max 0 (span.start_line - 1) in
+      let col0 = max 0 span.start_col in
+      let col1 = max 0 span.end_col in
+      let builtin_type_context name =
+        is_builtin_type_context_at_offsets doc name ~start_off:span.start_off
+          ~end_off:span.end_off
+      in
+      match semantic_class_of_lex_token ~macro_keys ~builtin_type_context tok with
       | None -> ()
-      | Some f ->
-          lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-      let out = ref [] in
-      let rec loop () =
-        let tok = Lexer.token lexbuf in
-        let sp = Lexing.lexeme_start_p lexbuf in
-        let ep = Lexing.lexeme_end_p lexbuf in
-        let line0 = max 0 (sp.Lexing.pos_lnum - 1) in
-        let col0 = max 0 (sp.Lexing.pos_cnum - sp.Lexing.pos_bol) in
-        let col1 = max 0 (ep.Lexing.pos_cnum - ep.Lexing.pos_bol) in
-        (match semantic_class_of_lex_token ~macro_keys tok with
-        | None -> ()
-        | Some (typ, mods) -> (
-            match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
-            | None -> ()
-            | Some st -> out := st :: !out));
-        match tok with Parser.EOF -> () | _ -> loop ()
-      in
-      (try loop () with _ -> ());
-      List.rev !out)
-
-let semantic_tokens_json_of_tokens (tokens : semantic_token list) :
-    Yojson.Safe.t =
-  let data_rev = ref [] in
-  let prev_line = ref 0 in
-  let prev_start = ref 0 in
-  let first = ref true in
-  List.iter
-    (fun t ->
-      let delta_line, delta_start =
-        if !first then (t.st_line, t.st_start)
-        else if t.st_line = !prev_line then (0, t.st_start - !prev_start)
-        else (t.st_line - !prev_line, t.st_start)
-      in
-      data_rev :=
-        t.st_mods :: t.st_typ :: t.st_len :: delta_start :: delta_line
-        :: !data_rev;
-      first := false;
-      prev_line := t.st_line;
-      prev_start := t.st_start)
+      | Some (typ, mods) -> (
+          match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
+          | None -> ()
+          | Some st -> out := st :: !out))
     tokens;
-  `Assoc [ ("data", `List (List.rev_map (fun i -> `Int i) !data_rev)) ]
+  List.rev !out
 
-let semantic_tokens_with_result_id (doc : Document.t) (base : Yojson.Safe.t) :
-    Yojson.Safe.t =
-  let result_id = Digest.(to_hex (string doc.Document.text)) in
-  match base with
-  | `Assoc xs -> `Assoc (("resultId", `String result_id) :: xs)
-  | _ -> base
+let background_queue_length (ws : t) : int =
+  Queue.length ws.bg_high_small_queue
+  + Queue.length ws.bg_norm_small_queue
+  + Queue.length ws.bg_root_small_queue
+  + Queue.length ws.bg_high_large_queue
+  + Queue.length ws.bg_root_large_queue
+  + Queue.length ws.bg_norm_large_queue
+  + Queue.length ws.parse_worker_jobs
+
+let schedule_open_doc_parse_fallback (ws : t) (doc : Document.t)
+    ~(reason_group : string) : unit =
+  if enqueue_open_doc_parse_if_pending ~reason_group ws doc then (
+    Perf_stats.tick ("sched." ^ reason_group);
+    Perf_log.log_event ("background_scheduled_" ^ reason_group)
+      ~uri:(Uri_path.docuri_to_string doc.Document.uri)
+      ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev
+      ~queue:(background_queue_length ws))
+
+let line_window_for_range (doc : Document.t) (range : T.Range.t) :
+    (string * int * int) option =
+  let range = normalize_range_order range in
+  let start_line = max 0 range.start.line in
+  let end_line = max start_line range.end_.line in
+  match Text_index.line_start_offset doc.Document.index ~line:start_line with
+  | None -> None
+  | Some start_off ->
+      let end_off =
+        match
+          Text_index.line_start_offset doc.Document.index ~line:(end_line + 1)
+        with
+        | Some off -> off
+        | None -> String.length doc.Document.text
+      in
+      if
+        start_off < 0 || end_off < start_off
+        || start_off > String.length doc.Document.text
+      then None
+      else
+        let end_off = min end_off (String.length doc.Document.text) in
+        Some
+          ( String.sub doc.Document.text start_off (end_off - start_off),
+            start_off,
+            start_line )
+
+let semantic_lex_tokens_for_doc_range (doc : Document.t)
+    ~(macro_keys : (string, bool) Hashtbl.t) ~(range : T.Range.t) :
+    semantic_token list =
+  match line_window_for_range doc range with
+  | None -> []
+  | Some (text, base_off, base_line0) ->
+      let tokens = Preprocess.lex_all_tokens ~file:doc.Document.file ~text in
+      let out = ref [] in
+      Array.iter
+        (fun (span : Preprocess.lex_tok) ->
+          let tok = span.Parser.tok in
+          let line0 = base_line0 + max 0 (span.start_line - 1) in
+          let col0 = max 0 span.start_col in
+          let col1 = max 0 span.end_col in
+          let start_off = base_off + span.start_off in
+          let end_off = base_off + span.end_off in
+          let builtin_type_context name =
+            is_builtin_type_context_at_offsets doc name ~start_off ~end_off
+          in
+          match
+            semantic_class_of_lex_token ~macro_keys ~builtin_type_context tok
+          with
+          | None -> ()
+          | Some (typ, mods) -> (
+              match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
+              | None -> ()
+              | Some st ->
+                  if semantic_token_intersects_range st range then out := st :: !out))
+        tokens;
+      List.rev !out
 
 let semantic_tokens_for_doc (ws : t) (doc : Document.t)
     ~(range : T.Range.t option) : semantic_token list =
@@ -286,13 +381,31 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
     | None -> true
     | Some r -> semantic_token_intersects_range tok r
   in
+  let doc_current = doc.Document.parse_rev = doc.Document.rev in
+  let doc_large =
+    String.length doc.Document.text >= ws.full_semantic_tokens_max_bytes
+  in
+  let range_fallback =
+    match norm_range with
+    | Some r when (not doc_current) || doc_large -> Some r
+    | _ -> None
+  in
+  if not doc_current then
+    schedule_open_doc_parse_fallback ws doc
+      ~reason_group:"semantic_range_fallback";
+  if range = None && doc_large then (
+    Perf_stats.tick "semantic_tokens.full_skipped_large";
+    schedule_open_doc_parse_fallback ws doc
+      ~reason_group:"semantic_full_large";
+    [])
+  else
   let cached =
     if ws.sem_store_enabled then
       match
         Semantic_store.snapshot_for_uri ws.semantic_store ~uri:doc.Document.uri
       with
-      | Some snap when snap.Doc_snapshot.doc_rev = doc.Document.rev -> (
-          match snap.Doc_snapshot.semantic_tokens_full with
+      | Some snap when snap.Semantic_store.Snapshot.doc_rev = doc.Document.rev -> (
+          match snap.Semantic_store.Snapshot.semantic_tokens_full with
           | None -> None
           | Some toks ->
               Perf_stats.tick "semantic_tokens.cache_hit";
@@ -306,6 +419,13 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
   | Some toks -> toks
   | None ->
       Perf_stats.tick "semantic_tokens.cache_miss";
+      (match range_fallback with
+      | Some r ->
+          Perf_stats.tick "semantic_tokens.range_lex_fallback";
+          let macro_keys = collect_define_macro_keys doc in
+          semantic_lex_tokens_for_doc_range doc ~macro_keys ~range:r
+          |> List.sort semantic_token_compare
+      | None ->
       let seen = Hashtbl.create 2048 in
       let out = ref [] in
       let add tok =
@@ -315,38 +435,38 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
             Hashtbl.add seen k true;
             out := tok :: !out)
       in
-      semantic_symbol_tokens_for_doc ws doc |> List.iter add;
+      if doc_current then semantic_symbol_tokens_for_doc ws doc |> List.iter add
+      else Perf_stats.tick "semantic_tokens.symbol_skip_stale";
       let macro_keys = collect_define_macro_keys doc in
-      semantic_lex_tokens_for_doc doc ~macro_keys |> List.iter add;
+      let lex_tokens =
+        if ws.sem_store_enabled then
+          match
+            Semantic_store.snapshot_for_uri ws.semantic_store
+              ~uri:doc.Document.uri
+          with
+          | Some snap when snap.Semantic_store.Snapshot.doc_rev = doc.Document.rev -> (
+              match snap.Semantic_store.Snapshot.semantic_lex_tokens with
+              | Some toks -> List.map semantic_token_of_snapshot toks
+              | None ->
+                  let toks = semantic_lex_tokens_for_doc doc ~macro_keys in
+                  Semantic_store.Snapshot.set_semantic_lex_tokens snap
+                    (List.map snapshot_token_of_semantic toks);
+                  toks)
+          | _ -> semantic_lex_tokens_for_doc doc ~macro_keys
+        else semantic_lex_tokens_for_doc doc ~macro_keys
+      in
+      lex_tokens |> List.iter add;
       let toks = List.sort semantic_token_compare (List.rev !out) in
       (if ws.sem_store_enabled && range = None then
          match
            Semantic_store.snapshot_for_uri ws.semantic_store
              ~uri:doc.Document.uri
          with
-         | Some snap when snap.Doc_snapshot.doc_rev = doc.Document.rev ->
-             Doc_snapshot.set_semantic_tokens_full snap
+         | Some snap when snap.Semantic_store.Snapshot.doc_rev = doc.Document.rev ->
+             Semantic_store.Snapshot.set_semantic_tokens_full snap
                (List.map snapshot_token_of_semantic toks)
          | _ -> ());
-      toks
-
-let semantic_tokens_full_json_for (ws : t) ~(uri : T.DocumentUri.t) :
-    Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Assoc [ ("data", `List []) ]
-  | Some doc ->
-      semantic_tokens_for_doc ws doc ~range:None
-      |> semantic_tokens_json_of_tokens
-      |> semantic_tokens_with_result_id doc
-
-let semantic_tokens_range_json_for (ws : t) ~(uri : T.DocumentUri.t)
-    ~(range : T.Range.t) : Yojson.Safe.t =
-  match doc_of_uri ws uri with
-  | None -> `Assoc [ ("data", `List []) ]
-  | Some doc ->
-      semantic_tokens_for_doc ws doc ~range:(Some range)
-      |> semantic_tokens_json_of_tokens
-      |> semantic_tokens_with_result_id doc
+      toks)
 
 type doc_symbol = {
   ds_name : string;
@@ -357,25 +477,7 @@ type doc_symbol = {
   ds_children : doc_symbol list;
 }
 
-let rec doc_symbol_json (s : doc_symbol) : Yojson.Safe.t =
-  let fields =
-    [
-      ("name", `String s.ds_name);
-      ("kind", `Int s.ds_kind);
-      ("range", range_json_of_loc s.ds_range);
-      ("selectionRange", range_json_of_loc s.ds_selection);
-      ("children", `List (List.map doc_symbol_json s.ds_children));
-    ]
-  in
-  let fields =
-    match s.ds_detail with
-    | Some d when String.trim d <> "" -> ("detail", `String d) :: fields
-    | _ -> fields
-  in
-  `Assoc fields
-
 let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
-  let doc = Document.ensure_parsed doc in
   let current_compool_key =
     match doc.Document.compool_def with
     | None -> None
@@ -432,12 +534,17 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
   in
   let rec of_decl (d : Ast.decl Ast.node) : doc_symbol list =
     match d.v with
-    | Ast.DVar { name; dtype; _ } ->
+    | Ast.DVar { name; dtype; data_decl_kind; _ } ->
+        let kind =
+          match data_decl_kind with
+          | Ast.DataBlock -> sym_kind_module
+          | _ -> sym_kind_var
+        in
         [
-          mk_symbol ~name:name.v ~kind:sym_kind_var ~range:d.loc
+          mk_symbol ~name:name.v ~kind ~range:d.loc
             ~selection:name.loc
             ~detail:(Some (type_expr_to_compact_string dtype))
-            ~children:[];
+            ~children:(of_type_fields dtype);
         ]
     | Ast.DConst { name; dtype; _ } ->
         let detail =
@@ -449,7 +556,7 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
           mk_symbol ~name:name.v ~kind:sym_kind_const ~range:d.loc
             ~selection:name.loc ~detail ~children:[];
         ]
-    | Ast.DType { name; defn } ->
+    | Ast.DType { name; defn; _ } ->
         [
           mk_symbol ~name:name.v ~kind:sym_kind_type ~range:d.loc
             ~selection:name.loc
@@ -502,54 +609,37 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
         | "BLOCK", _ -> []
         | _ -> [])
   in
-  match doc.Document.ast with
-  | None -> []
-  | Some prog ->
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } ->
       prog
       |> List.concat_map (function
         | Ast.TopDecl d -> of_decl d
         | Ast.TopStmt _ -> [])
+  | _ -> []
 
-let document_symbols_json_for (ws : t) ~(uri : T.DocumentUri.t) : Yojson.Safe.t
-    =
-  match doc_of_uri ws uri with
-  | None -> `List []
-  | Some doc -> (
-      if ws.sem_store_enabled then
-        ignore (nav_for_doc_cached ws (Hashtbl.create 1) doc);
-      let from_cache =
-        if ws.sem_store_enabled then
-          match
-            Semantic_store.snapshot_for_uri ws.semantic_store
-              ~uri:doc.Document.uri
-          with
-          | Some snap when snap.Doc_snapshot.doc_rev = doc.Document.rev -> (
-              match snap.Doc_snapshot.doc_symbols with
-              | Some xs ->
-                  Perf_stats.tick "document_symbols.cache_hit";
-                  Some (`List xs)
-              | None -> None)
-          | _ -> None
-        else None
-      in
-      match from_cache with
-      | Some x -> x
-      | None ->
-          Perf_stats.tick "document_symbols.cache_miss";
-          let payload =
-            match document_symbols_from_ast doc with
-            | [] -> collect_doc_defs doc |> uniq_defs |> List.map symbol_json
-            | xs -> List.map doc_symbol_json xs
-          in
-          (if ws.sem_store_enabled then
-             match
-               Semantic_store.snapshot_for_uri ws.semantic_store
-                 ~uri:doc.Document.uri
-             with
-             | Some snap when snap.Doc_snapshot.doc_rev = doc.Document.rev ->
-                 Doc_snapshot.set_doc_symbols snap payload
-             | _ -> ());
-          `List payload)
+let startup_priority_mode_to_string = function
+  | Workspace_settings.StartupPriorityBalanced -> "balanced"
+  | Workspace_settings.StartupPriorityInfoFirst -> "infoFirst"
+
+let feature_flags_json_for_report (ws : t) : Yojson.Safe.t =
+  let flags = ws.feature_flags in
+  `Assoc
+    [
+      ("diagnostics", `Bool flags.diagnostics);
+      ("definition", `Bool flags.definition);
+      ("declaration", `Bool flags.declaration);
+      ("typeDefinition", `Bool flags.type_definition);
+      ("implementation", `Bool flags.implementation);
+      ("references", `Bool flags.references);
+      ("documentSymbols", `Bool flags.document_symbols);
+      ("workspaceSymbols", `Bool flags.workspace_symbols);
+      ("hover", `Bool flags.hover);
+      ("signatureHelp", `Bool flags.signature_help);
+      ("rename", `Bool flags.rename);
+      ("completion", `Bool flags.completion);
+      ("codeActions", `Bool flags.code_actions);
+      ("semanticTokens", `Bool flags.semantic_tokens);
+    ]
 
 let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
     Yojson.Safe.t =
@@ -627,19 +717,19 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
 
       let tokens =
         let text = Document.text doc in
-        Lexer.with_session_state (fun () ->
+        Lexer.with_session_state (fun lexer ->
             let lexbuf = Lexing.from_string text in
             let rec loop i acc =
               if i >= max_tokens then List.rev acc
               else
-                let t = Lexer.token lexbuf in
+                let t = Lexer.token lexer lexbuf in
                 let sp = Lexing.lexeme_start_p lexbuf in
                 let ep = Lexing.lexeme_end_p lexbuf in
                 let lex = Lexing.lexeme lexbuf in
                 let item =
                   `Assoc
                     [
-                      ("token", `String (Parse.Debug.string_of_token t));
+                      ("token", `String (Parser.Debug.string_of_token t));
                       ("lexeme", `String lex);
                       ("range", lsp_range_of_lex sp ep);
                     ]
@@ -720,6 +810,7 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
             ("enqueuedSet", `Int (Hashtbl.length ws.bg_enqueued));
             ( "parseWorkerInFlight",
               `Int (Hashtbl.length ws.parse_worker_inflight) );
+            ("parseWorkerCount", `Int ws.parse_worker_count);
             ("parseWorkerJobs", `Int (Queue.length ws.parse_worker_jobs));
             ("parseWorkerResults", `Int (Queue.length ws.parse_worker_results));
             ("parsedDocs", `Int (Hashtbl.length ws.bg_parsed));
@@ -762,6 +853,14 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
         [
           ("uri", `String (Uri_path.docuri_to_string uri));
           ("root", root);
+          ( "settings",
+            `Assoc
+              [
+                ( "startupPriorityMode",
+                  `String
+                    (startup_priority_mode_to_string ws.startup_priority_mode) );
+                ("features", feature_flags_json_for_report ws);
+              ] );
           ("startup", startup_readiness_json_for_report ws);
           ("compools", compools);
           ("imports", `List imports);
@@ -779,31 +878,40 @@ type lsif_symbol_bucket = {
   sb_id : string;
   mutable sb_key : string;
   mutable sb_kind : int;
+  mutable sb_metadata : Workspace_symbol_metadata.jovial_symbol_metadata;
   sb_defs : (string, T.DocumentUri.t * Ast.Loc.t) Hashtbl.t;
   sb_impls : (string, T.DocumentUri.t * Ast.Loc.t) Hashtbl.t;
   sb_refs : (string, lsif_ref) Hashtbl.t;
 }
 
-let lsif_symbol_bucket_create ~(id : string) ~(key : string) (kind : int) :
+let lsif_symbol_bucket_create ~(id : string) ~(key : string) ~(kind : int)
+    ~(metadata : Workspace_symbol_metadata.jovial_symbol_metadata) :
     lsif_symbol_bucket =
   {
     sb_id = id;
     sb_key = key;
     sb_kind = kind;
+    sb_metadata = metadata;
     sb_defs = Hashtbl.create 8;
     sb_impls = Hashtbl.create 8;
     sb_refs = Hashtbl.create 16;
   }
 
 let lsif_bucket_for (tbl : (string, lsif_symbol_bucket) Hashtbl.t)
-    ~(sym_id : string) ~(key : string) ~(kind : int) : lsif_symbol_bucket =
+    ~(sym_id : string) ~(key : string) ~(kind : int)
+    ~(metadata : Workspace_symbol_metadata.jovial_symbol_metadata) :
+    lsif_symbol_bucket =
   match Hashtbl.find_opt tbl sym_id with
   | Some b ->
       if b.sb_key = "" then b.sb_key <- key;
       if b.sb_kind <= 0 then b.sb_kind <- kind;
+      if
+        b.sb_metadata.Workspace_symbol_metadata.jovial_kind
+        = Workspace_symbol_metadata.JovialUnknownSymbol
+      then b.sb_metadata <- metadata;
       b
   | None ->
-      let b = lsif_symbol_bucket_create ~id:sym_id ~key kind in
+      let b = lsif_symbol_bucket_create ~id:sym_id ~key ~kind ~metadata in
       Hashtbl.add tbl sym_id b;
       b
 
@@ -857,7 +965,8 @@ let docs_for_lsif (ws : t) : Document.t list =
           Perf_stats.time "lsif.doc_load" (fun () ->
               try
                 let parsed =
-                  parse_guarded_document_make ws ~uri:doc.Document.uri
+                  parse_guarded_document_make ~profile:Parser.Background ws
+                    ~uri:doc.Document.uri
                     ~file:doc.Document.file ~text:doc.Document.text
                   |> background_doc_with_diags ws
                 in
@@ -907,9 +1016,13 @@ let lsif_index_payload (ws : t) :
 
   let add_definition (sym_id : string) (d : def) : unit =
     if d.key <> "" then (
-      let bucket = lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind in
+      let bucket =
+        lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind
+          ~metadata:d.metadata
+      in
       lsif_add_key_index key_index ~key:d.key ~sym_id;
-      lsif_add_loc bucket.sb_defs ~uri:d.uri ~loc:d.loc;
+      if not (is_ref_import_def d) then
+        lsif_add_loc bucket.sb_defs ~uri:d.uri ~loc:d.loc;
       if d.kind = sym_kind_func && is_likely_proc_implementation ws d then
         lsif_add_loc bucket.sb_impls ~uri:d.uri ~loc:d.loc)
   in
@@ -926,10 +1039,11 @@ let lsif_index_payload (ws : t) :
               add_definition sym_id d;
               let bucket =
                 lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind
+                  ~metadata:d.metadata
               in
               lsif_add_key_index key_index ~key:d.key ~sym_id;
               lsif_add_ref bucket.sb_refs ~uri:d.uri ~loc:d.loc
-                ~declaration:true));
+                ~declaration:(not (is_ref_import_def d))));
       Hashtbl.iter
         (fun sym_id occs ->
           match Hashtbl.find_opt nav.defs_by_id sym_id with
@@ -938,6 +1052,7 @@ let lsif_index_payload (ws : t) :
               if d.key <> "" then (
                 let bucket =
                   lsif_bucket_for symbols ~sym_id ~key:d.key ~kind:d.kind
+                    ~metadata:d.metadata
                 in
                 lsif_add_key_index key_index ~key:d.key ~sym_id;
                 let decl_key = loc_key ~uri:d.uri d.loc in
@@ -945,7 +1060,8 @@ let lsif_index_payload (ws : t) :
                   (fun (occ_uri, occ_loc) ->
                     let occ_key = loc_key ~uri:occ_uri occ_loc in
                     lsif_add_ref bucket.sb_refs ~uri:occ_uri ~loc:occ_loc
-                      ~declaration:(occ_key = decl_key))
+                      ~declaration:
+                        (occ_key = decl_key && not (is_ref_import_def d)))
                   occs))
         nav.occs_by_id)
     docs;
@@ -971,15 +1087,57 @@ let lsif_index_payload (ws : t) :
                   ("declaration", `Bool r.r_declaration);
                 ])
         in
+        let metadata = bucket.sb_metadata in
+        let type_display, resolved_type_display =
+          match metadata.Workspace_symbol_metadata.type_info with
+          | None -> (`Null, `Null)
+          | Some ti ->
+              ( `String ti.Workspace_symbol_metadata.display,
+                match ti.resolved_display with
+                | Some r -> `String r
+                | None -> (
+                    match ti.explanation with
+                    | Some e ->
+                        `String
+                          (ti.Workspace_symbol_metadata.display ^ " - " ^ e)
+                    | None -> `Null) )
+        in
+        let import_refs_json =
+          sorted_assoc_values bucket.sb_refs
+          |> List.filter_map (fun (_k, r) ->
+                 match Hashtbl.find_opt bucket.sb_defs (loc_key ~uri:r.r_uri r.r_loc) with
+                 | Some _ -> None
+                 | None ->
+                     if
+                       metadata.Workspace_symbol_metadata.external_kind
+                       = Workspace_symbol_metadata.ExternalRef
+                     then Some (location_json ~uri:r.r_uri r.r_loc)
+                     else None)
+        in
         let item =
           `Assoc
             [
               ("id", `String bucket.sb_id);
               ("key", `String bucket.sb_key);
               ("kind", `Int bucket.sb_kind);
+              ( "classification",
+                `String
+                  (Workspace_symbol_metadata.symbol_kind_label
+                     metadata.jovial_kind) );
+              ( "externalKind",
+                `String
+                  (Workspace_symbol_metadata.external_label
+                     metadata.external_kind) );
+              ( "declarationRole",
+                `String
+                  (Workspace_symbol_metadata.decl_role_label
+                     metadata.decl_role) );
+              ("typeDisplay", type_display);
+              ("resolvedTypeDisplay", resolved_type_display);
               ("definitions", `List defs_json);
               ("implementations", `List impls_json);
               ("references", `List refs_json);
+              ("importReferences", `List import_refs_json);
             ]
         in
         Hashtbl.replace symbols_table bucket.sb_id item;
@@ -1129,15 +1287,42 @@ let semantic_tokens_data_of_tokens (tokens : semantic_token list) : int array =
     tokens;
   Array.of_list (List.rev !data_rev)
 
+let semantic_tokens_result_id (doc : Document.t) : string =
+  Digest.(to_hex (string doc.Document.text))
+
+let remember_semantic_tokens_data (ws : t) ~(result_id : string)
+    ~(data : int array) : unit =
+  if Hashtbl.length ws.semantic_tokens_cache > 128 then
+    Hashtbl.clear ws.semantic_tokens_cache;
+  Hashtbl.replace ws.semantic_tokens_cache result_id data
+
 let semantic_tokens_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(range : T.Range.t option) : T.SemanticTokens.t option =
   match doc_of_uri ws uri with
   | None -> None
   | Some doc ->
+      let event =
+        match range with
+        | None -> "semantic_tokens_full"
+        | Some _ -> "semantic_tokens_range"
+      in
+      let t0 = Perf_log.now_ms () in
+      Perf_log.log_event (event ^ "_received")
+        ~uri:(Uri_path.docuri_to_string uri)
+        ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev;
       let data =
         semantic_tokens_for_doc ws doc ~range |> semantic_tokens_data_of_tokens
       in
-      let resultId = Some Digest.(to_hex (string doc.Document.text)) in
+      let result_id = semantic_tokens_result_id doc in
+      (match range with
+      | None -> remember_semantic_tokens_data ws ~result_id ~data
+      | Some _ -> ());
+      let resultId = Some result_id in
+      Perf_log.log_event (event ^ "_responded")
+        ~uri:(Uri_path.docuri_to_string uri)
+        ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev
+        ~ms:(max 0.0 (Perf_log.now_ms () -. t0))
+        ~queue:(background_queue_length ws);
       Some (T.SemanticTokens.create ~data ?resultId ())
 
 let semantic_tokens_full_for (ws : t) ~(uri : T.DocumentUri.t) :
@@ -1148,9 +1333,69 @@ let semantic_tokens_range_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(range : T.Range.t) : T.SemanticTokens.t option =
   semantic_tokens_for ws ~uri ~range:(Some range)
 
+let subarray (arr : int array) ~(pos : int) ~(len : int) : int array =
+  if len <= 0 then [||] else Array.sub arr pos len
+
+let semantic_tokens_delta_edit ~(old_data : int array) ~(new_data : int array) :
+    T.SemanticTokensEdit.t =
+  let old_len = Array.length old_data in
+  let new_len = Array.length new_data in
+  let max_prefix = min old_len new_len in
+  let rec prefix i =
+    if i >= max_prefix then i
+    else if old_data.(i) = new_data.(i) then prefix (i + 1)
+    else i
+  in
+  let prefix_len = prefix 0 in
+  let max_suffix = min (old_len - prefix_len) (new_len - prefix_len) in
+  let rec suffix n =
+    if n >= max_suffix then n
+    else if old_data.(old_len - 1 - n) = new_data.(new_len - 1 - n) then
+      suffix (n + 1)
+    else n
+  in
+  let suffix_len = suffix 0 in
+  let deleteCount = old_len - prefix_len - suffix_len in
+  let insert_len = new_len - prefix_len - suffix_len in
+  let data =
+    if insert_len <= 0 then None
+    else Some (subarray new_data ~pos:prefix_len ~len:insert_len)
+  in
+  T.SemanticTokensEdit.create ?data ~deleteCount ~start:prefix_len ()
+
+let semantic_tokens_delta_for (ws : t) ~(uri : T.DocumentUri.t)
+    ~(previous_result_id : string) :
+    [ `SemanticTokens of T.SemanticTokens.t
+    | `SemanticTokensDelta of T.SemanticTokensDelta.t ]
+    option =
+  match doc_of_uri ws uri with
+  | None -> None
+  | Some doc ->
+      let new_data =
+        semantic_tokens_for_doc ws doc ~range:None
+        |> semantic_tokens_data_of_tokens
+      in
+      let result_id = semantic_tokens_result_id doc in
+      remember_semantic_tokens_data ws ~result_id ~data:new_data;
+      match Hashtbl.find_opt ws.semantic_tokens_cache previous_result_id with
+      | None ->
+          Perf_stats.tick "semantic_tokens.delta_cache_miss";
+          Some
+            (`SemanticTokens
+              (T.SemanticTokens.create ~data:new_data ~resultId:result_id ()))
+      | Some old_data ->
+          Perf_stats.tick "semantic_tokens.delta_cache_hit";
+          let edits =
+            if old_data = new_data then []
+            else [ semantic_tokens_delta_edit ~old_data ~new_data ]
+          in
+          Some
+            (`SemanticTokensDelta
+              (T.SemanticTokensDelta.create ~edits ~resultId:result_id ()))
+
 let rec document_symbol_t_of_doc_symbol (s : doc_symbol) : T.DocumentSymbol.t =
   T.DocumentSymbol.create ~name:s.ds_name
-    ~kind:(symbol_kind_of_def_kind s.ds_kind)
+    ~kind:(lsp_symbol_kind_of_def_kind s.ds_kind)
     ~range:(Lsp_conv.range_of_loc s.ds_range)
     ~selectionRange:(Lsp_conv.range_of_loc s.ds_selection)
     ?detail:s.ds_detail
