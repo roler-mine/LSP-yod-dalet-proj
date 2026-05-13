@@ -146,6 +146,26 @@ val completion_items_for :
 val code_actions_for :
   t -> uri:T.DocumentUri.t -> range:T.Range.t -> T.CodeAction.t list
 
+val code_lenses_for : t -> uri:T.DocumentUri.t -> T.CodeLens.t list
+
+val resolve_code_lens : t -> T.CodeLens.t -> T.CodeLens.t
+
+val inlay_hints_for :
+  t -> uri:T.DocumentUri.t -> range:T.Range.t -> T.InlayHint.t list
+
+val formatting_edits_for :
+  t ->
+  uri:T.DocumentUri.t ->
+  options:Workspace_formatting.options ->
+  T.TextEdit.t list
+
+val range_formatting_edits_for :
+  t ->
+  uri:T.DocumentUri.t ->
+  range:T.Range.t ->
+  options:Workspace_formatting.options ->
+  T.TextEdit.t list
+
 val semantic_tokens_full_for :
   t -> uri:T.DocumentUri.t -> T.SemanticTokens.t option
 
@@ -166,6 +186,9 @@ val perf_stats_json : t -> Yojson.Safe.t
 
 val debug_report_for :
   t -> uri:T.DocumentUri.t -> max_tokens:int -> Yojson.Safe.t
+
+val debug_scheduler_json : t -> Yojson.Safe.t
+val debug_memory_json : t -> Yojson.Safe.t
 
 val snapshot : t -> Workspace_snapshot.snapshot
 val publish_snapshot : t -> unit

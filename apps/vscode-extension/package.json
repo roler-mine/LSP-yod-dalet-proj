@@ -4,7 +4,10 @@
   "description": "VS Code client for the Jovial OCaml LSP server",
   "version": "0.0.10",
   "publisher": "roler-mine",
-  "repository": "https://google.com",
+  "repository": "https://github.com/roler-mine/LSP-yod-dalet-proj",
+  "config": {
+    "vscodeTestVersion": "1.85.2"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -192,7 +195,9 @@
             "signatureHelp",
             "completion",
             "codeActions",
+            "codeLens",
             "inlayHints",
+            "formatting",
             "semanticTokens"
           ],
           "uniqueItems": true,
@@ -205,7 +210,9 @@
               "signatureHelp",
               "completion",
               "codeActions",
+              "codeLens",
               "inlayHints",
+              "formatting",
               "semanticTokens"
             ],
             "enumDescriptions": [
@@ -215,11 +222,13 @@
               "Provide signature help.",
               "Provide completion items.",
               "Provide code actions.",
-              "Provide inlay hints.",
+              "Show CodeLens reference and impact counts.",
+              "Show procedure argument and type-detail inlay hints.",
+              "Format JOVIAL documents and ranges conservatively.",
               "Provide semantic tokens."
             ]
           },
-          "description": "Passive LSP features enabled when jovial.features.profile is custom. Add items from the dropdown to choose the features this server should expose."
+          "description": "Passive LSP features enabled when jovial.features.profile is custom."
         },
         "jovial.features.overrides.diagnostics": {
           "type": [
@@ -356,6 +365,20 @@
           "default": null,
           "description": "Override code actions for the selected feature profile."
         },
+        "jovial.features.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.codeLens.",
+          "description": "Legacy CodeLens override."
+        },
+        "jovial.features.overrides.codeLens": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override CodeLens for the selected feature profile."
+        },
         "jovial.features.inlayHints": {
           "type": "boolean",
           "default": true,
@@ -369,6 +392,20 @@
           ],
           "default": null,
           "description": "Override inlay hints for the selected feature profile."
+        },
+        "jovial.features.formatting": {
+          "type": "boolean",
+          "default": true,
+          "deprecationMessage": "Use jovial.features.profile or jovial.features.overrides.formatting.",
+          "description": "Legacy formatting override."
+        },
+        "jovial.features.overrides.formatting": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "description": "Override formatting for the selected feature profile."
         },
         "jovial.features.semanticTokens": {
           "type": "boolean",
@@ -479,7 +516,9 @@
     "compile": "tsc -p .",
     "compile:test": "tsc -p tsconfig.test.json",
     "test:unit": "npm run compile:test && node out-test/test/run_unit_tests.js",
-    "test:integration": "npm run compile && npm run compile:test && node out-test/test/run_integration_tests.js",
+    "test:integration": "npm run test:integration:pinned",
+    "test:integration:pinned": "npm run compile && npm run compile:test && node out-test/test/run_integration_tests.js",
+    "test:integration:ci": "npm run test:integration:pinned",
     "test": "npm run test:unit && npm run test:integration",
     "watch": "tsc -p . -w",
     "vscode:prepublish": "npm run compile",
@@ -489,6 +528,8 @@
     "package:vsix": "npm run package:vsix:dev"
   },
   "dependencies": {
+    "@vscode/vsce": "^3.9.1",
+    "vsce": "^2.15.0",
     "vscode-languageclient": "^9.0.0"
   },
   "devDependencies": {

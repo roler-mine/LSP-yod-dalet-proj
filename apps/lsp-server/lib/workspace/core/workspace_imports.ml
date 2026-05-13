@@ -36,9 +36,60 @@ let parse_guarded_document_make ?lsp_version
   else Document.make_with_profile_versioned ~lsp_version ~profile ~uri ~file ~text
 
 let diag_missing_compool (loc : Ast.Loc.t) (name : string) : T.Diagnostic.t =
-  Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"import"
-    ~message:("Missing COMPOOL: " ^ name)
-    loc
+  let key = normalize_name name in
+  {
+    (Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"import"
+       ~message:("Missing COMPOOL: " ^ name)
+       loc)
+    with
+    T.Diagnostic.data =
+      Some
+        (`Assoc
+          [
+            ("kind", `String "missingCompool");
+            ("compool", `String key);
+          ]);
+  }
+
+let diag_unresolved_icopy
+    (target : Workspace_include_model.include_target) : T.Diagnostic.t =
+  let display =
+    if target.target <> "" then target.target else target.normalized_target
+  in
+  {
+    (Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"include"
+       ~message:("Unresolved ICOPY target: " ^ display)
+       target.target_loc)
+    with
+    T.Diagnostic.data =
+      Some
+        (`Assoc
+          [
+            ("kind", `String "unresolvedIcopy");
+            ("target", `String display);
+            ("normalizedTarget", `String target.normalized_target);
+          ]);
+  }
+
+let diag_cyclic_icopy
+    (target : Workspace_include_model.include_target) : T.Diagnostic.t =
+  let display =
+    if target.target <> "" then target.target else target.normalized_target
+  in
+  {
+    (Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"include"
+       ~message:("Cyclic ICOPY include detected for " ^ display)
+       target.directive_loc)
+    with
+    T.Diagnostic.data =
+      Some
+        (`Assoc
+          [
+            ("kind", `String "cyclicIcopy");
+            ("target", `String display);
+            ("normalizedTarget", `String target.normalized_target);
+          ]);
+  }
 
 let has_known_source_ext_name ~(source_extensions : string list) (name : string)
     : bool =
@@ -59,7 +110,8 @@ let source_stem_of_filename ~(source_extensions : string list) (name : string) :
 
 let find_compool_path_fallback (ws : t) ~(key : string) : string option =
   if key = "" then None
-  else
+  else (
+    Perf_stats.tick "query.cross_module.fallback_scan";
     ws.source_file_paths
     |> List.find_opt (fun path ->
            match
@@ -67,7 +119,7 @@ let find_compool_path_fallback (ws : t) ~(key : string) : string option =
                (Filename.basename path)
            with
            | Some stem -> normalize_name stem = key
-           | None -> false)
+           | None -> false))
 
 let find_open_compool_doc_by_key (ws : t) (key : string) : Document.t option =
   let found = ref None in
@@ -122,8 +174,21 @@ let diag_missing_import_hint ~(loc : Ast.Loc.t) ~(kind : string)
          selective import)."
         kind symbol targets (List.hd compools)
   in
-  Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Warning ~source:"import"
-    ~message:msg loc
+  let compools = compools |> List.map normalize_name |> List.filter (( <> ) "") in
+  {
+    (Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Warning ~source:"import"
+       ~message:msg loc)
+    with
+    T.Diagnostic.data =
+      Some
+        (`Assoc
+          [
+            ("kind", `String "missingImportHint");
+            ("symbolKind", `String kind);
+            ("symbol", `String symbol);
+            ("compools", `List (List.map (fun c -> `String c) compools));
+          ]);
+  }
 
 let is_builtin_type (k : string) : bool = Keyword.is_builtin_type_name k
 
@@ -315,11 +380,51 @@ let resolve_compool_doc_uncached (ws : t) ~(name : string) : Document.t option =
       | None -> None
       | Some path -> doc_from_path_cached ws path)
 
+let read_include_prefix_text (path : string) ~(max_bytes : int) :
+    string option =
+  if max_bytes <= 0 then None
+  else
+    try
+      let ic = open_in_bin path in
+      Fun.protect
+        ~finally:(fun () -> close_in_noerr ic)
+        (fun () ->
+          let len = in_channel_length ic in
+          let take = min len max_bytes in
+          Some (really_input_string ic take))
+    with _ -> None
+
+let include_cycle_detected (ws : t) ~(importer_path : string)
+    (target : Workspace_include_model.include_target) : bool =
+  let importer_key = normalize_path_key importer_path in
+  match target.resolved_path with
+  | None -> false
+  | Some resolved_path ->
+      let resolved_key = normalize_path_key resolved_path in
+      if importer_key <> "" && resolved_key = importer_key then true
+      else
+        match read_include_prefix_text resolved_path ~max_bytes:65536 with
+        | None -> false
+        | Some text ->
+            Workspace_include_model.include_targets_of_text
+              ~file:(Some resolved_path) ~text
+            |> List.exists
+                 (fun (nested : Workspace_include_model.include_target) ->
+                   match
+                     resolve_icopy_include_path ws ~importer_path:resolved_path
+                       nested.target
+                   with
+                   | Some path -> normalize_path_key path = importer_key
+                   | None -> false)
+
 let validate_imports ?(pump_lookup : bool = true) (ws : t) (doc : Document.t) :
     T.Diagnostic.t list =
   let pre_imports = Document.imports doc in
   let has_compool_import = pre_imports <> [] in
-  if has_compool_import && pump_lookup then pump_index_lookup ws;
+  let raw_icopy_includes = Workspace_include_model.include_targets_of_doc doc in
+  let has_icopy_include = raw_icopy_includes <> [] in
+  if (has_compool_import || has_icopy_include) && pump_lookup then
+    pump_index_lookup ws;
   let missing_compools =
     pre_imports
     |> List.filter_map (fun (imp : Preprocess.import) ->
@@ -328,4 +433,21 @@ let validate_imports ?(pump_lookup : bool = true) (ws : t) (doc : Document.t) :
             if has_compool_target ws imp.name then None
             else Some (diag_missing_compool imp.loc imp.name))
   in
-  missing_compools
+  let include_diags =
+    match doc.Document.file with
+    | None -> []
+    | Some importer_path ->
+        let include_targets =
+          if has_icopy_include then icopy_include_targets_for_doc ws doc else []
+        in
+        include_targets
+        |> List.filter_map
+             (fun (target : Workspace_include_model.include_target) ->
+               match target.resolved_path with
+               | None -> Some (diag_unresolved_icopy target)
+               | Some _ ->
+                   if include_cycle_detected ws ~importer_path target then
+                     Some (diag_cyclic_icopy target)
+                   else None)
+  in
+  missing_compools @ include_diags

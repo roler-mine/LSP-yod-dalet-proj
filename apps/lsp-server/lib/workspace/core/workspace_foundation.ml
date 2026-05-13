@@ -200,6 +200,7 @@ type graph_node = {
   gn_path_key : string;
   mutable gn_import_compools : string list;
   mutable gn_import_paths : string list;
+  mutable gn_include_targets : Workspace_include_model.include_target list;
   mutable gn_rev_importers : string list;
   mutable gn_dependency_edges : dependency_edge list;
   mutable gn_file_class : file_class;
@@ -249,6 +250,17 @@ type quick_nav_entry = {
   qn_kind : int;
   qn_container : string option;
   qn_metadata : Workspace_symbol_metadata.jovial_symbol_metadata;
+}
+
+type module_summary_authority =
+  | ModuleSummaryProvisional
+  | ModuleSummaryMetadataValidated
+
+type module_summary_cache_entry = {
+  msc_path : string;
+  msc_path_key : string;
+  msc_summary : Module_summary.t;
+  mutable msc_authority : module_summary_authority;
 }
 
 module Lsif_delta = struct
@@ -446,6 +458,10 @@ type t = {
   skeleton_prefix_bytes : int;
   sched_open_doc_min_share_pct : int;
   quick_nav_index : (string, quick_nav_entry list) Hashtbl.t;
+  module_summary_cache : (string, module_summary_cache_entry) Hashtbl.t;
+  module_summary_compool_index : (string, string) Hashtbl.t;
+  module_summary_reverse_importers : (string, string list) Hashtbl.t;
+  mutable module_summary_cache_loaded : bool;
   quick_nav_pending_paths : string Queue.t;
   quick_nav_pending_set : (string, bool) Hashtbl.t;
   quick_nav_done_set : (string, bool) Hashtbl.t;

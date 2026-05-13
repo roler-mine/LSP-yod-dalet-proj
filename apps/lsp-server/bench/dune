@@ -1,0 +1,3 @@
+(executable
+ (name workspace_bench)
+ (libraries jovial_lsp_lib unix yojson str threads))

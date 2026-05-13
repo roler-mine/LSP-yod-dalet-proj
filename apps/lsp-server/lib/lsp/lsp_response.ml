@@ -77,6 +77,15 @@ let yojson_of_completion_items (xs : T.CompletionItem.t list) : Yojson.Safe.t =
 let yojson_of_code_actions (xs : T.CodeAction.t list) : Yojson.Safe.t =
   `List (List.map T.CodeAction.yojson_of_t xs)
 
+let yojson_of_code_lenses (xs : T.CodeLens.t list) : Yojson.Safe.t =
+  `List (List.map T.CodeLens.yojson_of_t xs)
+
+let yojson_of_inlay_hints (xs : T.InlayHint.t list) : Yojson.Safe.t =
+  `List (List.map T.InlayHint.yojson_of_t xs)
+
+let yojson_of_text_edits (xs : T.TextEdit.t list) : Yojson.Safe.t =
+  `List (List.map T.TextEdit.yojson_of_t xs)
+
 let yojson_of_semantic_tokens_opt = function
   | None -> `Null
   | Some payload -> T.SemanticTokens.yojson_of_t payload
@@ -189,6 +198,13 @@ let initialize_result_json
           ("resolveProvider", `Bool true);
         ] );
   add_if feature_flags.code_actions ("codeActionProvider", `Bool true);
+  add_if feature_flags.code_lens
+    ("codeLensProvider", json_obj [ ("resolveProvider", `Bool true) ]);
+  add_if feature_flags.inlay_hints
+    ("inlayHintProvider", json_obj [ ("resolveProvider", `Bool false) ]);
+  add_if feature_flags.formatting ("documentFormattingProvider", `Bool true);
+  add_if feature_flags.formatting
+    ("documentRangeFormattingProvider", `Bool true);
   List.iter add
     [
       ( "executeCommandProvider",
@@ -203,6 +219,8 @@ let initialize_result_json
                   `String "jovial.dumpLsifDelta";
                   `String "jovial.debugReport";
                   `String "jovial.debugPerfStats";
+                  `String "jovial.debugScheduler";
+                  `String "jovial.debugMemory";
                   `String "jovial.rescanWorkspace";
                 ] );
           ] );

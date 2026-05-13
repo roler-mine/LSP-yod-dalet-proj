@@ -13,6 +13,7 @@ type doc_store_diff = {
   structural_changed : bool;
   rev_changed : bool;
   parse_rev_changed : bool;
+  public_signature_changed : bool;
   imports_changed : bool;
   defines_changed : bool;
   icopy_includes_changed : bool;
@@ -21,6 +22,8 @@ type doc_store_diff = {
   file_changed : bool;
   old_has_compool : bool;
   new_has_compool : bool;
+  old_summary : Module_summary.t option;
+  new_summary : Module_summary.t;
 }
 
 let has_compool_doc (doc : Document.t) : bool =
@@ -127,12 +130,14 @@ let validated_doc_with_diags ?(import_lookup_pump : bool = true)
 
 let doc_store_diff ~(old_doc : Document.t option) ~(new_doc : Document.t) :
     doc_store_diff =
+  let new_summary = Module_summary.of_document new_doc in
   match old_doc with
   | None ->
       {
         structural_changed = true;
         rev_changed = true;
         parse_rev_changed = true;
+        public_signature_changed = true;
         imports_changed = true;
         defines_changed = true;
         icopy_includes_changed = true;
@@ -141,37 +146,49 @@ let doc_store_diff ~(old_doc : Document.t option) ~(new_doc : Document.t) :
         file_changed = true;
         old_has_compool = false;
         new_has_compool = has_compool_doc new_doc;
+        old_summary = None;
+        new_summary;
       }
   | Some old_doc ->
+      let old_summary = Module_summary.of_document old_doc in
       let rev_changed = old_doc.Document.rev <> new_doc.Document.rev in
       let parse_rev_changed =
         old_doc.Document.parse_rev <> new_doc.Document.parse_rev
       in
       let imports_changed =
-        import_signature old_doc.Document.imports
-        <> import_signature new_doc.Document.imports
+        old_summary.Module_summary.imported_compools
+        <> new_summary.Module_summary.imported_compools
       in
       let defines_changed =
-        define_signature old_doc.Document.defines
-        <> define_signature new_doc.Document.defines
+        old_summary.Module_summary.define_public_macros
+        <> new_summary.Module_summary.define_public_macros
       in
       let icopy_includes_changed =
-        include_signature old_doc <> include_signature new_doc
+        old_summary.Module_summary.icopy_targets
+        <> new_summary.Module_summary.icopy_targets
       in
       let declaration_signature_changed =
         declaration_signature old_doc <> declaration_signature new_doc
+      in
+      let public_signature_changed =
+        not
+          (Module_summary.public_signature_unchanged old_summary new_summary)
       in
       let old_compool_key = compool_key_of_doc old_doc in
       let new_compool_key = compool_key_of_doc new_doc in
       let compool_key_changed = old_compool_key <> new_compool_key in
       let file_changed = old_doc.Document.file <> new_doc.Document.file in
+      let has_compool =
+        has_compool_doc old_doc || has_compool_doc new_doc
+      in
       {
         structural_changed =
           imports_changed || defines_changed || icopy_includes_changed
-          || declaration_signature_changed || compool_key_changed
-          || file_changed;
+          || public_signature_changed || compool_key_changed || file_changed
+          || ((not has_compool) && declaration_signature_changed);
         rev_changed;
         parse_rev_changed;
+        public_signature_changed;
         imports_changed;
         defines_changed;
         icopy_includes_changed;
@@ -180,6 +197,8 @@ let doc_store_diff ~(old_doc : Document.t option) ~(new_doc : Document.t) :
         file_changed;
         old_has_compool = has_compool_doc old_doc;
         new_has_compool = has_compool_doc new_doc;
+        old_summary = Some old_summary;
+        new_summary;
       }
 
 let replace_doc_storage ?(touch_bg_parsed : bool = true)
@@ -209,6 +228,39 @@ let replace_doc_storage ?(touch_bg_parsed : bool = true)
       if touch_bg_parsed then Hashtbl.replace ws.bg_parsed path_key true;
       if clear_closed_doc_touch then
         Hashtbl.remove ws.closed_doc_last_touch path_key
+
+let update_module_summary_cache_for_doc (ws : t)
+    ~(old_doc : Document.t option) (doc : Document.t)
+    (summary : Module_summary.t) : unit =
+  (match old_doc with
+  | Some old_doc -> (
+      match (old_doc.Document.file, doc.Document.file) with
+      | Some old_path, Some new_path
+        when normalize_path_key old_path <> normalize_path_key new_path ->
+          remove_module_summary_cache_entry ws
+            ~path_key:(normalize_path_key old_path)
+      | Some old_path, None ->
+          remove_module_summary_cache_entry ws
+            ~path_key:(normalize_path_key old_path)
+      | _ -> ())
+  | None -> ());
+  match doc.Document.file with
+  | None -> ()
+  | Some path ->
+      let path_key = normalize_path_key path in
+      if path_key <> "" then (
+        install_module_summary_cache_entry ws
+          {
+            msc_path = path;
+            msc_path_key = path_key;
+            msc_summary = summary;
+            msc_authority = ModuleSummaryMetadataValidated;
+          };
+        match ws.root_path with
+        | None -> ()
+        | Some root ->
+            Persistent_cache.save_module_summary_entry
+              ~source_extensions:ws.source_extensions ~root ~path ~summary)
 
 let maybe_shed_doc_ast (ws : t) ~(uri : T.DocumentUri.t) (doc : Document.t) :
     bool =
@@ -254,7 +306,9 @@ let maybe_shed_open_doc_parse_state
 let revalidate_importers_for_doc_diff (ws : t) ~(old_doc : Document.t option)
     ~(new_doc : Document.t) ~(diff : doc_store_diff) ~(enqueue_open_diag : bool)
     : unit =
-  if diff.structural_changed && (diff.old_has_compool || diff.new_has_compool)
+  if
+    diff.public_signature_changed
+    && (diff.old_has_compool || diff.new_has_compool)
   then (
     let seen = Hashtbl.create 4 in
     let revalidate_importers_for_compool (key_opt : string option) : unit =
@@ -283,19 +337,27 @@ let revalidate_importers_for_doc_diff (ws : t) ~(old_doc : Document.t option)
     if enqueue_open_diag then
       enqueue_all_open_diag_revalidate ws ~reason:"compool_change")
 
-let install_doc_surface ?(touch_bg_parsed : bool = true)
-    ?(clear_closed_doc_touch : bool = true)
-    ?(enqueue_importer_revalidate : bool = true) ?(allow_ast_shed : bool = true)
-    (ws : t) ~(uri : T.DocumentUri.t) ~(old_doc : Document.t option)
-    (doc : Document.t) : doc_store_diff =
-  let diff = doc_store_diff ~old_doc ~new_doc:doc in
+let record_doc_diff_side_effects (ws : t) (diff : doc_store_diff) : unit =
+  (match diff.old_summary with
+  | None -> Perf_stats.tick "summary.public_hash_changed"
+  | Some _ ->
+      if diff.public_signature_changed then
+        Perf_stats.tick "summary.public_hash_changed"
+      else Perf_stats.tick "summary.public_hash_unchanged");
+  if
+    diff.declaration_signature_changed
+    && not diff.public_signature_changed
+    && (diff.old_has_compool || diff.new_has_compool)
+  then Perf_stats.tick "dep.invalidate.pruned_by_summary";
   if diff.structural_changed then (
     mark_graph_dirty ws;
     Perf_stats.tick "dep.invalidate.graph_dirty";
+    if diff.public_signature_changed then
+      Perf_stats.tick "dep.invalidate.public_signature";
     if diff.imports_changed then Perf_stats.tick "dep.invalidate.icompools";
     if diff.icopy_includes_changed then Perf_stats.tick "dep.invalidate.icopy";
     if diff.defines_changed then Perf_stats.tick "dep.invalidate.define";
-    if diff.declaration_signature_changed then
+    if diff.declaration_signature_changed && diff.public_signature_changed then
       Perf_stats.tick "dep.invalidate.declaration")
   else if diff.rev_changed || diff.parse_rev_changed then
     Perf_stats.tick "dep.invalidate.current_file_only"
@@ -304,9 +366,18 @@ let install_doc_surface ?(touch_bg_parsed : bool = true)
     diff.compool_key_changed
     || diff.structural_changed
        && (diff.old_has_compool || diff.new_has_compool)
-  then invalidate_symbol_hints ws;
+  then invalidate_symbol_hints ws
+
+let install_doc_surface ?(touch_bg_parsed : bool = true)
+    ?(clear_closed_doc_touch : bool = true)
+    ?(enqueue_importer_revalidate : bool = true) ?(allow_ast_shed : bool = true)
+    (ws : t) ~(uri : T.DocumentUri.t) ~(old_doc : Document.t option)
+    (doc : Document.t) : doc_store_diff =
+  let diff = doc_store_diff ~old_doc ~new_doc:doc in
+  record_doc_diff_side_effects ws diff;
   replace_doc_storage ~touch_bg_parsed ~clear_closed_doc_touch ws ~uri ~old_doc
     doc;
+  update_module_summary_cache_for_doc ws ~old_doc doc diff.new_summary;
   if allow_ast_shed then
     maybe_shed_open_doc_parse_state ws ~prefer_uri:(Some uri);
   revalidate_importers_for_doc_diff ws ~old_doc ~new_doc:doc ~diff
@@ -428,6 +499,7 @@ let refresh_closed_doc_diagnostics_now (ws : t) ~(uri : T.DocumentUri.t) : bool
           Hashtbl.remove ws.files path_key;
           Hashtbl.remove ws.bg_parsed path_key;
           Hashtbl.remove ws.closed_doc_last_touch path_key;
+          remove_module_summary_cache_entry ws ~path_key;
           if had then enqueue_bg_diag_update ws ~uri ~diags:[];
           had)
         else
@@ -454,6 +526,26 @@ let refresh_closed_doc_diagnostics_now (ws : t) ~(uri : T.DocumentUri.t) : bool
               queue_workspace_diag_update_for_doc ws doc;
               true
 
+let quick_nav_entry_add (ws : t) ~(key : string) (entry : quick_nav_entry) :
+    unit =
+  let k = normalize_name key in
+  if k = "" then ()
+  else
+    let prev =
+      match Hashtbl.find_opt ws.quick_nav_index k with
+      | Some xs -> xs
+      | None -> []
+    in
+    if
+      List.exists
+        (fun x ->
+          Uri_path.docuri_to_string x.qn_uri
+          = Uri_path.docuri_to_string entry.qn_uri
+          && x.qn_loc = entry.qn_loc)
+        prev
+    then ()
+    else Hashtbl.replace ws.quick_nav_index k (entry :: prev)
+
 let refresh_bg_seed_paths (ws : t) : unit =
   ensure_graph_fresh ws;
   match ws.index with
@@ -472,6 +564,16 @@ let refresh_bg_seed_paths (ws : t) : unit =
   | Some idx ->
       ws.bg_seed_paths <- Array.of_list (Workspace_index.all_source_paths idx);
       ws.bg_seed_cursor <- 0;
+      let cached_nav =
+        match ws.root_path with
+        | None -> None
+        | Some root ->
+            Some
+              (Persistent_cache.load_skeleton_cache
+                 ~source_extensions:ws.source_extensions ~root
+                 ~max_bytes:nav_quick_scan_per_file_bytes
+                 ~paths:(Array.to_list ws.bg_seed_paths))
+      in
       let total_unique = ref 0 in
       let seen = Hashtbl.create (max 16 (Array.length ws.bg_seed_paths)) in
       Array.iter
@@ -483,9 +585,22 @@ let refresh_bg_seed_paths (ws : t) : unit =
             if
               (not (Hashtbl.mem ws.quick_nav_done_set key))
               && not (Hashtbl.mem ws.quick_nav_pending_set key)
-            then (
-              Hashtbl.replace ws.quick_nav_pending_set key true;
-              Queue.add p ws.quick_nav_pending_paths)))
+            then
+              match cached_nav with
+              | Some cache -> (
+                  match Persistent_cache.skeleton_entries cache ~path:p with
+                  | Some entries ->
+                      List.iter
+                        (fun e -> quick_nav_entry_add ws ~key:e.qn_key e)
+                        entries;
+                      Hashtbl.replace ws.quick_nav_done_set key true;
+                      Perf_stats.tick "persistent_cache.skeleton_hit"
+                  | None ->
+                      Hashtbl.replace ws.quick_nav_pending_set key true;
+                      Queue.add p ws.quick_nav_pending_paths)
+              | None ->
+                  Hashtbl.replace ws.quick_nav_pending_set key true;
+                  Queue.add p ws.quick_nav_pending_paths))
         ws.bg_seed_paths;
       ws.quick_nav_index_total <- !total_unique;
       ws.quick_nav_index_done <- Hashtbl.length ws.quick_nav_done_set;
@@ -722,26 +837,6 @@ let try_submit_large_parse_job (ws : t) ~(path : string)
         Hashtbl.replace ws.parse_worker_inflight path_key pj_kind;
         true
 
-let quick_nav_entry_add (ws : t) ~(key : string) (entry : quick_nav_entry) :
-    unit =
-  let k = normalize_name key in
-  if k = "" then ()
-  else
-    let prev =
-      match Hashtbl.find_opt ws.quick_nav_index k with
-      | Some xs -> xs
-      | None -> []
-    in
-    if
-      List.exists
-        (fun x ->
-          Uri_path.docuri_to_string x.qn_uri
-          = Uri_path.docuri_to_string entry.qn_uri
-          && x.qn_loc = entry.qn_loc)
-        prev
-    then ()
-    else Hashtbl.replace ws.quick_nav_index k (entry :: prev)
-
 let quick_nav_kind_of_skeleton_kind = function
   | Syntax_cache.SkModule | Syntax_cache.SkCompool | Syntax_cache.SkBlock -> 2
   | Syntax_cache.SkType -> 5
@@ -840,6 +935,12 @@ let quick_nav_index_step (ws : t) ~(budget_ms : int) : unit =
               ~max_bytes:nav_quick_scan_per_file_bytes
           in
           List.iter (fun e -> quick_nav_entry_add ws ~key:e.qn_key e) entries;
+          (match ws.root_path with
+          | None -> ()
+          | Some root ->
+              Persistent_cache.save_skeleton_entry
+                ~source_extensions:ws.source_extensions ~root
+                ~max_bytes:nav_quick_scan_per_file_bytes ~path ~entries);
           if not (Hashtbl.mem ws.quick_nav_done_set path_key) then (
             Hashtbl.replace ws.quick_nav_done_set path_key true;
             ws.quick_nav_index_done <- ws.quick_nav_index_done + 1));
@@ -900,20 +1001,6 @@ let apply_parse_result_open (ws : t) ~(pr_kind : parse_job_kind)
                 Hashtbl.remove ws.closed_doc_last_touch pk
             | None -> ());
             enqueue_doc_imports_high ws doc;
-            (match compool_key_of_doc doc with
-            | None -> ()
-            | Some key ->
-                let importers =
-                  importer_uris_for_compool_key ws ~compool_key:key
-                in
-                invalidate_importer_nav_state_for_compool_key ws
-                  ~compool_key:key;
-                if xmodule_diag_prereqs_ready ws then
-                  List.iter
-                    (fun importer_uri ->
-                      enqueue_open_diag_revalidate ws ~uri:importer_uri
-                        ~reason:"compool_change")
-                    importers);
             invalidate_lsif_snapshot ws)
 
 let apply_parse_result_path (ws : t) ~(pr_kind : parse_job_kind)
@@ -938,20 +1025,19 @@ let apply_parse_result_path (ws : t) ~(pr_kind : parse_job_kind)
               else doc
         in
         invalidate_lsif_snapshot ws;
+        let old_doc = Hashtbl.find_opt ws.files path_key in
+        let diff = doc_store_diff ~old_doc ~new_doc:doc in
+        (match old_doc with
+        | None -> ()
+        | Some _ -> record_doc_diff_side_effects ws diff);
+        revalidate_importers_for_doc_diff ws ~old_doc ~new_doc:doc ~diff
+          ~enqueue_open_diag:true;
         Hashtbl.replace ws.files path_key doc;
         Hashtbl.replace ws.bg_parsed path_key true;
         touch_closed_doc_path ws ~path_key;
         evict_closed_docs_if_needed ws;
-        (match compool_key_of_doc doc with
-        | None -> ()
-        | Some key ->
-            let importers = importer_uris_for_compool_key ws ~compool_key:key in
-            invalidate_importer_nav_state_for_compool_key ws ~compool_key:key;
-            List.iter
-              (fun importer_uri ->
-                enqueue_open_diag_revalidate ws ~uri:importer_uri
-                  ~reason:"compool_change")
-              importers);
+        if ws.sem_store_enabled && (diff.rev_changed || diff.parse_rev_changed)
+        then Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
         queue_workspace_diag_update_for_doc ws doc
 
 let apply_parse_result_stale (ws : t) ~(pr_epoch : int) ~(path_key : string) :
@@ -1108,8 +1194,9 @@ let background_parse_path (ws : t) (path : string) : unit =
               Perf_stats.tick "diag.open.stale_version_drop"
             else (
               let old_doc = Hashtbl.find_opt ws.docs uri in
+              let enqueue_importer_revalidate = xmodule_diag_prereqs_ready ws in
               ignore
-                (install_doc_surface ~enqueue_importer_revalidate:false
+                (install_doc_surface ~enqueue_importer_revalidate
                    ~allow_ast_shed:false ws ~uri ~old_doc parsed_doc);
               if parsed_doc.Document.parse_rev = parsed_doc.Document.rev then (
                 let key = Uri_path.docuri_to_string uri in
@@ -1131,21 +1218,7 @@ let background_parse_path (ws : t) (path : string) : unit =
               Hashtbl.replace ws.files path_key parsed_doc;
               Hashtbl.replace ws.bg_parsed path_key true;
               Hashtbl.remove ws.closed_doc_last_touch path_key;
-              enqueue_doc_imports_high ws parsed_doc;
-              match compool_key_of_doc parsed_doc with
-              | None -> ()
-              | Some key ->
-                  let importers =
-                    importer_uris_for_compool_key ws ~compool_key:key
-                  in
-                  invalidate_importer_nav_state_for_compool_key ws
-                    ~compool_key:key;
-                  if xmodule_diag_prereqs_ready ws then
-                    List.iter
-                      (fun importer_uri ->
-                        enqueue_open_diag_revalidate ws ~uri:importer_uri
-                          ~reason:"compool_change")
-                      importers))
+              enqueue_doc_imports_high ws parsed_doc))
     | None -> (
         let uri =
           match Uri_path.docuri_of_path path with
@@ -1189,23 +1262,20 @@ let background_parse_path (ws : t) (path : string) : unit =
         | None -> ()
         | Some doc ->
             invalidate_lsif_snapshot ws;
+            let old_doc = Hashtbl.find_opt ws.files path_key in
+            let diff = doc_store_diff ~old_doc ~new_doc:doc in
+            (match old_doc with
+            | None -> ()
+            | Some _ -> record_doc_diff_side_effects ws diff);
+            revalidate_importers_for_doc_diff ws ~old_doc ~new_doc:doc ~diff
+              ~enqueue_open_diag:true;
             Hashtbl.replace ws.files path_key doc;
             Hashtbl.replace ws.bg_parsed path_key true;
             touch_closed_doc_path ws ~path_key;
             evict_closed_docs_if_needed ws;
-            (match compool_key_of_doc doc with
-            | None -> ()
-            | Some key ->
-                let importers =
-                  importer_uris_for_compool_key ws ~compool_key:key
-                in
-                invalidate_importer_nav_state_for_compool_key ws
-                  ~compool_key:key;
-                List.iter
-                  (fun importer_uri ->
-                    enqueue_open_diag_revalidate ws ~uri:importer_uri
-                      ~reason:"compool_change")
-                  importers);
+            if
+              ws.sem_store_enabled && (diff.rev_changed || diff.parse_rev_changed)
+            then Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
             queue_workspace_diag_update_for_doc ws doc)
 
 let revalidate_closed_docs_for_hint_readiness (ws : t) : unit =

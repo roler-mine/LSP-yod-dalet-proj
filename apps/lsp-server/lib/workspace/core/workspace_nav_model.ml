@@ -138,6 +138,32 @@ let metadata_for_define =
     source_keyword = Some "DEFINE";
   }
 
+let metadata_for_status_constant ~(owner : string option) ~(ordinal : int) () =
+  let explanation =
+    match owner with
+    | Some owner when String.trim owner <> "" ->
+        Some
+          (Printf.sprintf "status value %d in STATUS list for %s"
+             (ordinal + 1) owner)
+    | _ -> Some (Printf.sprintf "status value %d" (ordinal + 1))
+  in
+  {
+    Metadata.default_metadata with
+    jovial_kind = Metadata.JovialStatusConstant;
+    is_constant = true;
+    source_keyword = Some "V";
+    type_info =
+      Some
+        {
+          Metadata.display = "STATUS value";
+          origin = Metadata.InferredType;
+          resolved_display = None;
+          type_decl_uri = None;
+          type_decl_loc = None;
+          explanation;
+        };
+  }
+
 let metadata_for_module ?(compool = false) () =
   {
     Metadata.default_metadata with
@@ -425,6 +451,18 @@ let rec collect_type_defs ~(uri : T.DocumentUri.t) ~(container : string option)
   | Ast.TName _ -> acc
   | Ast.TPointer inner -> collect_type_defs ~uri ~container acc inner
   | Ast.TArray { elem; _ } -> collect_type_defs ~uri ~container acc elem
+  | Ast.TSpecifiedTable { elem; _ } ->
+      collect_type_defs ~uri ~container acc elem
+  | Ast.TStatus values ->
+      values
+      |> List.mapi (fun ordinal value -> (ordinal, value))
+      |> List.fold_left
+           (fun a (ordinal, value) ->
+             add_ident_def
+               ~metadata:
+                 (metadata_for_status_constant ~owner:container ~ordinal ())
+               a ~uri ~id:value.v.sv_name ~kind:sym_kind_const ~container)
+           acc
   | Ast.TRecord fields ->
       List.fold_left
         (fun a f ->
@@ -499,7 +537,7 @@ and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
                ~dtype:(Some dtype) ~storage:(Some storage) ())
           acc ~uri ~id:name ~kind:sym_kind_var ~container
       in
-      collect_type_defs ~uri ~container acc dtype
+      collect_type_defs ~uri ~container:(Some name.v) acc dtype
   | Ast.DConst { name; dtype; external_modifier; data_decl_kind; _ } -> (
       let acc =
         add_ident_def
@@ -510,7 +548,7 @@ and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
       in
       match dtype with
       | None -> acc
-      | Some ty -> collect_type_defs ~uri ~container acc ty)
+      | Some ty -> collect_type_defs ~uri ~container:(Some name.v) acc ty)
   | Ast.DType { name; defn; external_modifier } ->
       let acc =
         add_ident_def
@@ -1111,6 +1149,10 @@ type nav_scope = {
   types : (string, nav_binding) Hashtbl.t;
   labels : (string, nav_binding) Hashtbl.t;
   fields : (string, nav_binding) Hashtbl.t;
+  fields_by_name : (string, nav_binding list) Hashtbl.t;
+  status_values : (string, nav_binding list) Hashtbl.t;
+  value_types : (string, Ast.type_expr Ast.node) Hashtbl.t;
+  type_exprs : (string, Ast.type_expr Ast.node) Hashtbl.t;
   ambiguous_fields : (string, bool) Hashtbl.t;
 }
 
@@ -1126,6 +1168,10 @@ let nav_scope_empty () : nav_scope =
     types = Hashtbl.create 32;
     labels = Hashtbl.create 32;
     fields = Hashtbl.create 64;
+    fields_by_name = Hashtbl.create 64;
+    status_values = Hashtbl.create 64;
+    value_types = Hashtbl.create 64;
+    type_exprs = Hashtbl.create 32;
     ambiguous_fields = Hashtbl.create 16;
   }
 
@@ -1135,6 +1181,10 @@ let nav_scope_copy (s : nav_scope) : nav_scope =
     types = copy_tbl s.types;
     labels = copy_tbl s.labels;
     fields = copy_tbl s.fields;
+    fields_by_name = copy_tbl s.fields_by_name;
+    status_values = copy_tbl s.status_values;
+    value_types = copy_tbl s.value_types;
+    type_exprs = copy_tbl s.type_exprs;
     ambiguous_fields = copy_tbl s.ambiguous_fields;
   }
 
@@ -1222,6 +1272,7 @@ let upsert_semantic_snapshot_for_doc_with_nav (ws : t) (doc : Document.t)
   if ws.sem_store_enabled then
     Perf_stats.time "snapshot.build" (fun () ->
         let snap = snapshot_for_doc ws doc nav in
+        Perf_stats.tick "query.cache.upsert";
         Semantic_store.upsert_snapshot ws.semantic_store snap)
 
 let nav_add_occurrence (nav : doc_nav) ~(sym_id : string)
@@ -1265,6 +1316,11 @@ let nav_bind_label (scope : nav_scope) (b : nav_binding) : unit =
 
 let nav_bind_field (scope : nav_scope) (b : nav_binding) : unit =
   let key = b.decl.key in
+  let prev =
+    Option.value (Hashtbl.find_opt scope.fields_by_name key) ~default:[]
+  in
+  if not (List.exists (fun old -> old.sym_id = b.sym_id) prev) then
+    Hashtbl.replace scope.fields_by_name key (b :: prev);
   if Hashtbl.mem scope.ambiguous_fields key then ()
   else
     match Hashtbl.find_opt scope.fields key with
@@ -1274,8 +1330,18 @@ let nav_bind_field (scope : nav_scope) (b : nav_binding) : unit =
         Hashtbl.remove scope.fields key;
         Hashtbl.replace scope.ambiguous_fields key true
 
+let nav_bind_status (scope : nav_scope) (b : nav_binding) : unit =
+  let key = b.decl.key in
+  let prev =
+    Option.value (Hashtbl.find_opt scope.status_values key) ~default:[]
+  in
+  if not (List.exists (fun old -> old.sym_id = b.sym_id) prev) then
+    Hashtbl.replace scope.status_values key (b :: prev)
+
 let nav_bind_decl_default (scope : nav_scope) (b : nav_binding) : unit =
-  if b.decl.kind = sym_kind_type then nav_bind_type scope b
+  if b.decl.metadata.Metadata.jovial_kind = Metadata.JovialStatusConstant then
+    nav_bind_status scope b
+  else if b.decl.kind = sym_kind_type then nav_bind_type scope b
   else if b.decl.kind = sym_kind_field then nav_bind_field scope b
   else nav_bind_value scope b
 
@@ -1301,6 +1367,59 @@ let nav_find_field (scope : nav_scope) (name : string) : nav_binding option =
     match Hashtbl.find_opt scope.fields k with
     | Some _ as x -> x
     | None -> Hashtbl.find_opt scope.values k
+
+let nav_find_field_for_owner (scope : nav_scope) (name : string)
+    (owner_key : string option) : nav_binding option =
+  let k = normalize_name name in
+  match owner_key with
+  | Some owner_key when owner_key <> "" -> (
+      let owner_key = normalize_name owner_key in
+      let owned =
+        Option.value (Hashtbl.find_opt scope.fields_by_name k) ~default:[]
+        |> List.filter (fun b ->
+               match b.decl.container with
+               | Some c -> normalize_name c = owner_key
+               | None -> false)
+      in
+      match owned with
+      | [ b ] -> Some b
+      | _ -> None)
+  | _ -> nav_find_field scope name
+
+let nav_find_status_unique (scope : nav_scope) (name : string) :
+    nav_binding option =
+  match Hashtbl.find_opt scope.status_values (normalize_name name) with
+  | Some [ b ] -> Some b
+  | _ -> None
+
+let nav_find_status_for_owner (scope : nav_scope) (name : string)
+    (owner : Jovial_status.owner option) : nav_binding option =
+  let bindings =
+    Option.value
+      (Hashtbl.find_opt scope.status_values (normalize_name name))
+      ~default:[]
+  in
+  match owner with
+  | Some { Jovial_status.owner_key = Some owner_key; _ } ->
+      let owned =
+        bindings
+        |> List.filter (fun b ->
+               match b.decl.container with
+               | Some c -> normalize_name c = owner_key
+               | None -> false)
+      in
+      (match owned with [ b ] -> Some b | _ -> nav_find_status_unique scope name)
+  | _ -> nav_find_status_unique scope name
+
+let nav_bind_value_type (scope : nav_scope) (id : Ast.ident)
+    (ty : Ast.type_expr Ast.node) : unit =
+  let key = normalize_name id.v in
+  if key <> "" then Hashtbl.replace scope.value_types key ty
+
+let nav_bind_type_expr (scope : nav_scope) (id : Ast.ident)
+    (ty : Ast.type_expr Ast.node) : unit =
+  let key = normalize_name id.v in
+  if key <> "" then Hashtbl.replace scope.type_exprs key ty
 
 let def_of_ident ?(metadata = Metadata.default_metadata)
     ~(uri : T.DocumentUri.t) ~(id : Ast.ident) ~(kind : int)
@@ -1329,7 +1448,8 @@ let exported_defs_for_import_scope (doc : Document.t) : def list =
     | _ -> Hashtbl.create 1
   in
   let is_exported (d : def) : bool =
-    if d.kind = sym_kind_field then false
+    if d.metadata.Metadata.jovial_kind = Metadata.JovialStatusConstant then true
+    else if d.kind = sym_kind_field then false
     else
       match d.container with
       | None -> true
@@ -1401,6 +1521,10 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
     add_decl_binding ?metadata scope ~id ~kind ~container nav_bind_field
   in
 
+  let add_decl_status ?metadata scope ~id ~kind ~container =
+    add_decl_binding ?metadata scope ~id ~kind ~container nav_bind_status
+  in
+
   let bind_external_def (scope : nav_scope) (d : def) : unit =
     if d.key <> "" then (
       let sym_id = def_symbol_id d in
@@ -1423,8 +1547,124 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   let use_label (scope : nav_scope) (id : Ast.ident) : unit =
     add_usage (nav_find_label scope id.v) id
   in
-  let use_field (scope : nav_scope) (id : Ast.ident) : unit =
-    add_usage (nav_find_field scope id.v) id
+  let use_field ?owner_key (scope : nav_scope) (id : Ast.ident) : unit =
+    add_usage (nav_find_field_for_owner scope id.v owner_key) id
+  in
+
+  let rec status_owner_for_type_expr (scope : nav_scope) ?owner_name ?owner_loc
+      (ty : Ast.type_expr Ast.node) : Jovial_status.owner option =
+    match ty.v with
+    | Ast.TStatus _ | Ast.TArray { elem = { v = Ast.TName _; _ }; _ } -> (
+        match
+          Jovial_status.owner_of_type_expr ?owner_name ?owner_loc ty
+        with
+        | Some owner -> Some owner
+        | None -> (
+            match ty.v with
+            | Ast.TArray { elem; _ } ->
+                status_owner_for_type_expr scope ?owner_name ?owner_loc elem
+            | _ -> None))
+    | Ast.TName id -> (
+        match Hashtbl.find_opt scope.type_exprs (normalize_name id.v) with
+        | None -> None
+        | Some defn ->
+            status_owner_for_type_expr scope ~owner_name:id.v ~owner_loc:id.loc
+              defn)
+    | Ast.TArray { elem; _ } ->
+        status_owner_for_type_expr scope ?owner_name ?owner_loc elem
+    | Ast.TSpecifiedTable { elem; _ } ->
+        status_owner_for_type_expr scope ?owner_name ?owner_loc elem
+    | Ast.TPointer inner ->
+        status_owner_for_type_expr scope ?owner_name ?owner_loc inner
+    | Ast.TRecord _ | Ast.TFunc _ -> None
+  in
+
+  let status_owner_for_lvalue (scope : nav_scope) (e : Ast.expr Ast.node) :
+      Jovial_status.owner option =
+    match e.v with
+    | Ast.EName id -> (
+        match Hashtbl.find_opt scope.value_types (normalize_name id.v) with
+        | None -> None
+        | Some ty ->
+            status_owner_for_type_expr scope ~owner_name:id.v ~owner_loc:id.loc
+              ty)
+    | _ -> None
+  in
+
+  let rec type_expr_has_fields (scope : nav_scope) (ty : Ast.type_expr Ast.node)
+      : bool =
+    match ty.v with
+    | Ast.TRecord _ -> true
+    | Ast.TArray { elem; _ } -> type_expr_has_fields scope elem
+    | Ast.TSpecifiedTable { elem; _ } -> type_expr_has_fields scope elem
+    | Ast.TPointer inner -> type_expr_has_fields scope inner
+    | Ast.TName id -> (
+        match Hashtbl.find_opt scope.type_exprs (normalize_name id.v) with
+        | Some defn -> type_expr_has_fields scope defn
+        | None -> false)
+    | Ast.TStatus _ | Ast.TFunc _ -> false
+  in
+
+  let rec field_owner_for_type_expr (scope : nav_scope) ?value_name
+      (ty : Ast.type_expr Ast.node) : string option =
+    match ty.v with
+    | Ast.TName id ->
+        let key = normalize_name id.v in
+        if key <> "" && type_expr_has_fields scope ty then Some key else None
+    | Ast.TRecord _ ->
+        (match Option.map normalize_name value_name with
+        | Some key when key <> "" -> Some key
+        | _ -> None)
+    | Ast.TArray { elem = ({ v = Ast.TRecord _; _ } as elem); _ }
+    | Ast.TSpecifiedTable { elem = ({ v = Ast.TRecord _; _ } as elem); _ } ->
+        let direct =
+          match Option.map normalize_name value_name with
+          | Some key when key <> "" -> Some key
+          | _ -> None
+        in
+        (match direct with
+        | Some _ as owner -> owner
+        | None -> field_owner_for_type_expr scope elem)
+    | Ast.TArray { elem; _ } -> field_owner_for_type_expr scope elem
+    | Ast.TSpecifiedTable { elem; _ } -> field_owner_for_type_expr scope elem
+    | Ast.TPointer inner -> field_owner_for_type_expr scope inner
+    | Ast.TStatus _ | Ast.TFunc _ -> None
+  in
+
+  let rec field_owner_for_expr (scope : nav_scope) (e : Ast.expr Ast.node) :
+      string option =
+    match e.v with
+    | Ast.EName id -> (
+        match Hashtbl.find_opt scope.value_types (normalize_name id.v) with
+        | Some ty -> field_owner_for_type_expr scope ~value_name:id.v ty
+        | None -> None)
+    | Ast.ECall { callee; _ } -> (
+        match Hashtbl.find_opt scope.value_types (normalize_name callee.v) with
+        | Some ty -> field_owner_for_type_expr scope ~value_name:callee.v ty
+        | None -> None)
+    | Ast.EIndex { base; _ } | Ast.EField { base; _ } ->
+        field_owner_for_expr scope base
+    | Ast.EParen inner -> field_owner_for_expr scope inner
+    | Ast.EDeref { ptr } -> field_owner_for_expr scope ptr
+    | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _ | Ast.EPreset _
+    | Ast.ERange _ | Ast.EAt _ ->
+        None
+  in
+
+  let field_owner_for_pointer_expr (scope : nav_scope) (ptr : Ast.expr Ast.node)
+      : string option =
+    match ptr.v with
+    | Ast.EName id -> (
+        match Hashtbl.find_opt scope.value_types (normalize_name id.v) with
+        | Some { v = Ast.TPointer target; _ } ->
+            field_owner_for_type_expr scope target
+        | _ -> None)
+    | _ -> None
+  in
+
+  let use_status ?expected_status_owner (scope : nav_scope) (id : Ast.ident) :
+      unit =
+    add_usage (nav_find_status_for_owner scope id.v expected_status_owner) id
   in
 
   let resolve_type_info_from_scope (scope : nav_scope)
@@ -1473,6 +1713,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         in
         add_decl_default
           ~metadata scope ~id:name ~kind:sym_kind_var ~container
+        ;
+        nav_bind_value_type scope name dtype
     | Ast.DConst { name; dtype; external_modifier; data_decl_kind; _ } ->
         let metadata =
           metadata_for_var ~is_constant:true ~external_modifier
@@ -1480,11 +1722,13 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
           |> resolve_metadata_type scope
         in
         add_decl_default
-          ~metadata scope ~id:name ~kind:sym_kind_const ~container
+          ~metadata scope ~id:name ~kind:sym_kind_const ~container;
+        Option.iter (nav_bind_value_type scope name) dtype
     | Ast.DType { name; defn; external_modifier } ->
         add_decl_type
           ~metadata:(metadata_for_type ~external_modifier ~defn ())
-          scope ~id:name ~kind:sym_kind_type ~container
+          scope ~id:name ~kind:sym_kind_type ~container;
+        nav_bind_type_expr scope name defn
     | Ast.DProc p ->
         add_decl_value
           ~metadata:
@@ -1508,6 +1752,23 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
     | Ast.TArray { elem; dims } ->
         walk_type scope ~container elem;
         List.iter (walk_expr scope ~container) dims
+    | Ast.TSpecifiedTable { elem; dims; kind } ->
+        walk_type scope ~container elem;
+        List.iter (walk_expr scope ~container) dims;
+        (match kind with
+        | Ast.SpecTableW entry_size
+        | Ast.SpecTableV (Some entry_size) ->
+            walk_expr scope ~container entry_size
+        | Ast.SpecTableV None -> ())
+    | Ast.TStatus values ->
+        values
+        |> List.iteri (fun ordinal value ->
+               add_decl_status
+                 ~metadata:
+                   (metadata_for_status_constant ~owner:container ~ordinal ())
+                 scope ~id:value.v.sv_name ~kind:sym_kind_const ~container;
+               Option.iter (walk_expr scope ~container)
+                 value.v.sv_representation)
     | Ast.TRecord fields ->
         List.iter
           (fun f ->
@@ -1515,7 +1776,12 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
             add_decl_field
               ~metadata:(metadata_for_field ~ftype:fv.ftype ())
               scope ~id:fv.fname ~kind:sym_kind_field ~container;
-            walk_type scope ~container fv.ftype)
+            walk_type scope ~container fv.ftype;
+            Option.iter
+              (fun (pos : Ast.field_position) ->
+                walk_expr scope ~container pos.pos_start_bit;
+                walk_expr scope ~container pos.pos_start_word)
+              fv.fpos)
           fields
     | Ast.TFunc { params; returns } -> (
         let fn_scope = nav_scope_copy scope in
@@ -1530,8 +1796,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         match returns with
         | None -> ()
         | Some r -> walk_type fn_scope ~container r)
-  and walk_expr (scope : nav_scope) ~(container : string option)
-      (e : Ast.expr Ast.node) : unit =
+  and walk_expr ?expected_status_owner (scope : nav_scope)
+      ~(container : string option) (e : Ast.expr Ast.node) : unit =
     match e.v with
     | Ast.EName id -> use_value scope id
     | Ast.ELit _ -> ()
@@ -1540,14 +1806,21 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         walk_expr scope ~container lhs;
         walk_expr scope ~container rhs
     | Ast.ECall { callee; args } ->
-        use_value scope callee;
-        List.iter (walk_expr scope ~container) args
+        if normalize_name callee.v = "V" then
+          match args with
+          | [ { v = Ast.EName id; _ } ] ->
+              use_status ?expected_status_owner scope id
+          | _ -> List.iter (walk_expr scope ~container) args
+        else (
+          use_value scope callee;
+          List.iter (walk_expr scope ~container) args)
     | Ast.EIndex { base; index } ->
         walk_expr scope ~container base;
         List.iter (walk_expr scope ~container) index
     | Ast.EField { base; field } ->
         walk_expr scope ~container base;
-        use_field scope field
+        let owner_key = field_owner_for_expr scope base in
+        use_field ?owner_key scope field
     | Ast.EConvert { ty; expr } ->
         walk_type scope ~container ty;
         walk_expr scope ~container expr
@@ -1558,26 +1831,42 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         walk_expr scope ~container lo;
         walk_expr scope ~container hi
     | Ast.EAt { field; ptr } ->
+        let owner_key = field_owner_for_pointer_expr scope ptr in
         (match field.v with
-        | Ast.EName id -> use_field scope id
+        | Ast.EName id -> use_field ?owner_key scope id
         | Ast.EIndex { base; index } ->
             (match base.v with
-            | Ast.EName id -> use_field scope id
+            | Ast.EName id -> use_field ?owner_key scope id
             | _ -> walk_expr scope ~container base);
             List.iter (walk_expr scope ~container) index
         | _ -> walk_expr scope ~container field);
         walk_expr scope ~container ptr
     | Ast.EDeref { ptr } -> walk_expr scope ~container ptr
-    | Ast.EParen x -> walk_expr scope ~container x
+    | Ast.EParen x -> walk_expr ?expected_status_owner scope ~container x
   and walk_decl (scope : nav_scope) ~(container : string option)
       (d : Ast.decl Ast.node) : unit =
     match d.v with
-    | Ast.DVar { dtype; init; _ } -> (
-        walk_type scope ~container dtype;
-        match init with None -> () | Some e -> walk_expr scope ~container e)
-    | Ast.DConst { dtype; value; _ } ->
-        (match dtype with None -> () | Some t -> walk_type scope ~container t);
-        walk_expr scope ~container value
+    | Ast.DVar { name; dtype; init; _ } -> (
+        walk_type scope ~container:(Some name.v) dtype;
+        let expected_status_owner =
+          status_owner_for_type_expr scope ~owner_name:name.v
+            ~owner_loc:name.loc dtype
+        in
+        match init with
+        | None -> ()
+        | Some e -> walk_expr ?expected_status_owner scope ~container e)
+    | Ast.DConst { name; dtype; value; _ } ->
+        (match dtype with
+        | None -> ()
+        | Some t -> walk_type scope ~container:(Some name.v) t);
+        let expected_status_owner =
+          match dtype with
+          | None -> None
+          | Some t ->
+              status_owner_for_type_expr scope ~owner_name:name.v
+                ~owner_loc:name.loc t
+        in
+        walk_expr ?expected_status_owner scope ~container value
     | Ast.DType { name; defn; _ } -> walk_type scope ~container:(Some name.v) defn
     | Ast.DProc p ->
         let proc_container = Some p.v.name.v in
@@ -1593,7 +1882,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
             add_decl_value
               ~metadata:(metadata_for_parameter ~ptype:prm.v.ptype ())
               proc_scope ~id:prm.v.pname ~kind:sym_kind_var
-              ~container:proc_container)
+              ~container:proc_container;
+            nav_bind_value_type proc_scope prm.v.pname prm.v.ptype)
           p.v.params;
         List.iter (prebind_decl proc_scope ~container:proc_container) p.v.locals;
         List.iter
@@ -1618,7 +1908,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         walk_stmt_list block_scope ~container xs
     | Ast.SAssign { lhs; rhs } ->
         walk_expr scope ~container lhs;
-        walk_expr scope ~container rhs
+        let expected_status_owner = status_owner_for_lvalue scope lhs in
+        walk_expr ?expected_status_owner scope ~container rhs
     | Ast.SCallStmt { callee; args; _ } ->
         use_value scope callee;
         List.iter (walk_expr scope ~container) args

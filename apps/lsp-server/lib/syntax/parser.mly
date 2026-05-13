@@ -47,6 +47,42 @@
     let base = n sp ep (Ast.ELit (Ast.LInt base_num)) in
     n sp ep (Ast.EPreset { base; items })
 
+  let mk_empty_table_preset sp ep : Ast.expr Ast.node =
+    mk_preset sp ep "0" []
+
+  let specified_table_kind_of_elem_type (ty : Ast.type_expr Ast.node option)
+      : Ast.specified_table_kind option =
+    match ty with
+    | Some { v = Ast.TArray { elem = { v = Ast.TName id; _ }; dims = [entry_size] }; _ }
+      when String.uppercase_ascii id.v = "W" ->
+        Some (Ast.SpecTableW entry_size)
+    | Some { v = Ast.TArray { elem = { v = Ast.TName id; _ }; dims = [entry_size] }; _ }
+      when String.uppercase_ascii id.v = "V" ->
+        Some (Ast.SpecTableV (Some entry_size))
+    | Some { v = Ast.TName id; _ } when String.uppercase_ascii id.v = "V" ->
+        Some (Ast.SpecTableV None)
+    | _ -> None
+
+  let mk_table_type sp ep dims elem_ty_opt recopt_before recopt_after : Ast.type_expr Ast.node =
+    let record_fields =
+      match recopt_after with
+      | Some _ as fields -> fields
+      | None -> recopt_before
+    in
+    let elem_ty =
+      match record_fields with
+      | Some fields ->
+          n sp ep (Ast.TRecord fields)
+      | None ->
+          (match elem_ty_opt with
+           | Some ty -> ty
+           | None -> n sp ep (Ast.TName (nid sp ep "__table_elem__")))
+    in
+    match (record_fields, specified_table_kind_of_elem_type elem_ty_opt) with
+    | Some _, Some kind ->
+        n sp ep (Ast.TSpecifiedTable { elem = elem_ty; dims; kind })
+    | _ -> n sp ep (Ast.TArray { elem = elem_ty; dims })
+
   let proc_use_from_flags (seen_rec:bool) (seen_rent:bool) : Ast.proc_use =
     if seen_rec then Ast.UseRec else if seen_rent then Ast.UseRent else Ast.UseNormal
 
@@ -79,9 +115,9 @@
   let field_of_block_decl (d : Ast.decl Ast.node) : Ast.field_decl Ast.node option =
     match d.v with
     | Ast.DVar { name; dtype; _ } ->
-        Some (Ast.node ~loc:d.loc { Ast.fname = name; ftype = dtype })
+        Some (Ast.node ~loc:d.loc { Ast.fname = name; ftype = dtype; fpos = None })
     | Ast.DConst { name; dtype = Some dtype; _ } ->
-        Some (Ast.node ~loc:d.loc { Ast.fname = name; ftype = dtype })
+        Some (Ast.node ~loc:d.loc { Ast.fname = name; ftype = dtype; fpos = None })
     | _ -> None
 
   let block_fields_of_body = function
@@ -129,6 +165,7 @@
 
 /* “header / meta” keywords (safe even if used as IDs) */
 %token PROGRAM COMPOOL ICOMPOOL DEFINE TYPE BLOCK
+%token POS
 
 /* conversion brackets */
 %token CONV_L CONV_R
@@ -414,9 +451,34 @@ type_decl:
         [n $startpos $endpos (Ast.DType { name = nm; defn; external_modifier = Ast.LocalDecl })]
       }
   /* Legacy form used by existing examples: TYPE T TABLE W 1; BEGIN ... END */
-  | TYPE nm=ident TABLE _base=ident _sizes=type_sizes_opt _t=terminator BEGIN fs=field_decl_list END
+  | TYPE nm=ident TABLE base=ident sizes=type_sizes_opt _t=terminator BEGIN fs=field_decl_list END
       {
-        let defn = n $startpos $endpos (Ast.TRecord fs) in
+        let elem = n $startpos $endpos (Ast.TRecord fs) in
+        let defn =
+          match String.uppercase_ascii base.v, sizes with
+          | "W", [entry_size] ->
+              n $startpos $endpos
+                (Ast.TSpecifiedTable {
+                  elem;
+                  dims = [];
+                  kind = Ast.SpecTableW entry_size;
+                })
+          | "V", [] ->
+              n $startpos $endpos
+                (Ast.TSpecifiedTable {
+                  elem;
+                  dims = [];
+                  kind = Ast.SpecTableV None;
+                })
+          | "V", [entry_size] ->
+              n $startpos $endpos
+                (Ast.TSpecifiedTable {
+                  elem;
+                  dims = [];
+                  kind = Ast.SpecTableV (Some entry_size);
+                })
+          | _ -> elem
+        in
         [n $startpos $endpos (Ast.DType { name = nm; defn; external_modifier = Ast.LocalDecl })]
       }
   ;
@@ -562,6 +624,79 @@ data_decl:
             [md; c]
       }
 
+  | mod_=modifier_opt CONSTANT TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
+      {
+        let _storage =
+          match mod_ with
+          | None -> if st then Ast.Static else Ast.Automatic
+          | Some _ -> Ast.External
+        in
+        let external_modifier = external_modifier_of_string_opt mod_ in
+        let ty =
+          mk_table_type $startpos $endpos dims elem_ty_opt recopt_before
+            recopt_after
+        in
+        let value =
+          match preset with
+          | Some p -> p
+          | None -> mk_empty_table_preset $startpos $endpos
+        in
+        let c =
+          n $startpos $endpos
+            (Ast.DConst {
+              name = nm;
+              dtype = Some ty;
+              value;
+              external_modifier;
+              data_decl_kind = Ast.DataTable;
+            })
+        in
+        match mod_ with
+        | None -> [c]
+        | Some m ->
+            let md =
+              n $startpos(mod_) $endpos(mod_)
+                (Ast.DDirective {
+                  name = nid $startpos(mod_) $endpos(mod_) m;
+                  args = [nid $startpos(nm) $endpos(nm) nm.v];
+                })
+            in
+            [md; c]
+      }
+
+  | mod_=modifier_opt CONSTANT TABLE nm=ident st=static_opt dims=table_dims_opt BEGIN fs=field_decl_list END _tail=terminator_opt
+      {
+        let _storage =
+          match mod_ with
+          | None -> if st then Ast.Static else Ast.Automatic
+          | Some _ -> Ast.External
+        in
+        let external_modifier = external_modifier_of_string_opt mod_ in
+        let elem_ty = n $startpos $endpos (Ast.TRecord fs) in
+        let ty = n $startpos $endpos (Ast.TArray { elem = elem_ty; dims }) in
+        let c =
+          n $startpos $endpos
+            (Ast.DConst {
+              name = nm;
+              dtype = Some ty;
+              value = mk_empty_table_preset $startpos $endpos;
+              external_modifier;
+              data_decl_kind = Ast.DataTable;
+            })
+        in
+        match mod_ with
+        | None -> [c]
+        | Some m ->
+            let md =
+              n $startpos(mod_) $endpos(mod_)
+                (Ast.DDirective {
+                  name = nid $startpos(mod_) $endpos(mod_) m;
+                  args = [nid $startpos(nm) $endpos(nm) nm.v];
+                })
+            in
+            [md; c]
+      }
+
   /* TABLE name [ (dims) ] [elem-type] [ - preset ] [ , BEGIN fielddecls END ] ; [BEGIN fielddecls END] */
   | mod_=modifier_opt TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
       {
@@ -575,20 +710,10 @@ data_decl:
           | Ast.Automatic when st -> Ast.Static
           | x -> x
         in
-        let elem_ty =
-          match recopt_after with
-          | Some fields ->
-              n $startpos $endpos (Ast.TRecord fields)
-          | None ->
-              (match recopt_before with
-               | Some fields ->
-                   n $startpos $endpos (Ast.TRecord fields)
-               | None ->
-                   (match elem_ty_opt with
-                    | Some ty -> ty
-                    | None -> n $startpos $endpos (Ast.TName (nid $startpos $endpos "__table_elem__"))))
+        let ty =
+          mk_table_type $startpos $endpos dims elem_ty_opt recopt_before
+            recopt_after
         in
-        let ty = n $startpos $endpos (Ast.TArray { elem = elem_ty; dims }) in
 
         (* keep preset as init placeholder if you want; otherwise ignore *)
         let init = preset in
@@ -761,11 +886,44 @@ rev_field_decl_list:
   ;
 
 field_decl:
-  | ITEM nm=ident ty=type_spec _init=item_init_opt _attrs=item_attrs_opt _t=terminator
-      { n $startpos $endpos { Ast.fname = nm; ftype = ty } }
+  | ITEM nm=ident ty=type_spec _init=item_init_opt pos=field_attrs_opt _t=terminator
+      { n $startpos $endpos { Ast.fname = nm; ftype = ty; fpos = pos } }
+  ;
+
+field_attrs_opt:
+  | /* empty */ { None }
+  | attrs=field_attrs { attrs }
+  ;
+
+field_attrs:
+  | x=field_attr { x }
+  | x=field_attr xs=field_attrs { match x with Some _ -> x | None -> xs }
+  ;
+
+field_attr:
+  | POS LPAREN start_bit=expr COMMA start_word=expr RPAREN
+      { Some { Ast.pos_start_bit = start_bit; pos_start_word = start_word } }
+  | STATIC { None }
+  | _id=ident { None }
+  | _id=ident _p=attr_paren_payload { None }
+  | _p=attr_paren_payload { None }
   ;
 
 type_spec:
+  | base=ident LPAREN values=status_value_list RPAREN
+      {
+        if String.uppercase_ascii base.v = "STATUS" then
+          n $startpos $endpos (Ast.TStatus values)
+        else
+          let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
+          let dims =
+            List.map
+              (fun (value : Ast.status_value Ast.node) ->
+                Ast.node ~loc:value.loc (Ast.EName value.v.sv_name))
+              values
+          in
+          n $startpos $endpos (Ast.TArray { elem; dims })
+      }
   | base=ident sizes=type_sizes_opt
       {
         match String.uppercase_ascii base.v, sizes with
@@ -777,6 +935,29 @@ type_spec:
         | _, dims ->
             let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
             n $startpos $endpos (Ast.TArray { elem; dims })
+      }
+  ;
+
+status_value_list:
+  | xs=rev_status_value_list { List.rev xs }
+  ;
+
+rev_status_value_list:
+  | x=status_value { [x] }
+  | xs=rev_status_value_list COMMA x=status_value { x :: xs }
+  ;
+
+status_value:
+  | nm=ident
+      { n $startpos $endpos { Ast.sv_name = nm; sv_representation = None } }
+  | ctor=ident LPAREN nm=ident RPAREN
+      {
+        if String.uppercase_ascii ctor.v <> "V" then
+          Parse_diags.add ctor.loc
+            (Printf.sprintf
+               "Unknown STATUS value constructor %S (expected V)."
+               ctor.v);
+        n $startpos $endpos { Ast.sv_name = nm; sv_representation = None }
       }
   ;
 
@@ -1272,7 +1453,7 @@ type checkpoint_entry = {
   token_start_line : int;
   token_start_col : int;
   checkpoint : Ast.program I.checkpoint;
-}
+} [@@warning "-69"]
 
 type checkpoint_cache = {
   token_count : int;
@@ -1282,7 +1463,7 @@ type checkpoint_cache = {
   landmark_count : int;
   entries : checkpoint_entry list;
   output : output option;
-}
+} [@@warning "-69"]
 
 type checkpoint_stats = {
   cache_hit : bool;
@@ -1414,6 +1595,7 @@ module Debug = struct
     | XOR -> "XOR"
     | EQV -> "EQV"
     | MOD -> "MOD"
+    | POS -> "POS"
     | LPAREN -> "("
     | RPAREN -> ")"
     | COMMA -> ","
@@ -1476,6 +1658,7 @@ let expected_candidates : token list =
     DEFINE;
     TYPE;
     BLOCK;
+    POS;
     IF;
     ELSE;
     WHILE;

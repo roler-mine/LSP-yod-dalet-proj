@@ -127,10 +127,12 @@ function lsifRefreshCount(): number {
   ).length;
 }
 
+function requestCount(method: string): number {
+  return readEvents().filter((event) => event.method === method).length;
+}
+
 function inlayHintRequestCount(): number {
-  return readEvents().filter(
-    (event) => event.method === "textDocument/inlayHint",
-  ).length;
+  return requestCount("textDocument/inlayHint");
 }
 
 async function refreshEditorInlayHints(): Promise<void> {
@@ -515,6 +517,87 @@ async function fetchInlayHints(
   );
 }
 
+async function executeProviderAndWait(
+  description: string,
+  lspMethod: string,
+  command: string,
+  ...args: unknown[]
+): Promise<void> {
+  const before = requestCount(lspMethod);
+  try {
+    await vscode.commands.executeCommand(command, ...args);
+  } catch (error) {
+    throw new Error(
+      `${description} command '${command}' failed before reaching the fake LSP server: ${String(
+        error,
+      )}`,
+    );
+  }
+  await waitFor(`${description} request`, () => {
+    const count = requestCount(lspMethod);
+    return count > before ? count : undefined;
+  });
+}
+
+async function testAdvertisedFeatureProvidersReachServer(): Promise<void> {
+  await activateExtension();
+
+  const samplePath = requireEnv("JOVIAL_INTEGRATION_SAMPLE", SAMPLE_PATH);
+  const document = await vscode.workspace.openTextDocument(
+    vscode.Uri.file(samplePath),
+  );
+  await vscode.window.showTextDocument(document);
+
+  const range = new vscode.Range(
+    new vscode.Position(0, 0),
+    new vscode.Position(0, Math.max(1, document.lineAt(0).text.length)),
+  );
+  const position = new vscode.Position(0, 0);
+  const formatOptions = { insertSpaces: true, tabSize: 2 };
+
+  await executeProviderAndWait(
+    "formatting",
+    "textDocument/formatting",
+    "vscode.executeFormatDocumentProvider",
+    document.uri,
+    formatOptions,
+  );
+  await executeProviderAndWait(
+    "CodeLens",
+    "textDocument/codeLens",
+    "vscode.executeCodeLensProvider",
+    document.uri,
+  );
+  await executeProviderAndWait(
+    "code actions",
+    "textDocument/codeAction",
+    "vscode.executeCodeActionProvider",
+    document.uri,
+    range,
+  );
+  await executeProviderAndWait(
+    "semantic tokens range",
+    "textDocument/semanticTokens/range",
+    "vscode.provideDocumentRangeSemanticTokens",
+    document.uri,
+    range,
+  );
+  await executeProviderAndWait(
+    "definition navigation",
+    "textDocument/definition",
+    "vscode.executeDefinitionProvider",
+    document.uri,
+    position,
+  );
+  await executeProviderAndWait(
+    "references navigation",
+    "textDocument/references",
+    "vscode.executeReferenceProvider",
+    document.uri,
+    position,
+  );
+}
+
 async function testMiddlewareLsifFallback(): Promise<void> {
   await setConfig("lsif.fastPath", true);
   await activateExtension();
@@ -573,5 +656,6 @@ export async function run(): Promise<void> {
   await testRestartCommand();
   await testWatchedFileNotifications();
   await testLsifRefreshCommand();
+  await testAdvertisedFeatureProvidersReachServer();
   await testMiddlewareLsifFallback();
 }

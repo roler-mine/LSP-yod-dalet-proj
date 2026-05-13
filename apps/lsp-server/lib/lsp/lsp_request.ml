@@ -389,7 +389,9 @@ let parse_client_overrides (params : Yojson.Safe.t) :
       rename = feature_bool "rename";
       completion = feature_bool "completion";
       code_actions = feature_bool "codeActions";
+      code_lens = feature_bool "codeLens";
       inlay_hints = feature_bool "inlayHints";
+      formatting = feature_bool "formatting";
       semantic_tokens = feature_bool "semanticTokens";
     }
   in

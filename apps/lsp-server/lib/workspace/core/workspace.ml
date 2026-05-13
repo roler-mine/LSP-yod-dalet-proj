@@ -55,27 +55,34 @@ let document_version = Workspace_state.document_version
 let diagnostics_snapshot_for = Workspace_state.diagnostics_snapshot_for
 let ast_dump_for = Workspace_state.ast_dump_for
 let cst_dump_for = Workspace_state.cst_dump_for
-let definition_locations_for = Workspace_navigation.definition_locations_for
-let declaration_locations_for = Workspace_navigation.declaration_locations_for
+let definition_locations_for = Workspace_query.definition_locations_for
+let declaration_locations_for = Workspace_definition.declaration_locations_for
 let type_definition_locations_for =
-  Workspace_navigation.type_definition_locations_for
+  Workspace_type_definition.type_definition_locations_for
 
 let implementation_locations_for =
-  Workspace_navigation.implementation_locations_for
+  Workspace_implementation.implementation_locations_for
 
-let references_locations_for = Workspace_navigation.references_locations_for
-let references_locations_stream =
-  Workspace_navigation.references_locations_stream
+let references_locations_for = Workspace_query.references_locations_for
+
+let references_locations_stream ws ~uri ~pos ~include_decl ~emit =
+  Workspace_references.references_locations_stream ws ~uri ~pos ~include_decl
+    ~emit
 
 let document_symbols_for = Workspace_reporting.document_symbols_for
-let workspace_symbols_for = Workspace_navigation.workspace_symbols_for
-let workspace_symbols_stream = Workspace_navigation.workspace_symbols_stream
-let hover_for = Workspace_navigation.hover_for
-let signature_help_for = Workspace_navigation.signature_help_for
-let prepare_rename_for = Workspace_navigation.prepare_rename_for
-let rename_for = Workspace_navigation.rename_for
-let completion_items_for = Workspace_navigation.completion_items_for
-let code_actions_for = Workspace_navigation.code_actions_for
+let workspace_symbols_for = Workspace_symbols.workspace_symbols_for
+let workspace_symbols_stream = Workspace_symbols.workspace_symbols_stream
+let hover_for = Workspace_query.hover_for
+let signature_help_for = Workspace_signature_help.signature_help_for
+let prepare_rename_for = Workspace_rename.prepare_rename_for
+let rename_for = Workspace_rename.rename_for
+let completion_items_for = Workspace_completion.completion_items_for
+let code_actions_for = Workspace_code_actions.code_actions_for
+let code_lenses_for = Workspace_codelens.code_lenses_for
+let resolve_code_lens = Workspace_codelens.resolve_code_lens
+let inlay_hints_for = Workspace_inlay_hints.inlay_hints_for
+let formatting_edits_for = Workspace_formatting.document_edits_for
+let range_formatting_edits_for = Workspace_formatting.range_edits_for
 let semantic_tokens_full_for = Workspace_reporting.semantic_tokens_full_for
 let semantic_tokens_range_for = Workspace_reporting.semantic_tokens_range_for
 let semantic_tokens_delta_for = Workspace_reporting.semantic_tokens_delta_for
@@ -83,6 +90,8 @@ let lsif_index_json = Workspace_reporting.lsif_index_json
 let lsif_delta_json = Workspace_reporting.lsif_delta_json
 let perf_stats_json = Workspace_nav_lookup.perf_stats_json
 let debug_report_for = Workspace_reporting.debug_report_for
+let debug_scheduler_json = Workspace_reporting.debug_scheduler_json
+let debug_memory_json = Workspace_reporting.debug_memory_json
 let snapshot = Workspace_snapshot.of_workspace
 
 let publish_snapshot ws =

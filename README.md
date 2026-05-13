@@ -41,7 +41,7 @@ npm run lint
 npm run format:check
 npm run check
 npm run test:unit
-npm run test:integration
+npm run test:integration:pinned
 ```
 
 Run extension in VS Code (development):
@@ -139,10 +139,18 @@ Startup behavior:
 ## Testing And CI
 
 - Extension unit tests: `npm --prefix ./apps/vscode-extension run test:unit`
-- Extension integration tests: `npm --prefix ./apps/vscode-extension run test:integration`
+- Extension integration tests: `npm --prefix ./apps/vscode-extension run test:integration:pinned`
 - Extension lint/format/typecheck: `npm --prefix ./apps/vscode-extension run lint`, `format:check`, `check`
 - Server smoke/stability: `npm run test:server`
 - Cross-project local check: `npm run check`
+
+The extension integration runner uses the pinned VS Code version in
+`apps/vscode-extension/package.json` (`config.vscodeTestVersion`) and launches a
+downloaded test host with temporary user-data and extension directories. The
+plain `test:integration` script aliases this pinned path. Override with
+`VSCODE_TEST_VERSION=<version>` for another downloaded build, or
+`VSCODE_TEST_EXECUTABLE_PATH=<path-to-Code>` only when deliberately bypassing
+the downloaded host.
 
 Main CI currently gates:
 

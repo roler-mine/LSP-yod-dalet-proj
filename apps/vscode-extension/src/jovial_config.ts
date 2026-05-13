@@ -24,7 +24,9 @@ export type JovialFeatureFlags = {
   rename: boolean;
   completion: boolean;
   codeActions: boolean;
+  codeLens: boolean;
   inlayHints: boolean;
+  formatting: boolean;
   semanticTokens: boolean;
 };
 
@@ -36,7 +38,9 @@ export type JovialPassiveFeatureOverrides = {
   signatureHelp: boolean | null;
   completion: boolean | null;
   codeActions: boolean | null;
+  codeLens: boolean | null;
   inlayHints: boolean | null;
+  formatting: boolean | null;
   semanticTokens: boolean | null;
 };
 
@@ -94,7 +98,9 @@ const passiveFeatureNames: readonly JovialPassiveFeatureName[] = [
   "signatureHelp",
   "completion",
   "codeActions",
+  "codeLens",
   "inlayHints",
+  "formatting",
   "semanticTokens",
 ];
 
@@ -110,7 +116,9 @@ function allPassiveFeatureFlags(enabled: boolean): JovialPassiveFeatureFlags {
     signatureHelp: enabled,
     completion: enabled,
     codeActions: enabled,
+    codeLens: enabled,
     inlayHints: enabled,
+    formatting: enabled,
     semanticTokens: enabled,
   };
 }
@@ -124,7 +132,9 @@ function passiveFlagsForProfile(
       return {
         ...allPassiveFeatureFlags(true),
         codeActions: false,
+        codeLens: false,
         inlayHints: false,
+        formatting: true,
         semanticTokens: false,
       };
     case "minimal":
@@ -135,7 +145,9 @@ function passiveFlagsForProfile(
         signatureHelp: false,
         completion: false,
         codeActions: false,
+        codeLens: false,
         inlayHints: false,
+        formatting: false,
         semanticTokens: false,
       };
     case "custom": {
@@ -148,7 +160,9 @@ function passiveFlagsForProfile(
         signatureHelp: selected.has("signatureHelp"),
         completion: selected.has("completion"),
         codeActions: selected.has("codeActions"),
+        codeLens: selected.has("codeLens"),
         inlayHints: selected.has("inlayHints"),
+        formatting: selected.has("formatting"),
         semanticTokens: selected.has("semanticTokens"),
       };
     }
@@ -170,7 +184,9 @@ function applyPassiveOverrides(
     signatureHelp: overrides.signatureHelp ?? base.signatureHelp,
     completion: overrides.completion ?? base.completion,
     codeActions: overrides.codeActions ?? base.codeActions,
+    codeLens: overrides.codeLens ?? base.codeLens,
     inlayHints: overrides.inlayHints ?? base.inlayHints,
+    formatting: overrides.formatting ?? base.formatting,
     semanticTokens: overrides.semanticTokens ?? base.semanticTokens,
   };
 }
@@ -404,11 +420,13 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
     ),
     completion: readPassiveOverride("completion", "features.completion"),
     codeActions: readPassiveOverride("codeActions", "features.codeActions"),
+    codeLens: readPassiveOverride("codeLens", "features.codeLens"),
     inlayHints: readPassiveOverride("inlayHints", "features.inlayHints", [
       "server.inlayHints",
       "server.inlayhints",
       "server.InlayHint",
     ]),
+    formatting: readPassiveOverride("formatting", "features.formatting"),
     semanticTokens: readPassiveOverride(
       "semanticTokens",
       "features.semanticTokens",
@@ -438,7 +456,9 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
     rename: true,
     completion: passiveFeatures.completion,
     codeActions: passiveFeatures.codeActions,
+    codeLens: passiveFeatures.codeLens,
     inlayHints: passiveFeatures.inlayHints,
+    formatting: passiveFeatures.formatting,
     semanticTokens: passiveFeatures.semanticTokens,
   };
 

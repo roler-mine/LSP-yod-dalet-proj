@@ -126,11 +126,35 @@ type binop =
 type type_expr =
   | TName of ident
   | TArray of { elem : type_expr node; dims : expr node list }
+  | TSpecifiedTable of {
+      elem : type_expr node;
+      dims : expr node list;
+      kind : specified_table_kind;
+    }
   | TPointer of type_expr node
+  | TStatus of status_value node list
   | TRecord of field_decl node list
   | TFunc of { params : param node list; returns : type_expr node option }
 
-and field_decl = { fname : ident; ftype : type_expr node }
+and specified_table_kind =
+  | SpecTableW of expr node
+  | SpecTableV of expr node option
+
+and status_value = {
+  sv_name : ident;
+  sv_representation : expr node option;
+}
+
+and field_position = {
+  pos_start_bit : expr node;
+  pos_start_word : expr node;
+}
+
+and field_decl = {
+  fname : ident;
+  ftype : type_expr node;
+  fpos : field_position option;
+}
 and param_mode = In | Out | InOut
 and param = { pname : ident; pmode : param_mode; ptype : type_expr node }
 
@@ -310,6 +334,19 @@ module Debug = struct
             elem
             (pp_list (pp_expr opts b (depth + 1)))
             dims (pp_loc_if opts) t.loc
+      | TSpecifiedTable { elem; dims; kind } ->
+          Format.fprintf fmt
+            "@[TSpecifiedTable(elem=%a; dims=[%a]; kind=%a)@]%a"
+            (pp_type_expr opts b (depth + 1))
+            elem
+            (pp_list (pp_expr opts b (depth + 1)))
+            dims
+            (pp_specified_table_kind opts b (depth + 1))
+            kind (pp_loc_if opts) t.loc
+      | TStatus values ->
+          Format.fprintf fmt "@[TStatus([%a])@]%a"
+            (pp_list (pp_status_value opts b (depth + 1)))
+            values (pp_loc_if opts) t.loc
       | TRecord fields ->
           Format.fprintf fmt "@[TRecord([%a])@]%a"
             (pp_list (pp_field_decl opts b (depth + 1)))
@@ -321,13 +358,46 @@ module Debug = struct
             (pp_opt (pp_type_expr opts b (depth + 1)))
             returns (pp_loc_if opts) t.loc
 
+  and pp_specified_table_kind opts b depth fmt = function
+    | SpecTableW entry_size ->
+        Format.fprintf fmt "W(%a)"
+          (pp_expr opts b (depth + 1))
+          entry_size
+    | SpecTableV None -> Format.pp_print_string fmt "V"
+    | SpecTableV (Some entry_size) ->
+        Format.fprintf fmt "V(%a)"
+          (pp_expr opts b (depth + 1))
+          entry_size
+
+  and pp_status_value opts b depth fmt (sv : status_value node) =
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
+    else
+      let x = sv.v in
+      Format.fprintf fmt "@[V(%a%a)@]%a" pp_ident x.sv_name
+        (fun fmt -> function
+          | None -> ()
+          | Some rep ->
+              Format.fprintf fmt " = %a"
+                (pp_expr opts b (depth + 1))
+                rep)
+        x.sv_representation (pp_loc_if opts) sv.loc
+
   and pp_field_decl opts b depth fmt (f : field_decl node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else
       let x = f.v in
-      Format.fprintf fmt "@[Field(%a : %a)@]%a" pp_ident x.fname
+      Format.fprintf fmt "@[Field(%a : %a%a)@]%a" pp_ident x.fname
         (pp_type_expr opts b (depth + 1))
-        x.ftype (pp_loc_if opts) f.loc
+        x.ftype
+        (fun fmt -> function
+          | None -> ()
+          | Some pos ->
+              Format.fprintf fmt " POS(%a, %a)"
+                (pp_expr opts b (depth + 1))
+                pos.pos_start_bit
+                (pp_expr opts b (depth + 1))
+                pos.pos_start_word)
+        x.fpos (pp_loc_if opts) f.loc
 
   and pp_param_mode fmt = function
     | In -> Format.pp_print_string fmt "In"

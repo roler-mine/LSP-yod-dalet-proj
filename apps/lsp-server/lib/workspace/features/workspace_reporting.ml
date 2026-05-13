@@ -1,5 +1,6 @@
 module T = Lsp.Types
 open Ast
+open Workspace_foundation
 open Workspace_state
 open Workspace_runtime
 open Workspace_index_graph
@@ -206,31 +207,47 @@ let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
   | _ -> ());
   out
 
-let semantic_symbol_tokens_for_doc (ws : t) (doc : Document.t) :
+let budget_should_stop ?(phase = "semantic_tokens") = function
+  | None -> false
+  | Some budget -> Workspace_budget.should_stop ~phase budget
+
+let budget_stopped = function
+  | None -> false
+  | Some budget -> Workspace_budget.reason_if_stopped budget <> None
+
+let semantic_symbol_tokens_for_doc ?budget (ws : t) (doc : Document.t) :
     semantic_token list =
-  let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 1 in
-  let nav = nav_for_doc_cached ws cache doc in
-  let out = ref [] in
-  Hashtbl.iter
-    (fun sym_id occs ->
-      match Hashtbl.find_opt nav.defs_by_id sym_id with
-      | None -> ()
-      | Some decl -> (
-          match semantic_type_of_metadata decl.metadata decl.kind with
+  if budget_should_stop ~phase:"semantic_tokens.symbols" budget then []
+  else
+    let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 1 in
+    let nav = nav_for_doc_cached ws cache doc in
+    let out = ref [] in
+    Hashtbl.iter
+      (fun sym_id occs ->
+        if not (budget_should_stop ~phase:"semantic_tokens.symbols" budget) then
+          match Hashtbl.find_opt nav.defs_by_id sym_id with
           | None -> ()
-          | Some typ ->
-              List.iter
-                (fun (occ_uri, occ_loc) ->
-                  if same_uri occ_uri doc.Document.uri then
-                    let mods =
-                      semantic_mods_for_occurrence ~decl ~occ_uri ~occ_loc
-                    in
-                    match semantic_token_of_loc occ_loc ~typ ~mods with
-                    | None -> ()
-                    | Some tok -> out := tok :: !out)
-                occs))
-    nav.occs_by_id;
-  List.rev !out
+          | Some decl -> (
+              match semantic_type_of_metadata decl.metadata decl.kind with
+              | None -> ()
+              | Some typ ->
+                  List.iter
+                    (fun (occ_uri, occ_loc) ->
+                      if
+                        (not
+                           (budget_should_stop ~phase:"semantic_tokens.symbols"
+                              budget))
+                        && same_uri occ_uri doc.Document.uri
+                      then
+                        let mods =
+                          semantic_mods_for_occurrence ~decl ~occ_uri ~occ_loc
+                        in
+                        match semantic_token_of_loc occ_loc ~typ ~mods with
+                        | None -> ()
+                        | Some tok -> out := tok :: !out)
+                    occs))
+      nav.occs_by_id;
+    List.rev !out
 
 let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
     ~(builtin_type_context : string -> bool)
@@ -254,7 +271,7 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
   | Parser.EXIT | Parser.GOTO | Parser.RETURN | Parser.ABORT | Parser.STOP
   | Parser.NOT | Parser.AND | Parser.OR | Parser.XOR | Parser.EQV | Parser.MOD
   | Parser.TRUE | Parser.FALSE | Parser.PROGRAM | Parser.COMPOOL
-  | Parser.ICOMPOOL | Parser.DEFINE | Parser.TYPE | Parser.BLOCK ->
+  | Parser.ICOMPOOL | Parser.DEFINE | Parser.TYPE | Parser.BLOCK | Parser.POS ->
       Some (sem_tt_keyword, 0)
   | Parser.EQ | Parser.NE | Parser.LT | Parser.LE | Parser.GT | Parser.GE
   | Parser.PLUS | Parser.MINUS | Parser.STAR | Parser.SLASH | Parser.POW
@@ -264,39 +281,44 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
   | Parser.DOT | Parser.EOF ->
       None
 
-let semantic_lex_tokens_for_doc (doc : Document.t)
+let semantic_lex_tokens_for_doc ?budget (doc : Document.t)
     ~(macro_keys : (string, bool) Hashtbl.t) : semantic_token list =
-  let tokens =
-    match Document.current_parse doc with
-    | Some { Document.parsed_syntax = Some syntax; _ }
-      when syntax.Syntax_cache.raw_hash = Digest.to_hex (Digest.string doc.Document.text) -> (
-        match syntax.Syntax_cache.raw_tokens with
-        | Some toks -> toks
-        | None ->
-            Preprocess.lex_all_tokens ~file:doc.Document.file
-              ~text:doc.Document.text)
-    | _ ->
-        Preprocess.lex_all_tokens ~file:doc.Document.file ~text:doc.Document.text
-  in
-  let out = ref [] in
-  Array.iter
-    (fun (span : Preprocess.lex_tok) ->
-      let tok = span.Parser.tok in
-      let line0 = max 0 (span.start_line - 1) in
-      let col0 = max 0 span.start_col in
-      let col1 = max 0 span.end_col in
-      let builtin_type_context name =
-        is_builtin_type_context_at_offsets doc name ~start_off:span.start_off
-          ~end_off:span.end_off
-      in
-      match semantic_class_of_lex_token ~macro_keys ~builtin_type_context tok with
-      | None -> ()
-      | Some (typ, mods) -> (
-          match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
+  if budget_should_stop ~phase:"semantic_tokens.lex" budget then []
+  else
+    let tokens =
+      match Document.current_parse doc with
+      | Some { Document.parsed_syntax = Some syntax; _ }
+        when syntax.Syntax_cache.raw_hash
+             = Digest.to_hex (Digest.string doc.Document.text) -> (
+          match syntax.Syntax_cache.raw_tokens with
+          | Some toks -> toks
+          | None ->
+              Preprocess.lex_all_tokens ~file:doc.Document.file
+                ~text:doc.Document.text)
+      | _ ->
+          Preprocess.lex_all_tokens ~file:doc.Document.file
+            ~text:doc.Document.text
+    in
+    let out = ref [] in
+    Array.iter
+      (fun (span : Preprocess.lex_tok) ->
+        if not (budget_should_stop ~phase:"semantic_tokens.lex" budget) then (
+          let tok = span.Parser.tok in
+          let line0 = max 0 (span.start_line - 1) in
+          let col0 = max 0 span.start_col in
+          let col1 = max 0 span.end_col in
+          let builtin_type_context name =
+            is_builtin_type_context_at_offsets doc name ~start_off:span.start_off
+              ~end_off:span.end_off
+          in
+          match semantic_class_of_lex_token ~macro_keys ~builtin_type_context tok with
           | None -> ()
-          | Some st -> out := st :: !out))
-    tokens;
-  List.rev !out
+          | Some (typ, mods) -> (
+              match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
+              | None -> ()
+              | Some st -> out := st :: !out)))
+      tokens;
+    List.rev !out
 
 let background_queue_length (ws : t) : int =
   Queue.length ws.bg_high_small_queue
@@ -342,39 +364,51 @@ let line_window_for_range (doc : Document.t) (range : T.Range.t) :
             start_off,
             start_line )
 
-let semantic_lex_tokens_for_doc_range (doc : Document.t)
+let semantic_lex_tokens_for_doc_range ?budget (doc : Document.t)
     ~(macro_keys : (string, bool) Hashtbl.t) ~(range : T.Range.t) :
     semantic_token list =
-  match line_window_for_range doc range with
+  if budget_should_stop ~phase:"semantic_tokens.range_lex" budget then []
+  else
+    match line_window_for_range doc range with
   | None -> []
   | Some (text, base_off, base_line0) ->
       let tokens = Preprocess.lex_all_tokens ~file:doc.Document.file ~text in
       let out = ref [] in
       Array.iter
         (fun (span : Preprocess.lex_tok) ->
-          let tok = span.Parser.tok in
-          let line0 = base_line0 + max 0 (span.start_line - 1) in
-          let col0 = max 0 span.start_col in
-          let col1 = max 0 span.end_col in
-          let start_off = base_off + span.start_off in
-          let end_off = base_off + span.end_off in
-          let builtin_type_context name =
-            is_builtin_type_context_at_offsets doc name ~start_off ~end_off
-          in
-          match
-            semantic_class_of_lex_token ~macro_keys ~builtin_type_context tok
-          with
-          | None -> ()
-          | Some (typ, mods) -> (
-              match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
-              | None -> ()
-              | Some st ->
-                  if semantic_token_intersects_range st range then out := st :: !out))
+          if
+            not (budget_should_stop ~phase:"semantic_tokens.range_lex" budget)
+          then (
+            let tok = span.Parser.tok in
+            let line0 = base_line0 + max 0 (span.start_line - 1) in
+            let col0 = max 0 span.start_col in
+            let col1 = max 0 span.end_col in
+            let start_off = base_off + span.start_off in
+            let end_off = base_off + span.end_off in
+            let builtin_type_context name =
+              is_builtin_type_context_at_offsets doc name ~start_off ~end_off
+            in
+            match
+              semantic_class_of_lex_token ~macro_keys ~builtin_type_context tok
+            with
+            | None -> ()
+            | Some (typ, mods) -> (
+                match semantic_token_of_span ~line0 ~col0 ~col1 ~typ ~mods with
+                | None -> ()
+                | Some st ->
+                    if semantic_token_intersects_range st range then
+                      out := st :: !out)))
         tokens;
       List.rev !out
 
-let semantic_tokens_for_doc (ws : t) (doc : Document.t)
+let semantic_tokens_for_doc ?budget (ws : t) (doc : Document.t)
     ~(range : T.Range.t option) : semantic_token list =
+  let budget =
+    match budget with
+    | Some _ as budget -> budget
+    | None ->
+        Some (Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms)
+  in
   let norm_range = Option.map normalize_range_order range in
   let in_range tok =
     match norm_range with
@@ -398,6 +432,7 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
     schedule_open_doc_parse_fallback ws doc
       ~reason_group:"semantic_full_large";
     [])
+  else if budget_should_stop ~phase:"semantic_tokens" budget then []
   else
   let cached =
     if ws.sem_store_enabled then
@@ -423,7 +458,7 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
       | Some r ->
           Perf_stats.tick "semantic_tokens.range_lex_fallback";
           let macro_keys = collect_define_macro_keys doc in
-          semantic_lex_tokens_for_doc_range doc ~macro_keys ~range:r
+          semantic_lex_tokens_for_doc_range ?budget doc ~macro_keys ~range:r
           |> List.sort semantic_token_compare
       | None ->
       let seen = Hashtbl.create 2048 in
@@ -435,11 +470,17 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
             Hashtbl.add seen k true;
             out := tok :: !out)
       in
-      if doc_current then semantic_symbol_tokens_for_doc ws doc |> List.iter add
+      if doc_current then
+        semantic_symbol_tokens_for_doc ?budget ws doc |> List.iter add
       else Perf_stats.tick "semantic_tokens.symbol_skip_stale";
-      let macro_keys = collect_define_macro_keys doc in
+      let macro_keys =
+        if budget_should_stop ~phase:"semantic_tokens.macros" budget then
+          Hashtbl.create 0
+        else collect_define_macro_keys doc
+      in
       let lex_tokens =
-        if ws.sem_store_enabled then
+        if budget_should_stop ~phase:"semantic_tokens.lex" budget then []
+        else if ws.sem_store_enabled then
           match
             Semantic_store.snapshot_for_uri ws.semantic_store
               ~uri:doc.Document.uri
@@ -448,16 +489,17 @@ let semantic_tokens_for_doc (ws : t) (doc : Document.t)
               match snap.Semantic_store.Snapshot.semantic_lex_tokens with
               | Some toks -> List.map semantic_token_of_snapshot toks
               | None ->
-                  let toks = semantic_lex_tokens_for_doc doc ~macro_keys in
-                  Semantic_store.Snapshot.set_semantic_lex_tokens snap
-                    (List.map snapshot_token_of_semantic toks);
+                  let toks = semantic_lex_tokens_for_doc ?budget doc ~macro_keys in
+                  if not (budget_stopped budget) then
+                    Semantic_store.Snapshot.set_semantic_lex_tokens snap
+                      (List.map snapshot_token_of_semantic toks);
                   toks)
-          | _ -> semantic_lex_tokens_for_doc doc ~macro_keys
-        else semantic_lex_tokens_for_doc doc ~macro_keys
+          | _ -> semantic_lex_tokens_for_doc ?budget doc ~macro_keys
+        else semantic_lex_tokens_for_doc ?budget doc ~macro_keys
       in
       lex_tokens |> List.iter add;
       let toks = List.sort semantic_token_compare (List.rev !out) in
-      (if ws.sem_store_enabled && range = None then
+      (if ws.sem_store_enabled && range = None && not (budget_stopped budget) then
          match
            Semantic_store.snapshot_for_uri ws.semantic_store
              ~uri:doc.Document.uri
@@ -497,8 +539,10 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
       ds_children = children;
     }
   in
-  let of_type_fields (t : Ast.type_expr Ast.node) : doc_symbol list =
+  let rec of_type_fields (t : Ast.type_expr Ast.node) : doc_symbol list =
     match t.v with
+    | Ast.TSpecifiedTable { elem; _ } -> of_type_fields elem
+    | Ast.TArray { elem; _ } -> of_type_fields elem
     | Ast.TRecord fields ->
         fields
         |> List.map (fun f ->
@@ -546,15 +590,22 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
             ~detail:(Some (type_expr_to_compact_string dtype))
             ~children:(of_type_fields dtype);
         ]
-    | Ast.DConst { name; dtype; _ } ->
+    | Ast.DConst { name; dtype; data_decl_kind; _ } ->
         let detail =
+          match (data_decl_kind, dtype) with
+          | Ast.DataTable, Some t ->
+              Some ("constant table " ^ type_expr_to_compact_string t)
+          | _, None -> Some "const"
+          | _, Some t -> Some ("const " ^ type_expr_to_compact_string t)
+        in
+        let children =
           match dtype with
-          | None -> Some "const"
-          | Some t -> Some ("const " ^ type_expr_to_compact_string t)
+          | Some t when data_decl_kind = Ast.DataTable -> of_type_fields t
+          | _ -> []
         in
         [
           mk_symbol ~name:name.v ~kind:sym_kind_const ~range:d.loc
-            ~selection:name.loc ~detail ~children:[];
+            ~selection:name.loc ~detail ~children;
         ]
     | Ast.DType { name; defn; _ } ->
         [
@@ -638,7 +689,253 @@ let feature_flags_json_for_report (ws : t) : Yojson.Safe.t =
       ("rename", `Bool flags.rename);
       ("completion", `Bool flags.completion);
       ("codeActions", `Bool flags.code_actions);
+      ("codeLens", `Bool flags.code_lens);
+      ("inlayHints", `Bool flags.inlay_hints);
       ("semanticTokens", `Bool flags.semantic_tokens);
+    ]
+
+let bg_queue_kind_to_string = function
+  | BgQueueHighSmall -> "highSmall"
+  | BgQueueRootSmall -> "rootSmall"
+  | BgQueueNormalSmall -> "normalSmall"
+  | BgQueueHighLarge -> "highLarge"
+  | BgQueueRootLarge -> "rootLarge"
+  | BgQueueNormalLarge -> "normalLarge"
+
+let parse_job_kind_to_string = function
+  | ParseJobHighLarge -> "highLarge"
+  | ParseJobRootLarge -> "rootLarge"
+  | ParseJobNormalLarge -> "normalLarge"
+
+let size_class_of_queue_kind = function
+  | BgQueueHighSmall | BgQueueRootSmall | BgQueueNormalSmall -> "small"
+  | BgQueueHighLarge | BgQueueRootLarge | BgQueueNormalLarge -> "large"
+
+let size_class_of_parse_job_kind = function
+  | ParseJobHighLarge | ParseJobRootLarge | ParseJobNormalLarge -> "large"
+
+let lane_of_parse_job_kind = function
+  | ParseJobHighLarge -> "open"
+  | ParseJobRootLarge -> "root"
+  | ParseJobNormalLarge -> "sweep"
+
+let path_debug_json path =
+  `Assoc
+    [
+      ("file", `String (Filename.basename path));
+      ("pathHash", `String (Digest.to_hex (Digest.string (normalize_path_key path))));
+    ]
+
+let queue_peek_opt (q : 'a Queue.t) : 'a option =
+  try Some (Queue.peek q) with Queue.Empty -> None
+
+let scheduler_queue_candidate_json (ws : t) ~(queue_name : string)
+    ~(kind : bg_queue_kind) (path : string) : Yojson.Safe.t =
+  let lane = string_of_lane (lane_of_bg_queue_kind kind) in
+  `Assoc
+    [
+      ("source", `String "backgroundQueue");
+      ("queue", `String queue_name);
+      ("path", path_debug_json path);
+      ("lane", `String lane);
+      ("sizeClass", `String (size_class_of_queue_kind kind));
+      ("ageMs", `Null);
+      ("score", `Int (queue_kind_priority kind));
+      ("reason", `Null);
+      ( "openDocPending",
+        `Bool
+          (open_doc_parse_pending_for_path_key ws
+             ~path_key:(normalize_path_key path)) );
+    ]
+
+let parse_job_path_json = function
+  | ParseJobOpen { doc; uri; generation; _ } ->
+      `Assoc
+        [
+          ( "path",
+            match doc.Document.file with
+            | Some path -> path_debug_json path
+            | None -> `Null );
+          ("uri", `String (Uri_path.docuri_to_string uri));
+          ("generation", `Int generation);
+        ]
+  | ParseJobPath { path; _ } ->
+      `Assoc [ ("path", path_debug_json path); ("uri", `Null) ]
+
+let scheduler_parse_job_candidate_json (job : parse_job) : Yojson.Safe.t =
+  `Assoc
+    [
+      ("source", `String "parseWorkerQueue");
+      ("queue", `String "parseWorkerJobs");
+      ("kind", `String (parse_job_kind_to_string job.pj_kind));
+      ("target", parse_job_path_json job.pj_payload);
+      ("lane", `String (lane_of_parse_job_kind job.pj_kind));
+      ("sizeClass", `String (size_class_of_parse_job_kind job.pj_kind));
+      ("ageMs", `Null);
+      ("score", `Int job.pj_epoch);
+      ("reason", `Null);
+    ]
+
+let parse_worker_queue_lengths (ws : t) : int * int * parse_job option =
+  Mutex.lock ws.parse_worker_mtx;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock ws.parse_worker_mtx)
+    (fun () ->
+      ( Queue.length ws.parse_worker_jobs,
+        Queue.length ws.parse_worker_results,
+        queue_peek_opt ws.parse_worker_jobs ))
+
+let debug_scheduler_json (ws : t) : Yojson.Safe.t =
+  let parse_jobs_len, parse_results_len, parse_job_head =
+    parse_worker_queue_lengths ws
+  in
+  let queue_head name kind queue =
+    match queue_peek_opt queue with
+    | None -> []
+    | Some path -> [ scheduler_queue_candidate_json ws ~queue_name:name ~kind path ]
+  in
+  let next_jobs =
+    queue_head "highSmall" BgQueueHighSmall ws.bg_high_small_queue
+    @ queue_head "highLarge" BgQueueHighLarge ws.bg_high_large_queue
+    @ queue_head "rootSmall" BgQueueRootSmall ws.bg_root_small_queue
+    @ queue_head "rootLarge" BgQueueRootLarge ws.bg_root_large_queue
+    @ queue_head "normalSmall" BgQueueNormalSmall ws.bg_norm_small_queue
+    @ queue_head "normalLarge" BgQueueNormalLarge ws.bg_norm_large_queue
+    @
+    match parse_job_head with
+    | None -> []
+    | Some job -> [ scheduler_parse_job_candidate_json job ]
+  in
+  `Assoc
+    [
+      ("pressureMode", `String (pressure_mode_to_string ws.pressure_mode));
+      ("pressureLiveMb", `Int ws.pressure_live_mb);
+      ( "queues",
+        `Assoc
+          [
+            ("highSmall", `Int (Queue.length ws.bg_high_small_queue));
+            ("rootSmall", `Int (Queue.length ws.bg_root_small_queue));
+            ("normalSmall", `Int (Queue.length ws.bg_norm_small_queue));
+            ("highLarge", `Int (Queue.length ws.bg_high_large_queue));
+            ("rootLarge", `Int (Queue.length ws.bg_root_large_queue));
+            ("normalLarge", `Int (Queue.length ws.bg_norm_large_queue));
+            ("quickNavPending", `Int (Queue.length ws.quick_nav_pending_paths));
+            ("parseWorkerJobs", `Int parse_jobs_len);
+            ("parseWorkerResults", `Int parse_results_len);
+            ("pendingDiagUpdates", `Int (Queue.length ws.bg_pending_diag_updates));
+            ( "openDiagRevalidate",
+              `Int (Queue.length ws.open_diag_revalidate_updates) );
+          ] );
+      ("enqueuedSet", `Int (Hashtbl.length ws.bg_enqueued));
+      ("parseWorkerInflightCount", `Int (Hashtbl.length ws.parse_worker_inflight));
+      ("parseWorkerCount", `Int ws.parse_worker_count);
+      ("parseWorkerMaxInflight", `Int ws.parse_worker_max_inflight);
+      ("parseWorkerStarted", `Bool ws.parse_worker_started);
+      ( "cursors",
+        `Assoc
+          [
+            ("seedCursor", `Int ws.bg_seed_cursor);
+            ("seedTotal", `Int (Array.length ws.bg_seed_paths));
+            ("seedNeedsRefresh", `Bool ws.bg_seed_needs_refresh);
+            ("rootClosureCursor", `Int ws.graph_root_closure_cursor);
+            ( "rootClosureTotal",
+              `Int (Array.length ws.graph_root_closure_paths) );
+            ("quickNavDone", `Int ws.quick_nav_index_done);
+            ("quickNavTotal", `Int ws.quick_nav_index_total);
+          ] );
+      ( "graph",
+        `Assoc
+          [
+            ("needsRefresh", `Bool ws.graph_needs_refresh);
+            ("epoch", `Int ws.graph_epoch);
+            ("nodes", `Int (Hashtbl.length ws.graph_nodes));
+            ("roots", `Int (Hashtbl.length ws.graph_root_reason));
+            ("sccCount", `Int ws.graph_scc_count);
+          ] );
+      ("nextJobs", `List next_jobs);
+    ]
+
+let perf_metric_calls name =
+  match Perf_stats.snapshot_json () with
+  | `Assoc fields -> (
+      match List.assoc_opt "metrics" fields with
+      | Some (`List metrics) -> (
+          let metric_name = function
+            | `Assoc fields -> (
+                match List.assoc_opt "name" fields with
+                | Some (`String s) -> s
+                | _ -> "")
+            | _ -> ""
+          in
+          match
+            List.find_opt (fun json -> metric_name json = name) metrics
+          with
+          | Some (`Assoc fields) -> (
+              match List.assoc_opt "calls" fields with
+              | Some (`Int n) -> n
+              | Some (`Intlit s) -> ( try int_of_string s with _ -> 0 )
+              | _ -> 0)
+          | _ -> 0)
+      | _ -> 0)
+  | _ -> 0
+
+let gc_live_mb () : int =
+  try
+    let s = Gc.quick_stat () in
+    words_to_mb (max s.Gc.live_words s.Gc.heap_words)
+  with _ -> 0
+
+let memory_doc_counts (ws : t) : int * int * int * int =
+  let seen = Hashtbl.create 128 in
+  let open_docs = Hashtbl.length ws.docs in
+  let closed_docs_cached = ref 0 in
+  let asts_retained = ref 0 in
+  let syntax_caches_retained = ref 0 in
+  let note_doc (doc : Document.t) =
+    let key = Uri_path.docuri_to_string doc.Document.uri in
+    if not (Hashtbl.mem seen key) then (
+      Hashtbl.replace seen key true;
+      (match doc.Document.ast with
+      | Some _ -> incr asts_retained
+      | None -> ());
+      match doc.Document.syntax with
+      | Some _ -> incr syntax_caches_retained
+      | None -> ())
+  in
+  Hashtbl.iter (fun _ doc -> note_doc doc) ws.docs;
+  Hashtbl.iter
+    (fun path_key doc ->
+      if not (has_open_doc_for_path_key ws ~path_key) then (
+        incr closed_docs_cached;
+        note_doc doc))
+    ws.files;
+  (open_docs, !closed_docs_cached, !asts_retained, !syntax_caches_retained)
+
+let debug_memory_json (ws : t) : Yojson.Safe.t =
+  let parse_jobs_len, parse_results_len, _ = parse_worker_queue_lengths ws in
+  let open_docs, closed_docs_cached, asts_retained, syntax_caches_retained =
+    memory_doc_counts ws
+  in
+  `Assoc
+    [
+      ("pressureMode", `String (pressure_mode_to_string ws.pressure_mode));
+      ("liveMb", `Int (gc_live_mb ()));
+      ("lastRecordedLiveMb", `Int ws.pressure_live_mb);
+      ("pressureSoftMb", `Int ws.pressure_soft_mb);
+      ("pressureCriticalMb", `Int ws.pressure_critical_mb);
+      ("openDocs", `Int open_docs);
+      ("closedDocsCached", `Int closed_docs_cached);
+      ("closedDocLruMax", `Int ws.closed_doc_lru_max);
+      ("closedDocTouched", `Int (Hashtbl.length ws.closed_doc_last_touch));
+      ("astsRetained", `Int asts_retained);
+      ("syntaxCachesRetained", `Int syntax_caches_retained);
+      ("astsShed", `Int (perf_metric_calls "mem.doc_ast_shed"));
+      ("closedDocEvictions", `Int (perf_metric_calls "mem.closed_doc_evict"));
+      ("parseJobsInflight", `Int (Hashtbl.length ws.parse_worker_inflight));
+      ("parseWorkerJobs", `Int parse_jobs_len);
+      ("parseWorkerResults", `Int parse_results_len);
+      ("semanticStoreEnabled", `Bool ws.sem_store_enabled);
+      ("semanticTokensCacheEntries", `Int (Hashtbl.length ws.semantic_tokens_cache));
     ]
 
 let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
@@ -713,6 +1010,19 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
                       ("col", `Int imp.loc.start_pos.col);
                     ] );
               ])
+      in
+
+      let includes =
+        Workspace_index_graph.icopy_include_targets_for_doc ws doc
+        |> List.map Workspace_include_model.include_target_to_yojson
+      in
+
+      let reverse_include_users =
+        match doc.Document.file with
+        | None -> []
+        | Some path ->
+            Workspace_index_graph.reverse_include_users_for_path ws ~path
+            |> List.map (fun user_path -> `String user_path)
       in
 
       let tokens =
@@ -864,7 +1174,13 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
           ("startup", startup_readiness_json_for_report ws);
           ("compools", compools);
           ("imports", `List imports);
+          ("includeTargets", `List includes);
+          ("reverseIncludeUsers", `List reverse_include_users);
           ("background", background);
+          ( "query",
+            Workspace_query.debug_report_json ws doc );
+          ( "semanticGraph",
+            Semantic_graph.debug_json (Semantic_graph.of_doc_defs doc) );
           ("tokens", `List tokens);
         ]
 
@@ -1310,13 +1626,18 @@ let semantic_tokens_for (ws : t) ~(uri : T.DocumentUri.t)
       Perf_log.log_event (event ^ "_received")
         ~uri:(Uri_path.docuri_to_string uri)
         ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev;
+      let budget =
+        Some (Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms)
+      in
       let data =
-        semantic_tokens_for_doc ws doc ~range |> semantic_tokens_data_of_tokens
+        semantic_tokens_for_doc ?budget ws doc ~range
+        |> semantic_tokens_data_of_tokens
       in
       let result_id = semantic_tokens_result_id doc in
       (match range with
-      | None -> remember_semantic_tokens_data ws ~result_id ~data
-      | Some _ -> ());
+      | None when not (budget_stopped budget) ->
+          remember_semantic_tokens_data ws ~result_id ~data
+      | _ -> ());
       let resultId = Some result_id in
       Perf_log.log_event (event ^ "_responded")
         ~uri:(Uri_path.docuri_to_string uri)
@@ -1371,12 +1692,16 @@ let semantic_tokens_delta_for (ws : t) ~(uri : T.DocumentUri.t)
   match doc_of_uri ws uri with
   | None -> None
   | Some doc ->
+      let budget =
+        Some (Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms)
+      in
       let new_data =
-        semantic_tokens_for_doc ws doc ~range:None
+        semantic_tokens_for_doc ?budget ws doc ~range:None
         |> semantic_tokens_data_of_tokens
       in
       let result_id = semantic_tokens_result_id doc in
-      remember_semantic_tokens_data ws ~result_id ~data:new_data;
+      if not (budget_stopped budget) then
+        remember_semantic_tokens_data ws ~result_id ~data:new_data;
       match Hashtbl.find_opt ws.semantic_tokens_cache previous_result_id with
       | None ->
           Perf_stats.tick "semantic_tokens.delta_cache_miss";

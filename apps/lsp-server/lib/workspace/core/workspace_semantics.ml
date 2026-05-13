@@ -6,6 +6,7 @@ open Workspace_index_graph
 open Workspace_imports
 open Workspace_tuning
 module Metadata = Workspace_symbol_metadata
+module DiagAuth = Workspace_diagnostic_authority
 
 type sem_ty =
   | TyUnknown
@@ -27,12 +28,72 @@ type sem_proc_sig = {
 
 type sem_value = SVVar of sem_ty | SVConst of sem_ty | SVProc of sem_proc_sig
 
+let rec sem_ty_of_jovial_type (ty : Jovial_type.t) : sem_ty =
+  match ty with
+  | Jovial_type.Unknown | Jovial_type.Named _ | Jovial_type.Procedure _ ->
+      TyUnknown
+  | Jovial_type.Integer _ -> TyInt
+  | Jovial_type.Float _ | Jovial_type.Fixed _ -> TyFloat
+  | Jovial_type.BitString _ -> TyBit
+  | Jovial_type.CharString _ -> TyChar
+  | Jovial_type.Status _ -> TyStatus
+  | Jovial_type.Pointer { target; _ } ->
+      TyPointer (Option.map sem_ty_of_jovial_type target)
+  | Jovial_type.Table { entry; _ } -> TyArray (sem_ty_of_jovial_type entry)
+  | Jovial_type.Block fields ->
+      TyRecord
+        (List.map
+           (fun (field : Jovial_type.field) ->
+             (field.name, sem_ty_of_jovial_type field.ty))
+           fields)
+
+let rec jovial_type_of_sem_ty (ty : sem_ty) : Jovial_type.t =
+  match ty with
+  | TyUnknown -> Jovial_type.Unknown
+  | TyInt -> Jovial_type.Integer { kind = Jovial_type.Signed; bits = None }
+  | TyFloat -> Jovial_type.Float { precision = None }
+  | TyBit -> Jovial_type.BitString { bits = None }
+  | TyChar | TyString -> Jovial_type.CharString { chars = None }
+  | TyStatus -> Jovial_type.Status { values = [] }
+  | TyPointer target ->
+      Jovial_type.Pointer
+        { target = Option.map jovial_type_of_sem_ty target; typed = Option.is_some target }
+  | TyArray entry ->
+      Jovial_type.Table { dims = []; entry = jovial_type_of_sem_ty entry }
+  | TyRecord fields ->
+      Jovial_type.Block
+        (List.map
+           (fun (name, ty) ->
+             {
+               Jovial_type.name = name;
+               key = normalize_name name;
+               ty = jovial_type_of_sem_ty ty;
+               loc = Ast.Loc.none;
+             })
+           fields)
+
 type sem_exports = {
   values : (string, sem_value) Hashtbl.t;
   types : (string, Ast.type_expr Ast.node) Hashtbl.t;
 }
 
 type sem_scope = sem_exports
+
+type rich_proc_sig = {
+  rich_param_tys : Jovial_type.t list option;
+  rich_ret_ty : Jovial_type.t option;
+  rich_use_attr : Ast.proc_use;
+}
+
+type rich_value =
+  | RichVar of Jovial_type.t
+  | RichConst of Jovial_type.t
+  | RichProc of rich_proc_sig
+
+type rich_scope = {
+  rich_values : (string, rich_value) Hashtbl.t;
+  rich_types : (string, Ast.type_expr Ast.node) Hashtbl.t;
+}
 
 type sem_proc_ctx = {
   proc_key : string;
@@ -75,6 +136,9 @@ let sem_scope_copy (s : sem_scope) : sem_scope =
 let sem_scope_empty () : sem_scope =
   { values = Hashtbl.create 64; types = Hashtbl.create 64 }
 
+let rich_scope_empty () : rich_scope =
+  { rich_values = Hashtbl.create 64; rich_types = Hashtbl.create 64 }
+
 let sem_add_value ?(overwrite = true) (s : sem_scope) (name : string)
     (v : sem_value) : unit =
   let k = normalize_name name in
@@ -86,6 +150,36 @@ let sem_add_type ?(overwrite = true) (s : sem_scope) (name : string)
   let k = normalize_name name in
   if k <> "" && (overwrite || not (Hashtbl.mem s.types k)) then
     Hashtbl.replace s.types k t
+
+let rich_scope_copy (s : rich_scope) : rich_scope =
+  {
+    rich_values = copy_tbl s.rich_values;
+    rich_types = copy_tbl s.rich_types;
+  }
+
+let rich_add_value ?(overwrite = true) (s : rich_scope) (name : string)
+    (v : rich_value) : unit =
+  let k = normalize_name name in
+  if k <> "" && (overwrite || not (Hashtbl.mem s.rich_values k)) then
+    Hashtbl.replace s.rich_values k v
+
+let rich_add_type ?(overwrite = true) (s : rich_scope) (name : string)
+    (t : Ast.type_expr Ast.node) : unit =
+  let k = normalize_name name in
+  if k <> "" && (overwrite || not (Hashtbl.mem s.rich_types k)) then
+    Hashtbl.replace s.rich_types k t
+
+let rich_type_env (s : rich_scope) : Jovial_type.type_env =
+  let env = Jovial_type.empty_type_env () in
+  Hashtbl.iter (fun k v -> Jovial_type.add_type env k v) s.rich_types;
+  env
+
+let rich_ty_of_type_expr (s : rich_scope) (t : Ast.type_expr Ast.node) :
+    Jovial_type.t =
+  Jovial_type.of_ast_type_expr (rich_type_env s) t
+
+let rich_lookup_value (s : rich_scope) (name : string) : rich_value option =
+  Hashtbl.find_opt s.rich_values (normalize_name name)
 
 let sem_find_record_field (fields : (string * sem_ty) list) (name : string) :
     sem_ty option =
@@ -120,9 +214,11 @@ let rec sem_ty_of_type_expr ?(seen : string list = [])
             match Hashtbl.find_opt types k with
             | None -> TyUnknown
             | Some defn -> sem_ty_of_type_expr ~seen:(k :: seen) types defn))
-  | Ast.TArray { elem; _ } -> TyArray (sem_ty_of_type_expr ~seen types elem)
+  | Ast.TArray { elem; _ } | Ast.TSpecifiedTable { elem; _ } ->
+      TyArray (sem_ty_of_type_expr ~seen types elem)
   | Ast.TPointer inner ->
       TyPointer (Some (sem_ty_of_type_expr ~seen types inner))
+  | Ast.TStatus _ -> TyStatus
   | Ast.TRecord fields ->
       TyRecord
         (fields
@@ -227,11 +323,106 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
     prog;
   out
 
+let rich_proc_sig_of_proc (scope : rich_scope) (p : Ast.proc Ast.node) :
+    rich_proc_sig =
+  let local_var_tys : (string, Jovial_type.t) Hashtbl.t = Hashtbl.create 32 in
+  let proc_scope = rich_scope_copy scope in
+  List.iter
+    (fun d ->
+      match d.v with
+      | Ast.DType { name; defn; _ } -> rich_add_type proc_scope name.v defn
+      | _ -> ())
+    p.v.locals;
+  List.iter
+    (fun d ->
+      match d.v with
+      | Ast.DVar { name; dtype; _ } ->
+          let ty = rich_ty_of_type_expr proc_scope dtype in
+          Hashtbl.replace local_var_tys (normalize_name name.v) ty
+      | Ast.DConst { name; dtype = Some dtype; _ } ->
+          let ty = rich_ty_of_type_expr proc_scope dtype in
+          Hashtbl.replace local_var_tys (normalize_name name.v) ty
+      | _ -> ())
+    p.v.locals;
+  let param_tys =
+    if p.v.params = [] then Some []
+    else
+      Some
+        (List.map
+           (fun prm ->
+             let direct = rich_ty_of_type_expr proc_scope prm.v.ptype in
+             match direct with
+             | Jovial_type.Named _ | Jovial_type.Unknown -> (
+                 match
+                   Hashtbl.find_opt local_var_tys
+                     (normalize_name prm.v.pname.v)
+                 with
+                 | Some ty -> ty
+                 | None -> direct)
+             | ty -> ty)
+           p.v.params)
+  in
+  let ret_ty = Option.map (rich_ty_of_type_expr proc_scope) p.v.returns in
+  { rich_param_tys = param_tys; rich_ret_ty = ret_ty; rich_use_attr = p.v.use_attr }
+
+let rich_exports_of_program (prog : Ast.program) : rich_scope =
+  let out = rich_scope_empty () in
+  let block_names = block_proc_names_of_program prog in
+  let is_block_proc (p : Ast.proc Ast.node) : bool =
+    Hashtbl.mem block_names (normalize_name p.v.name.v)
+  in
+  let rec collect_types_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit =
+    match d.v with
+    | Ast.DType { name; defn; _ } -> rich_add_type out name.v defn
+    | Ast.DProc p ->
+        if in_block || is_block_proc p then
+          List.iter (collect_types_decl ~in_block:true) p.v.locals
+    | Ast.DVar _ | Ast.DConst _ | Ast.DDirective _ -> ()
+  in
+  let rec collect_values_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit
+      =
+    match d.v with
+    | Ast.DVar { name; dtype; _ } ->
+        rich_add_value out name.v (RichVar (rich_ty_of_type_expr out dtype))
+    | Ast.DConst { name; dtype; _ } ->
+        let ty =
+          match dtype with
+          | Some t -> rich_ty_of_type_expr out t
+          | None -> Jovial_type.Unknown
+        in
+        rich_add_value out name.v (RichConst ty)
+    | Ast.DType _ -> ()
+    | Ast.DProc p ->
+        if not in_block then
+          rich_add_value out p.v.name.v
+            (RichProc (rich_proc_sig_of_proc out p));
+        if in_block || is_block_proc p then
+          List.iter (collect_values_decl ~in_block:true) p.v.locals
+    | Ast.DDirective _ -> ()
+  in
+  List.iter
+    (function
+      | Ast.TopDecl d -> collect_types_decl ~in_block:false d
+      | Ast.TopStmt _ -> ())
+    prog;
+  List.iter
+    (function
+      | Ast.TopDecl d -> collect_values_decl ~in_block:false d
+      | Ast.TopStmt _ -> ())
+    prog;
+  out
+
 let sem_exports_of_doc (doc : Document.t) : sem_exports =
   let doc = Document.ensure_parsed doc in
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } -> sem_exports_of_program prog
   | _ -> sem_scope_empty ()
+
+let rich_exports_of_doc (doc : Document.t) : rich_scope =
+  let doc = Document.ensure_parsed doc in
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } -> rich_exports_of_program prog
+  | _ -> rich_scope_empty ()
 
 let add_compool_hint (tbl : (string, string list) Hashtbl.t)
     ~(symbol_key : string) ~(compool_key : string) : unit =
@@ -445,12 +636,30 @@ let rec sem_compatible (lhs : sem_ty) (rhs : sem_ty) : bool =
   | TyArray a, TyArray b -> sem_compatible a b
   | _ -> false
 
-let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
+let validate_semantics_with_authority (ws : t) (doc : Document.t) :
+    DiagAuth.diagnostic list =
   let doc = Document.ensure_parsed doc in
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } ->
       let seen = Hashtbl.create 128 in
       let out = ref [] in
+      let diagnostic_message (diag : T.Diagnostic.t) =
+        match diag.message with
+        | `String s -> s
+        | `MarkupContent mc -> mc.value
+      in
+      let emit_diag (diag : DiagAuth.diagnostic) =
+        let loc = diag.lsp.range in
+        let k =
+          Printf.sprintf "%d|%d|%d|%s|%s"
+            loc.start.line loc.start.character loc.end_.line
+            (DiagAuth.label diag.authority)
+            (diagnostic_message diag.lsp)
+        in
+        if not (Hashtbl.mem seen k) then (
+          Hashtbl.replace seen k true;
+          out := diag :: !out)
+      in
       let emit (loc : Ast.Loc.t) (msg : string) =
         let k =
           Printf.sprintf "%s|%d|%d|%s"
@@ -459,7 +668,14 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         in
         if not (Hashtbl.mem seen k) then (
           Hashtbl.replace seen k true;
-          out := diag_semantic loc msg :: !out)
+          out := DiagAuth.local_semantic (diag_semantic loc msg) :: !out)
+      in
+      let emit_cross_module_provisional (loc : Ast.Loc.t) (msg : string) =
+        let diag =
+          diag_semantic loc msg |> DiagAuth.soften_for_warmup
+          |> DiagAuth.cross_module_provisional
+        in
+        emit_diag diag
       in
       let emit_import_hint (loc : Ast.Loc.t) ~(kind : string) ~(symbol : string)
           ~(compools : string list) =
@@ -471,7 +687,10 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         in
         if not (Hashtbl.mem seen k) then (
           Hashtbl.replace seen k true;
-          out := diag_missing_import_hint ~loc ~kind ~symbol ~compools :: !out)
+          out :=
+            DiagAuth.cross_module_authoritative
+              (diag_missing_import_hint ~loc ~kind ~symbol ~compools)
+            :: !out)
       in
 
       let import_dirs = sem_import_dirs doc in
@@ -479,6 +698,9 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         Hashtbl.create 16
       in
       let exports_cache : (string, sem_exports option) Hashtbl.t =
+        Hashtbl.create 16
+      in
+      let rich_exports_cache : (string, rich_scope option) Hashtbl.t =
         Hashtbl.create 16
       in
       let imported_compools : (string, [ `All | `Selected ]) Hashtbl.t =
@@ -501,6 +723,38 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
       (match doc.Document.compool_def with
       | None -> ()
       | Some c -> mark_import_mode c `All);
+
+      let emit_warning (loc : Ast.Loc.t) (msg : string) =
+        Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Warning
+          ~source:"semantic" ~message:msg loc
+        |> DiagAuth.local_semantic |> emit_diag
+      in
+
+      let status_owners = Jovial_status.owners_of_program prog in
+      let status_owners_by_value : (string, Jovial_status.owner list) Hashtbl.t =
+        Hashtbl.create 64
+      in
+      let add_status_owner_value (owner : Jovial_status.owner)
+          (value : Jovial_status.value) =
+        if value.key <> "" then
+          let prev =
+            Option.value
+              (Hashtbl.find_opt status_owners_by_value value.key)
+              ~default:[]
+          in
+          if
+            not
+              (List.exists
+                 (fun (old : Jovial_status.owner) ->
+                   old.owner_key = owner.owner_key
+                   && old.owner_name = owner.owner_name)
+                 prev)
+          then Hashtbl.replace status_owners_by_value value.key (owner :: prev)
+      in
+      List.iter
+        (fun (owner : Jovial_status.owner) ->
+          List.iter (add_status_owner_value owner) owner.values)
+        status_owners;
 
       let hint_tables :
           ((string, string list) Hashtbl.t * (string, string list) Hashtbl.t)
@@ -585,6 +839,19 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
             Hashtbl.replace exports_cache key x;
             x
       in
+      let get_rich_exports_for_compool (name : string) : rich_scope option =
+        let key = normalize_name name in
+        match Hashtbl.find_opt rich_exports_cache key with
+        | Some x -> x
+        | None ->
+            let x =
+              match get_doc_for_compool key with
+              | None -> None
+              | Some d -> Some (rich_exports_of_doc d)
+            in
+            Hashtbl.replace rich_exports_cache key x;
+            x
+      in
 
       let selected_import_contains (imp : compool_import_dir) (key : string) :
           bool =
@@ -615,11 +882,9 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
           import_dirs
       in
 
-      let should_suppress_cross_module_unresolved ~(is_type : bool)
+      let likely_cross_module_unresolved_candidate ~(is_type : bool)
           ~(name : string) : bool =
-        if not warmup_suppress_crossmodule_unresolved then false
-        else if ws.startup_diag_hover_ready_ms <> None then false
-        else if import_dirs = [] then false
+        if import_dirs = [] then false
         else
           let key = normalize_name name in
           if key = "" then false
@@ -638,35 +903,49 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                          (fun imp -> imp.compool = compool)
                          import_dirs
             in
-            if qualified_import_match then (
-              Perf_stats.tick "diag.xmodule_suppressed";
-              Perf_stats.tick "diag.warmup_suppressed";
-              true)
-            else
-              let maybe_external =
-                List.exists
-                  (fun imp ->
-                    let selected_match =
-                      List.exists (fun (nm, _loc) -> nm = key) imp.selected
-                    in
-                    match get_exports_for_compool imp.compool with
-                    | None -> true
-                    | Some exp ->
-                        let exported =
-                          if is_type then Hashtbl.mem exp.types key
-                          else Hashtbl.mem exp.values key
-                        in
-                        if imp.selected = [] then exported else selected_match)
-                  import_dirs
-              in
-              if maybe_external then (
-                Perf_stats.tick "diag.xmodule_suppressed";
-                Perf_stats.tick "diag.warmup_suppressed";
-                true)
-              else false
+            qualified_import_match
+            || List.exists
+                 (fun imp ->
+                   let selected_match =
+                     List.exists (fun (nm, _loc) -> nm = key) imp.selected
+                   in
+                   match get_exports_for_compool imp.compool with
+                   | None -> true
+                   | Some exp ->
+                       let exported =
+                         if is_type then Hashtbl.mem exp.types key
+                         else Hashtbl.mem exp.values key
+                       in
+                       if imp.selected = [] then exported else selected_match)
+                 import_dirs
+      in
+      let should_suppress_cross_module_unresolved ~(is_type : bool)
+          ~(name : string) : bool =
+        if not warmup_suppress_crossmodule_unresolved then false
+        else if ws.startup_diag_hover_ready_ms <> None then false
+        else if likely_cross_module_unresolved_candidate ~is_type ~name then (
+          Perf_stats.tick "diag.xmodule_suppressed";
+          Perf_stats.tick "diag.warmup_suppressed";
+          true)
+        else false
+      in
+      let emit_provisional_cross_module_unresolved ~(is_type : bool)
+          ~(name : string) ~(loc : Ast.Loc.t) ~(message : string) : bool =
+        if should_suppress_cross_module_unresolved ~is_type ~name then (
+          emit_cross_module_provisional loc message;
+          true)
+        else false
+      in
+      let emit_authoritative_unresolved ~(is_type : bool) ~(name : string)
+          ~(loc : Ast.Loc.t) ~(message : string) : unit =
+        if likely_cross_module_unresolved_candidate ~is_type ~name then
+          diag_semantic loc message
+          |> DiagAuth.cross_module_authoritative |> emit_diag
+        else emit loc message
       in
 
       let scope = sem_scope_copy (sem_exports_of_program prog) in
+      let rich_scope = rich_scope_copy (rich_exports_of_program prog) in
       List.iter
         (fun imp ->
           match get_exports_for_compool imp.compool with
@@ -693,6 +972,29 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                     | None -> ())
                   imp.selected))
         import_dirs;
+      List.iter
+        (fun imp ->
+          match get_rich_exports_for_compool imp.compool with
+          | None -> ()
+          | Some exp ->
+              if imp.selected = [] then (
+                Hashtbl.iter
+                  (fun k v -> rich_add_value ~overwrite:false rich_scope k v)
+                  exp.rich_values;
+                Hashtbl.iter
+                  (fun k v -> rich_add_type ~overwrite:false rich_scope k v)
+                  exp.rich_types)
+              else
+                List.iter
+                  (fun (nm, _loc) ->
+                    match Hashtbl.find_opt exp.rich_values nm with
+                    | Some v -> rich_add_value ~overwrite:false rich_scope nm v
+                    | None -> (
+                        match Hashtbl.find_opt exp.rich_types nm with
+                        | Some t -> rich_add_type ~overwrite:false rich_scope nm t
+                        | None -> ()))
+                  imp.selected)
+        import_dirs;
 
       let sem_lookup_value (scp : sem_scope) (name : string) : sem_value option
           =
@@ -703,6 +1005,234 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         let k = normalize_name name in
         k = "__CONV__" || k = "__PRESET__" || k = "__POW__" || k = "__RANGE__"
         || is_builtin_function_name k
+      in
+
+      let register_ctf_decl_symbol (ctf_env : Jovial_compile_time.env)
+          (d : Ast.decl Ast.node) : unit =
+        match d.v with
+        | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ } ->
+            Jovial_compile_time.add_non_constant ctf_env name.v
+        | Ast.DConst { name; value; _ } ->
+            Jovial_compile_time.add_constant ctf_env name.v value
+        | Ast.DVar { name; _ } | Ast.DType { name; _ } ->
+            Jovial_compile_time.add_non_constant ctf_env name.v
+        | Ast.DProc p ->
+            Jovial_compile_time.add_non_constant ctf_env p.v.name.v
+        | Ast.DDirective _ -> ()
+      in
+
+      let top_ctf_env = Jovial_compile_time.empty_env () in
+      List.iter
+        (function
+          | Ast.TopDecl d -> register_ctf_decl_symbol top_ctf_env d
+          | Ast.TopStmt _ -> ())
+        prog;
+
+      let emit_compile_time_required ?message
+          (ctf_env : Jovial_compile_time.env) (e : Ast.expr Ast.node) : unit =
+        let result = Jovial_compile_time.eval_expr ~env:ctf_env e in
+        let diag =
+          match message with
+          | None -> Jovial_compile_time.diagnostic_for_required result e.loc
+          | Some message ->
+              Jovial_compile_time.diagnostic_for_required ~message result e.loc
+        in
+        match diag with
+        | None -> ()
+        | Some d -> emit_diag (DiagAuth.local_semantic d)
+      in
+
+      let is_open_table_dim (e : Ast.expr Ast.node) : bool =
+        match e.v with
+        | Ast.EName id -> normalize_name id.v = "*"
+        | _ -> false
+      in
+
+      let ctf_int_value (ctf_env : Jovial_compile_time.env)
+          (e : Ast.expr Ast.node) : int64 option =
+        match Jovial_compile_time.eval_expr ~env:ctf_env e with
+        | Jovial_compile_time.Known (Jovial_compile_time.CtfInt n) -> Some n
+        | _ -> None
+      in
+
+      let ctf_int_required_value ~(message : string)
+          (ctf_env : Jovial_compile_time.env) (e : Ast.expr Ast.node) :
+          int64 option =
+        match Jovial_compile_time.eval_expr ~env:ctf_env e with
+        | Jovial_compile_time.Known (Jovial_compile_time.CtfInt n) -> Some n
+        | Jovial_compile_time.Known _ ->
+            emit e.loc (message ^ ": expected an integer compile-time value.");
+            None
+        | (Jovial_compile_time.Unknown _ as result) ->
+            let diag =
+              Jovial_compile_time.diagnostic_for_required
+                ~diagnose_unknown_identifiers:true
+                ~diagnose_unsupported_constructs:true ~message result e.loc
+            in
+            (match diag with
+            | Some d -> emit_diag (DiagAuth.local_semantic d)
+            | None -> emit e.loc (message ^ ": compile-time integer required."));
+            None
+      in
+
+      let check_specified_table_layout
+          (ctf_env : Jovial_compile_time.env)
+          ~(kind : Ast.specified_table_kind) (elem : Ast.type_expr Ast.node) :
+          unit =
+        let entry_size =
+          match kind with
+          | Ast.SpecTableW entry_size | Ast.SpecTableV (Some entry_size) ->
+              ctf_int_required_value
+                ~message:"Invalid specified table entry size" ctf_env
+                entry_size
+          | Ast.SpecTableV None -> None
+        in
+        let fields =
+          match elem.v with Ast.TRecord fields -> fields | _ -> []
+        in
+        let seen_positions : (string, Ast.ident) Hashtbl.t =
+          Hashtbl.create 16
+        in
+        List.iter
+          (fun (field : Ast.field_decl Ast.node) ->
+            match field.v.fpos with
+            | None ->
+                emit field.v.fname.loc
+                  (Printf.sprintf
+                     "Specified table field %S requires a POS(startbit,startword) clause."
+                     field.v.fname.v)
+            | Some pos ->
+                let start_bit =
+                  ctf_int_required_value ~message:"Invalid POS expression"
+                    ctf_env pos.pos_start_bit
+                in
+                let start_word =
+                  ctf_int_required_value ~message:"Invalid POS expression"
+                    ctf_env pos.pos_start_word
+                in
+                (match (start_bit, entry_size) with
+                | Some bit, Some size when bit < 0L || bit >= size ->
+                    emit pos.pos_start_bit.loc
+                      (Printf.sprintf
+                         "Specified table field %S POS start bit %Ld is outside entry size %Ld."
+                         field.v.fname.v bit size)
+                | _ -> ());
+                (match (start_bit, start_word) with
+                | Some bit, Some word ->
+                    let key = Int64.to_string bit ^ ":" ^ Int64.to_string word in
+                    (match Hashtbl.find_opt seen_positions key with
+                    | Some first ->
+                        emit field.v.fname.loc
+                          (Printf.sprintf
+                             "Duplicate specified table field POS(%Ld,%Ld) for %S; first used by %S."
+                             bit word field.v.fname.v first.v)
+                    | None -> Hashtbl.add seen_positions key field.v.fname)
+                | _ -> ()))
+          fields
+      in
+
+      let emit_invalid_dimension (loc : Ast.Loc.t) (msg : string) =
+        emit loc ("Invalid table dimension: " ^ msg)
+      in
+
+      let check_simple_dim_bounds (ctf_env : Jovial_compile_time.env)
+          (e : Ast.expr Ast.node) : unit =
+        if is_open_table_dim e then ()
+        else
+          match e.v with
+          | Ast.ERange { lo; hi } -> (
+              match (ctf_int_value ctf_env lo, ctf_int_value ctf_env hi) with
+              | Some lo_n, Some hi_n when hi_n < lo_n ->
+                  emit_invalid_dimension e.loc
+                    (Printf.sprintf
+                       "lower bound %Ld is greater than upper bound %Ld."
+                       lo_n hi_n)
+              | _ -> ())
+          | _ -> (
+              match ctf_int_value ctf_env e with
+              | Some n when n <= 0L ->
+                  emit_invalid_dimension e.loc
+                    (Printf.sprintf
+                       "entry count must be positive, got %Ld." n)
+              | _ -> ())
+      in
+
+      let dim_entry_count (ctf_env : Jovial_compile_time.env)
+          (e : Ast.expr Ast.node) : int64 option =
+        if is_open_table_dim e then None
+        else
+          match e.v with
+          | Ast.ERange { lo; hi } -> (
+              match (ctf_int_value ctf_env lo, ctf_int_value ctf_env hi) with
+              | Some lo_n, Some hi_n when hi_n >= lo_n ->
+                  Some (Int64.succ (Int64.sub hi_n lo_n))
+              | _ -> None)
+          | _ -> (
+              match ctf_int_value ctf_env e with
+              | Some n when n > 0L -> Some n
+              | _ -> None)
+      in
+
+      let table_entry_capacity (ctf_env : Jovial_compile_time.env)
+          (dims : Ast.expr Ast.node list) : int64 option =
+        match dims with
+        | [] -> None
+        | _ ->
+            let rec loop acc = function
+              | [] -> Some acc
+              | dim :: rest -> (
+                  match dim_entry_count ctf_env dim with
+                  | None -> None
+                  | Some n ->
+                      let next = Int64.mul acc n in
+                      if acc <> 0L && Int64.div next acc <> n then None
+                      else loop next rest)
+            in
+            loop 1L dims
+      in
+
+      let rec check_compile_time_type_expr
+          (ctf_env : Jovial_compile_time.env) (t : Ast.type_expr Ast.node) :
+          unit =
+        match t.v with
+        | Ast.TName _ -> ()
+        | Ast.TArray { elem; dims } ->
+            List.iter (check_compile_time_dim ctf_env) dims;
+            check_compile_time_type_expr ctf_env elem
+        | Ast.TSpecifiedTable { elem; dims; kind } ->
+            List.iter (check_compile_time_dim ctf_env) dims;
+            check_specified_table_layout ctf_env ~kind elem;
+            check_compile_time_type_expr ctf_env elem
+        | Ast.TPointer inner -> check_compile_time_type_expr ctf_env inner
+        | Ast.TStatus values ->
+            List.iter
+              (fun (value : Ast.status_value Ast.node) ->
+                Option.iter (emit_compile_time_required ctf_env)
+                  value.v.sv_representation)
+              values
+        | Ast.TRecord fields ->
+            List.iter
+              (fun field -> check_compile_time_type_expr ctf_env field.v.ftype)
+              fields
+        | Ast.TFunc { params; returns } ->
+            List.iter
+              (fun param -> check_compile_time_type_expr ctf_env param.v.ptype)
+              params;
+            (match returns with
+            | None -> ()
+            | Some r -> check_compile_time_type_expr ctf_env r)
+      and check_compile_time_dim (ctf_env : Jovial_compile_time.env)
+          (e : Ast.expr Ast.node) : unit =
+        if is_open_table_dim e then ()
+        else
+          match e.v with
+          | Ast.ERange { lo; hi } ->
+              emit_compile_time_required ctf_env lo;
+              emit_compile_time_required ctf_env hi;
+              check_simple_dim_bounds ctf_env e
+          | _ ->
+              emit_compile_time_required ctf_env e;
+              check_simple_dim_bounds ctf_env e
       in
 
       let rec check_type_import_hints (scp : sem_scope)
@@ -720,7 +1250,9 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                 suggest_missing_import ~loc:id.loc ~kind:"Type" ~is_type:true
                   ~symbol:id.v
         | Ast.TPointer inner -> check_type_import_hints scp inner
-        | Ast.TArray { elem; _ } -> check_type_import_hints scp elem
+        | Ast.TArray { elem; _ } | Ast.TSpecifiedTable { elem; _ } ->
+            check_type_import_hints scp elem
+        | Ast.TStatus _ -> ()
         | Ast.TRecord fields ->
             List.iter (fun f -> check_type_import_hints scp f.v.ftype) fields
         | Ast.TFunc { params; returns } -> (
@@ -820,14 +1352,19 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                   if maybe_visible_through_import ~is_type:false ~name:id.v
                   then ()
                   else if
-                    should_suppress_cross_module_unresolved ~is_type:false
-                      ~name:id.v
+                    emit_provisional_cross_module_unresolved ~is_type:false
+                      ~name:id.v ~loc:id.loc
+                      ~message:
+                        (Printf.sprintf "Undefined identifier %S." id.v)
                   then ()
                   else if has_import_hint ~is_type:false id.v then
                     suggest_missing_import ~loc:id.loc ~kind:"Identifier"
                       ~is_type:false ~symbol:id.v
                   else
-                    emit id.loc (Printf.sprintf "Undefined identifier %S." id.v);
+                    emit_authoritative_unresolved ~is_type:false ~name:id.v
+                      ~loc:id.loc
+                      ~message:
+                        (Printf.sprintf "Undefined identifier %S." id.v);
                   TyUnknown)
         | Ast.EUnop { rhs; _ } -> ty_of_expr scp current_proc rhs
         | Ast.EBinop { lhs; rhs; _ } ->
@@ -932,18 +1469,25 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                   if maybe_visible_through_import ~is_type:false ~name:callee.v
                   then ()
                   else if
-                    should_suppress_cross_module_unresolved ~is_type:false
-                      ~name:callee.v
+                    emit_provisional_cross_module_unresolved ~is_type:false
+                      ~name:callee.v ~loc:callee.loc
+                      ~message:
+                        (Printf.sprintf
+                           "Undefined procedure %S. Declare it with REF PROC \
+                            %S in scope."
+                           callee.v callee.v)
                   then ()
                   else if has_import_hint ~is_type:false callee.v then
                     suggest_missing_import ~loc:callee.loc ~kind:"Procedure"
                       ~is_type:false ~symbol:callee.v
                   else
-                    emit callee.loc
-                      (Printf.sprintf
-                         "Undefined procedure %S. Declare it with REF PROC %S \
-                          in scope."
-                         callee.v callee.v);
+                    emit_authoritative_unresolved ~is_type:false ~name:callee.v
+                      ~loc:callee.loc
+                      ~message:
+                        (Printf.sprintf
+                           "Undefined procedure %S. Declare it with REF PROC \
+                            %S in scope."
+                           callee.v callee.v);
                   List.iter
                     (fun a -> ignore (ty_of_expr scp current_proc a))
                     args;
@@ -1014,6 +1558,341 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         | Ast.EParen inner -> ty_of_expr scp current_proc inner
       in
 
+      let emit_typecheck_issues (issues : Jovial_typecheck.issue list) : unit =
+        List.iter
+          (fun issue ->
+            Jovial_typecheck.diagnostic issue
+            |> DiagAuth.local_semantic |> emit_diag)
+          issues
+      in
+
+      let status_owners_for_value (name : string) : Jovial_status.owner list =
+        match Hashtbl.find_opt status_owners_by_value (normalize_name name) with
+        | None -> []
+        | Some owners -> owners
+      in
+
+      let rec status_owner_of_jovial_type (ty : Jovial_type.t) :
+          Jovial_status.owner option =
+        match ty with
+        | Jovial_type.Status { values = [] } -> None
+        | Jovial_type.Status { values } ->
+            let ast_values =
+              values
+              |> List.map (fun (value : Jovial_type.status_value) ->
+                     let loc = Option.value value.loc ~default:Ast.Loc.none in
+                     Ast.node ~loc
+                       {
+                         Ast.sv_name = Ast.node ~loc value.name;
+                         sv_representation = None;
+                       })
+            in
+            Some
+              {
+                Jovial_status.owner_name = None;
+                owner_key = None;
+                owner_loc = None;
+                values =
+                  List.mapi
+                    (fun ordinal (sv : Ast.status_value Ast.node) ->
+                      {
+                        Jovial_status.name = sv.v.sv_name.v;
+                        key = normalize_name sv.v.sv_name.v;
+                        loc = sv.v.sv_name.loc;
+                        ordinal;
+                        representation = None;
+                      })
+                    ast_values;
+              }
+        | Jovial_type.Table { entry; _ } -> status_owner_of_jovial_type entry
+        | _ -> None
+      in
+
+      let status_expected_membership expected id =
+        match status_owner_of_jovial_type expected with
+        | None -> `Unknown
+        | Some owner ->
+            if Jovial_status.value_is_member owner id.Ast.v then `Member owner
+            else `NotMember owner
+      in
+
+      let emit_ambiguous_status_if_needed (id : Ast.ident) =
+        match status_owners_for_value id.v with
+        | [] | [ _ ] -> ()
+        | owners ->
+            let names =
+              owners
+              |> List.map Jovial_status.owner_display
+              |> List.sort_uniq String.compare
+              |> String.concat ", "
+            in
+            emit_warning id.loc
+              (Printf.sprintf
+                 "Ambiguous status constant V(%s): the value appears in \
+                  multiple STATUS lists (%s), and this expression has no \
+                  known status context."
+                 id.v names)
+      in
+
+      let check_status_value_expr ?expected (e : Ast.expr Ast.node) : unit =
+        match Jovial_status.status_constructor_arg e with
+        | None -> ()
+        | Some id -> (
+            match expected with
+            | Some expected -> (
+                match status_expected_membership expected id with
+                | `Member _ -> ()
+                | `NotMember owner ->
+                    emit id.loc
+                      (Printf.sprintf
+                         "Status value V(%s) is not a member of expected \
+                          status type %s."
+                         id.v (Jovial_status.owner_display owner))
+                | `Unknown -> emit_ambiguous_status_if_needed id)
+            | None -> emit_ambiguous_status_if_needed id)
+      in
+
+      List.iter
+        (fun (owner : Jovial_status.owner) ->
+          List.iter
+            (fun ((first : Jovial_status.value), (dup : Jovial_status.value)) ->
+              emit dup.Jovial_status.loc
+                (Printf.sprintf
+                   "Duplicate status value V(%s) in STATUS list for %s; first \
+                    declared at line %d."
+                   dup.name (Jovial_status.owner_display owner)
+                   first.loc.Ast.Loc.start_pos.line))
+            (Jovial_status.duplicate_values owner))
+        status_owners;
+
+      let constant_table_keys : (string, Ast.ident) Hashtbl.t =
+        Hashtbl.create 32
+      in
+      let rec collect_constant_table_decl (d : Ast.decl Ast.node) : unit =
+        match d.v with
+        | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ } ->
+            let key = normalize_name name.v in
+            if key <> "" then Hashtbl.replace constant_table_keys key name
+        | Ast.DProc p ->
+            List.iter collect_constant_table_decl p.v.locals;
+            collect_constant_table_stmt p.v.body
+        | Ast.DVar _ | Ast.DConst _ | Ast.DType _ | Ast.DDirective _ -> ()
+      and collect_constant_table_stmt (s : Ast.stmt Ast.node) : unit =
+        match s.v with
+        | Ast.SDecl d -> collect_constant_table_decl d
+        | Ast.SBlock xs -> List.iter collect_constant_table_stmt xs
+        | Ast.SIf { then_; else_; _ } ->
+            collect_constant_table_stmt then_;
+            Option.iter collect_constant_table_stmt else_
+        | Ast.SWhile { body; _ } -> collect_constant_table_stmt body
+        | Ast.SFor { init; step; body; _ } ->
+            Option.iter collect_constant_table_stmt init;
+            Option.iter collect_constant_table_stmt step;
+            collect_constant_table_stmt body
+        | Ast.SLabel { body; _ } -> collect_constant_table_stmt body
+        | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
+        | Ast.SGoto _ ->
+            ()
+      in
+      List.iter
+        (function
+          | Ast.TopDecl d -> collect_constant_table_decl d
+          | Ast.TopStmt s -> collect_constant_table_stmt s)
+        prog;
+
+      let rec constant_table_lvalue (e : Ast.expr Ast.node) : Ast.ident option =
+        match e.v with
+        | Ast.EName id | Ast.ECall { callee = id; _ } ->
+            if Hashtbl.mem constant_table_keys (normalize_name id.v) then
+              Some id
+            else None
+        | Ast.EIndex { base; _ } | Ast.EField { base; _ } ->
+            constant_table_lvalue base
+        | Ast.EAt { field; _ } -> constant_table_lvalue field
+        | Ast.EParen inner -> constant_table_lvalue inner
+        | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _
+        | Ast.EPreset _ | Ast.ERange _ | Ast.EDeref _ ->
+            None
+      in
+
+      let rec rich_subscript_value (ty : Jovial_type.t) (count : int) :
+          Jovial_type.t =
+        if count <= 0 then ty
+        else
+          match ty with
+          | Jovial_type.Table { entry; _ } -> rich_subscript_value entry (count - 1)
+          | Jovial_type.Pointer { target = Some target; typed } ->
+              let target = rich_subscript_value target count in
+              Jovial_type.Pointer { target = Some target; typed }
+          | _ -> Jovial_type.Unknown
+      in
+
+      let rec rich_ty_of_expr (rscp : rich_scope)
+          (current_proc : sem_proc_ctx option) (e : Ast.expr Ast.node) :
+          Jovial_type.t =
+        match e.v with
+        | Ast.ELit lit -> Jovial_typecheck.literal_type lit
+        | Ast.EName id -> (
+            match rich_lookup_value rscp id.v with
+            | Some (RichVar ty) | Some (RichConst ty) -> ty
+            | Some (RichProc sig_) -> (
+                match current_proc with
+                | Some cp when normalize_name id.v = cp.proc_key -> (
+                    match sig_.rich_ret_ty with
+                    | Some ty -> ty
+                    | None -> Jovial_type.Unknown)
+                | _ -> Jovial_type.Unknown)
+            | None -> Jovial_type.Unknown)
+        | Ast.EUnop { op; rhs } ->
+            let rhs_ty = rich_ty_of_expr rscp current_proc rhs in
+            let result = Jovial_typecheck.unary_result ~op ~rhs:rhs_ty ~loc:e.loc in
+            emit_typecheck_issues result.issues;
+            result.ty
+        | Ast.EBinop { op; lhs; rhs } ->
+            let lhs_ty = rich_ty_of_expr rscp current_proc lhs in
+            let rhs_ty = rich_ty_of_expr rscp current_proc rhs in
+            let result =
+              Jovial_typecheck.binary_result ~op ~lhs:lhs_ty ~rhs:rhs_ty
+                ~loc:e.loc
+            in
+            emit_typecheck_issues result.issues;
+            result.ty
+        | Ast.ECall { callee; args } -> (
+            let ck = normalize_name callee.v in
+            if ck = "V" then (
+              match args with
+              | [ { v = Ast.EName id; _ } ] ->
+                  Jovial_type.Status
+                    {
+                      values =
+                        [
+                          {
+                            Jovial_type.name = id.v;
+                            loc = Some id.loc;
+                            representation = None;
+                          };
+                        ];
+                    }
+              | _ ->
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    args;
+                  Jovial_type.Status { values = [] })
+            else if ck = "LOC" then
+              match args with
+              | arg :: rest ->
+                  let target = rich_ty_of_expr rscp current_proc arg in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  Jovial_type.Pointer { target = Some target; typed = true }
+              | [] -> Jovial_type.Pointer { target = None; typed = false }
+            else if ck = "NEXT" then
+              match args with
+              | ptr :: rest ->
+                  let ptr_ty = rich_ty_of_expr rscp current_proc ptr in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  (match ptr_ty with
+                  | Jovial_type.Pointer _ -> ptr_ty
+                  | _ -> Jovial_type.Unknown)
+              | [] -> Jovial_type.Unknown
+            else
+              match rich_lookup_value rscp callee.v with
+              | Some (RichProc sig_) ->
+                  (match sig_.rich_param_tys with
+                  | None -> ()
+                  | Some param_tys ->
+                      let rec check_pairs ps xs =
+                        match (ps, xs) with
+                        | pty :: pst, arg :: xst ->
+                            let aty = rich_ty_of_expr rscp current_proc arg in
+                            check_status_value_expr ~expected:pty arg;
+                            emit_typecheck_issues
+                              (Jovial_typecheck.assignment_issues ~lhs:pty
+                                 ~rhs:aty ~loc:arg.loc);
+                            check_pairs pst xst
+                        | _, [] -> ()
+                        | [], extra ->
+                            List.iter
+                              (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                              extra
+                      in
+                      check_pairs param_tys args);
+                  Option.value sig_.rich_ret_ty ~default:Jovial_type.Unknown
+              | Some (RichVar ty) | Some (RichConst ty) ->
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    args;
+                  if args = [] then Jovial_type.Unknown
+                  else rich_subscript_value ty (List.length args)
+              | None ->
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    args;
+                  Jovial_type.Unknown)
+        | Ast.EIndex { base; index } ->
+            let base_ty = rich_ty_of_expr rscp current_proc base in
+            List.iter
+              (fun i -> ignore (rich_ty_of_expr rscp current_proc i))
+              index;
+            rich_subscript_value base_ty (List.length index)
+        | Ast.EField { base; field } -> (
+            let base_ty = rich_ty_of_expr rscp current_proc base in
+            match Jovial_type.field_type base_ty field.v with
+            | Some ty -> ty
+            | None -> Jovial_type.Unknown)
+        | Ast.EConvert { ty; expr } ->
+            let target = rich_ty_of_type_expr rscp ty in
+            let source = rich_ty_of_expr rscp current_proc expr in
+            emit_typecheck_issues
+              (Jovial_typecheck.conversion_issues ~target ~source ~loc:e.loc);
+            target
+        | Ast.EPreset { base; items } ->
+            ignore (rich_ty_of_expr rscp current_proc base);
+            List.iter
+              (fun item -> ignore (rich_ty_of_expr rscp current_proc item))
+              items;
+            Jovial_type.Unknown
+        | Ast.ERange { lo; hi } ->
+            ignore (rich_ty_of_expr rscp current_proc lo);
+            ignore (rich_ty_of_expr rscp current_proc hi);
+            Jovial_type.Unknown
+        | Ast.EAt { field; ptr } ->
+            let ptr_ty = rich_ty_of_expr rscp current_proc ptr in
+            let result =
+              Jovial_typecheck.dereference_result ~ptr:ptr_ty ~loc:ptr.loc
+            in
+            emit_typecheck_issues result.issues;
+            (match field.v with
+            | Ast.EName id -> (
+                match Jovial_type.field_type result.ty id.v with
+                | Some ty -> ty
+                | None -> Jovial_type.Unknown)
+            | Ast.EIndex { base = { v = Ast.EName id; _ }; index } ->
+                List.iter
+                  (fun i -> ignore (rich_ty_of_expr rscp current_proc i))
+                  index;
+                let field_ty =
+                  match Jovial_type.field_type result.ty id.v with
+                  | Some ty -> ty
+                  | None -> Jovial_type.Unknown
+                in
+                rich_subscript_value field_ty (List.length index)
+            | _ ->
+                ignore (rich_ty_of_expr rscp current_proc field);
+                Jovial_type.Unknown)
+        | Ast.EDeref { ptr } ->
+            let ptr_ty = rich_ty_of_expr rscp current_proc ptr in
+            let result =
+              Jovial_typecheck.dereference_result ~ptr:ptr_ty ~loc:ptr.loc
+            in
+            emit_typecheck_issues result.issues;
+            result.ty
+        | Ast.EParen inner -> rich_ty_of_expr rscp current_proc inner
+      in
+
       let ty_of_lvalue (scp : sem_scope) (current_proc : sem_proc_ctx option)
           (e : Ast.expr Ast.node) : sem_ty option =
         match e.v with
@@ -1037,19 +1916,80 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                 if maybe_visible_through_import ~is_type:false ~name:id.v then
                   ()
                 else if
-                  should_suppress_cross_module_unresolved ~is_type:false
-                    ~name:id.v
+                  emit_provisional_cross_module_unresolved ~is_type:false
+                    ~name:id.v ~loc:id.loc
+                    ~message:(Printf.sprintf "Undefined item %S." id.v)
                 then ()
                 else if has_import_hint ~is_type:false id.v then
                   suggest_missing_import ~loc:id.loc ~kind:"Item" ~is_type:false
                     ~symbol:id.v
-                else emit id.loc (Printf.sprintf "Undefined item %S." id.v);
+                else
+                  emit_authoritative_unresolved ~is_type:false ~name:id.v
+                    ~loc:id.loc
+                    ~message:(Printf.sprintf "Undefined item %S." id.v);
                 None)
         | Ast.EField _ | Ast.EAt _ | Ast.EDeref _ | Ast.EIndex _ ->
             Some (ty_of_expr scp current_proc e)
         | _ ->
             ignore (ty_of_expr scp current_proc e);
             None
+      in
+
+      let rec table_dims_of_type_expr (rscp : rich_scope)
+          (t : Ast.type_expr Ast.node) : Ast.expr Ast.node list option =
+        match t.v with
+        | Ast.TArray { dims; _ } | Ast.TSpecifiedTable { dims; _ } -> Some dims
+        | Ast.TName id -> (
+            match Hashtbl.find_opt rscp.rich_types (normalize_name id.v) with
+            | Some defn -> table_dims_of_type_expr rscp defn
+            | None -> None)
+        | _ -> None
+      in
+
+      let is_omitted_preset_value (item : Ast.expr Ast.node) : bool =
+        match item.v with
+        | Ast.ELit (Ast.LString "") -> true
+        | _ -> false
+      in
+
+      let validate_table_preset (rscp : rich_scope)
+          (ctf_env : Jovial_compile_time.env)
+          (current_proc : sem_proc_ctx option)
+          ~(table_type : Ast.type_expr Ast.node) ~(preset : Ast.expr Ast.node) :
+          unit =
+        match preset.v with
+        | Ast.EPreset { items; _ } ->
+            (match table_dims_of_type_expr rscp table_type with
+            | Some dims -> (
+                match table_entry_capacity ctf_env dims with
+                | Some capacity
+                  when Int64.of_int (List.length items) > capacity ->
+                    emit preset.loc
+                      (Printf.sprintf
+                         "Table preset has %d positions but table capacity is \
+                          %Ld."
+                         (List.length items) capacity)
+                | _ -> ())
+            | None -> ());
+            let table_ty = rich_ty_of_type_expr rscp table_type in
+            let entry_ty =
+              match Jovial_type.table_entry_type table_ty with
+              | Some (Jovial_type.Block _) -> None
+              | Some entry -> Some entry
+              | None -> Some table_ty
+            in
+            (match entry_ty with
+            | None -> ()
+            | Some lhs ->
+                items
+                |> List.filter (fun item -> not (is_omitted_preset_value item))
+                |> List.iter (fun item ->
+                       let rhs = rich_ty_of_expr rscp current_proc item in
+                       emit_typecheck_issues
+                         (Jovial_typecheck.assignment_issues ~lhs ~rhs
+                            ~loc:item.loc);
+                       check_status_value_expr ~expected:lhs item))
+        | _ -> ()
       in
 
       let add_decl_symbol (scp : sem_scope) (d : Ast.decl Ast.node) : unit =
@@ -1068,6 +2008,26 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
         | Ast.DProc p ->
             sem_add_value scp p.v.name.v
               (SVProc (sem_proc_sig_of_proc scp.types p))
+        | Ast.DDirective _ -> ()
+      in
+
+      let rich_add_decl_symbol (rscp : rich_scope) (d : Ast.decl Ast.node) :
+          unit =
+        match d.v with
+        | Ast.DType { name; defn; _ } -> rich_add_type rscp name.v defn
+        | Ast.DVar { name; dtype; _ } ->
+            rich_add_value rscp name.v
+              (RichVar (rich_ty_of_type_expr rscp dtype))
+        | Ast.DConst { name; dtype; _ } ->
+            let ty =
+              match dtype with
+              | None -> Jovial_type.Unknown
+              | Some t -> rich_ty_of_type_expr rscp t
+            in
+            rich_add_value rscp name.v (RichConst ty)
+        | Ast.DProc p ->
+            rich_add_value rscp p.v.name.v
+              (RichProc (rich_proc_sig_of_proc rscp p))
         | Ast.DDirective _ -> ()
       in
 
@@ -1120,21 +2080,40 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
       in
 
       let rec check_stmt (scp : sem_scope) (current_proc : sem_proc_ctx option)
-          ~(loop_depth : int) ~(label_depths : (string, int) Hashtbl.t)
+          (rscp : rich_scope) (ctf_env : Jovial_compile_time.env)
+          ~(loop_depth : int)
+          ~(label_depths : (string, int) Hashtbl.t)
           (s : Ast.stmt Ast.node) : unit =
         match s.v with
         | Ast.SEmpty -> ()
         | Ast.SDecl d ->
             add_decl_symbol scp d;
-            check_decl scp current_proc ~loop_depth ~label_depths d
+            rich_add_decl_symbol rscp d;
+            register_ctf_decl_symbol ctf_env d;
+            check_decl scp current_proc rscp ctf_env ~loop_depth ~label_depths d
         | Ast.SBlock xs ->
             List.iter
               (fun st ->
-                check_stmt scp current_proc ~loop_depth ~label_depths st)
+                check_stmt scp current_proc rscp ctf_env ~loop_depth
+                  ~label_depths st)
               xs
         | Ast.SAssign { lhs; rhs } -> (
+            (match constant_table_lvalue lhs with
+            | None -> ()
+            | Some id ->
+                emit lhs.loc
+                  (Printf.sprintf
+                     "Cannot assign to constant table %S; CONSTANT TABLE \
+                      declarations are readonly."
+                     id.v));
             let lhs_ty = ty_of_lvalue scp current_proc lhs in
             let rhs_ty = ty_of_expr scp current_proc rhs in
+            let lhs_rich_ty = rich_ty_of_expr rscp current_proc lhs in
+            let rhs_rich_ty = rich_ty_of_expr rscp current_proc rhs in
+            emit_typecheck_issues
+              (Jovial_typecheck.assignment_issues ~lhs:lhs_rich_ty
+                 ~rhs:rhs_rich_ty ~loc:rhs.loc);
+            check_status_value_expr ~expected:lhs_rich_ty rhs;
             match lhs_ty with
             | None -> ()
             | Some lt ->
@@ -1188,18 +2167,25 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                             (maybe_visible_through_import ~is_type:false
                                ~name:callee.v)
                        && not
-                            (should_suppress_cross_module_unresolved
-                               ~is_type:false ~name:callee.v)
+                            (emit_provisional_cross_module_unresolved
+                               ~is_type:false ~name:callee.v ~loc:callee.loc
+                               ~message:
+                                 (Printf.sprintf
+                                    "Undefined procedure %S. Declare it with \
+                                     REF PROC %S in scope."
+                                    callee.v callee.v))
                      then
                        if has_import_hint ~is_type:false callee.v then
                          suggest_missing_import ~loc:callee.loc
                            ~kind:"Procedure" ~is_type:false ~symbol:callee.v
                        else
-                         emit callee.loc
-                           (Printf.sprintf
-                              "Undefined procedure %S. Declare it with REF \
-                               PROC %S in scope."
-                              callee.v callee.v));
+                         emit_authoritative_unresolved ~is_type:false
+                           ~name:callee.v ~loc:callee.loc
+                           ~message:
+                             (Printf.sprintf
+                                "Undefined procedure %S. Declare it with REF \
+                                 PROC %S in scope."
+                                callee.v callee.v));
             match abort_label with
             | None -> ()
             | Some lab ->
@@ -1214,14 +2200,21 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                       (Printf.sprintf "Undefined ABORT target label %S." lab.v))
         | Ast.SIf { cond; then_; else_ } -> (
             ignore (ty_of_expr scp current_proc cond);
-            check_stmt scp current_proc ~loop_depth ~label_depths then_;
+            ignore (rich_ty_of_expr rscp current_proc cond);
+            check_status_value_expr cond;
+            check_stmt scp current_proc rscp ctf_env ~loop_depth ~label_depths
+              then_;
             match else_ with
             | None -> ()
-            | Some e -> check_stmt scp current_proc ~loop_depth ~label_depths e)
+            | Some e ->
+                check_stmt scp current_proc rscp ctf_env ~loop_depth
+                  ~label_depths e)
         | Ast.SWhile { cond; body } ->
             ignore (ty_of_expr scp current_proc cond);
-            check_stmt scp current_proc ~loop_depth:(loop_depth + 1)
-              ~label_depths body
+            ignore (rich_ty_of_expr rscp current_proc cond);
+            check_status_value_expr cond;
+            check_stmt scp current_proc rscp ctf_env
+              ~loop_depth:(loop_depth + 1) ~label_depths body
         | Ast.SFor { init; cond; step; body } ->
             let for_scope =
               match init with
@@ -1237,31 +2230,52 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
             (match init with
             | None -> ()
             | Some i ->
-                check_stmt for_scope current_proc ~loop_depth ~label_depths i);
+                check_stmt for_scope current_proc rscp ctf_env ~loop_depth
+                  ~label_depths i);
             (match cond with
             | None -> ()
-            | Some c -> ignore (ty_of_expr for_scope current_proc c));
+            | Some c ->
+                ignore (ty_of_expr for_scope current_proc c);
+                ignore (rich_ty_of_expr rscp current_proc c);
+                check_status_value_expr c);
             (match step with
             | None -> ()
             | Some st ->
-                check_stmt for_scope current_proc ~loop_depth ~label_depths st);
-            check_stmt for_scope current_proc ~loop_depth:(loop_depth + 1)
-              ~label_depths body
+                check_stmt for_scope current_proc rscp ctf_env ~loop_depth
+                  ~label_depths st);
+            check_stmt for_scope current_proc rscp ctf_env
+              ~loop_depth:(loop_depth + 1) ~label_depths body
         | Ast.SReturn eo -> (
             if current_proc = None then
               emit s.loc "RETURN is only valid inside a procedure.";
             match (current_proc, eo) with
             | _, None -> ()
-            | None, Some e -> ignore (ty_of_expr scp current_proc e)
+            | None, Some e ->
+                ignore (ty_of_expr scp current_proc e);
+                ignore (rich_ty_of_expr rscp current_proc e)
             | Some cp, Some e -> (
                 let provided = ty_of_expr scp current_proc e in
+                let provided_rich = rich_ty_of_expr rscp current_proc e in
+                let expected_rich =
+                  match rich_lookup_value rscp cp.proc_name with
+                  | Some (RichProc sig_) -> sig_.rich_ret_ty
+                  | _ -> None
+                in
+                (match expected_rich with
+                | None -> ()
+                | Some expected ->
+                    emit_typecheck_issues
+                      (Jovial_typecheck.assignment_issues ~lhs:expected
+                         ~rhs:provided_rich ~loc:e.loc);
+                    check_status_value_expr ~expected e);
                 match cp.proc_ret_ty with
                 | Some expected ->
                     emit_function_result_mismatch ~loc:e.loc
                       ~proc_name:cp.proc_name ~expected ~provided
                 | None -> ()))
         | Ast.SLabel { body; _ } ->
-            check_stmt scp current_proc ~loop_depth ~label_depths body
+            check_stmt scp current_proc rscp ctf_env ~loop_depth ~label_depths
+              body
         | Ast.SGoto id -> (
             let key = normalize_name id.v in
             match Hashtbl.find_opt label_depths key with
@@ -1275,35 +2289,77 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                         allowed."
                        id.v))
       and check_decl (scp : sem_scope) (current_proc : sem_proc_ctx option)
+          (rscp : rich_scope) (ctf_env : Jovial_compile_time.env)
           ~(loop_depth : int)
           ~label_depths:(_label_depths : (string, int) Hashtbl.t)
           (d : Ast.decl Ast.node) : unit =
         let _ = loop_depth in
         match d.v with
-        | Ast.DVar { dtype; init; _ } -> (
+        | Ast.DVar { dtype; init; data_decl_kind; _ } -> (
             check_type_import_hints scp dtype;
+            check_compile_time_type_expr ctf_env dtype;
             match init with
             | None -> ()
             | Some rhs ->
                 let lty = sem_ty_of_type_expr scp.types dtype in
                 let rty = ty_of_expr scp current_proc rhs in
+                let lhs_rich_ty = rich_ty_of_type_expr rscp dtype in
+                let rhs_rich_ty = rich_ty_of_expr rscp current_proc rhs in
+                emit_typecheck_issues
+                  (Jovial_typecheck.assignment_issues ~lhs:lhs_rich_ty
+                     ~rhs:rhs_rich_ty ~loc:rhs.loc);
+                check_status_value_expr ~expected:lhs_rich_ty rhs;
                 if not (sem_compatible lty rty) then
                   emit rhs.loc
                     (Printf.sprintf
                        "Type mismatch in initializer: expected %s, got %s."
                        (sem_ty_to_mismatch_string lty)
-                       (sem_ty_to_mismatch_string rty)))
-        | Ast.DConst { dtype; value; _ } ->
+                       (sem_ty_to_mismatch_string rty));
+                if data_decl_kind = Ast.DataTable then
+                  validate_table_preset rscp ctf_env current_proc ~table_type:dtype
+                    ~preset:rhs)
+        | Ast.DConst { dtype; value; data_decl_kind; _ } ->
             (match dtype with
             | None -> ()
-            | Some t -> check_type_import_hints scp t);
+            | Some t ->
+                check_type_import_hints scp t;
+                check_compile_time_type_expr ctf_env t);
+            (match data_decl_kind with
+            | Ast.DataTable -> ()
+            | _ ->
+                emit_compile_time_required
+                  ~message:
+                    "Compile-time constant expression required for constant item"
+                  ctf_env value);
+            (match dtype with
+            | None -> ()
+            | Some t ->
+                let lhs_rich_ty = rich_ty_of_type_expr rscp t in
+                let rhs_rich_ty = rich_ty_of_expr rscp current_proc value in
+                emit_typecheck_issues
+                  (Jovial_typecheck.assignment_issues ~lhs:lhs_rich_ty
+                     ~rhs:rhs_rich_ty ~loc:value.loc);
+                check_status_value_expr ~expected:lhs_rich_ty value;
+                if data_decl_kind = Ast.DataTable then
+                  validate_table_preset rscp ctf_env current_proc ~table_type:t
+                    ~preset:value);
             ignore (ty_of_expr scp current_proc value)
-        | Ast.DType { defn; _ } -> check_type_import_hints scp defn
+        | Ast.DType { defn; _ } ->
+            check_type_import_hints scp defn;
+            check_compile_time_type_expr ctf_env defn
         | Ast.DDirective _ -> ()
         | Ast.DProc p ->
             let proc_scope = sem_scope_copy scp in
+            let proc_rich_scope = rich_scope_copy rscp in
+            let proc_ctf_env = Jovial_compile_time.copy_env ctf_env in
+            List.iter
+              (fun prm ->
+                Jovial_compile_time.add_non_constant proc_ctf_env prm.v.pname.v)
+              p.v.params;
+            List.iter (register_ctf_decl_symbol proc_ctf_env) p.v.locals;
             let proc_label_depths = collect_label_depths p.v.body in
             List.iter (add_decl_symbol proc_scope) p.v.locals;
+            List.iter (rich_add_decl_symbol proc_rich_scope) p.v.locals;
             let local_var_tys : (string, sem_ty) Hashtbl.t =
               Hashtbl.create 32
             in
@@ -1316,11 +2372,15 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                 | _ -> ())
               p.v.locals;
             List.iter
-              (fun prm -> check_type_import_hints proc_scope prm.v.ptype)
+              (fun prm ->
+                check_type_import_hints proc_scope prm.v.ptype;
+                check_compile_time_type_expr proc_ctf_env prm.v.ptype)
               p.v.params;
             (match p.v.returns with
             | None -> ()
-            | Some r -> check_type_import_hints proc_scope r);
+            | Some r ->
+                check_type_import_hints proc_scope r;
+                check_compile_time_type_expr proc_ctf_env r);
             let proc_ret_ty =
               match p.v.returns with
               | None -> None
@@ -1353,22 +2413,30 @@ let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
                 sem_add_value proc_scope pname (SVVar inferred_ty))
               p.v.params;
             List.iter
+              (fun prm ->
+                rich_add_value proc_rich_scope prm.v.pname.v
+                  (RichVar (rich_ty_of_type_expr proc_rich_scope prm.v.ptype)))
+              p.v.params;
+            List.iter
               (fun pd ->
-                check_decl proc_scope proc_ctx ~loop_depth:0
-                  ~label_depths:proc_label_depths pd)
+                check_decl proc_scope proc_ctx proc_rich_scope proc_ctf_env
+                  ~loop_depth:0 ~label_depths:proc_label_depths pd)
               p.v.locals;
-            check_stmt proc_scope proc_ctx ~loop_depth:0
+            check_stmt proc_scope proc_ctx proc_rich_scope proc_ctf_env ~loop_depth:0
               ~label_depths:proc_label_depths p.v.body
       in
 
       List.iter
         (function
           | Ast.TopDecl d ->
-              check_decl scope None ~loop_depth:0
+              check_decl scope None rich_scope top_ctf_env ~loop_depth:0
                 ~label_depths:top_level_label_depths d
           | Ast.TopStmt s ->
-              check_stmt scope None ~loop_depth:0
+              check_stmt scope None rich_scope top_ctf_env ~loop_depth:0
                 ~label_depths:top_level_label_depths s)
         prog;
       List.rev !out
   | _ -> []
+
+let validate_semantics (ws : t) (doc : Document.t) : T.Diagnostic.t list =
+  validate_semantics_with_authority ws doc |> DiagAuth.to_lsp_list

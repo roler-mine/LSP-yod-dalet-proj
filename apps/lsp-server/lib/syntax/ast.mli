@@ -106,11 +106,35 @@ type binop =
 type type_expr =
   | TName of ident
   | TArray of { elem : type_expr node; dims : expr node list }
+  | TSpecifiedTable of {
+      elem : type_expr node;
+      dims : expr node list;
+      kind : specified_table_kind;
+    }
   | TPointer of type_expr node
+  | TStatus of status_value node list
   | TRecord of field_decl node list
   | TFunc of { params : param node list; returns : type_expr node option }
 
-and field_decl = { fname : ident; ftype : type_expr node }
+and specified_table_kind =
+  | SpecTableW of expr node
+  | SpecTableV of expr node option
+
+and status_value = {
+  sv_name : ident;
+  sv_representation : expr node option;
+}
+
+and field_position = {
+  pos_start_bit : expr node;
+  pos_start_word : expr node;
+}
+
+and field_decl = {
+  fname : ident;
+  ftype : type_expr node;
+  fpos : field_position option;
+}
 and param_mode = In | Out | InOut
 and param = { pname : ident; pmode : param_mode; ptype : type_expr node }
 

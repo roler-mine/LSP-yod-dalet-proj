@@ -419,7 +419,9 @@ let close_doc (ws : t) ~(uri : T.DocumentUri.t) : unit =
   (if ws.sem_store_enabled then
      match Semantic_store.snapshot_for_uri ws.semantic_store ~uri with
      | Some snap when snap.Semantic_store.Snapshot.path_key <> None -> ()
-     | _ -> Semantic_store.remove_uri ws.semantic_store ~uri);
+     | _ ->
+         Perf_stats.tick "query.cache.invalidate_uri";
+         Semantic_store.remove_uri ws.semantic_store ~uri);
   pump_index_background ws;
   update_startup_ready_state ws
 
@@ -496,6 +498,7 @@ let apply_watched_file_changes (ws : t)
             Hashtbl.remove ws.files path_key;
             Hashtbl.remove ws.bg_parsed path_key;
             Hashtbl.remove ws.closed_doc_last_touch path_key;
+            remove_module_summary_cache_entry ws ~path_key;
             match kind with
             | `Deleted -> (
                 match Uri_path.docuri_of_path path with
@@ -509,6 +512,10 @@ let apply_watched_file_changes (ws : t)
                   ~high:true path
           with _ -> ())
         changes));
+  (if changes <> [] then
+    match ws.index with
+    | None -> ()
+    | Some idx -> save_index_checkpoint_if_possible ws idx);
   if dependent_paths <> [] then (
     Perf_stats.tick "dep.invalidate.file_reverse";
     Perf_stats.observe_ms "dep.invalidate.file_reverse_paths"
@@ -522,12 +529,16 @@ let apply_watched_file_changes (ws : t)
     List.iter
       (fun (path, _kind) ->
         let path_key = normalize_path_key path in
-        if path_key <> "" then
+        if path_key <> "" then (
+          Perf_stats.tick "query.cache.invalidate_path";
           let removed =
             Semantic_store.invalidate_path_and_dependents ws.semantic_store
               ~path_key
           in
-          if removed <> [] then sem_dirty := true)
+          if removed <> [] then
+            Perf_stats.observe_ms "query.cache.invalidate_path_removed"
+              (float_of_int (List.length removed));
+          if removed <> [] then sem_dirty := true))
       changes;
   ws.bg_seed_cursor <- 0;
   if changes <> [] || source_set_changed then ws.bg_seed_needs_refresh <- true;

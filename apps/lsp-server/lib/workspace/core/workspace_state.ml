@@ -109,6 +109,10 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     skeleton_prefix_bytes = settings.skeleton_prefix_bytes;
     sched_open_doc_min_share_pct = settings.sched_open_doc_min_share_pct;
     quick_nav_index = Hashtbl.create 2048;
+    module_summary_cache = Hashtbl.create 2048;
+    module_summary_compool_index = Hashtbl.create 512;
+    module_summary_reverse_importers = Hashtbl.create 512;
+    module_summary_cache_loaded = false;
     quick_nav_pending_paths = Queue.create ();
     quick_nav_pending_set = Hashtbl.create 4096;
     quick_nav_done_set = Hashtbl.create 4096;
@@ -175,41 +179,9 @@ let normalize_include_target (s : string) : string =
 
 let icopy_include_targets_of_text ~(file : string option) ~(text : string) :
     string list =
-  let tokens =
-    try Some (Preprocess.lex_all_tokens ~file ~text) with _ -> None
-  in
-  match tokens with
-  | None -> []
-  | Some tokens ->
-      let len = Array.length tokens in
-      let seen = Hashtbl.create 8 in
-      let out = ref [] in
-      let push raw =
-        let target = normalize_include_target raw in
-        let key = normalize_name target in
-        if target <> "" && not (Hashtbl.mem seen key) then (
-          Hashtbl.replace seen key true;
-          out := target :: !out)
-      in
-      let rec find_target j steps =
-        if j >= len || steps > 12 then None
-        else
-          match tokens.(j).Parser.tok with
-          | Parser.LPAREN | Parser.RPAREN | Parser.COMMA ->
-              find_target (j + 1) (steps + 1)
-          | Parser.ID raw | Parser.STRINGLIT raw -> Some raw
-          | Parser.SEMI | Parser.TERM | Parser.EOF -> None
-          | _ -> find_target (j + 1) (steps + 1)
-      in
-      for i = 0 to len - 1 do
-        match tokens.(i).Parser.tok with
-        | Parser.ID raw when normalize_name raw = "ICOPY" -> (
-            match find_target (i + 1) 0 with
-            | None -> ()
-            | Some raw -> push raw)
-        | _ -> ()
-      done;
-      List.rev !out
+  Workspace_include_model.include_targets_of_text ~file ~text
+  |> List.map (fun (target : Workspace_include_model.include_target) ->
+         target.target)
 
 let icopy_include_targets_of_doc (doc : Document.t) : string list =
   icopy_include_targets_of_text ~file:doc.Document.file
@@ -262,6 +234,7 @@ let invalidate_importer_nav_state_for_compool_key (ws : t)
     else
       Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
       |> List.iter (fun uri ->
+          Perf_stats.tick "query.cache.invalidate_uri";
           Semantic_store.remove_uri ws.semantic_store ~uri)
 
 let importer_uris_for_compool_key (ws : t) ~(compool_key : string) :
@@ -280,6 +253,21 @@ let importer_uris_for_compool_key (ws : t) ~(compool_key : string) :
     if ws.sem_store_enabled then
       Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
       |> List.iter add_uri;
+    (match Hashtbl.find_opt ws.module_summary_reverse_importers key with
+    | Some path_keys ->
+        List.iter
+          (fun path_key ->
+            match Hashtbl.find_opt ws.module_summary_cache path_key with
+            | Some entry -> (
+                match
+                  T.DocumentUri.t_of_yojson
+                    (`String entry.msc_summary.Module_summary.source_uri)
+                with
+                | uri -> add_uri uri
+                | exception _ -> ())
+            | None -> ())
+          path_keys
+    | None -> ());
     Hashtbl.iter
       (fun uri doc ->
         if
@@ -416,8 +404,9 @@ let evict_closed_docs_if_needed (ws : t) : unit =
             Hashtbl.remove ws.files path_key;
             Hashtbl.remove ws.bg_parsed path_key;
             Hashtbl.remove ws.closed_doc_last_touch path_key;
-            if ws.sem_store_enabled then
-              Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+            if ws.sem_store_enabled then (
+              Perf_stats.tick "query.cache.invalidate_uri";
+              Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri);
             Perf_stats.tick "mem.closed_doc_evict";
             drop (n - 1) tl
     in
@@ -696,9 +685,98 @@ let is_probably_network_path (p : string) : bool =
   let n = String.length p in
   n >= 2 && ((p.[0] = '\\' && p.[1] = '\\') || (p.[0] = '/' && p.[1] = '/'))
 
+let module_summary_authority_label = function
+  | ModuleSummaryProvisional -> "provisional"
+  | ModuleSummaryMetadataValidated -> "metadataValidated"
+
+let rebuild_module_summary_indexes (ws : t) : unit =
+  Hashtbl.clear ws.module_summary_compool_index;
+  Hashtbl.clear ws.module_summary_reverse_importers;
+  let add_reverse ~compool path_key =
+    let key = normalize_name compool in
+    if key <> "" then
+      let prev =
+        match Hashtbl.find_opt ws.module_summary_reverse_importers key with
+        | Some xs -> xs
+        | None -> []
+      in
+      if not (List.mem path_key prev) then
+        Hashtbl.replace ws.module_summary_reverse_importers key (path_key :: prev)
+  in
+  Hashtbl.iter
+    (fun path_key entry ->
+      (match entry.msc_summary.Module_summary.compool_name with
+      | Some key when normalize_name key <> "" ->
+          Hashtbl.replace ws.module_summary_compool_index (normalize_name key)
+            path_key
+      | _ -> ());
+      List.iter
+        (fun compool -> add_reverse ~compool path_key)
+        entry.msc_summary.Module_summary.imported_compools)
+    ws.module_summary_cache;
+  Hashtbl.iter
+    (fun key values ->
+      Hashtbl.replace ws.module_summary_reverse_importers key
+        (List.sort_uniq String.compare values))
+    ws.module_summary_reverse_importers
+
+let clear_module_summary_cache (ws : t) : unit =
+  Hashtbl.clear ws.module_summary_cache;
+  Hashtbl.clear ws.module_summary_compool_index;
+  Hashtbl.clear ws.module_summary_reverse_importers;
+  ws.module_summary_cache_loaded <- false
+
+let install_module_summary_cache_entry (ws : t)
+    (entry : module_summary_cache_entry) : unit =
+  if entry.msc_path_key <> "" then (
+    Hashtbl.replace ws.module_summary_cache entry.msc_path_key entry;
+    rebuild_module_summary_indexes ws)
+
+let remove_module_summary_cache_entry (ws : t) ~(path_key : string) : unit =
+  if path_key <> "" then (
+    Hashtbl.remove ws.module_summary_cache path_key;
+    rebuild_module_summary_indexes ws)
+
+let module_summary_entry_for_path (ws : t) ~(path : string) :
+    module_summary_cache_entry option =
+  Hashtbl.find_opt ws.module_summary_cache (normalize_path_key path)
+
+let module_summary_entry_for_compool_key (ws : t) ~(compool_key : string) :
+    module_summary_cache_entry option =
+  let key = normalize_name compool_key in
+  match Hashtbl.find_opt ws.module_summary_compool_index key with
+  | None -> None
+  | Some path_key -> Hashtbl.find_opt ws.module_summary_cache path_key
+
+let module_summary_entry_for_uri (ws : t) ~(uri : T.DocumentUri.t) :
+    module_summary_cache_entry option =
+  let uri_s = Uri_path.docuri_to_string uri in
+  match Uri_path.file_path_of_uri uri with
+  | Some path -> module_summary_entry_for_path ws ~path
+  | None ->
+      Hashtbl.fold
+        (fun _ entry acc ->
+          match acc with
+          | Some _ -> acc
+          | None ->
+              if entry.msc_summary.Module_summary.source_uri = uri_s then
+                Some entry
+              else None)
+        ws.module_summary_cache None
+
+let module_summary_cache_counts (ws : t) : int * int * int =
+  Hashtbl.fold
+    (fun _ entry (total, provisional, validated) ->
+      match entry.msc_authority with
+      | ModuleSummaryProvisional -> (total + 1, provisional + 1, validated)
+      | ModuleSummaryMetadataValidated ->
+          (total + 1, provisional, validated + 1))
+    ws.module_summary_cache (0, 0, 0)
+
 let set_root_path (ws : t) (root : string option) : unit =
   if ws.root_path <> root then (
     mark_graph_dirty ws;
+    clear_module_summary_cache ws;
     ws.root_path <- root;
     ws.startup_started_ms <- Perf_stats.now_ms ();
     ws.startup_diag_hover_ready_ms <- None;
@@ -745,6 +823,7 @@ let set_source_files (ws : t) (paths : string list) : bool =
   if source_paths <> ws.source_file_paths then (
     ws.source_file_paths <- source_paths;
     ws.index <- None;
+    clear_module_summary_cache ws;
     mark_graph_dirty ws;
     ws.bg_seed_needs_refresh <- true;
     true)

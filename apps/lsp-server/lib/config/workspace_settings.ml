@@ -35,7 +35,9 @@ type feature_flags = {
   rename : bool;
   completion : bool;
   code_actions : bool;
+  code_lens : bool;
   inlay_hints : bool;
+  formatting : bool;
   semantic_tokens : bool;
 }
 
@@ -53,7 +55,9 @@ type feature_overrides = {
   rename : bool option;
   completion : bool option;
   code_actions : bool option;
+  code_lens : bool option;
   inlay_hints : bool option;
+  formatting : bool option;
   semantic_tokens : bool option;
 }
 
@@ -130,7 +134,9 @@ let empty_feature_overrides : feature_overrides =
     rename = None;
     completion = None;
     code_actions = None;
+    code_lens = None;
     inlay_hints = None;
+    formatting = None;
     semantic_tokens = None;
   }
 
@@ -226,7 +232,9 @@ let feature_flags_from_env () : feature_flags =
     rename = true;
     completion = Env_utils.flag "JOVIAL_FEATURE_COMPLETION" ~default:true;
     code_actions = Env_utils.flag "JOVIAL_FEATURE_CODE_ACTIONS" ~default:true;
+    code_lens = Env_utils.flag "JOVIAL_FEATURE_CODE_LENS" ~default:true;
     inlay_hints = Env_utils.flag "JOVIAL_FEATURE_INLAY_HINTS" ~default:true;
+    formatting = Env_utils.flag "JOVIAL_FEATURE_FORMATTING" ~default:true;
     semantic_tokens =
       Env_utils.flag "JOVIAL_FEATURE_SEMANTIC_TOKENS" ~default:true;
   }
@@ -268,10 +276,18 @@ let apply_feature_overrides (base : feature_flags) (overrides : feature_override
       (match overrides.code_actions with
       | Some enabled -> enabled
       | None -> base.code_actions);
+    code_lens =
+      (match overrides.code_lens with
+      | Some enabled -> enabled
+      | None -> base.code_lens);
     inlay_hints =
       (match overrides.inlay_hints with
       | Some enabled -> enabled
       | None -> base.inlay_hints);
+    formatting =
+      (match overrides.formatting with
+      | Some enabled -> enabled
+      | None -> base.formatting);
     semantic_tokens =
       (match overrides.semantic_tokens with
       | Some enabled -> enabled
@@ -287,6 +303,7 @@ let apply_feature_overrides (base : feature_flags) (overrides : feature_override
       {
         base with
         code_actions = false;
+        code_lens = false;
         inlay_hints = false;
         semantic_tokens = false;
       }
@@ -298,7 +315,9 @@ let apply_feature_overrides (base : feature_flags) (overrides : feature_override
         signature_help = false;
         completion = false;
         code_actions = false;
+        code_lens = false;
         inlay_hints = false;
+        formatting = false;
         semantic_tokens = false;
       }
 

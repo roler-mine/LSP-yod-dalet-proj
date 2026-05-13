@@ -11,6 +11,50 @@ Entry module:
 
 - `core/workspace.ml` (exposed as module `Workspace`)
 
+Compatibility boundary:
+
+- `features/workspace_navigation.ml` is a legacy facade kept for compatibility
+  with older callers. New internal feature logic should depend on the focused
+  `Workspace_*` feature module that owns the capability, or on `Workspace_query`
+  when it needs readiness/authority metadata for definition, references, or
+  hover.
+- `workspace_core_suite_test` includes a lightweight architecture guardrail that
+  fails if new `lib/` code starts depending on `Workspace_navigation`.
+
+Public module summaries:
+
+- `core/module_summary.ml` derives the dependency-facing surface for each
+  document: COMPOOL name, exported symbols/types, COMPOOL/ICOPY imports, DEFINE
+  macro signatures, and a `public_signature_hash`.
+- Workspace invalidation keeps the older declaration signature as a safety
+  comparison, but COMPOOL importer revalidation is pruned when the public
+  summary hash is unchanged. Incomplete summaries are conservative and include
+  the content hash, so partial or skipped parses invalidate rather than risk
+  stale cross-module results.
+- The persistent cache stores these lightweight summaries in
+  `.jovial-lsp-cache/module-summaries.json` with cache-version, source
+  extension, parser/indexer, metadata, content-hash, and reverse-importer data.
+  Hydrated summaries can answer warm-start cross-module lookups, but summary-only
+  query results remain provisional until normal workspace readiness catches up.
+- Perf counters exposed through the existing debug snapshot include
+  `summary.public_hash_unchanged`, `summary.public_hash_changed`, and
+  `dep.invalidate.pruned_by_summary`.
+
+Cross-module lookup order:
+
+- Definition, type-definition, and reference helpers prefer local semantic/nav
+  bindings first, then semantic-store hits scoped to imported COMPOOLs, then
+  cached/open module summaries, and only then the bounded fallback scans.
+- Fallbacks remain available for broken, cold, or partially indexed workspaces,
+  but they are counted as emergency paths via
+  `query.cross_module.fallback_scan`. Related counters include
+  `query.cross_module.semantic_hit`, `query.cross_module.summary_hit`,
+  `query.cross_module.provisional_result`, and
+  `query.cross_module.authoritative_result`.
+- `Workspace_query.debug_report_json` includes a `moduleSummaryCache` object with
+  loaded, entry count, metadata-validated count, reverse-importer count, and
+  per-document cache authority.
+
 ## Client-Supplied Settings
 
 The VS Code client now sends its primary runtime settings in LSP `initialize`
@@ -46,6 +90,8 @@ Current user-facing typed settings:
 - `features.rename`
 - `features.completion`
 - `features.codeActions`
+- `features.codeLens`
+- `features.formatting`
 - `features.inlayHints`
 - `features.semanticTokens`
 - `server.parseMaxFileBytes`

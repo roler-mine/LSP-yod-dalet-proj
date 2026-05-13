@@ -12,22 +12,25 @@ let allow_fallback_scan (ws : t) : bool = not (is_network_root ws)
 let ensure_index_started (ws : t) : unit =
   match (ws.root_path, ws.index) with
   | Some root, None ->
-      let idx =
-        match
-          Workspace_persistent_index.load_workspace_index
-            ~source_extensions:ws.source_extensions ~root
-        with
-        | Some idx ->
-            ws.index_checkpoint_loaded <- true;
-            ignore
-              (Workspace_index.replace_source_files idx
-                 ~paths:ws.source_file_paths);
-            idx
-        | None ->
-            ws.index_checkpoint_loaded <- false;
-            Workspace_index.of_source_files ~source_extensions:ws.source_extensions
-              ~root ~paths:ws.source_file_paths
+      let loaded =
+        Persistent_cache.load_or_build_source_index
+          ~source_extensions:ws.source_extensions ~root
+          ~paths:ws.source_file_paths
       in
+      let idx = loaded.Persistent_cache.index in
+      ws.index_checkpoint_loaded <- loaded.loaded_from_cache;
+      clear_module_summary_cache ws;
+      let summary_cache =
+        Persistent_cache.load_module_summary_cache
+          ~source_extensions:ws.source_extensions ~root
+          ~paths:(Workspace_index.all_source_paths idx)
+      in
+      List.iter
+        (install_module_summary_cache_entry ws)
+        (Persistent_cache.module_summary_entries summary_cache);
+      ws.module_summary_cache_loaded <- true;
+      Persistent_cache.save_source_index ~source_extensions:ws.source_extensions
+        ~root idx;
       Workspace_persistent_index.save_workspace_index ~root idx;
       ws.index <- Some idx
   | _ -> ()
@@ -68,7 +71,10 @@ let save_index_checkpoint_if_possible (ws : t) (idx : Workspace_index.t) : unit
     =
   match ws.root_path with
   | None -> ()
-  | Some root -> Workspace_persistent_index.save_workspace_index ~root idx
+  | Some root ->
+      Persistent_cache.save_source_index ~source_extensions:ws.source_extensions
+        ~root idx;
+      Workspace_persistent_index.save_workspace_index ~root idx
 
 let note_index_health_repair (ws : t) : unit =
   mark_graph_dirty ws;
@@ -282,8 +288,9 @@ let resolve_icopy_include_path (ws : t) ~(importer_path : string)
                    path_base_key path = target_base
                    || path_stem_key path = target_stem))
 
-let graph_icopy_include_paths_for_path (ws : t) ~(path : string)
-    ~(doc_opt : Document.t option) : string list =
+let graph_icopy_include_targets_for_path (ws : t) ~(path : string)
+    ~(doc_opt : Document.t option) :
+    Workspace_include_model.include_target list =
   let text =
     match doc_opt with
     | Some doc -> Some doc.Document.text
@@ -292,9 +299,26 @@ let graph_icopy_include_paths_for_path (ws : t) ~(path : string)
   match text with
   | None -> []
   | Some text ->
-      icopy_include_targets_of_text ~file:(Some path) ~text
-      |> List.filter_map (resolve_icopy_include_path ws ~importer_path:path)
-      |> List.sort_uniq String.compare
+      Workspace_include_model.include_targets_of_text ~file:(Some path) ~text
+      |> List.map (fun target ->
+             Workspace_include_model.with_resolved_path target
+               (resolve_icopy_include_path ws ~importer_path:path target.target))
+
+let graph_icopy_include_paths_for_path (ws : t) ~(path : string)
+    ~(doc_opt : Document.t option) : string list =
+  graph_icopy_include_targets_for_path ws ~path ~doc_opt
+  |> List.filter_map
+       (fun (target : Workspace_include_model.include_target) ->
+         target.resolved_path)
+  |> List.sort_uniq String.compare
+
+let icopy_include_targets_for_doc (ws : t) (doc : Document.t) :
+    Workspace_include_model.include_target list =
+  match doc.Document.file with
+  | None ->
+      Workspace_include_model.include_targets_of_doc doc
+  | Some path ->
+      graph_icopy_include_targets_for_path ws ~path ~doc_opt:(Some doc)
 
 let edge ?path_key (kind : dependency_edge_kind) ~(target : string) :
     dependency_edge =
@@ -426,7 +450,16 @@ let graph_refresh (ws : t) : unit =
                 | None -> None)
             |> List.sort_uniq String.compare
           in
-          let include_paths = graph_icopy_include_paths_for_path ws ~path ~doc_opt in
+          let include_targets =
+            graph_icopy_include_targets_for_path ws ~path ~doc_opt
+          in
+          let include_paths =
+            include_targets
+            |> List.filter_map
+                 (fun (target : Workspace_include_model.include_target) ->
+                   target.resolved_path)
+            |> List.sort_uniq String.compare
+          in
           let import_paths =
             (compool_import_paths @ include_paths) |> List.sort_uniq String.compare
           in
@@ -446,14 +479,22 @@ let graph_refresh (ws : t) : unit =
                    edge ?path_key ICompoolImport ~target:compool)
           in
           let include_edges =
-            include_paths
-            |> List.filter_map (fun include_path ->
-                   let key = normalize_path_key include_path in
-                   if key = "" then None
-                   else
-                     Some
-                       (edge ~path_key:key ICopyInclude
-                          ~target:include_path))
+            include_targets
+            |> List.filter_map
+                 (fun (target : Workspace_include_model.include_target) ->
+                   match target.resolved_path with
+                   | Some include_path ->
+                       let key = normalize_path_key include_path in
+                       if key = "" then None
+                       else
+                         Some
+                           (edge ~path_key:key ICopyInclude
+                              ~target:include_path)
+                   | None ->
+                       if target.normalized_target = "" then None
+                       else
+                         Some
+                           (edge ICopyInclude ~target:target.normalized_target))
           in
           let local_edges =
             match doc_opt with
@@ -466,6 +507,7 @@ let graph_refresh (ws : t) : unit =
               gn_path_key = path_key;
               gn_import_compools = import_compools;
               gn_import_paths = import_paths;
+              gn_include_targets = include_targets;
               gn_rev_importers = [];
               gn_dependency_edges = compool_edges @ include_edges @ local_edges;
               gn_file_class = graph_file_class_for_path ws ~path ~doc_opt;
@@ -667,6 +709,26 @@ let graph_refresh (ws : t) : unit =
 
 let ensure_graph_fresh (ws : t) : unit =
   if ws.graph_needs_refresh then graph_refresh ws
+
+let reverse_include_users_for_path (ws : t) ~(path : string) : string list =
+  ensure_index_started ws;
+  ensure_graph_fresh ws;
+  let wanted = normalize_path_key path in
+  if wanted = "" then []
+  else
+    Hashtbl.fold
+      (fun _ node acc ->
+        if
+          List.exists
+            (fun (target : Workspace_include_model.include_target) ->
+              match target.resolved_path with
+              | Some resolved -> normalize_path_key resolved = wanted
+              | None -> false)
+            node.gn_include_targets
+        then node.gn_path :: acc
+        else acc)
+      ws.graph_nodes []
+    |> List.sort_uniq String.compare
 
 let graph_reverse_dependency_closure_paths (ws : t) ~(path_keys : string list) :
     string list =
@@ -912,23 +974,15 @@ let rescan (ws : t) : unit =
       ws.index <- None;
       ws.index_checkpoint_loaded <- false
   | Some root ->
-      let idx =
-        match
-          Workspace_persistent_index.load_workspace_index
-            ~source_extensions:ws.source_extensions ~root
-        with
-        | Some idx ->
-            ws.index_checkpoint_loaded <- true;
-            ignore
-              (Workspace_index.replace_source_files idx
-                 ~paths:ws.source_file_paths);
-            idx
-        | None ->
-            ws.index_checkpoint_loaded <- false;
-            Workspace_index.of_source_files
-              ~source_extensions:ws.source_extensions ~root
-              ~paths:ws.source_file_paths
+      let loaded =
+        Persistent_cache.load_or_build_source_index
+          ~source_extensions:ws.source_extensions ~root
+          ~paths:ws.source_file_paths
       in
+      let idx = loaded.Persistent_cache.index in
+      ws.index_checkpoint_loaded <- loaded.loaded_from_cache;
+      Persistent_cache.save_source_index ~source_extensions:ws.source_extensions
+        ~root idx;
       Workspace_persistent_index.save_workspace_index ~root idx;
       ws.index <- Some idx
 

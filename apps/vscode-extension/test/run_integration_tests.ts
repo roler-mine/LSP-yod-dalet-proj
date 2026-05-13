@@ -5,6 +5,36 @@ import { pathToFileURL } from "url";
 
 import { downloadAndUnzipVSCode, runTests } from "@vscode/test-electron";
 
+const DEFAULT_PINNED_VSCODE_VERSION = "1.85.2";
+
+type ExtensionManifest = {
+  config?: {
+    vscodeTestVersion?: unknown;
+  };
+  engines?: {
+    vscode?: unknown;
+  };
+};
+
+type ResolvedVsCode = {
+  executablePath: string;
+  source: string;
+  version: string;
+};
+
+type LaunchDiagnostics = {
+  extensionDevelopmentPath: string;
+  extensionTestsPath: string;
+  fixtureWorkspacePath: string;
+  userDataDir: string;
+  extensionsDir: string;
+  vscodeExecutablePath?: string;
+  vscodeSource?: string;
+  vscodeVersion: string;
+};
+
+let launchDiagnostics: LaunchDiagnostics | undefined;
+
 function ensureDir(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -14,9 +44,13 @@ function writeJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function readManifest(extensionDevelopmentPath: string): ExtensionManifest {
+  const manifestPath = path.join(extensionDevelopmentPath, "package.json");
+  return JSON.parse(fs.readFileSync(manifestPath, "utf8")) as ExtensionManifest;
+}
+
 function findInstalledVsCode(): string | undefined {
   const candidates = [
-    process.env.VSCODE_EXECUTABLE_PATH,
     path.join(
       process.env.LOCALAPPDATA ?? "",
       "Programs",
@@ -30,15 +64,121 @@ function findInstalledVsCode(): string | undefined {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
-function preferredVsCodeVersion(extensionDevelopmentPath: string): string {
-  const manifestPath = path.join(extensionDevelopmentPath, "package.json");
-  const raw = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
-    engines?: { vscode?: unknown };
+function configuredVsCodeVersion(extensionDevelopmentPath: string): string {
+  const envVersion = process.env.VSCODE_TEST_VERSION?.trim();
+  if (envVersion) return envVersion;
+
+  const manifest = readManifest(extensionDevelopmentPath);
+  const configured = manifest.config?.vscodeTestVersion;
+  if (typeof configured === "string" && configured.trim()) {
+    return configured.trim();
+  }
+
+  const engine = manifest.engines?.vscode;
+  if (typeof engine === "string") {
+    const exact = engine.match(/(\d+\.\d+\.\d+)/);
+    if (exact) return exact[1];
+  }
+
+  return DEFAULT_PINNED_VSCODE_VERSION;
+}
+
+function configuredExecutablePath(): string | undefined {
+  return (
+    process.env.VSCODE_TEST_EXECUTABLE_PATH?.trim() ||
+    process.env.VSCODE_EXECUTABLE_PATH?.trim() ||
+    undefined
+  );
+}
+
+function requireExistingExecutable(filePath: string, source: string): string {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`${source} does not exist: ${filePath}`);
+  }
+  return filePath;
+}
+
+async function resolveVsCodeExecutable(
+  extensionDevelopmentPath: string,
+): Promise<ResolvedVsCode> {
+  const version = configuredVsCodeVersion(extensionDevelopmentPath);
+  const explicitPath = configuredExecutablePath();
+  if (explicitPath) {
+    return {
+      executablePath: requireExistingExecutable(
+        explicitPath,
+        "Configured VS Code executable",
+      ),
+      source: "explicit environment override",
+      version,
+    };
+  }
+
+  if (process.env.JOVIAL_INTEGRATION_USE_INSTALLED_VSCODE === "1") {
+    const installed = findInstalledVsCode();
+    if (!installed) {
+      throw new Error(
+        "JOVIAL_INTEGRATION_USE_INSTALLED_VSCODE=1 was set, but no installed VS Code executable was found.",
+      );
+    }
+    return {
+      executablePath: installed,
+      source: "installed VS Code opt-in",
+      version,
+    };
+  }
+
+  return {
+    executablePath: await downloadAndUnzipVSCode({ version }),
+    source: "downloaded pinned VS Code test host",
+    version,
   };
-  const engine = raw.engines?.vscode;
-  if (typeof engine !== "string") return "stable";
-  const match = engine.match(/(\d+\.\d+\.\d+)/);
-  return match?.[1] ?? "stable";
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) {
+    return error.stack ?? error.message;
+  }
+  return String(error);
+}
+
+function formatLaunchFailure(error: unknown): string {
+  const diag = launchDiagnostics;
+  const lines = [
+    "",
+    "VS Code integration tests could not launch the pinned test host.",
+    "",
+    "This runner downloads a fixed VS Code build by default and launches it with a temporary user-data-dir and extensions-dir, so it should not depend on a locally updating VS Code installation.",
+  ];
+
+  if (diag) {
+    lines.push(
+      "",
+      `Pinned VS Code version: ${diag.vscodeVersion}`,
+      `VS Code source: ${diag.vscodeSource ?? "not resolved"}`,
+      `VS Code executable: ${diag.vscodeExecutablePath ?? "not resolved"}`,
+      `Extension path: ${diag.extensionDevelopmentPath}`,
+      `Test entrypoint: ${diag.extensionTestsPath}`,
+      `Workspace fixture: ${diag.fixtureWorkspacePath}`,
+      `User data dir: ${diag.userDataDir}`,
+      `Extensions dir: ${diag.extensionsDir}`,
+    );
+  }
+
+  lines.push(
+    "",
+    "Actionable checks:",
+    "- Re-run `npm run test:integration:pinned` to retry a failed or interrupted VS Code download.",
+    "- Delete `apps/vscode-extension/.vscode-test` if the downloaded test host cache is corrupt.",
+    "- Set `VSCODE_TEST_VERSION=<version>` to test a different downloaded VS Code build.",
+    "- Set `VSCODE_TEST_EXECUTABLE_PATH=<path-to-Code>` only when you intentionally want to bypass the downloaded test host.",
+    "- On headless Linux, run under Xvfb or provide another display server.",
+    "",
+    "Underlying error:",
+    errorText(error),
+  );
+
+  return lines.join("\n");
 }
 
 async function main(): Promise<void> {
@@ -65,6 +205,16 @@ async function main(): Promise<void> {
   const logPath = path.join(tempRoot, "fake-server.log");
   const userDataDir = path.join(tempRoot, "user-data");
   const extensionsDir = path.join(tempRoot, "extensions");
+  const vscodeVersion = configuredVsCodeVersion(extensionDevelopmentPath);
+
+  launchDiagnostics = {
+    extensionDevelopmentPath,
+    extensionTestsPath,
+    fixtureWorkspacePath,
+    userDataDir,
+    extensionsDir,
+    vscodeVersion,
+  };
 
   ensureDir(workspacePath);
   ensureDir(userDataDir);
@@ -114,18 +264,18 @@ async function main(): Promise<void> {
     `--extensions-dir=${extensionsDir}`,
     `--user-data-dir=${userDataDir}`,
   ];
-  const shouldUseInstalledVsCode = process.env.CI !== "true";
-  const installedVsCode = shouldUseInstalledVsCode
-    ? findInstalledVsCode()
-    : undefined;
-  const vscodeExecutablePath =
-    installedVsCode ??
-    (await downloadAndUnzipVSCode({
-      version: preferredVsCodeVersion(extensionDevelopmentPath),
-    }));
+  const resolvedVsCode = await resolveVsCodeExecutable(
+    extensionDevelopmentPath,
+  );
+  launchDiagnostics = {
+    ...launchDiagnostics,
+    vscodeExecutablePath: resolvedVsCode.executablePath,
+    vscodeSource: resolvedVsCode.source,
+    vscodeVersion: resolvedVsCode.version,
+  };
 
   await runTests({
-    vscodeExecutablePath,
+    vscodeExecutablePath: resolvedVsCode.executablePath,
     extensionDevelopmentPath,
     extensionTestsPath,
     extensionTestsEnv,
@@ -135,6 +285,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error(error);
+  console.error(formatLaunchFailure(error));
   process.exit(1);
 });

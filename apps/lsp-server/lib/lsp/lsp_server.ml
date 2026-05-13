@@ -236,6 +236,33 @@ let parse_range (params : Yojson.Safe.t) : T.Range.t option =
           | _ -> None)
       | _ -> None)
 
+let parse_formatting_options (params : Yojson.Safe.t) :
+    Workspace_formatting.options =
+  let default = Workspace_formatting.default_options in
+  let int_field key xs =
+    match find_field key xs with
+    | Some (`Int n) -> Some n
+    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
+    | _ -> None
+  in
+  let bool_field key xs =
+    match find_field key xs with Some (`Bool b) -> Some b | _ -> None
+  in
+  match get_assoc params with
+  | None -> default
+  | Some xs -> (
+      match find_field "options" xs with
+      | Some (`Assoc options) ->
+          {
+            Workspace_formatting.tab_size =
+              Option.value (int_field "tabSize" options)
+                ~default:default.Workspace_formatting.tab_size;
+            insert_spaces =
+              Option.value (bool_field "insertSpaces" options)
+                ~default:default.insert_spaces;
+          }
+      | _ -> default)
+
 let parse_new_name (params : Yojson.Safe.t) : string option =
   match get_assoc params with
   | None -> None
@@ -1008,6 +1035,26 @@ let handle_execute_command (roots_state : roots_state)
     | "jovial.debugPerfStats" ->
         respond oc ~id
           ~result:(Workspace.perf_stats_json roots_state.default_ws)
+    | "jovial.debugScheduler" ->
+        let ws =
+          match p.arguments with
+          | Some (a0 :: _) -> (
+              match parse_uri_arg a0 with
+              | Some uri -> ws_for_uri roots_state uri
+              | None -> roots_state.default_ws)
+          | _ -> roots_state.default_ws
+        in
+        respond oc ~id ~result:(Workspace.debug_scheduler_json ws)
+    | "jovial.debugMemory" ->
+        let ws =
+          match p.arguments with
+          | Some (a0 :: _) -> (
+              match parse_uri_arg a0 with
+              | Some uri -> ws_for_uri roots_state uri
+              | None -> roots_state.default_ws)
+          | _ -> roots_state.default_ws
+        in
+        respond oc ~id ~result:(Workspace.debug_memory_json ws)
     | _ -> respond_error oc ~id ~code:(-32601) ~message:"Unknown command"
   with _ ->
     respond_error oc ~id ~code:(-32602) ~message:"Invalid executeCommand params"
@@ -1291,13 +1338,15 @@ let request_priority_of_method = function
   | "textDocument/completion" | "textDocument/hover"
   | "textDocument/signatureHelp" ->
       Interactive
-  | "textDocument/semanticTokens/range" | "textDocument/documentSymbol" ->
+  | "textDocument/semanticTokens/range" | "textDocument/documentSymbol"
+  | "textDocument/codeLens" | "textDocument/inlayHint"
+  | "textDocument/formatting" | "textDocument/rangeFormatting" ->
       Visible
   | "textDocument/definition" | "textDocument/declaration"
   | "textDocument/typeDefinition" | "textDocument/implementation" ->
       Navigation
   | "textDocument/references" | "textDocument/prepareRename"
-  | "textDocument/rename" | "textDocument/codeAction" ->
+  | "textDocument/rename" | "textDocument/codeAction" | "codeLens/resolve" ->
       Medium
   | "workspace/symbol" | "textDocument/diagnostic"
   | "textDocument/semanticTokens/full"
@@ -1622,6 +1671,102 @@ let handle_request (roots_state : roots_state)
         | _ ->
             respond_error oc ~id ~code:(-32602)
               ~message:"codeAction: invalid textDocument or range")
+    | "textDocument/codeLens" -> (
+        try
+          let p = T.CodeLensParams.t_of_yojson params in
+          let uri = p.textDocument.uri in
+          let ws = ws_for_uri roots_state uri in
+          let flags = Workspace.feature_flags ws in
+          if not flags.code_lens then respond_result (`List [])
+          else
+            let j =
+              with_cancel_ws ws (fun () ->
+                  Workspace.code_lenses_for ws ~uri
+                  |> Resp.yojson_of_code_lenses)
+            in
+            respond_result j
+        with _ ->
+          respond_error oc ~id ~code:(-32602)
+            ~message:"codeLens: invalid textDocument")
+    | "codeLens/resolve" -> (
+        try
+          let lens = T.CodeLens.t_of_yojson params in
+          let uri_opt =
+            match lens.data with
+            | Some (`Assoc fields) -> (
+                match List.assoc_opt "uri" fields with
+                | Some (`String s) -> Uri_path.docuri_of_string s
+                | _ -> None)
+            | _ -> None
+          in
+          match uri_opt with
+          | None -> respond_result (T.CodeLens.yojson_of_t lens)
+          | Some uri ->
+              let ws = ws_for_uri roots_state uri in
+              let flags = Workspace.feature_flags ws in
+              if not flags.code_lens then respond_result (T.CodeLens.yojson_of_t lens)
+              else
+                let j =
+                  with_cancel_ws ws (fun () ->
+                      Workspace.resolve_code_lens ws lens
+                      |> T.CodeLens.yojson_of_t)
+                in
+                respond_result j
+        with _ ->
+          respond_error oc ~id ~code:(-32602)
+            ~message:"codeLens/resolve: invalid CodeLens")
+    | "textDocument/inlayHint" -> (
+        try
+          let p = T.InlayHintParams.t_of_yojson params in
+          let uri = p.textDocument.uri in
+          let ws = ws_for_uri roots_state uri in
+          let flags = Workspace.feature_flags ws in
+          if not flags.inlay_hints then respond_result (`List [])
+          else
+            let j =
+              with_cancel_ws ws (fun () ->
+                  Workspace.inlay_hints_for ws ~uri ~range:p.range
+                  |> Resp.yojson_of_inlay_hints)
+            in
+            respond_result j
+        with _ ->
+          respond_error oc ~id ~code:(-32602)
+            ~message:"inlayHint: invalid params")
+    | "textDocument/formatting" -> (
+        match parse_text_document_uri params with
+        | Some uri ->
+            let ws = ws_for_uri roots_state uri in
+            let flags = Workspace.feature_flags ws in
+            if not flags.formatting then respond_result (`List [])
+            else
+              let options = parse_formatting_options params in
+              let j =
+                with_cancel_ws ws (fun () ->
+                    Workspace.formatting_edits_for ws ~uri ~options
+                    |> Resp.yojson_of_text_edits)
+              in
+              respond_result j
+        | _ ->
+            respond_error oc ~id ~code:(-32602)
+              ~message:"formatting: invalid textDocument")
+    | "textDocument/rangeFormatting" -> (
+        match (parse_text_document_uri params, parse_range params) with
+        | Some uri, Some range ->
+            let ws = ws_for_uri roots_state uri in
+            let flags = Workspace.feature_flags ws in
+            if not flags.formatting then respond_result (`List [])
+            else
+              let options = parse_formatting_options params in
+              let j =
+                with_cancel_ws ws (fun () ->
+                    Workspace.range_formatting_edits_for ws ~uri ~range
+                      ~options
+                    |> Resp.yojson_of_text_edits)
+              in
+              respond_result j
+        | _ ->
+            respond_error oc ~id ~code:(-32602)
+              ~message:"rangeFormatting: invalid textDocument or range")
     | "textDocument/diagnostic" -> (
         try
           let p = T.DocumentDiagnosticParams.t_of_yojson params in

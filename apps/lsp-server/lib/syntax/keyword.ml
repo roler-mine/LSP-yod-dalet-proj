@@ -46,6 +46,7 @@ let classify (s : string) : Parser.token option =
       | 'F' -> match1 s "FOR" FOR
       | 'M' -> match1 s "MOD" MOD
       | 'N' -> match1 s "NOT" NOT
+      | 'P' -> match1 s "POS" POS
       | 'R' -> match1 s "REF" REF
       | 'X' -> match1 s "XOR" XOR
       | _ -> None)
@@ -88,7 +89,7 @@ let class_of_token = function
   | START | TERM | BEGIN | END | DEF | REF | PROC | ITEM | TABLE | STATIC
   | CONSTANT | IF | ELSE | WHILE | FOR | BY | THEN | CASE | FALLTHRU | EXIT
   | GOTO | RETURN | ABORT | STOP | TRUE | FALSE | NOT | AND | OR | XOR | EQV
-  | MOD | COMPOOL | ICOMPOOL | DEFINE ->
+  | MOD | POS | COMPOOL | ICOMPOOL | DEFINE ->
       Some Hard
   | _ -> None
 

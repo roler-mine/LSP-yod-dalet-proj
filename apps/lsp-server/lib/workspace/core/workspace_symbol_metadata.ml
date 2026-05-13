@@ -274,6 +274,21 @@ and type_display (t : Ast.type_expr Ast.node) =
   match t.v with
   | Ast.TName id -> id.v
   | Ast.TPointer inner -> "P " ^ type_display inner
+  | Ast.TSpecifiedTable { elem; dims; kind } ->
+      let dim_text =
+        match dims with
+        | [] -> ""
+        | _ ->
+            "(" ^ (dims |> List.map expr_display |> String.concat ",") ^ ")"
+      in
+      let kind_text =
+        match kind with
+        | Ast.SpecTableW entry_size -> "W " ^ expr_display entry_size
+        | Ast.SpecTableV None -> "V"
+        | Ast.SpecTableV (Some entry_size) -> "V " ^ expr_display entry_size
+      in
+      "SPECIFIED TABLE" ^ dim_text ^ " " ^ kind_text ^ " "
+      ^ type_display elem
   | Ast.TArray { elem; dims } -> (
       match elem.v with
       | Ast.TName id
@@ -288,8 +303,67 @@ and type_display (t : Ast.type_expr Ast.node) =
           type_display elem ^ "("
           ^ (dims |> List.map expr_display |> String.concat ",")
           ^ ")")
+  | Ast.TStatus values ->
+      "STATUS ("
+      ^ (values
+        |> List.map (fun (sv : Ast.status_value Ast.node) ->
+               "V(" ^ sv.v.sv_name.v ^ ")")
+        |> String.concat ", ")
+      ^ ")"
   | Ast.TRecord _ -> "BLOCK"
   | Ast.TFunc _ -> "PROC"
+
+let int_literal_expr (e : Ast.expr Ast.node) =
+  match e.v with
+  | Ast.ELit (Ast.LInt s) -> (
+      try
+        ignore (int_of_string s);
+        true
+      with _ -> false)
+  | _ -> false
+
+let builtin_size_name name =
+  let key = String.uppercase_ascii (String.trim name) in
+  match key with "U" | "S" | "W" | "F" | "A" | "B" | "C" -> true | _ -> false
+
+let rec has_non_integer_builtin_size (t : Ast.type_expr Ast.node) =
+  match t.v with
+  | Ast.TArray { elem = { v = Ast.TName id; _ }; dims }
+    when builtin_size_name id.v ->
+      List.exists (fun dim -> not (int_literal_expr dim)) dims
+  | Ast.TArray { elem; _ } | Ast.TPointer elem ->
+      has_non_integer_builtin_size elem
+  | Ast.TSpecifiedTable { elem; dims; kind } ->
+      List.exists (fun dim -> not (int_literal_expr dim)) dims
+      || (match kind with
+         | Ast.SpecTableW entry_size
+         | Ast.SpecTableV (Some entry_size) ->
+             not (int_literal_expr entry_size)
+         | Ast.SpecTableV None -> false)
+      || has_non_integer_builtin_size elem
+  | Ast.TStatus _ -> false
+  | Ast.TRecord fields ->
+      List.exists
+        (fun (field : Ast.field_decl Ast.node) ->
+          has_non_integer_builtin_size field.v.ftype)
+        fields
+  | Ast.TFunc { params; returns } ->
+      List.exists
+        (fun (param : Ast.param Ast.node) ->
+          has_non_integer_builtin_size param.v.ptype)
+        params
+      || Option.fold ~none:false ~some:has_non_integer_builtin_size returns
+  | Ast.TName _ -> false
+
+let rich_type_display (t : Ast.type_expr Ast.node) =
+  match t.v with
+  | Ast.TSpecifiedTable _ -> type_display t
+  | _ when has_non_integer_builtin_size t -> type_display t
+  | _ ->
+      let ty = Jovial_type.of_ast_type_expr (Jovial_type.empty_type_env ()) t in
+      match Jovial_type.display ty with
+      | "unknown" -> type_display t
+      | display -> display
 
 let builtin_type_details name dims =
   let key = String.uppercase_ascii (String.trim name) in
@@ -340,7 +414,7 @@ let is_builtin_type_name name =
   | _ -> false
 
 let type_info_of_type_expr (t : Ast.type_expr Ast.node) : jovial_type_info =
-  let display = type_display t in
+  let display = rich_type_display t in
   match t.v with
   | Ast.TName id when is_builtin_type_name id.v ->
       let cls, explanation = builtin_type_details id.v [] in
@@ -400,6 +474,39 @@ let type_info_of_type_expr (t : Ast.type_expr Ast.node) : jovial_type_info =
         type_decl_uri = None;
         type_decl_loc = None;
         explanation = Some "table type";
+      }
+  | Ast.TSpecifiedTable { kind; _ } ->
+      let entry_size =
+        match kind with
+        | Ast.SpecTableW entry_size
+        | Ast.SpecTableV (Some entry_size) ->
+            Some (expr_display entry_size)
+        | Ast.SpecTableV None -> None
+      in
+      {
+        display;
+        origin = InferredType;
+        resolved_display = None;
+        type_decl_uri = None;
+        type_decl_loc = None;
+        explanation =
+          Some
+            (match entry_size with
+            | Some size -> "specified table, entry size " ^ size
+            | None -> "specified table");
+      }
+  | Ast.TStatus values ->
+      {
+        display;
+        origin = BuiltinType;
+        resolved_display = None;
+        type_decl_uri = None;
+        type_decl_loc = None;
+        explanation =
+          Some
+            (Printf.sprintf "status enumeration/list with %d %s"
+               (List.length values)
+               (if List.length values = 1 then "value" else "values"));
       }
   | Ast.TRecord _ ->
       {

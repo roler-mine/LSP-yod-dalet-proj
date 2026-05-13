@@ -16,10 +16,66 @@ function parseArgs(argv) {
 }
 
 const { logPath } = parseArgs(process.argv.slice(2));
-let inlayHintsEnabled = true;
+
+const semanticTokenTypes = [
+  "namespace",
+  "type",
+  "class",
+  "enum",
+  "interface",
+  "struct",
+  "typeParameter",
+  "parameter",
+  "variable",
+  "property",
+  "enumMember",
+  "event",
+  "function",
+  "method",
+  "macro",
+  "keyword",
+  "modifier",
+  "comment",
+  "string",
+  "number",
+  "regexp",
+  "operator",
+];
+const semanticTokenModifiers = ["declaration", "readonly"];
+const defaultFeatures = {
+  definition: true,
+  declaration: true,
+  typeDefinition: true,
+  implementation: true,
+  references: true,
+  documentSymbols: true,
+  workspaceSymbols: true,
+  hover: true,
+  signatureHelp: true,
+  rename: true,
+  completion: true,
+  codeActions: true,
+  codeLens: true,
+  inlayHints: true,
+  formatting: true,
+  semanticTokens: true,
+};
+let enabledFeatures = { ...defaultFeatures };
 
 function featureEnabled(features, key) {
   return features?.[key] !== false;
+}
+
+function readEnabledFeatures(features) {
+  const out = {};
+  for (const key of Object.keys(defaultFeatures)) {
+    out[key] = featureEnabled(features, key);
+  }
+  return out;
+}
+
+function isEnabled(key) {
+  return enabledFeatures[key] !== false;
 }
 
 function appendEvent(event) {
@@ -33,13 +89,21 @@ function appendEvent(event) {
   fs.appendFileSync(logPath, `${JSON.stringify(rec)}\n`);
 }
 
+function sampleUri() {
+  return process.env.JOVIAL_INTEGRATION_SAMPLE_URI ?? "file:///sample.jov";
+}
+
+function makeRange() {
+  return {
+    start: { line: 0, character: 0 },
+    end: { line: 0, character: 3 },
+  };
+}
+
 function makeLocation(uri) {
   return {
     uri,
-    range: {
-      start: { line: 0, character: 0 },
-      end: { line: 0, character: 3 },
-    },
+    range: makeRange(),
   };
 }
 
@@ -71,6 +135,56 @@ function makeInlayHint() {
     label: "FAKE_PARAM:",
     kind: 2,
     paddingRight: true,
+  };
+}
+
+function makeCodeLens() {
+  return {
+    range: makeRange(),
+    command: {
+      title: "1 reference",
+      command: "jovial.refreshLsifCache",
+      arguments: [sampleUri()],
+    },
+  };
+}
+
+function makeDocumentSymbol() {
+  return {
+    name: "FOO",
+    detail: "fake JOVIAL symbol",
+    kind: 12,
+    range: makeRange(),
+    selectionRange: makeRange(),
+  };
+}
+
+function makeWorkspaceSymbol() {
+  return {
+    name: "FOO",
+    kind: 12,
+    location: makeLocation(sampleUri()),
+  };
+}
+
+function makeCodeAction() {
+  return {
+    title: "Fake Jovial quick fix",
+    kind: "quickfix",
+    diagnostics: [],
+  };
+}
+
+function makeCompletionList() {
+  return {
+    isIncomplete: false,
+    items: [
+      {
+        label: "FOO",
+        kind: 3,
+        detail: "fake JOVIAL completion",
+      },
+    ],
   };
 }
 
@@ -109,44 +223,66 @@ function handleRequest(message) {
   switch (method) {
     case "initialize":
       const features = params?.initializationOptions?.jovial?.features ?? {};
-      inlayHintsEnabled = featureEnabled(features, "inlayHints");
+      enabledFeatures = readEnabledFeatures(features);
       respond(message.id, {
         capabilities: {
-          textDocumentSync: 2,
-          ...(featureEnabled(features, "definition")
-            ? { definitionProvider: true }
-            : {}),
-          ...(featureEnabled(features, "declaration")
-            ? { declarationProvider: true }
-            : {}),
-          ...(featureEnabled(features, "typeDefinition")
+          textDocumentSync: { openClose: true, change: 2 },
+          ...(isEnabled("definition") ? { definitionProvider: true } : {}),
+          ...(isEnabled("declaration") ? { declarationProvider: true } : {}),
+          ...(isEnabled("typeDefinition")
             ? { typeDefinitionProvider: true }
             : {}),
-          ...(featureEnabled(features, "implementation")
+          ...(isEnabled("implementation")
             ? { implementationProvider: true }
             : {}),
-          ...(featureEnabled(features, "references")
-            ? { referencesProvider: true }
+          ...(isEnabled("references") ? { referencesProvider: true } : {}),
+          ...(isEnabled("documentSymbols")
+            ? { documentSymbolProvider: true }
             : {}),
-          ...(featureEnabled(features, "hover") ? { hoverProvider: true } : {}),
-          ...(featureEnabled(features, "signatureHelp")
-            ? { signatureHelpProvider: { triggerCharacters: ["(", ","] } }
+          ...(isEnabled("workspaceSymbols")
+            ? { workspaceSymbolProvider: true }
             : {}),
-          ...(featureEnabled(features, "rename")
+          ...(isEnabled("hover") ? { hoverProvider: true } : {}),
+          ...(isEnabled("signatureHelp")
+            ? {
+                signatureHelpProvider: {
+                  triggerCharacters: ["(", ","],
+                  retriggerCharacters: [","],
+                },
+              }
+            : {}),
+          ...(isEnabled("rename")
             ? { renameProvider: { prepareProvider: true } }
             : {}),
-          ...(featureEnabled(features, "completion")
-            ? { completionProvider: { triggerCharacters: ["."] } }
+          ...(isEnabled("completion")
+            ? {
+                completionProvider: {
+                  triggerCharacters: [".", "!", "'", '"'],
+                  resolveProvider: true,
+                },
+              }
             : {}),
-          ...(featureEnabled(features, "codeActions")
-            ? { codeActionProvider: true }
+          ...(isEnabled("codeActions") ? { codeActionProvider: true } : {}),
+          ...(isEnabled("codeLens")
+            ? { codeLensProvider: { resolveProvider: true } }
             : {}),
-          ...(inlayHintsEnabled ? { inlayHintProvider: true } : {}),
-          ...(featureEnabled(features, "semanticTokens")
+          ...(isEnabled("formatting")
+            ? {
+                documentFormattingProvider: true,
+                documentRangeFormattingProvider: true,
+              }
+            : {}),
+          ...(isEnabled("inlayHints")
+            ? { inlayHintProvider: { resolveProvider: false } }
+            : {}),
+          ...(isEnabled("semanticTokens")
             ? {
                 semanticTokensProvider: {
-                  legend: { tokenTypes: [], tokenModifiers: [] },
-                  full: true,
+                  legend: {
+                    tokenTypes: semanticTokenTypes,
+                    tokenModifiers: semanticTokenModifiers,
+                  },
+                  full: { delta: true },
                   range: true,
                 },
               }
@@ -158,7 +294,15 @@ function handleRequest(message) {
               "jovial.dumpAst",
               "jovial.dumpCst",
               "jovial.dumpAstGraph",
+              "jovial.debugReport",
+              "jovial.debugPerfStats",
+              "jovial.debugScheduler",
+              "jovial.debugMemory",
+              "jovial.rescanWorkspace",
             ],
+          },
+          workspace: {
+            didChangeWatchedFiles: { dynamicRegistration: false },
           },
         },
       });
@@ -213,8 +357,49 @@ function handleRequest(message) {
     case "textDocument/hover":
       respond(message.id, null);
       return;
+    case "textDocument/documentSymbol":
+      respond(
+        message.id,
+        isEnabled("documentSymbols") ? [makeDocumentSymbol()] : [],
+      );
+      return;
+    case "workspace/symbol":
+      respond(
+        message.id,
+        isEnabled("workspaceSymbols") ? [makeWorkspaceSymbol()] : [],
+      );
+      return;
+    case "textDocument/completion":
+      respond(
+        message.id,
+        isEnabled("completion") ? makeCompletionList() : null,
+      );
+      return;
+    case "completionItem/resolve":
+      respond(message.id, params);
+      return;
+    case "textDocument/codeAction":
+      respond(message.id, isEnabled("codeActions") ? [makeCodeAction()] : []);
+      return;
+    case "textDocument/codeLens":
+      respond(message.id, isEnabled("codeLens") ? [makeCodeLens()] : []);
+      return;
+    case "codeLens/resolve":
+      respond(message.id, params);
+      return;
     case "textDocument/inlayHint":
-      respond(message.id, inlayHintsEnabled ? [makeInlayHint()] : []);
+      respond(message.id, isEnabled("inlayHints") ? [makeInlayHint()] : []);
+      return;
+    case "textDocument/formatting":
+    case "textDocument/rangeFormatting":
+      respond(message.id, []);
+      return;
+    case "textDocument/semanticTokens/full":
+    case "textDocument/semanticTokens/range":
+      respond(message.id, { data: [] });
+      return;
+    case "textDocument/semanticTokens/full/delta":
+      respond(message.id, { edits: [] });
       return;
     default:
       respond(message.id, null);

@@ -6,6 +6,7 @@ open Workspace_runtime
 open Workspace_index_graph
 open Workspace_imports
 open Workspace_nav_model
+open Workspace_semantics
 open Workspace_symbol_kinds
 open Workspace_tuning
 module Metadata = Workspace_symbol_metadata
@@ -387,6 +388,7 @@ let semantic_role_for_def (ws : t) (d : def) : string =
       match jovial_kind_for_def ws d with
   | "item" -> "scalar data object / variable or constant"
   | "table" -> "structured collection of entries"
+  | "constant table" -> "readonly structured collection of entries"
   | "block" -> "contiguous data grouping"
   | "type" -> "user-defined type description"
   | "procedure" -> "executable subroutine"
@@ -398,6 +400,7 @@ let semantic_role_for_def (ws : t) (d : def) : string =
   | "external REF" -> "imported external reference"
   | "label" -> "statement name / jump target"
   | "status constant" -> "status value / status constant"
+  | "constant item" -> "readonly scalar data object"
       | _ -> role_of_def_kind d.kind)
 
 let cached_doc_for_def (ws : t) (d : def) : Document.t option =
@@ -478,6 +481,246 @@ let find_compool_target (ws : t) ~(name : string) : Document.t option =
               enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"compool_target"
                 ~high:true path;
               None))
+
+type imported_compool_scope = {
+  ics_compool : string;
+  ics_selected : string list;
+}
+
+let imported_compool_scopes (doc : Document.t) : imported_compool_scope list =
+  let from_ast =
+    match Document.current_parse doc with
+    | Some { Document.parsed_ast = Some _; _ } ->
+        sem_import_dirs doc
+        |> List.map (fun imp ->
+               {
+                 ics_compool = normalize_name imp.compool;
+                 ics_selected =
+                   imp.selected
+                   |> List.map (fun (nm, _) -> normalize_name nm)
+                   |> List.filter (( <> ) "");
+               })
+    | _ -> []
+  in
+  if from_ast <> [] then from_ast
+  else
+    Document.imports doc
+    |> List.filter_map (fun (imp : Preprocess.import) ->
+           match imp.kind with
+           | Preprocess.Compool ->
+               let key = normalize_name imp.name in
+               if key = "" then None
+               else Some { ics_compool = key; ics_selected = [] })
+
+let imported_scope_allows_symbol (scope : imported_compool_scope) ~(key : string)
+    : bool =
+  scope.ics_selected = [] || List.mem key scope.ics_selected
+
+let cached_compool_doc_for_key (ws : t) ~(key : string) : Document.t option =
+  let key = normalize_name key in
+  if key = "" then None
+  else
+    match find_open_compool_doc_by_key ws key with
+    | Some doc -> Some doc
+    | None -> (
+        match ws.index with
+        | None -> None
+        | Some idx -> (
+            match Workspace_index.find_compool idx ~name:key with
+            | None -> None
+            | Some path -> doc_from_path_cached_only ws path))
+
+let uri_of_summary ~(fallback_path : string option)
+    (summary : Module_summary.t) : T.DocumentUri.t option =
+  match T.DocumentUri.t_of_yojson (`String summary.Module_summary.source_uri) with
+  | uri -> Some uri
+  | exception _ -> (
+      match fallback_path with
+      | Some path -> Uri_path.docuri_of_path path
+      | None -> None)
+
+let cached_compool_summary_for_key (ws : t) ~(key : string) :
+    (T.DocumentUri.t * Module_summary.t * module_summary_authority) option =
+  let key = normalize_name key in
+  if key = "" then None
+  else
+    match find_open_compool_doc_by_key ws key with
+    | Some doc ->
+        Some
+          ( doc.Document.uri,
+            Module_summary.of_document doc,
+            ModuleSummaryMetadataValidated )
+    | None -> (
+        match module_summary_entry_for_compool_key ws ~compool_key:key with
+        | Some entry -> (
+            match
+              uri_of_summary ~fallback_path:(Some entry.msc_path)
+                entry.msc_summary
+            with
+            | Some uri -> Some (uri, entry.msc_summary, entry.msc_authority)
+            | None -> None)
+        | None -> (
+            match cached_compool_doc_for_key ws ~key with
+            | Some doc ->
+                Some
+                  ( doc.Document.uri,
+                    Module_summary.of_document doc,
+                    ModuleSummaryMetadataValidated )
+            | None -> None))
+
+let compool_target_uris_for_key (ws : t) ~(key : string) : T.DocumentUri.t list =
+  let key = normalize_name key in
+  match cached_compool_doc_for_key ws ~key with
+  | Some doc -> [ doc.Document.uri ]
+  | None -> (
+      match module_summary_entry_for_compool_key ws ~compool_key:key with
+      | Some entry -> (
+          match uri_of_summary ~fallback_path:(Some entry.msc_path) entry.msc_summary with
+          | Some uri -> [ uri ]
+          | None -> [])
+      | None -> (
+      match ws.index with
+      | None -> []
+      | Some idx -> (
+          match Workspace_index.find_compool idx ~name:key with
+          | None -> []
+          | Some path ->
+              let path_key = normalize_path_key path in
+              let from_store =
+                if ws.sem_store_enabled then
+                  Semantic_store.uris_for_path_key ws.semantic_store ~path_key
+                else []
+              in
+              if from_store <> [] then from_store
+              else
+                match Uri_path.docuri_of_path path with
+                | Some uri -> [ uri ]
+                | None -> [])))
+
+let kind_matches_lookup ~(type_only : bool) (d : def) : bool =
+  if type_only then d.kind = sym_kind_type else d.kind <> sym_kind_module
+
+let imported_compool_target_uris (ws : t) (doc : Document.t) ~(key : string) :
+    (string * T.DocumentUri.t) list =
+  imported_compool_scopes doc
+  |> List.filter (fun scope -> imported_scope_allows_symbol scope ~key)
+  |> List.concat_map (fun scope ->
+         compool_target_uris_for_key ws ~key:scope.ics_compool
+         |> List.map (fun uri -> (scope.ics_compool, uri)))
+
+let semantic_defs_for_imported_compools ?(type_only : bool = false) (ws : t)
+    (doc : Document.t) ~(key : string) : def list =
+  if (not ws.sem_store_enabled) || key = "" then []
+  else
+    let target_uris = imported_compool_target_uris ws doc ~key in
+    if target_uris = [] then []
+    else
+      let targets = Hashtbl.create 16 in
+      List.iter
+        (fun (_, uri) -> Hashtbl.replace targets (Uri_path.docuri_to_string uri) true)
+        target_uris;
+      let hits =
+        Semantic_store.sym_ids_for_key ws.semantic_store ~key
+        |> List.concat_map (fun sym_id ->
+               Semantic_store.defs_for_sym_id ws.semantic_store sym_id)
+        |> List.map def_of_snapshot_def
+        |> List.filter (fun d ->
+               d.key = key
+               && Hashtbl.mem targets (Uri_path.docuri_to_string d.uri)
+               && kind_matches_lookup ~type_only d)
+        |> uniq_defs
+      in
+      if hits <> [] then Perf_stats.tick "query.cross_module.semantic_hit";
+      hits
+
+let summary_kind_to_symbol_kind = function
+  | "type" -> sym_kind_type
+  | "procedure" | "function" -> sym_kind_func
+  | "define" -> sym_kind_const
+  | "module" | "compool" | "block" -> sym_kind_module
+  | _ -> sym_kind_var
+
+let summary_metadata (s : Module_summary.public_symbol) :
+    Metadata.jovial_symbol_metadata =
+  let external_kind =
+    if s.imported then Metadata.ExternalRef
+    else if s.exported then Metadata.ExternalDef
+    else Metadata.ExternalLocal
+  in
+  let jovial_kind =
+    match s.kind with
+    | "type" -> Metadata.JovialType
+    | "table" -> Metadata.JovialTable
+    | "block" -> Metadata.JovialBlock
+    | "procedure" -> Metadata.JovialProcedure
+    | "function" -> Metadata.JovialFunction
+    | "define" -> Metadata.JovialDefine
+    | "compool" -> Metadata.JovialCompool
+    | _ -> Metadata.JovialItem
+  in
+  {
+    Metadata.default_metadata with
+    jovial_kind;
+    external_kind;
+    decl_role = Metadata.decl_role_of_external_kind external_kind;
+    is_imported = s.imported;
+    is_exported = s.exported;
+    source_keyword = Some (String.uppercase_ascii s.kind);
+  }
+
+let def_of_summary_symbol ~(uri : T.DocumentUri.t)
+    (s : Module_summary.public_symbol) : def =
+  {
+    uri;
+    name = s.name;
+    key = s.key;
+    loc = s.loc;
+    kind = summary_kind_to_symbol_kind s.kind;
+    container = None;
+    metadata = summary_metadata s;
+  }
+
+let summary_defs_for_imported_compools ?(type_only : bool = false) (ws : t)
+    (doc : Document.t) ~(key : string) : def list =
+  if key = "" then []
+  else
+    let hits =
+      imported_compool_scopes doc
+      |> List.filter (fun scope -> imported_scope_allows_symbol scope ~key)
+      |> List.filter_map (fun scope ->
+             cached_compool_summary_for_key ws ~key:scope.ics_compool)
+      |> List.concat_map (fun (uri, summary, _authority) ->
+             summary.Module_summary.exported_symbols
+             |> List.filter (fun (symbol : Module_summary.public_symbol) ->
+                    symbol.Module_summary.key = key
+                    && (not type_only
+                       || summary_kind_to_symbol_kind symbol.kind = sym_kind_type))
+             |> List.map (def_of_summary_symbol ~uri))
+      |> uniq_defs
+  in
+  if hits <> [] then Perf_stats.tick "query.cross_module.summary_hit";
+  hits
+
+let scoped_reference_docs_for_imported_symbol (ws : t) (doc : Document.t)
+    ~(key : string) : Document.t list =
+  let seen = Hashtbl.create 16 in
+  let out = ref [] in
+  let add_doc d =
+    let uri_key = Uri_path.docuri_to_string d.Document.uri in
+    if not (Hashtbl.mem seen uri_key) then (
+      Hashtbl.replace seen uri_key true;
+      out := d :: !out)
+  in
+  add_doc doc;
+  imported_compool_scopes doc
+  |> List.filter (fun scope -> imported_scope_allows_symbol scope ~key)
+  |> List.iter (fun scope ->
+         importer_uris_for_compool_key ws ~compool_key:scope.ics_compool
+         |> List.iter (fun uri ->
+                match Hashtbl.find_opt ws.docs uri with
+                | Some d -> add_doc d
+                | None -> ()));
+  List.rev !out
 
 let nav_for_doc_cached (ws : t) (cache : (string, doc_nav) Hashtbl.t)
     (doc : Document.t) : doc_nav =
@@ -589,7 +832,10 @@ let fallback_defs_by_name (ws : t) (doc : Document.t) (key : string) : def list
     if local_hits <> [] then local_hits
     else
       let sem_hits = from_semantic_store () in
-      if sem_hits <> [] then sem_hits else collect (docs_for_rename ws doc)
+      if sem_hits <> [] then sem_hits
+      else (
+        Perf_stats.tick "query.cross_module.fallback_scan";
+        collect (docs_for_rename ws doc))
 
 let allow_unscoped_fallback (doc : Document.t) : bool =
   has_unscoped_fallback_context doc
@@ -974,6 +1220,7 @@ let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
                   ~returns:hit.qps_returns ~has_body:hit.qps_has_body ();
             }
           in
+          let fallback_counted = ref false in
           let rec scan scanned scanned_bytes (acc : def list) = function
             | [] -> sort_quick_proc_hits (uniq_defs acc)
             | _ when scanned >= scan_files_budget ->
@@ -993,7 +1240,10 @@ let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
                     ~reason_group:"quick_nav_scan" ~high:true path;
                   if Hashtbl.mem ws.files path_key then
                     scan scanned scanned_bytes acc tl
-                  else
+                  else (
+                    if not !fallback_counted then (
+                      fallback_counted := true;
+                      Perf_stats.tick "query.cross_module.fallback_scan");
                     let offset =
                       match
                         Hashtbl.find_opt ws.nav_quick_scan_offset_by_path
@@ -1022,7 +1272,7 @@ let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
                               quick_proc_hits_in_text ~path ~text ~key
                               |> List.map (mk_quick_hit ~path ~text)
                             in
-                            scan (scanned + 1) next_bytes (hits @ acc) tl))
+                            scan (scanned + 1) next_bytes (hits @ acc) tl)))
           in
           scan 0 0 indexed_hits candidate_paths
 

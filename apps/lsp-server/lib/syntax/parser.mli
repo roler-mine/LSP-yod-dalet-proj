@@ -25,6 +25,7 @@ type token =
   | PROGRAM
   | PROC
   | POW
+  | POS
   | PLUS
   | OR
   | NOT
