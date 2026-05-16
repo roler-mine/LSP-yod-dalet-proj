@@ -1,3 +1,5 @@
+(* Module overview: Type-definition navigation for Jovial type and item declarations. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_model

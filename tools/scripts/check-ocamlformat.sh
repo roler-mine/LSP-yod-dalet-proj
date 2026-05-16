@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Module overview: Verifies that OCaml sources match the repository ocamlformat settings.
+
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

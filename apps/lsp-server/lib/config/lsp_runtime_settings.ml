@@ -1,3 +1,5 @@
+(* Module overview: Runtime server settings that combine environment defaults with client overrides. *)
+
 type t = {
   sem_refresh_every_didchange : int;
   bg_tick_budget_ms : int;
@@ -29,6 +31,7 @@ type client_overrides = {
   pressure_soft_mb : int option;
   pressure_critical_mb : int option;
   startup_priority_mode : Workspace_settings.startup_priority_mode option;
+  implementation_config : Implementation_config.client_overrides;
   bg_tick_budget_ms : int option;
   bg_diag_batch_size : int option;
 }
@@ -52,6 +55,7 @@ let empty_client_overrides : client_overrides =
     pressure_soft_mb = None;
     pressure_critical_mb = None;
     startup_priority_mode = None;
+    implementation_config = Implementation_config.empty_client_overrides;
     bg_tick_budget_ms = None;
     bg_diag_batch_size = None;
   }

@@ -1,3 +1,5 @@
+(** Module overview: Summarizes parsed modules and compools for change detection and indexing. *)
+
 (* Dependency-facing public surface of one source file.
 
    The hash is intentionally narrower than the full document digest for parsed

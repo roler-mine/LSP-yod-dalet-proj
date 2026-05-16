@@ -1,3 +1,5 @@
+(** Module overview: Tracks whether diagnostics are provisional or authoritative for each document. *)
+
 type t =
   | ParseAuthoritative
   | LocalSemanticAuthoritative

@@ -1,3 +1,5 @@
+(** Module overview: Mutable semantic store backing hover, navigation, and LSIF symbol metadata. *)
+
 module T = Lsp.Types
 
 type t
@@ -63,6 +65,9 @@ val resolve_symbol_at :
   t -> uri:T.DocumentUri.t -> pos:T.Position.t -> string option
 
 val defs_for_sym_id : t -> string -> Snapshot.nav_def list
+val defs_for_key_kind : t -> key:string -> kind:int -> Snapshot.nav_def list
+val defs_for_key_in_uri :
+  t -> uri:T.DocumentUri.t -> key:string -> Snapshot.nav_def list
 val refs_for_sym_id : t -> string -> Snapshot.nav_occ list
 val sym_ids_for_key : t -> key:string -> string list
 val symbols_for_prefix : t -> prefix:string -> string list

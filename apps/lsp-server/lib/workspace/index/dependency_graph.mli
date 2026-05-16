@@ -1,3 +1,5 @@
+(** Module overview: Tracks imports/includes between source files for workspace graph traversal. *)
+
 type edge_kind =
   | ICompoolImport
   | ICopyInclude

@@ -1,3 +1,5 @@
+// Module overview: Worker-thread entrypoint for parsing large LSIF payloads off the extension host thread.
+
 import { parentPort } from "worker_threads";
 import { parseLsifDeltaPayload, parseLsifIndexPayload } from "./lsif_codec";
 import { asRecord } from "./unknown_utils";

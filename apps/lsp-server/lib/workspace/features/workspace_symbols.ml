@@ -1,3 +1,5 @@
+(* Module overview: Workspace symbol search and streaming results. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_model

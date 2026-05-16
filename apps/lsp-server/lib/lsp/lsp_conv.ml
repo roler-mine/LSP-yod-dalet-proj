@@ -1,3 +1,5 @@
+(* Module overview: Converts between internal AST/text positions and LSP protocol shapes. *)
+
 module T = Lsp.Types
 
 let position_of_ast_pos (p : Ast.Loc.pos) : T.Position.t =

@@ -1,3 +1,5 @@
+(* Module overview: Maintains searchable symbol definitions and names across the workspace. *)
+
 type symbol_id = string
 
 type type_info = { display : string }

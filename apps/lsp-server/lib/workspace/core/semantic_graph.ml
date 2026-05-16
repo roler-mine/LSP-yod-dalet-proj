@@ -1,3 +1,5 @@
+(* Module overview: Semantic graph representation of symbols, scopes, definitions, and references. *)
+
 module T = Lsp.Types
 module Metadata = Workspace_symbol_metadata
 open Ast
@@ -714,6 +716,8 @@ let build_ast_scopes (graph : t) (doc : Document.t) (prog : Ast.program) : unit 
           p.v.params;
         List.iter (walk_decl proc (Some proc)) p.v.locals;
         walk_stmt proc (Some proc) p.v.body
+    | Ast.DOverlay overlay ->
+        ignore (declare_ident graph scope ~uri overlay.overlay_name)
     | Ast.DDirective _ -> (
         match proc_scope with None -> () | Some _ -> ())
   and walk_stmt (scope : scope) (proc_scope : scope option)

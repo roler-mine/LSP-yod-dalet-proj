@@ -1,3 +1,5 @@
+(** Module overview: Reads and writes JSON-RPC/LSP messages over Content-Length framed stdio. *)
+
 type read_result =
   [ `Eof | `Message of string | `Oversize of int | `Invalid of string ]
 

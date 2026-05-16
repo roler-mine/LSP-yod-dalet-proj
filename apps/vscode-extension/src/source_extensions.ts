@@ -1,3 +1,5 @@
+// Module overview: Builds normalized source-extension sets and workspace watcher globs for Jovial files.
+
 export const DEFAULT_JOVIAL_SOURCE_EXTENSIONS = [".jov", ".j73", ".jvl"];
 
 export function normalizeSourceExtension(value: string): string | undefined {

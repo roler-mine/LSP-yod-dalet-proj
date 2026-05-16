@@ -1,3 +1,5 @@
+(* Module overview: Indexes syntax skeletons before full semantic analysis is available. *)
+
 module T = Lsp.Types
 
 type module_kind =

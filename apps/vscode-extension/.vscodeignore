@@ -1,11 +1,15 @@
 .vs/**
 .vscode-test/**
+node_modules/**
 out-test/**
 src/**
 test/**
 tsconfig.json
 tsconfig.test.json
 eslint.config.mjs
+esbuild.config.mjs
+.prettierrc.json
+.prettierignore
 *.vsix
 runtime/server/**/.gitkeep
 runtime/server/**/*.pending-*

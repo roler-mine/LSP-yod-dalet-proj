@@ -1,3 +1,5 @@
+// Module overview: Defines the TypeScript linting rules used by the VS Code extension package.
+
 import tseslint from "@typescript-eslint/eslint-plugin";
 import tsParser from "@typescript-eslint/parser";
 

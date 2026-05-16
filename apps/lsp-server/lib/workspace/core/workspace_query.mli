@@ -1,3 +1,5 @@
+(** Module overview: High-level query API for hover, definition, references, AST/CST dumps, and debug output. *)
+
 module T = Lsp.Types
 
 type query_context = {
@@ -49,5 +51,11 @@ val references_locations_for :
 
 val hover_for :
   Workspace_state.t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Hover.t option
+
+val explain_symbol_resolution_json :
+  Workspace_state.t ->
+  uri:T.DocumentUri.t ->
+  pos:T.Position.t ->
+  Yojson.Safe.t
 
 val debug_report_json : Workspace_state.t -> Document.t -> Yojson.Safe.t

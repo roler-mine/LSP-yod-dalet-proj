@@ -1,3 +1,5 @@
+(** Module overview: Stable type identifier helpers used by semantic type metadata. *)
+
 type t = private int
 
 val of_int : int -> t

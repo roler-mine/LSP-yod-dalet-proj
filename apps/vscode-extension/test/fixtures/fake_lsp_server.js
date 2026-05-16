@@ -1,3 +1,5 @@
+// Module overview: Fixture language server used by extension integration tests.
+
 "use strict";
 
 const fs = require("fs");

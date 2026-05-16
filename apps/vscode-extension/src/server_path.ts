@@ -1,3 +1,5 @@
+// Module overview: Resolves the Jovial language-server executable from bundled runtime paths or user settings.
+
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -86,19 +88,31 @@ function addRelativeCandidates(
 }
 
 function bundledRuntimeRelPaths(): { exact: string[]; fallback: string[] } {
-  if (process.platform !== "win32") {
-    return { exact: [], fallback: [] };
-  }
-  if (process.arch === "arm64") {
+  if (process.platform === "win32" && process.arch === "arm64") {
     return {
       exact: [path.join("runtime", "server", "win32-arm64", "jovial-lsp.exe")],
       fallback: [path.join("runtime", "server", "win32-x64", "jovial-lsp.exe")],
     };
   }
-  return {
-    exact: [path.join("runtime", "server", "win32-x64", "jovial-lsp.exe")],
-    fallback: [],
-  };
+  if (process.platform === "win32" && process.arch === "x64") {
+    return {
+      exact: [path.join("runtime", "server", "win32-x64", "jovial-lsp.exe")],
+      fallback: [],
+    };
+  }
+  if (process.platform === "linux" && process.arch === "arm64") {
+    return {
+      exact: [path.join("runtime", "server", "linux-arm64", "jovial-lsp")],
+      fallback: [],
+    };
+  }
+  if (process.platform === "linux" && process.arch === "x64") {
+    return {
+      exact: [path.join("runtime", "server", "linux-x64", "jovial-lsp")],
+      fallback: [],
+    };
+  }
+  return { exact: [], fallback: [] };
 }
 
 function findExistingCandidate(candidates: string[]): string | undefined {

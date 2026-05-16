@@ -1,3 +1,5 @@
+(* Module overview: Fast navigation lookup helpers layered over indexes and semantic metadata. *)
+
 module T = Lsp.Types
 open Ast
 open Workspace_foundation
@@ -271,8 +273,9 @@ let proc_signature_of_proc (p : Ast.proc Ast.node) : string =
     | None -> ""
     | Some r -> " " ^ type_expr_to_compact_string r
   in
-  Printf.sprintf "PROC %s(%s)%s%s;" p.v.name.v params ret
-    (proc_use_suffix p.v.use_attr)
+  let inline = if p.v.is_inline then " INLINE" else "" in
+  Printf.sprintf "PROC %s(%s)%s%s%s;" p.v.name.v params ret
+    (proc_use_suffix p.v.use_attr) inline
 
 let proc_signature_for_def (ws : t) (d : def) : string option =
   if d.kind <> sym_kind_func then None
@@ -608,28 +611,48 @@ let imported_compool_target_uris (ws : t) (doc : Document.t) ~(key : string) :
          compool_target_uris_for_key ws ~key:scope.ics_compool
          |> List.map (fun uri -> (scope.ics_compool, uri)))
 
-let semantic_defs_for_imported_compools ?(type_only : bool = false) (ws : t)
-    (doc : Document.t) ~(key : string) : def list =
+let semantic_defs_for_imported_compools ?max_defs
+    ?(type_only : bool = false) (ws : t) (doc : Document.t) ~(key : string) :
+    def list =
   if (not ws.sem_store_enabled) || key = "" then []
   else
     let target_uris = imported_compool_target_uris ws doc ~key in
     if target_uris = [] then []
     else
-      let targets = Hashtbl.create 16 in
-      List.iter
-        (fun (_, uri) -> Hashtbl.replace targets (Uri_path.docuri_to_string uri) true)
-        target_uris;
-      let hits =
-        Semantic_store.sym_ids_for_key ws.semantic_store ~key
-        |> List.concat_map (fun sym_id ->
-               Semantic_store.defs_for_sym_id ws.semantic_store sym_id)
-        |> List.map def_of_snapshot_def
-        |> List.filter (fun d ->
-               d.key = key
-               && Hashtbl.mem targets (Uri_path.docuri_to_string d.uri)
-               && kind_matches_lookup ~type_only d)
-        |> uniq_defs
+      let max_defs =
+        match max_defs with Some n when n > 0 -> Some n | _ -> None
       in
+      let seen = Hashtbl.create 32 in
+      let full acc =
+        match max_defs with None -> false | Some n -> List.length acc >= n
+      in
+      let add_hit acc (sd : Semantic_store.Snapshot.nav_def) =
+        if full acc then acc
+        else
+          let d = def_of_snapshot_def sd in
+          if d.key <> key || not (kind_matches_lookup ~type_only d) then acc
+          else
+            let k = def_key d in
+            if Hashtbl.mem seen k then acc
+            else (
+              Hashtbl.replace seen k true;
+              d :: acc)
+      in
+      let rec add_defs acc = function
+        | [] -> acc
+        | _ when full acc -> acc
+        | d :: tl -> add_defs (add_hit acc d) tl
+      in
+      let rec collect acc = function
+        | [] -> List.rev acc
+        | _ when full acc -> List.rev acc
+        | (_, uri) :: tl ->
+            let defs =
+              Semantic_store.defs_for_key_in_uri ws.semantic_store ~uri ~key
+            in
+            collect (add_defs acc defs) tl
+      in
+      let hits = collect [] target_uris in
       if hits <> [] then Perf_stats.tick "query.cross_module.semantic_hit";
       hits
 
@@ -680,24 +703,51 @@ let def_of_summary_symbol ~(uri : T.DocumentUri.t)
     metadata = summary_metadata s;
   }
 
-let summary_defs_for_imported_compools ?(type_only : bool = false) (ws : t)
-    (doc : Document.t) ~(key : string) : def list =
+let summary_defs_for_imported_compools ?max_defs
+    ?(type_only : bool = false) (ws : t) (doc : Document.t) ~(key : string) :
+    def list =
   if key = "" then []
   else
-    let hits =
-      imported_compool_scopes doc
-      |> List.filter (fun scope -> imported_scope_allows_symbol scope ~key)
-      |> List.filter_map (fun scope ->
-             cached_compool_summary_for_key ws ~key:scope.ics_compool)
-      |> List.concat_map (fun (uri, summary, _authority) ->
-             summary.Module_summary.exported_symbols
-             |> List.filter (fun (symbol : Module_summary.public_symbol) ->
-                    symbol.Module_summary.key = key
-                    && (not type_only
-                       || summary_kind_to_symbol_kind symbol.kind = sym_kind_type))
-             |> List.map (def_of_summary_symbol ~uri))
-      |> uniq_defs
-  in
+    let max_defs =
+      match max_defs with Some n when n > 0 -> Some n | _ -> None
+    in
+    let seen = Hashtbl.create 32 in
+    let full acc =
+      match max_defs with None -> false | Some n -> List.length acc >= n
+    in
+    let add_symbol uri acc (symbol : Module_summary.public_symbol) =
+      if full acc then acc
+      else if
+        symbol.Module_summary.key <> key
+        || (type_only && summary_kind_to_symbol_kind symbol.kind <> sym_kind_type)
+      then acc
+      else
+        let d = def_of_summary_symbol ~uri symbol in
+        let k = def_key d in
+        if Hashtbl.mem seen k then acc
+        else (
+          Hashtbl.replace seen k true;
+          d :: acc)
+    in
+    let rec add_symbols uri acc = function
+      | [] -> acc
+      | _ when full acc -> acc
+      | symbol :: tl -> add_symbols uri (add_symbol uri acc symbol) tl
+    in
+    let rec collect acc = function
+      | [] -> List.rev acc
+      | _ when full acc -> List.rev acc
+      | scope :: tl -> (
+          if not (imported_scope_allows_symbol scope ~key) then collect acc tl
+          else
+            match cached_compool_summary_for_key ws ~key:scope.ics_compool with
+            | None -> collect acc tl
+            | Some (uri, summary, _authority) ->
+                collect
+                  (add_symbols uri acc summary.Module_summary.exported_symbols)
+                  tl)
+    in
+    let hits = collect [] (imported_compool_scopes doc) in
   if hits <> [] then Perf_stats.tick "query.cross_module.summary_hit";
   hits
 
@@ -734,9 +784,19 @@ let nav_for_doc_cached (ws : t) (cache : (string, doc_nav) Hashtbl.t)
           ~uri:(Uri_path.docuri_to_string doc.Document.uri)
           ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev ();
       let nav =
-        if stale then (
-          Perf_stats.tick "nav.stale_snapshot_empty";
-          doc_nav_create ())
+        if stale then
+          match
+            if ws.sem_store_enabled then
+              Semantic_store.snapshot_for_uri ws.semantic_store
+                ~uri:doc.Document.uri
+            else None
+          with
+          | Some snap when snap.Semantic_store.Snapshot.doc_rev = doc.Document.parse_rev ->
+              Perf_stats.tick "nav.stale_snapshot_reused";
+              doc_nav_of_snapshot snap
+          | _ ->
+              Perf_stats.tick "nav.stale_snapshot_empty";
+              doc_nav_create ()
         else if ws.sem_store_enabled then (
           match
             Semantic_store.snapshot_for_uri ws.semantic_store
@@ -799,8 +859,9 @@ let defs_for_import_cursor (ws : t) (imp : Preprocess.import) : def list =
 
 let fallback_defs_by_name (ws : t) (doc : Document.t) (key : string) : def list
     =
-  if key = "" || is_reserved_keyword key then []
-  else
+  Perf_stats.time "query.fallback_defs_by_name_ms" (fun () ->
+      if key = "" || is_reserved_keyword key then []
+      else
     let suppress_ambiguous_fields (defs : def list) : def list =
       let field_count =
         List.fold_left
@@ -835,7 +896,7 @@ let fallback_defs_by_name (ws : t) (doc : Document.t) (key : string) : def list
       if sem_hits <> [] then sem_hits
       else (
         Perf_stats.tick "query.cross_module.fallback_scan";
-        collect (docs_for_rename ws doc))
+        collect (docs_for_rename ws doc)))
 
 let allow_unscoped_fallback (doc : Document.t) : bool =
   has_unscoped_fallback_context doc
@@ -890,6 +951,70 @@ let docuri_of_path_unsafe (path : string) : T.DocumentUri.t =
       with
       | u -> u
       | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
+
+let imported_prefix_scan_max_bytes (ws : t) : int =
+  match workspace_profile_for_budget ws with
+  | ProfileLarge -> max nav_quick_scan_per_file_bytes 393_216
+  | ProfileMedium -> max nav_quick_scan_per_file_bytes 196_608
+  | ProfileSmall -> nav_quick_scan_per_file_bytes
+
+let complete_line_prefix (text : string) : string =
+  let n = String.length text in
+  if n = 0 || text.[n - 1] = '\n' || text.[n - 1] = '\r' then text
+  else
+    match String.rindex_opt text '\n' with
+    | None -> text
+    | Some i -> String.sub text 0 (i + 1)
+
+let compool_path_for_key (ws : t) ~(key : string) : string option =
+  match ws.index with
+  | Some idx -> (
+      match Workspace_index.find_compool idx ~name:key with
+      | Some path -> Some path
+      | None ->
+          if allow_fallback_scan ws then find_compool_path_fallback ws ~key
+          else None)
+  | None ->
+      if allow_fallback_scan ws then find_compool_path_fallback ws ~key
+      else None
+
+let promote_prefix_import_def (d : def) : def =
+  {
+    d with
+    metadata =
+      {
+        d.metadata with
+        Metadata.external_kind = Metadata.ExternalDef;
+        decl_role =
+          Metadata.decl_role_of_external_kind Metadata.ExternalDef;
+        is_exported = true;
+      };
+  }
+
+let prefix_defs_for_imported_compools ?(type_only : bool = false) (ws : t)
+    (doc : Document.t) ~(key : string) : def list =
+  if key = "" || nav_quick_scan_per_file_bytes <= 0 then []
+  else
+    let max_bytes = imported_prefix_scan_max_bytes ws in
+    imported_compool_scopes doc
+    |> List.filter (fun scope -> imported_scope_allows_symbol scope ~key)
+    |> List.filter_map (fun scope ->
+           compool_path_for_key ws ~key:scope.ics_compool)
+    |> List.concat_map (fun path ->
+           match read_include_prefix_text path ~max_bytes with
+           | None -> []
+           | Some text ->
+               let text = complete_line_prefix text in
+               let uri = docuri_of_path_unsafe path in
+               let prefix_doc =
+                 Document.make_unparsed ~uri ~file:(Some path) ~text
+                   ~parse_diags:[]
+               in
+               fallback_line_defs prefix_doc
+               |> List.filter (fun d ->
+                      d.key = key && kind_matches_lookup ~type_only d)
+               |> List.map promote_prefix_import_def)
+    |> uniq_defs
 
 type quick_proc_scan_hit = {
   qps_name : string;
@@ -1149,6 +1274,16 @@ let quick_proc_defs_from_nav_index (ws : t) (doc : Document.t) ~(key : string) :
             }))
     |> uniq_defs
 
+let proc_index_defs_by_key (ws : t) (doc : Document.t) ~(key : string) :
+    def list =
+  if key = "" then []
+  else quick_proc_defs_from_nav_index ws doc ~key |> uniq_defs
+
+let proc_index_real_defs_by_key (ws : t) (doc : Document.t) ~(key : string) :
+    def list =
+  proc_index_defs_by_key ws doc ~key |> prefer_real_definition_targets ws
+  |> prefer_non_ref_targets
+
 let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
     ~(key : string) : def list =
   if
@@ -1162,6 +1297,9 @@ let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
       | None -> sort_quick_proc_hits (uniq_defs indexed_hits)
       | Some idx ->
           let profile = workspace_profile_for_budget ws in
+          if profile = ProfileLarge && ws.startup_fully_nav_ready_ms = None then
+            sort_quick_proc_hits (uniq_defs indexed_hits)
+          else
           let scan_files_budget =
             match profile with
             | ProfileLarge -> max nav_quick_scan_files 128
@@ -1217,7 +1355,8 @@ let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
               metadata =
                 metadata_for_proc
                   ~external_modifier:hit.qps_external_modifier
-                  ~returns:hit.qps_returns ~has_body:hit.qps_has_body ();
+                  ~returns:hit.qps_returns ~has_body:hit.qps_has_body
+                  ~is_inline:false ();
             }
           in
           let fallback_counted = ref false in
@@ -1289,9 +1428,8 @@ let proc_defs_by_key (ws : t) (doc : Document.t) ~(key : string) : def list =
     let from_semantic_store () : def list =
       if not ws.sem_store_enabled then []
       else
-        Semantic_store.sym_ids_for_key ws.semantic_store ~key
-        |> List.concat_map (fun sym_id ->
-            Semantic_store.defs_for_sym_id ws.semantic_store sym_id)
+        Semantic_store.defs_for_key_kind ws.semantic_store ~key
+          ~kind:sym_kind_func
         |> List.map def_of_snapshot_def
         |> List.filter (fun d -> d.kind = sym_kind_func && d.key = key)
         |> uniq_defs
@@ -1320,8 +1458,9 @@ let proc_impl_defs_by_key (ws : t) (doc : Document.t) ~(key : string) : def list
 
 let proc_real_defs_by_key (ws : t) (doc : Document.t) ~(key : string) :
     def list =
-  proc_defs_by_key ws doc ~key |> prefer_real_definition_targets ws
-  |> prefer_non_ref_targets
+  Perf_stats.time "query.proc_real_defs_by_key_ms" (fun () ->
+      proc_defs_by_key ws doc ~key |> prefer_real_definition_targets ws
+      |> prefer_non_ref_targets)
 
 let perf_stats_json (_ws : t) : Yojson.Safe.t =
   match Perf_stats.snapshot_json () with

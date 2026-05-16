@@ -1,3 +1,5 @@
+(** Module overview: Jovial AST data model with locations, recovery metadata, and debug renderers. *)
+
 (** lib/ast.mli Core AST + source locations + debug dump/pretty-printing. *)
 
 module Loc : sig
@@ -138,6 +140,17 @@ and field_decl = {
 and param_mode = In | Out | InOut
 and param = { pname : ident; pmode : param_mode; ptype : type_expr node }
 
+and overlay_item =
+  | OverlayTarget of ident
+  | OverlaySpacer of expr node
+  | OverlayGroup of overlay_item node list
+
+and overlay_decl = {
+  overlay_name : ident;
+  overlay_items : overlay_item node list;
+  overlay_pos : expr node option;
+}
+
 and expr =
   | EName of ident
   | ELit of literal
@@ -187,6 +200,7 @@ and decl =
       storage : storage;
       external_modifier : external_modifier;
       data_decl_kind : data_decl_kind;
+      is_readonly : bool;
     }
   | DConst of {
       name : ident;
@@ -201,6 +215,7 @@ and decl =
       external_modifier : external_modifier;
     }
   | DProc of proc node
+  | DOverlay of overlay_decl
   | DDirective of { name : ident; args : string node list }
 
 and proc = {
@@ -212,6 +227,7 @@ and proc = {
   body : stmt node;
   external_modifier : external_modifier;
   has_body : bool;
+  is_inline : bool;
 }
 
 type toplevel = TopDecl of decl node | TopStmt of stmt node

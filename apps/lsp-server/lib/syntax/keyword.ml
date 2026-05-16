@@ -1,3 +1,5 @@
+(* Module overview: Case-insensitive Jovial keyword classification shared by the lexer and parser. *)
+
 open Parser
 
 type class_ = Hard | Soft
@@ -72,6 +74,7 @@ let classify (s : string) : Parser.token option =
   | 6 -> (
       match upper_char s.[0] with
       | 'D' -> match1 s "DEFINE" DEFINE
+      | 'I' -> match1 s "INLINE" INLINE
       | 'R' -> match1 s "RETURN" RETURN
       | 'S' -> match1 s "STATIC" STATIC
       | _ -> None)
@@ -79,17 +82,20 @@ let classify (s : string) : Parser.token option =
       match upper_char s.[0] with
       | 'C' -> match1 s "COMPOOL" COMPOOL
       | 'D' -> match1 s "DEFAULT" DEFAULT
+      | 'O' -> match1 s "OVERLAY" OVERLAY
       | 'P' -> match1 s "PROGRAM" PROGRAM
       | _ -> None)
-  | 8 -> match3 s "CONSTANT" CONSTANT "FALLTHRU" FALLTHRU "ICOMPOOL" ICOMPOOL
+  | 8 ->
+      match4 s "CONSTANT" CONSTANT "FALLTHRU" FALLTHRU "ICOMPOOL" ICOMPOOL
+        "READONLY" READONLY
   | _ -> None
 
 let class_of_token = function
   | PROGRAM | TYPE | BLOCK | DEFAULT -> Some Soft
   | START | TERM | BEGIN | END | DEF | REF | PROC | ITEM | TABLE | STATIC
-  | CONSTANT | IF | ELSE | WHILE | FOR | BY | THEN | CASE | FALLTHRU | EXIT
-  | GOTO | RETURN | ABORT | STOP | TRUE | FALSE | NOT | AND | OR | XOR | EQV
-  | MOD | POS | COMPOOL | ICOMPOOL | DEFINE ->
+  | CONSTANT | READONLY | INLINE | OVERLAY | IF | ELSE | WHILE | FOR | BY | THEN | CASE
+  | FALLTHRU | EXIT | GOTO | RETURN | ABORT | STOP | TRUE | FALSE | NOT
+  | AND | OR | XOR | EQV | MOD | POS | COMPOOL | ICOMPOOL | DEFINE ->
       Some Hard
   | _ -> None
 

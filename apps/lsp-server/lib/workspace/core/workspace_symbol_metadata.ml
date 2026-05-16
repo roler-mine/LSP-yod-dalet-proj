@@ -1,3 +1,5 @@
+(* Module overview: Extracts symbol classifications, declaration roles, and type display metadata. *)
+
 module T = Lsp.Types
 
 type jovial_external_kind =
@@ -24,6 +26,7 @@ type jovial_symbol_kind =
   | JovialItem
   | JovialTable
   | JovialBlock
+  | JovialOverlay
   | JovialType
   | JovialProcedure
   | JovialFunction
@@ -59,6 +62,8 @@ type jovial_symbol_metadata = {
   type_info : jovial_type_info option;
   storage : Ast.storage option;
   is_constant : bool;
+  is_readonly : bool;
+  is_inline : bool;
   is_imported : bool;
   is_exported : bool;
   source_keyword : string option;
@@ -83,10 +88,22 @@ let default_metadata =
     type_info = None;
     storage = None;
     is_constant = false;
+    is_readonly = false;
+    is_inline = false;
     is_imported = false;
     is_exported = false;
     source_keyword = None;
     has_body = None;
+  }
+
+let system_subroutine_metadata =
+  {
+    default_metadata with
+    jovial_kind = JovialProcedure;
+    external_kind = ExternalSystem;
+    decl_role = RealDeclaration;
+    source_keyword = Some "SYSTEM";
+    has_body = Some false;
   }
 
 let external_kind_of_ast = function
@@ -128,6 +145,7 @@ let symbol_kind_label = function
   | JovialItem -> "item"
   | JovialTable -> "table"
   | JovialBlock -> "block"
+  | JovialOverlay -> "overlay declaration"
   | JovialType -> "type"
   | JovialProcedure -> "procedure"
   | JovialFunction -> "function"
@@ -149,6 +167,7 @@ let symbol_kind_summary = function
   | JovialItem -> "JOVIAL item"
   | JovialTable -> "JOVIAL table"
   | JovialBlock -> "JOVIAL block"
+  | JovialOverlay -> "JOVIAL overlay declaration"
   | JovialType -> "JOVIAL type"
   | JovialProcedure -> "JOVIAL procedure"
   | JovialFunction -> "JOVIAL function"
@@ -355,17 +374,28 @@ let rec has_non_integer_builtin_size (t : Ast.type_expr Ast.node) =
       || Option.fold ~none:false ~some:has_non_integer_builtin_size returns
   | Ast.TName _ -> false
 
-let rich_type_display (t : Ast.type_expr Ast.node) =
+let rich_type_display ?implementation_config (t : Ast.type_expr Ast.node) =
+  let implementation_config : Implementation_config.t option =
+    implementation_config
+  in
   match t.v with
   | Ast.TSpecifiedTable _ -> type_display t
   | _ when has_non_integer_builtin_size t -> type_display t
   | _ ->
       let ty = Jovial_type.of_ast_type_expr (Jovial_type.empty_type_env ()) t in
-      match Jovial_type.display ty with
+      let display =
+        match implementation_config with
+        | None -> Jovial_type.display ty
+        | Some config -> Jovial_type.display_with_config config ty
+      in
+      match display with
       | "unknown" -> type_display t
       | display -> display
 
-let builtin_type_details name dims =
+let builtin_type_details ?implementation_config name dims =
+  let implementation_config : Implementation_config.t option =
+    implementation_config
+  in
   let key = String.uppercase_ascii (String.trim name) in
   let dim () =
     match dims with
@@ -384,13 +414,27 @@ let builtin_type_details name dims =
           (fun n -> "signed integer, " ^ n ^ " magnitude bits plus sign")
           size )
   | "F" ->
-      let precision = dim () in
+      let precision =
+        match dim () with
+        | Some _ as hit -> hit
+        | None ->
+            Option.bind implementation_config (fun c ->
+                Option.map string_of_int c.Implementation_config.float_precision)
+      in
       ( "floating",
         Option.map
           (fun n -> "floating type, mantissa precision " ^ n)
           precision )
   | "A" ->
-      let parts = dims |> List.map expr_display in
+      let parts =
+        match dims with
+        | [] -> (
+            match implementation_config with
+            | Some { Implementation_config.fixed_precision = Some n; _ } ->
+                [ "?"; string_of_int n ]
+            | _ -> [])
+        | _ -> dims |> List.map expr_display
+      in
       ( "fixed",
         match parts with
         | scale :: fraction :: _ ->
@@ -413,11 +457,17 @@ let is_builtin_type_name name =
   | "U" | "S" | "F" | "A" | "B" | "C" | "STATUS" | "P" -> true
   | _ -> false
 
-let type_info_of_type_expr (t : Ast.type_expr Ast.node) : jovial_type_info =
-  let display = rich_type_display t in
+let type_info_of_type_expr ?implementation_config
+    (t : Ast.type_expr Ast.node) : jovial_type_info =
+  let implementation_config : Implementation_config.t option =
+    implementation_config
+  in
+  let display = rich_type_display ?implementation_config t in
   match t.v with
   | Ast.TName id when is_builtin_type_name id.v ->
-      let cls, explanation = builtin_type_details id.v [] in
+      let cls, explanation =
+        builtin_type_details ?implementation_config id.v []
+      in
       {
         display;
         origin = BuiltinType;
@@ -457,7 +507,9 @@ let type_info_of_type_expr (t : Ast.type_expr Ast.node) : jovial_type_info =
           })
   | Ast.TArray { elem = { v = Ast.TName id; _ }; dims }
     when is_builtin_type_name id.v ->
-      let _, explanation = builtin_type_details id.v dims in
+      let _, explanation =
+        builtin_type_details ?implementation_config id.v dims
+      in
       {
         display;
         origin = BuiltinType;

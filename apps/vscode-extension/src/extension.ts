@@ -1,3 +1,5 @@
+// Module overview: Main VS Code extension entrypoint for client lifecycle, diagnostics, file watching, and LSIF fallback navigation.
+
 import * as vscode from "vscode";
 import * as cp from "child_process";
 import * as fs from "fs";
@@ -11,6 +13,12 @@ import {
   ExecuteCommandRequest,
   Trace,
 } from "vscode-languageclient/node";
+import { DocumentDiagnosticRequest } from "vscode-languageserver-protocol";
+import type {
+  Diagnostic as ProtocolDiagnostic,
+  DocumentDiagnosticParams,
+  DocumentDiagnosticReport,
+} from "vscode-languageserver-protocol";
 import type {
   ExecuteCommandParams,
   LanguageClientOptions,
@@ -62,8 +70,13 @@ import {
   showSyntaxTreesUi as showSyntaxTreesUiView,
 } from "./syntax_tree_ui";
 
+// Extension-wide singleton state. Activation creates one client, one watcher,
+// and background queues that are torn down together on stop.
 let client: LanguageClient | undefined;
 let fileWatcher: vscode.FileSystemWatcher | undefined;
+
+// Timing and chunk-size guardrails keep large-workspace background work from
+// monopolizing the extension host.
 const WATCH_FLUSH_DELAY_MS = 150;
 const WATCH_CHUNK_SIZE = 256;
 const WATCH_FORCE_FLUSH_SIZE = 2000;
@@ -75,12 +88,17 @@ const LSIF_REFRESH_MIN_INTERVAL_MS = 1200;
 const LSIF_MAX_FAST_RESULTS = 300;
 const LSIF_FALLBACK_RACE_BUDGET_MS = 75;
 const LSIF_HOVER_FALLBACK_RACE_BUDGET_MS = 250;
+const PROVIDER_LATE_BUDGET_MS = 1500;
 const DIAGNOSTIC_REFRESH_INTERVAL_MS = 30000;
 const DIAGNOSTIC_REFRESH_STARTUP_DELAY_MS = 5000;
 const DIAGNOSTIC_REFRESH_EDITOR_DELAY_MS = 1000;
+const DIAGNOSTIC_REFRESH_EDIT_DELAY_MS = 400;
 const DIAGNOSTIC_REFRESH_SOURCE_CHUNK_SIZE = 64;
 const DIAGNOSTIC_REFRESH_PENDING_CHUNK_SIZE = 128;
+const DIAGNOSTIC_REFRESH_NOTIFY_CHUNK_SIZE = 96;
 
+// File watching and diagnostics receive bursty input, so this module coalesces
+// events before forwarding them to the language server.
 const pendingWatchedFileChanges = new Map<string, PendingWatchedFileChange>();
 let pendingWatchedFileFlushTimer: NodeJS.Timeout | undefined;
 let watchedFileFlushInFlight = false;
@@ -91,10 +109,17 @@ let startInProgress = false;
 let currentSourceFileSets: JovialSourceFileSet[] = [];
 let diagnosticRefreshTimer: NodeJS.Timeout | undefined;
 let diagnosticRefreshInFlight = false;
-const diagnosticPullResultIds = new Map<string, string>();
+let diagnosticRefreshPending = false;
 let diagnosticSourceRefreshCursor = 0;
 const pendingDiagnosticRefreshUris = new Set<string>();
+let liveEditDiagnosticCollection:
+  | vscode.DiagnosticCollection
+  | undefined;
+const LIVE_EDIT_PARSE_MESSAGE =
+  "Expected START before source text; full diagnostics are updating in the background.";
 
+// The LSIF cache is shaped for fast editor-provider lookups: resolve a position
+// to a symbol id, then use that symbol's precomputed navigation locations.
 type LsifReference = LsifReferenceData;
 type LsifSymbolEntry = LsifSymbolEntryData;
 type LsifOccurrenceEntry = {
@@ -131,6 +156,8 @@ type LsifWorkerPendingRequest = {
   reject: (reason?: unknown) => void;
 };
 
+// Multi-root workspaces keep independent LSIF refresh state so one root's cache
+// refreshes do not invalidate another root's fast-path answers.
 const lsifRootStates = new Map<string, LsifRootState>();
 let lsifWorker: Worker | undefined;
 let lsifWorkerRequestSeq = 0;
@@ -138,6 +165,8 @@ let lsifWorkerShutdownRequested = false;
 let lsifWorkerFallbackLogged = false;
 const lsifWorkerPending = new Map<number, LsifWorkerPendingRequest>();
 
+// Root keys use normalized filesystem paths because VS Code may surface the
+// same path with different casing or separators on different platforms.
 function rootKeyForFolder(folder: vscode.WorkspaceFolder): string {
   return `folder:${watchPathKey(folder.uri.fsPath)}`;
 }
@@ -198,6 +227,22 @@ type LsifRootContext = {
   contextUri: vscode.Uri;
 };
 
+type ExecuteCommandRegistrationData = {
+  id: string;
+  registerOptions: {
+    commands?: string[];
+  };
+};
+
+type PatchableExecuteCommandFeature = {
+  register?: (data: ExecuteCommandRegistrationData) => void;
+  unregister?: (id: string) => void;
+  clear?: () => void;
+  __jovialSafeRegistrationInstalled?: boolean;
+};
+
+// Pick the LSIF cache bucket for a URI. Commands that are not tied to a file can
+// fall back to the active Jovial editor or first workspace folder.
 function resolveLsifRootContext(
   preferredUri?: vscode.Uri,
   allowFallback = true,
@@ -219,6 +264,115 @@ function resolveLsifRootContext(
   return { rootKey: rootKeyForFileUri(uri), contextUri: normalizeNavUri(uri) };
 }
 
+function isCommandAlreadyRegisteredError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  return message.includes("command") && message.includes("already exists");
+}
+
+function executeCommandFeatureOf(
+  languageClient: LanguageClient,
+): PatchableExecuteCommandFeature | undefined {
+  return languageClient.getFeature(ExecuteCommandRequest.method) as
+    | PatchableExecuteCommandFeature
+    | undefined;
+}
+
+function installSafeExecuteCommandRegistration(
+  languageClient: LanguageClient,
+  output: vscode.OutputChannel,
+): void {
+  // Some server commands share ids with extension-owned UI commands. Patching
+  // the dynamic registration hook lets startup continue while preserving the
+  // command binding that VS Code already has.
+  const feature = executeCommandFeatureOf(languageClient);
+  if (!feature || feature.__jovialSafeRegistrationInstalled) return;
+
+  const registrations = new Map<string, vscode.Disposable[]>();
+
+  const disposeRegistration = (id: string): void => {
+    const disposables = registrations.get(id);
+    if (!disposables) return;
+    for (const disposable of disposables) {
+      disposable.dispose();
+    }
+    registrations.delete(id);
+  };
+
+  const executeServerBackedCommand = (
+    command: string,
+    args: unknown[],
+  ): Thenable<unknown> => {
+    const executeCommand = (nextCommand: string, nextArgs: unknown[]) => {
+      const params: ExecuteCommandParams = {
+        command: nextCommand,
+        arguments: nextArgs,
+      };
+      return languageClient.sendRequest(ExecuteCommandRequest.type, params);
+    };
+    const middleware = languageClient.middleware.executeCommand;
+    if (middleware) {
+      return Promise.resolve(middleware(command, args, executeCommand));
+    }
+    return executeCommand(command, args);
+  };
+
+  feature.register = (data: ExecuteCommandRegistrationData): void => {
+    disposeRegistration(data.id);
+
+    const disposables: vscode.Disposable[] = [];
+    const commands = data.registerOptions.commands ?? [];
+    for (const command of commands) {
+      try {
+        disposables.push(
+          vscode.commands.registerCommand(command, (...args: unknown[]) =>
+            executeServerBackedCommand(command, args),
+          ),
+        );
+      } catch (e) {
+        if (isCommandAlreadyRegisteredError(e)) {
+          output.appendLine(
+            `Server command '${command}' is already registered; keeping the existing VS Code command binding.`,
+          );
+          continue;
+        }
+
+        for (const disposable of disposables) {
+          disposable.dispose();
+        }
+        throw e;
+      }
+    }
+
+    registrations.set(data.id, disposables);
+  };
+
+  feature.unregister = (id: string): void => {
+    disposeRegistration(id);
+  };
+
+  feature.clear = (): void => {
+    for (const id of [...registrations.keys()]) {
+      disposeRegistration(id);
+    }
+  };
+
+  feature.__jovialSafeRegistrationInstalled = true;
+}
+
+function clearExecuteCommandRegistrations(
+  languageClient: LanguageClient | undefined,
+  output: vscode.OutputChannel,
+): void {
+  if (!languageClient) return;
+  try {
+    executeCommandFeatureOf(languageClient)?.clear?.();
+  } catch (e) {
+    output.appendLine(
+      `Failed to clear server command registrations: ${String(e)}`,
+    );
+  }
+}
+
 function isOpenFileDocumentPath(fsPath: string): boolean {
   const target = watchPathKey(fsPath);
   return vscode.workspace.textDocuments.some(
@@ -234,12 +388,83 @@ function isJovialDiagnosticDocument(doc: vscode.TextDocument): boolean {
   );
 }
 
-function diagnosticReportResultId(report: unknown): string | undefined {
-  const rec = asRecord(report);
-  const resultId = rec?.resultId;
-  return typeof resultId === "string" ? resultId : undefined;
+type SignificantLine = {
+  line: number;
+  character: number;
+  text: string;
+};
+
+function firstSignificantLine(
+  text: string,
+  maxScanChars = 8192,
+): SignificantLine | undefined {
+  const scanLimit = Math.min(text.length, maxScanChars);
+  let line = 0;
+  let start = 0;
+  while (start < scanLimit) {
+    let end = text.indexOf("\n", start);
+    if (end < 0 || end > scanLimit) end = scanLimit;
+    const raw = text.slice(start, end);
+    const trimmed = raw.trim();
+    if (trimmed && !trimmed.startsWith("%") && !trimmed.startsWith('"')) {
+      const character = raw.length - raw.trimStart().length;
+      return { line, character, text: trimmed };
+    }
+    line += 1;
+    start = end + 1;
+  }
+  return undefined;
 }
 
+function firstWordUpper(text: string): string {
+  const end = text.search(/[ \t\r\n;()]/);
+  return text.slice(0, end < 0 ? text.length : end).toUpperCase();
+}
+
+function updateHugeLiveEditDiagnostics(doc: vscode.TextDocument): void {
+  const collection = liveEditDiagnosticCollection;
+  if (!collection) return;
+  if (!isJovialDiagnosticDocument(doc)) {
+    collection.delete(doc.uri);
+    return;
+  }
+
+  const text = doc.getText();
+  if (text.length <= getConfig().hugeFileThresholdBytes) {
+    collection.delete(doc.uri);
+    return;
+  }
+
+  const first = firstSignificantLine(text);
+  if (!first || firstWordUpper(first.text) === "START") {
+    collection.delete(doc.uri);
+    return;
+  }
+
+  const start = new vscode.Position(first.line, first.character);
+  const diagnostic = new vscode.Diagnostic(
+    new vscode.Range(start, start.translate(0, 1)),
+    LIVE_EDIT_PARSE_MESSAGE,
+    vscode.DiagnosticSeverity.Error,
+  );
+  diagnostic.source = "jovial-live";
+  collection.set(doc.uri, [diagnostic]);
+}
+
+function reconcileLiveEditDiagnostics(uri: vscode.Uri): void {
+  const collection = liveEditDiagnosticCollection;
+  if (!collection || (collection.get(uri) ?? []).length === 0) return;
+  const hasServerParseDiag = vscode.languages
+    .getDiagnostics(uri)
+    .some(
+      (diag) =>
+        diag.source === "parse" && diag.message === LIVE_EDIT_PARSE_MESSAGE,
+    );
+  if (hasServerParseDiag) collection.delete(uri);
+}
+
+// Diagnostics are refreshed in priority order: open editors first, then files
+// touched by recent events, then a round-robin slice of the known source set.
 function knownSourceDiagnosticUris(skipUris: ReadonlySet<string>): string[] {
   const seen = new Set<string>();
   const uris: string[] = [];
@@ -297,12 +522,7 @@ function clearDiagnosticRefreshTimer(): void {
   diagnosticRefreshTimer = undefined;
 }
 
-async function refreshOpenDocumentDiagnostics(
-  output: vscode.OutputChannel,
-  reason: string,
-): Promise<void> {
-  const c = client;
-  if (!c || diagnosticRefreshInFlight) return;
+function diagnosticRefreshUris(): string[] {
   const docs = vscode.workspace.textDocuments.filter(
     isJovialDiagnosticDocument,
   );
@@ -310,42 +530,125 @@ async function refreshOpenDocumentDiagnostics(
   const openUriSet = new Set(openUris);
   const pendingUris = takePendingDiagnosticRefreshUris(openUriSet);
   const skippedUris = new Set([...openUris, ...pendingUris]);
+  // Round-robin background refresh prevents very large workspaces from starving
+  // open-editor diagnostics.
   const sourceUris = nextKnownSourceDiagnosticUris(skippedUris);
-  const uris = [...openUris, ...pendingUris, ...sourceUris];
-  if (uris.length === 0) return;
+  return [...openUris, ...pendingUris, ...sourceUris];
+}
+
+function chunked<T>(items: readonly T[], chunkSize: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    chunks.push(items.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+
+async function sendDiagnosticRefreshNotifications(
+  languageClient: LanguageClient,
+  output: vscode.OutputChannel,
+  reason: string,
+  uris: readonly string[],
+): Promise<void> {
+  for (const batch of chunked(uris, DIAGNOSTIC_REFRESH_NOTIFY_CHUNK_SIZE)) {
+    if (client !== languageClient) break;
+    try {
+      // This extension/server notification is intentionally lighter than
+      // textDocument/diagnostic: the server revalidates and publishes once,
+      // without echoing the same diagnostics back in a discarded response body.
+      await languageClient.sendNotification("jovial/refreshDiagnostics", {
+        reason,
+        uris: batch,
+      });
+    } catch (e) {
+      output.appendLine(
+        `Jovial diagnostic refresh (${reason}) failed for ${batch.length} file(s): ${String(e)}`,
+      );
+    }
+  }
+}
+
+async function refreshOpenDocumentDiagnostics(
+  output: vscode.OutputChannel,
+  reason: string,
+): Promise<void> {
+  // Collapse overlapping requests into at most one follow-up pass. That keeps
+  // save storms responsive without dropping the newest refresh signal.
+  const c = client;
+  if (!c) return;
+  if (diagnosticRefreshInFlight) {
+    diagnosticRefreshPending = true;
+    return;
+  }
 
   diagnosticRefreshInFlight = true;
   try {
-    for (const uri of uris) {
-      if (client !== c) break;
-      const previousResultId = diagnosticPullResultIds.get(uri);
-      const params: {
-        textDocument: { uri: string };
-        previousResultId?: string;
-      } = {
-        textDocument: { uri },
-      };
-      if (previousResultId) params.previousResultId = previousResultId;
-
-      try {
-        const report = await c.sendRequest("textDocument/diagnostic", params);
-        const resultId = diagnosticReportResultId(report);
-        if (resultId) diagnosticPullResultIds.set(uri, resultId);
-      } catch (e) {
-        output.appendLine(
-          `Jovial diagnostic refresh (${reason}) failed for ${uri}: ${String(e)}`,
-        );
+    do {
+      diagnosticRefreshPending = false;
+      const uris = diagnosticRefreshUris();
+      if (uris.length > 0) {
+        await sendDiagnosticRefreshNotifications(c, output, reason, uris);
       }
-    }
+    } while (diagnosticRefreshPending && client === c);
   } finally {
     diagnosticRefreshInFlight = false;
   }
+}
+
+async function refreshDiagnosticsNow(
+  output: vscode.OutputChannel,
+  reason: string,
+  preferredUri?: vscode.Uri,
+): Promise<void> {
+  if (preferredUri) {
+    pendingDiagnosticRefreshUris.add(preferredUri.toString());
+  }
+  await refreshOpenDocumentDiagnostics(output, reason);
+}
+
+type DiagnosticPullSummary = {
+  kind: string;
+  count: number;
+  messages: string[];
+};
+
+function protocolDiagnosticMessage(diag: ProtocolDiagnostic): string {
+  return typeof diag.message === "string"
+    ? diag.message
+    : JSON.stringify(diag.message);
+}
+
+async function pullDiagnosticsNow(
+  preferredUri: vscode.Uri,
+): Promise<DiagnosticPullSummary> {
+  if (!client) {
+    throw new Error("Jovial LSP client is not running.");
+  }
+  const params: DocumentDiagnosticParams = {
+    textDocument: { uri: preferredUri.toString() },
+  };
+  const protocolClient = client as unknown as {
+    sendRequest<T>(type: unknown, params: unknown): Promise<T>;
+  };
+  const report = await protocolClient.sendRequest<DocumentDiagnosticReport>(
+    DocumentDiagnosticRequest.type,
+    params,
+  );
+  if (report.kind !== "full") {
+    return { kind: report.kind, count: 0, messages: [] };
+  }
+  return {
+    kind: report.kind,
+    count: report.items.length,
+    messages: report.items.map(protocolDiagnosticMessage),
+  };
 }
 
 function scheduleDiagnosticRefresh(
   output: vscode.OutputChannel,
   delayMs = DIAGNOSTIC_REFRESH_INTERVAL_MS,
   force = false,
+  reason = "periodic",
 ): void {
   if (!client) return;
   if (force) clearDiagnosticRefreshTimer();
@@ -353,7 +656,7 @@ function scheduleDiagnosticRefresh(
   diagnosticRefreshTimer = setTimeout(
     () => {
       diagnosticRefreshTimer = undefined;
-      void refreshOpenDocumentDiagnostics(output, "periodic").finally(() => {
+      void refreshOpenDocumentDiagnostics(output, reason).finally(() => {
         if (client) {
           scheduleDiagnosticRefresh(output, DIAGNOSTIC_REFRESH_INTERVAL_MS);
         }
@@ -378,6 +681,8 @@ function resetWatchedFileStreamingState(): void {
 async function flushWatchedFileChanges(
   output: vscode.OutputChannel,
 ): Promise<void> {
+  // Stream watched-file events in bounded batches. If a change reshapes source
+  // roots, defer the cheap cache update and run full source discovery instead.
   clearWatchedFileFlushTimer();
   if (
     watchedFileFlushInFlight ||
@@ -434,6 +739,7 @@ async function flushWatchedFileChanges(
         output,
         DIAGNOSTIC_REFRESH_EDITOR_DELAY_MS,
         true,
+        "watched-files",
       );
     }
     if (pendingWatchedFileChanges.size > 0 && client) {
@@ -457,6 +763,10 @@ function scheduleWatchedFileFlush(output: vscode.OutputChannel): void {
 
 function getConfig() {
   return readJovialConfig(vscode.workspace.getConfiguration("jovial"));
+}
+
+function isHugeDocument(document: vscode.TextDocument): boolean {
+  return document.getText().length > getConfig().hugeFileThresholdBytes;
 }
 
 function parseFileUriFsPath(raw: string | undefined): string | undefined {
@@ -581,6 +891,8 @@ async function discoverSourceFileSets(
   cfg: JovialConfig,
   output: vscode.OutputChannel,
 ): Promise<JovialSourceFileSet[]> {
+  // The server gets an inferred source-set snapshot before initialize so it can
+  // start indexing without waiting for workspace notifications.
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 0) return [];
 
@@ -619,6 +931,8 @@ function sourceFileSetRefreshReasonForChanges(
   changes: readonly PendingWatchedFileChange[],
   cfg: JovialConfig,
 ): string | undefined {
+  // A changed/deleted JOVIAL file can affect dependency shape; a new file only
+  // forces rediscovery when it sits outside the currently inferred root.
   for (const change of changes) {
     if (
       shouldIgnoreWatchedPath(
@@ -654,6 +968,8 @@ function updateCachedSourceFileSetsForChanges(
   changes: readonly PendingWatchedFileChange[],
   cfg: JovialConfig,
 ): void {
+  // When roots are stable, keep the cached file list fresh without running a
+  // workspace-wide file search.
   for (const change of changes) {
     if (
       shouldIgnoreWatchedPath(
@@ -727,6 +1043,8 @@ async function refreshSourceFileSets(
   output: vscode.OutputChannel,
   reason: string,
 ): Promise<void> {
+  // Full rediscovery is reserved for changes that may alter the source-root
+  // boundary; the resulting snapshot is pushed to the running server.
   if (!client) return;
   const cfg = getConfig();
   const oldSets = currentSourceFileSets;
@@ -802,6 +1120,8 @@ function disposeLsifWorker(): void {
 }
 
 function ensureLsifWorker(output: vscode.OutputChannel): Worker | undefined {
+  // LSIF payloads can be large, so production builds parse them in a worker when
+  // available and fall back to extension-thread parsing during development.
   if (lsifWorker) return lsifWorker;
 
   const workerPath = path.join(__dirname, "lsif_worker.js");
@@ -901,6 +1221,8 @@ async function runLsifWorkerTask<T>(
 }
 
 function toLsifIndexCache(parsed: ParsedLsifIndex): LsifIndexCache {
+  // Convert the server payload into derived indexes once so provider calls avoid
+  // scanning every symbol/reference on each cursor movement.
   const symbolsById = new Map<string, LsifSymbolEntry>();
   for (const entry of parsed.symbols) symbolsById.set(entry.id, entry);
 
@@ -1005,6 +1327,8 @@ function applyLsifDelta(
   cache: LsifIndexCache,
   delta: LsifDeltaPayload,
 ): LsifIndexCache {
+  // Delta payloads replace symbol records. Rebuilding derived indexes keeps the
+  // lookup logic consistent with full-index parsing.
   const symbolsById = new Map(cache.symbolsById);
   for (const symbolId of delta.deletes) {
     symbolsById.delete(symbolId);
@@ -1052,6 +1376,8 @@ function normalizeSymbolKeyAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position,
 ): string | undefined {
+  // JOVIAL symbol lookup is case-insensitive, and identifiers may contain the
+  // apostrophe form used by some dialects.
   const identRange =
     document.getWordRangeAtPosition(position, /[A-Za-z_$'][A-Za-z0-9_$']*/) ??
     document.getWordRangeAtPosition(position);
@@ -1099,6 +1425,8 @@ function lsifSymbolIdAtPosition(
   docUri: string,
   position: vscode.Position,
 ): string | undefined {
+  // Prefer the narrowest occurrence span under the cursor so overlapping ranges
+  // resolve to the most specific symbol.
   const byLine = cache.occurrenceIndexByDoc.get(docUri);
   if (!byLine) return undefined;
   const entries = byLine.get(position.line);
@@ -1132,6 +1460,8 @@ function resolveLsifSymbolsAt(
   document: vscode.TextDocument,
   position: vscode.Position,
 ): LsifResolution | undefined {
+  // Exact occurrence hits are authoritative. Text-key lookup is a fallback for
+  // stale or sparse indexes where the cursor is not in the occurrence map.
   const cache = lsifCacheForDocument(document);
   if (!cache) return undefined;
   const docUri = normalizeNavUri(document.uri).toString();
@@ -1175,6 +1505,8 @@ function collectLsifLocations(
   symbols: readonly LsifSymbolEntry[],
   select: (sym: LsifSymbolEntry) => readonly LsifLocationData[],
 ): LsifLocationData[] {
+  // Cap merged results before and after dedupe so large reference sets stay
+  // cheap enough for VS Code's provider path.
   const merged: LsifLocationData[] = [];
   for (const sym of symbols) {
     const next = select(sym);
@@ -1300,6 +1632,8 @@ function lsifHoverFastPath(
   document: vscode.TextDocument,
   position: vscode.Position,
 ): vscode.Hover | undefined {
+  // The fast hover is deliberately metadata-heavy: it explains what the cache
+  // knows while the full server hover may still be catching up.
   const resolved = resolveLsifSymbolsAt(document, position);
   if (!resolved || resolved.symbols.length === 0) return undefined;
   if (!resolved.fromOccurrence && resolved.symbols.length !== 1) {
@@ -1435,6 +1769,8 @@ function isLocationLinkLike(value: unknown): value is vscode.LocationLink {
 }
 
 function normalizeNavResult<T>(value: T): T {
+  // Normalize provider results that cross the server/fallback boundary so URI
+  // casing and parsed Range objects behave consistently in VS Code.
   const normalizeOne = (item: unknown): unknown => {
     if (item && typeof item === "object") {
       const rec = item as Record<string, unknown>;
@@ -1474,9 +1810,13 @@ async function raceLsifProviderFallback<T>(
   fallback: () => T | undefined,
   normalizeResult?: (value: T) => T,
   budgetMs = LSIF_FALLBACK_RACE_BUDGET_MS,
+  lateBudgetMs = PROVIDER_LATE_BUDGET_MS,
 ): Promise<T | undefined> {
+  // Give the authoritative server a short head start, then use the LSIF cache as
+  // a responsive fallback while still accepting late server results.
   return raceServerWithFallback({
     budgetMs,
+    lateBudgetMs,
     token,
     server,
     fallback,
@@ -1516,6 +1856,8 @@ async function refreshLsifIndex(
   reason: string,
   preferredUri?: vscode.Uri,
 ): Promise<void> {
+  // Prefer incremental LSIF deltas when the server can produce them; fall back
+  // to a full cache snapshot whenever the revision chain is broken.
   if (!client || !getConfig().lsifFastPath) return;
   const context = resolveLsifRootContext(preferredUri, true);
   if (!context) return;
@@ -1666,10 +2008,12 @@ function applyTraceSetting(output: vscode.OutputChannel): void {
 }
 
 async function stopClient(status: vscode.StatusBarItem) {
+  // Stop owns every background timer and queue so an explicit restart starts
+  // from a clean extension-host state.
   serverStopRequested = true;
   clearAutoRestartTimer();
   clearDiagnosticRefreshTimer();
-  diagnosticPullResultIds.clear();
+  diagnosticRefreshPending = false;
   diagnosticSourceRefreshCursor = 0;
   pendingDiagnosticRefreshUris.clear();
   resetLsifState();
@@ -1730,6 +2074,8 @@ async function startClient(
   status: vscode.StatusBarItem,
   source: "manual" | "auto-restart" | "config-change" = "manual",
 ) {
+  // Startup resolves the server binary, discovers initial sources, wires file
+  // watching, then creates the LanguageClient over the server's stdio streams.
   if (startInProgress) {
     output.appendLine(
       `Start request (${source}) ignored: startup already in progress.`,
@@ -1861,6 +2207,8 @@ async function startClient(
     const serverOptions = async (): Promise<StreamInfo> => {
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
+      // On Windows, overlapped stdio avoids pipe deadlocks with Node's child
+      // process handling; POSIX platforms use ordinary pipes.
       const stdioMode =
         process.platform === "win32"
           ? (["overlapped", "overlapped", "overlapped"] as cp.StdioOptions)
@@ -1911,7 +2259,18 @@ async function startClient(
       ),
       outputChannel: output,
       middleware: {
+        provideDocumentSymbols: (document, token, next) => {
+          if (isHugeDocument(document)) return [];
+          return next(document, token);
+        },
+        // Navigation requests race the canonical server answer against the
+        // local LSIF cache so large workspaces still feel immediate.
         provideDefinition: async (document, position, token, next) => {
+          if (isHugeDocument(document)) {
+            return normalizeNavResult(
+              lsifDefinitionFastPath(document, position) ?? [],
+            );
+          }
           return raceLsifProviderFallback(
             output,
             "definition",
@@ -1925,6 +2284,11 @@ async function startClient(
           );
         },
         provideDeclaration: async (document, position, token, next) => {
+          if (isHugeDocument(document)) {
+            return normalizeNavResult(
+              lsifDeclarationFastPath(document, position) ?? [],
+            );
+          }
           return raceLsifProviderFallback(
             output,
             "declaration",
@@ -1938,6 +2302,11 @@ async function startClient(
           );
         },
         provideTypeDefinition: async (document, position, token, next) => {
+          if (isHugeDocument(document)) {
+            return normalizeNavResult(
+              lsifTypeDefinitionFastPath(document, position) ?? [],
+            );
+          }
           return raceLsifProviderFallback(
             output,
             "typeDefinition",
@@ -1951,6 +2320,11 @@ async function startClient(
           );
         },
         provideImplementation: async (document, position, token, next) => {
+          if (isHugeDocument(document)) {
+            return normalizeNavResult(
+              lsifImplementationFastPath(document, position) ?? [],
+            );
+          }
           return raceLsifProviderFallback(
             output,
             "implementation",
@@ -1964,6 +2338,7 @@ async function startClient(
           );
         },
         provideReferences: async (document, position, context, token, next) => {
+          if (isHugeDocument(document)) return [];
           return raceLsifProviderFallback(
             output,
             "references",
@@ -1979,6 +2354,9 @@ async function startClient(
           );
         },
         provideHover: async (document, position, token, next) => {
+          if (isHugeDocument(document)) {
+            return lsifHoverFastPath(document, position);
+          }
           return raceLsifProviderFallback(
             output,
             "hover",
@@ -1992,8 +2370,17 @@ async function startClient(
             LSIF_HOVER_FALLBACK_RACE_BUDGET_MS,
           );
         },
+        provideCompletionItem: (document, position, context, token, next) => {
+          if (isHugeDocument(document)) return [];
+          return next(document, position, context, token);
+        },
         provideInlayHints: async (document, range, token, next) => {
-          if (!getConfig().features.inlayHints) return [];
+          const cfg = getConfig();
+          if (!cfg.features.inlayHints) return [];
+          // VS Code can queue inlay requests behind large-document provider work.
+          // Keep huge files responsive; the server still offers richer hints once
+          // clients request them directly or the file is below the huge cutoff.
+          if (document.getText().length > cfg.hugeFileThresholdBytes) return [];
           try {
             return await next(document, range, token);
           } catch (e) {
@@ -2001,8 +2388,20 @@ async function startClient(
             return [];
           }
         },
+        provideDocumentRangeSemanticTokens: (document, range, token, next) => {
+          const cfg = getConfig();
+          if (!cfg.features.semanticTokens) {
+            return new vscode.SemanticTokens(new Uint32Array());
+          }
+          if (document.getText().length > cfg.hugeFileThresholdBytes) {
+            return new vscode.SemanticTokens(new Uint32Array());
+          }
+          return next(document, range, token);
+        },
       },
       errorHandler: {
+        // Transport closures are restartable unless the user explicitly stopped
+        // the server; protocol errors are logged and allowed to continue.
         error: (error, message, count) => {
           output.appendLine(
             `Client error (${count ?? 0}): ${message ?? ""} ${String(error)}`,
@@ -2012,9 +2411,10 @@ async function startClient(
         closed: () => {
           output.appendLine("Client closed.");
           setStatus(status, "stopped", "Client closed.");
+          clearExecuteCommandRegistrations(client, output);
           client = undefined;
           clearDiagnosticRefreshTimer();
-          diagnosticPullResultIds.clear();
+          diagnosticRefreshPending = false;
           diagnosticSourceRefreshCursor = 0;
           pendingDiagnosticRefreshUris.clear();
           if (!serverStopRequested) {
@@ -2032,6 +2432,7 @@ async function startClient(
       serverOptions,
       clientOptions,
     );
+    installSafeExecuteCommandRegistration(client, output);
 
     const startupDiagTargetMs = STARTUP_DIAG_TARGET_DEFAULT_MS;
     const startupNavTargetMs = STARTUP_NAV_TARGET_DEFAULT_MS;
@@ -2050,6 +2451,7 @@ async function startClient(
       output,
       DIAGNOSTIC_REFRESH_STARTUP_DELAY_MS,
       true,
+      "startup",
     );
     autoRestartAttempts = [];
     output.appendLine("Jovial LSP client started.");
@@ -2057,6 +2459,7 @@ async function startClient(
   } catch (e) {
     output.appendLine(`Client failed to start: ${String(e)}`);
     setStatus(status, "error", `Client failed to start: ${String(e)}`);
+    clearExecuteCommandRegistrations(client, output);
     client = undefined;
     if (!serverStopRequested) {
       scheduleAutoRestart(context, output, status, "startup failure");
@@ -2070,6 +2473,8 @@ async function executeServerCommand(
   command: string,
   args: unknown[],
 ): Promise<unknown> {
+  // UI commands share this helper so command payload validation remains on the
+  // server side and the extension only handles transport concerns.
   if (!client) {
     throw new Error("Jovial LSP client is not running.");
   }
@@ -2077,9 +2482,42 @@ async function executeServerCommand(
   return client.sendRequest(ExecuteCommandRequest.type, params);
 }
 
+async function explainSymbolResolutionUi(
+  output: vscode.OutputChannel,
+): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || !isJovialDiagnosticDocument(editor.document)) {
+    vscode.window.showInformationMessage(
+      "Jovial: open a Jovial document and place the cursor on a symbol first.",
+    );
+    return;
+  }
+  const pos = editor.selection.active;
+  const uri = normalizeNavUri(editor.document.uri).toString();
+  const result = await executeServerCommand("jovial.explainSymbolResolution", [
+    uri,
+    pos.line,
+    pos.character,
+  ]);
+  const text = JSON.stringify(result, null, 2);
+  output.appendLine("Jovial symbol resolution explanation:");
+  output.appendLine(text);
+  output.show(true);
+  const doc = await vscode.workspace.openTextDocument({
+    content: text,
+    language: "json",
+  });
+  await vscode.window.showTextDocument(doc, { preview: true });
+}
+
 export async function activate(context: vscode.ExtensionContext) {
+  // VS Code calls activate once per extension host. Register all UI hooks and
+  // lightweight editor listeners before optional autostart.
   const output = vscode.window.createOutputChannel("Jovial LSP");
   context.subscriptions.push(output);
+  liveEditDiagnosticCollection =
+    vscode.languages.createDiagnosticCollection("jovial-live");
+  context.subscriptions.push(liveEditDiagnosticCollection);
 
   const status = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -2091,27 +2529,57 @@ export async function activate(context: vscode.ExtensionContext) {
   setStatus(status, "stopped", "Click to start / restart Jovial LSP");
 
   context.subscriptions.push(
+    // Editor events keep diagnostics warm for the files the user is actively
+    // touching, even when the periodic background refresh has not fired yet.
     vscode.workspace.onDidOpenTextDocument((doc) => {
       if (isJovialDiagnosticDocument(doc)) {
+        updateHugeLiveEditDiagnostics(doc);
         scheduleDiagnosticRefresh(
           output,
           DIAGNOSTIC_REFRESH_EDITOR_DELAY_MS,
           true,
+          "open-editor",
         );
+      }
+    }),
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      if (
+        event.contentChanges.length > 0 &&
+        isJovialDiagnosticDocument(event.document)
+      ) {
+        updateHugeLiveEditDiagnostics(event.document);
+        pendingDiagnosticRefreshUris.add(event.document.uri.toString());
+        scheduleDiagnosticRefresh(
+          output,
+          DIAGNOSTIC_REFRESH_EDIT_DELAY_MS,
+          true,
+          "edit",
+        );
+      }
+    }),
+    vscode.workspace.onDidCloseTextDocument((doc) => {
+      liveEditDiagnosticCollection?.delete(doc.uri);
+    }),
+    vscode.languages.onDidChangeDiagnostics((event) => {
+      for (const uri of event.uris) {
+        reconcileLiveEditDiagnostics(uri);
       }
     }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor && isJovialDiagnosticDocument(editor.document)) {
+        updateHugeLiveEditDiagnostics(editor.document);
         scheduleDiagnosticRefresh(
           output,
           DIAGNOSTIC_REFRESH_EDITOR_DELAY_MS,
           true,
+          "active-editor",
         );
       }
     }),
   );
 
-  // UI command (renamed) — does NOT collide with languageclient’s auto registration
+  // Extension-owned UI commands avoid the language client's dynamic command
+  // registrations.
   registerExtensionHooks({
     context,
     output,
@@ -2121,6 +2589,8 @@ export async function activate(context: vscode.ExtensionContext) {
     startClient,
     stopClient,
     refreshLsifIndex,
+    refreshDiagnosticsNow,
+    pullDiagnosticsNow,
     firstPreferredLsifUri,
     scheduleLsifRefresh,
     refreshStartupStatusBar,
@@ -2144,6 +2614,7 @@ export async function activate(context: vscode.ExtensionContext) {
         output,
         isServerRunning: () => Boolean(client),
       }),
+    explainSymbolResolution: () => explainSymbolResolutionUi(output),
   });
 
   if (getConfig().autostart) {
@@ -2152,10 +2623,12 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate() {
+  // Mirror explicit stop cleanup so extension-host shutdown does not leave
+  // timers, workers, or server processes alive.
   serverStopRequested = true;
   clearAutoRestartTimer();
   clearDiagnosticRefreshTimer();
-  diagnosticPullResultIds.clear();
+  diagnosticRefreshPending = false;
   diagnosticSourceRefreshCursor = 0;
   pendingDiagnosticRefreshUris.clear();
   resetLsifState();
@@ -2165,5 +2638,7 @@ export async function deactivate() {
   }
   resetWatchedFileStreamingState();
   currentSourceFileSets = [];
+  liveEditDiagnosticCollection?.dispose();
+  liveEditDiagnosticCollection = undefined;
   if (client) await client.stop();
 }

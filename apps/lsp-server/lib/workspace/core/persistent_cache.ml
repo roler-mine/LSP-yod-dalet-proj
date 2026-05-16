@@ -1,3 +1,5 @@
+(* Module overview: Disk cache helpers for workspace summaries and index reuse. *)
+
 module T = Lsp.Types
 
 open Workspace_foundation
@@ -535,6 +537,7 @@ let string_of_jovial_kind = function
   | Workspace_symbol_metadata.JovialItem -> "item"
   | Workspace_symbol_metadata.JovialTable -> "table"
   | Workspace_symbol_metadata.JovialBlock -> "block"
+  | Workspace_symbol_metadata.JovialOverlay -> "overlay"
   | Workspace_symbol_metadata.JovialType -> "type"
   | Workspace_symbol_metadata.JovialProcedure -> "procedure"
   | Workspace_symbol_metadata.JovialFunction -> "function"
@@ -556,6 +559,7 @@ let jovial_kind_of_string = function
   | "item" -> Some Workspace_symbol_metadata.JovialItem
   | "table" -> Some Workspace_symbol_metadata.JovialTable
   | "block" -> Some Workspace_symbol_metadata.JovialBlock
+  | "overlay" -> Some Workspace_symbol_metadata.JovialOverlay
   | "type" -> Some Workspace_symbol_metadata.JovialType
   | "procedure" -> Some Workspace_symbol_metadata.JovialProcedure
   | "function" -> Some Workspace_symbol_metadata.JovialFunction
@@ -577,6 +581,8 @@ let json_of_metadata (m : Workspace_symbol_metadata.jovial_symbol_metadata) =
       ("externalKind", `String (string_of_external_kind m.external_kind));
       ("declRole", `String (string_of_decl_role m.decl_role));
       ("isConstant", `Bool m.is_constant);
+      ("isReadonly", `Bool m.is_readonly);
+      ("isInline", `Bool m.is_inline);
       ("isImported", `Bool m.is_imported);
       ("isExported", `Bool m.is_exported);
       ("sourceKeyword", json_of_option (fun s -> `String s) m.source_keyword);
@@ -596,6 +602,14 @@ let metadata_of_json = function
       | Some jovial_kind, Some external_kind, Some decl_role ->
           let is_constant =
             field_bind "isConstant" fields bool_of_json
+            |> Option.value ~default:false
+          in
+          let is_readonly =
+            field_bind "isReadonly" fields bool_of_json
+            |> Option.value ~default:is_constant
+          in
+          let is_inline =
+            field_bind "isInline" fields bool_of_json
             |> Option.value ~default:false
           in
           let is_imported =
@@ -622,6 +636,8 @@ let metadata_of_json = function
               external_kind;
               decl_role;
               is_constant;
+              is_readonly;
+              is_inline;
               is_imported;
               is_exported;
               source_keyword;
@@ -758,28 +774,128 @@ let json_of_skeleton_payload ~(source_extensions : string list)
   cache_header ~source_extensions
     [ ("maxBytes", `Int max_bytes); ("entries", `List entries) ]
 
+let retained_skeleton_payload ~(source_extensions : string list)
+    (payload : skeleton_payload) : skeleton_payload =
+  let retained = Hashtbl.create (Hashtbl.length payload.skeleton_entries) in
+  Hashtbl.iter
+    (fun key (meta, entries) ->
+      if metadata_matches ~source_extensions meta ~path:meta.path then
+        Hashtbl.replace retained key (meta, entries))
+    payload.skeleton_entries;
+  { skeleton_entries = retained }
+
+let load_retained_skeleton_payload ~(root : string)
+    ~(source_extensions : string list) ~(max_bytes : int) : skeleton_payload =
+  match read_skeleton_payload ~source_extensions ~max_bytes ~root with
+  | Some payload -> retained_skeleton_payload ~source_extensions payload
+  | None -> { skeleton_entries = Hashtbl.create 512 }
+
+let apply_skeleton_entries ~(source_extensions : string list)
+    (payload : skeleton_payload)
+    (entries_by_path : (string * quick_nav_entry list) list) : unit =
+  List.iter
+    (fun (path, entries) ->
+      match metadata_for_path ~source_extensions path with
+      | None -> Hashtbl.remove payload.skeleton_entries (Uri_path.normalize_path_key path)
+      | Some meta -> Hashtbl.replace payload.skeleton_entries meta.path_key (meta, entries))
+    entries_by_path
+
+let write_skeleton_payload ~(root : string) ~(source_extensions : string list)
+    ~(max_bytes : int) (payload : skeleton_payload) : unit =
+  save_cache_version ~root ~source_extensions;
+  save_json (skeleton_index_json_path ~root)
+    (json_of_skeleton_payload ~source_extensions ~max_bytes payload)
+
+type skeleton_write_buffer = {
+  swb_root : string;
+  swb_source_extensions : string list;
+  swb_max_bytes : int;
+  swb_payload : skeleton_payload;
+  mutable swb_dirty_count : int;
+}
+
+let skeleton_write_buffers : (string, skeleton_write_buffer) Hashtbl.t =
+  Hashtbl.create 8
+
+let skeleton_write_batch_size = 64
+
+let skeleton_buffer_key ~(root : string) ~(source_extensions : string list)
+    ~(max_bytes : int) : string =
+  String.concat "\000"
+    (root :: string_of_int max_bytes :: normalized_source_extensions source_extensions)
+
+let flush_skeleton_buffer (buffer : skeleton_write_buffer) : unit =
+  if buffer.swb_dirty_count <= 0 then ()
+  else (
+    write_skeleton_payload ~root:buffer.swb_root
+      ~source_extensions:buffer.swb_source_extensions
+      ~max_bytes:buffer.swb_max_bytes buffer.swb_payload;
+    buffer.swb_dirty_count <- 0;
+    Perf_stats.tick "persistent_cache.skeleton_batch_flush")
+
+let skeleton_write_buffer ~(root : string) ~(source_extensions : string list)
+    ~(max_bytes : int) : skeleton_write_buffer =
+  let key = skeleton_buffer_key ~root ~source_extensions ~max_bytes in
+  match Hashtbl.find_opt skeleton_write_buffers key with
+  | Some buffer -> buffer
+  | None ->
+      let payload =
+        load_retained_skeleton_payload ~root ~source_extensions ~max_bytes
+      in
+      let buffer =
+        {
+          swb_root = root;
+          swb_source_extensions = normalized_source_extensions source_extensions;
+          swb_max_bytes = max_bytes;
+          swb_payload = payload;
+          swb_dirty_count = 0;
+        }
+      in
+      Hashtbl.replace skeleton_write_buffers key buffer;
+      buffer
+
+let save_skeleton_entries_immediate ~(root : string)
+    ~(source_extensions : string list) ~(max_bytes : int)
+    ~(entries_by_path : (string * quick_nav_entry list) list) : unit =
+  if entries_by_path = [] then ()
+  else
+    let key = skeleton_buffer_key ~root ~source_extensions ~max_bytes in
+    Hashtbl.remove skeleton_write_buffers key;
+    let payload =
+      load_retained_skeleton_payload ~root ~source_extensions ~max_bytes
+    in
+    apply_skeleton_entries ~source_extensions payload entries_by_path;
+    write_skeleton_payload ~root ~source_extensions ~max_bytes payload
+
 let save_skeleton_entry ~(root : string) ~(source_extensions : string list)
     ~(max_bytes : int) ~(path : string) ~(entries : quick_nav_entry list) :
     unit =
   try
-    let payload =
-      match read_skeleton_payload ~source_extensions ~max_bytes ~root with
-      | Some payload -> payload
-      | None -> { skeleton_entries = Hashtbl.create 512 }
-    in
-    let retained = Hashtbl.create (Hashtbl.length payload.skeleton_entries + 1) in
-    Hashtbl.iter
-      (fun key (meta, entries) ->
-        if metadata_matches ~source_extensions meta ~path:meta.path then
-          Hashtbl.replace retained key (meta, entries))
-      payload.skeleton_entries;
-    (match metadata_for_path ~source_extensions path with
-    | None -> Hashtbl.remove retained (Uri_path.normalize_path_key path)
-    | Some meta -> Hashtbl.replace retained meta.path_key (meta, entries));
-    let payload = { skeleton_entries = retained } in
-    save_cache_version ~root ~source_extensions;
-    save_json (skeleton_index_json_path ~root)
-      (json_of_skeleton_payload ~source_extensions ~max_bytes payload)
+    save_skeleton_entries_immediate ~root ~source_extensions ~max_bytes
+      ~entries_by_path:[ (path, entries) ]
+  with _ -> Perf_stats.tick "persistent_cache.write_failed"
+
+let save_skeleton_entries_buffered ~(root : string)
+    ~(source_extensions : string list) ~(max_bytes : int)
+    ~(entries_by_path : (string * quick_nav_entry list) list) : unit =
+  if entries_by_path = [] then ()
+  else
+    try
+      let buffer = skeleton_write_buffer ~root ~source_extensions ~max_bytes in
+      apply_skeleton_entries ~source_extensions buffer.swb_payload entries_by_path;
+      buffer.swb_dirty_count <-
+        buffer.swb_dirty_count + List.length entries_by_path;
+      if buffer.swb_dirty_count >= skeleton_write_batch_size then
+        flush_skeleton_buffer buffer
+    with _ -> Perf_stats.tick "persistent_cache.write_failed"
+
+let flush_skeleton_entries ~(root : string) ~(source_extensions : string list)
+    ~(max_bytes : int) : unit =
+  try
+    let key = skeleton_buffer_key ~root ~source_extensions ~max_bytes in
+    match Hashtbl.find_opt skeleton_write_buffers key with
+    | None -> ()
+    | Some buffer -> flush_skeleton_buffer buffer
   with _ -> Perf_stats.tick "persistent_cache.write_failed"
 
 let read_module_summary_payload ~(source_extensions : string list) ~(root : string)

@@ -1,3 +1,5 @@
+(* Module overview: Jovial compile-time expression evaluation helpers used by semantic checks. *)
+
 module T = Lsp.Types
 
 type ctf_value =
@@ -53,6 +55,24 @@ let add_non_constant (env : env) (name : string) : unit =
 let add_impl_param (env : env) (name : string) (value : ctf_value) : unit =
   let key = normalize_name name in
   if key <> "" then Hashtbl.replace env.bindings key (Impl_param value)
+
+let add_impl_int (env : env) (name : string) (value : int option) : unit =
+  match value with
+  | Some n when n > 0 -> add_impl_param env name (CtfInt (Int64.of_int n))
+  | _ -> ()
+
+let add_implementation_config (env : env)
+    (config : Implementation_config.t) : unit =
+  add_impl_int env "BITSINWORD" config.bits_in_word;
+  add_impl_int env "WORDSIZE" config.bits_in_word;
+  add_impl_int env "BYTESINWORD" config.bytes_in_word;
+  add_impl_int env "BITSINBYTE" (Implementation_config.byte_size_bits config);
+  add_impl_int env "BYTESIZE" (Implementation_config.byte_size_bits config);
+  add_impl_int env "FLOATPRECISION" config.float_precision;
+  add_impl_int env "FIXEDPRECISION" config.fixed_precision;
+  add_impl_int env "MAXINTSIZE" config.max_int_size;
+  add_impl_int env "MAXBITS" config.max_bits;
+  add_impl_int env "MAXBYTES" config.max_bytes
 
 let err (loc : Ast.Loc.t) (kind : ctf_error_kind) (message : string) :
     ctf_result =
@@ -222,17 +242,21 @@ let rec eval ?env (expr : Ast.expr Ast.node) ~(stack : string list) : ctf_result
         err_of_kind id.loc
           (UnsupportedConstruct
              (Printf.sprintf "recursive constant reference %S" id.v))
-      else if is_unsupported_compile_time_builtin key then
-        err_of_kind id.loc (UnsupportedBuiltin key)
       else
         match env with
-        | None -> err_of_kind id.loc (UnknownIdentifier id.v)
         | Some env -> (
             match Hashtbl.find_opt env.bindings key with
             | Some (Impl_param value) -> Known value
             | Some Non_constant -> err_of_kind id.loc (NonConstantReference id.v)
             | Some (Constant rhs) -> eval ~env rhs ~stack:(key :: stack)
-            | None -> err_of_kind id.loc (UnknownIdentifier id.v)))
+            | None ->
+                if is_unsupported_compile_time_builtin key then
+                  err_of_kind id.loc (UnsupportedBuiltin key)
+                else err_of_kind id.loc (UnknownIdentifier id.v))
+        | None ->
+            if is_unsupported_compile_time_builtin key then
+              err_of_kind id.loc (UnsupportedBuiltin key)
+            else err_of_kind id.loc (UnknownIdentifier id.v))
   | Ast.EUnop { op; rhs } -> (
       match eval_child rhs with
       | Unknown _ as u -> u

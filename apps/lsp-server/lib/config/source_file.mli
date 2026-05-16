@@ -1,3 +1,5 @@
+(** Module overview: Normalizes Jovial source-file extensions and filename matching rules. *)
+
 val default_extensions : string list
 val normalize_extension : string -> string option
 val normalize_extensions : string list -> string list

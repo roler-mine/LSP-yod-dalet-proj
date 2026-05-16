@@ -1,3 +1,5 @@
+(** Module overview: Token stream cache used by syntax display, semantic tokens, and incremental features. *)
+
 type edit_summary = {
   full_sync : bool;
   start_off : int;

@@ -1,3 +1,5 @@
+(* Module overview: Implementation navigation for procedures, declarations, and external definitions. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_model

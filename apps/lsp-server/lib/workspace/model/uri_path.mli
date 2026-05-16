@@ -1,3 +1,5 @@
+(** Module overview: URI and filesystem path conversions shared by the workspace and LSP layers. *)
+
 module T = Lsp.Types
 
 val docuri_to_string : T.DocumentUri.t -> string

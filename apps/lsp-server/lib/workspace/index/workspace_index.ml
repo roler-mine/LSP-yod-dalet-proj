@@ -1,3 +1,5 @@
+(* Module overview: Filesystem-backed workspace index for source discovery and dependency lookup. *)
+
 type file_change_kind = Created | Changed | Deleted
 
 type t = {
@@ -15,6 +17,11 @@ type t = {
 
 let normalize_path_key = Uri_path.normalize_path_key
 let normalize_key (s : string) : string = String.uppercase_ascii (String.trim s)
+
+let index_hint_prefix_bytes =
+  max 1024
+    (Env_utils.nonneg_int "JOVIAL_INDEX_HINT_PREFIX_BYTES"
+       ~default:(8 * 1024))
 
 let source_count (t : t) : int = Hashtbl.length t.sources
 let compool_count (t : t) : int = Hashtbl.length t.compools
@@ -194,7 +201,7 @@ let index_source_file (t : t) (path : string) : bool =
     match prev_source with Some prev when prev = path -> false | _ -> true
   in
   let compool_changed, hints_changed =
-    match read_prefix path 65536 with
+    match read_prefix path index_hint_prefix_bytes with
     | None ->
         let compool_removed = remove_compool_for_path t ~path_key in
         let import_changed = Hashtbl.mem t.source_import_hints path_key in

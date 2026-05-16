@@ -1,3 +1,5 @@
+(* Module overview: Line and offset index for converting between byte offsets and LSP positions. *)
+
 type t = {
   text : string;
   (* line_starts.(i) = absolute offset of first char in line i (0-based) *)

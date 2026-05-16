@@ -1,3 +1,5 @@
+(** Module overview: Produces code actions from diagnostics and workspace context. *)
+
 module T = Lsp.Types
 
 val code_actions_for :

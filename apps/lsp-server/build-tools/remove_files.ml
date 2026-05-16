@@ -1,3 +1,5 @@
+(* Module overview: Build-time utility used by repository maintenance scripts. *)
+
 let remove_if_exists path =
   try if Sys.file_exists path then Sys.remove path with _ -> ()
 

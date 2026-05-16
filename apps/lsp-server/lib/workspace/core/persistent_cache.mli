@@ -1,3 +1,5 @@
+(** Module overview: Disk cache helpers for workspace summaries and index reuse. *)
+
 type file_metadata = {
   path : string;
   path_key : string;
@@ -60,6 +62,16 @@ val save_skeleton_entry :
   path:string ->
   entries:Workspace_foundation.quick_nav_entry list ->
   unit
+
+val save_skeleton_entries_buffered :
+  root:string ->
+  source_extensions:string list ->
+  max_bytes:int ->
+  entries_by_path:(string * Workspace_foundation.quick_nav_entry list) list ->
+  unit
+
+val flush_skeleton_entries :
+  root:string -> source_extensions:string list -> max_bytes:int -> unit
 
 val load_module_summary_cache :
   root:string ->

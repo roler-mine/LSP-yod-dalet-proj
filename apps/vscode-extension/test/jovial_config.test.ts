@@ -1,8 +1,11 @@
+// Module overview: Tests for the jovial config.test extension module.
+
 import assert from "node:assert/strict";
 
 import {
   buildInitializationOptions,
   readJovialConfig,
+  sanitizeOptionalPositiveInt,
   sanitizePositiveInt,
   sanitizeStringArray,
   sanitizeWorkspaceDiagnosticsMode,
@@ -33,6 +36,15 @@ export function run(): void {
     "server.parseMaxFileBytes": 4096.3,
     "server.pressureSoftMb": 640,
     "server.pressureCriticalMb": 896,
+    "implementation.dialect": " test-target ",
+    "implementation.bitsInWord": 24.8,
+    "implementation.bytesInWord": 3,
+    "implementation.floatPrecision": 48,
+    "implementation.fixedPrecision": 32,
+    "implementation.maxIntSize": 24,
+    "implementation.maxBits": 4096,
+    "implementation.maxBytes": 512,
+    "implementation.systemSubroutines": ["sysio", " ", 9, "wait"],
     "startup.priorityMode": "infoFirst",
     "features.profile": "responsive",
     "features.hover": false,
@@ -116,6 +128,17 @@ export function run(): void {
       formatting: true,
       semanticTokens: false,
     },
+    implementation: {
+      dialect: "test-target",
+      bitsInWord: 24,
+      bytesInWord: 3,
+      floatPrecision: 48,
+      fixedPrecision: 32,
+      maxIntSize: 24,
+      maxBits: 4096,
+      maxBytes: 512,
+      systemSubroutines: ["sysio", "wait"],
+    },
   });
 
   const customCfg = readJovialConfig({
@@ -195,6 +218,20 @@ export function run(): void {
     },
   });
   assert.equal(defaultCfg.maxStartupFiles, 1000);
+  assert.equal(defaultCfg.hugeFileThresholdBytes, 15728640);
+  assert.equal(defaultCfg.fullParseMaxBytes, 15728640);
+  assert.equal(defaultCfg.parseMaxFileBytes, 15728640);
+  assert.deepEqual(defaultCfg.implementation, {
+    dialect: "",
+    bitsInWord: null,
+    bytesInWord: null,
+    floatPrecision: null,
+    fixedPrecision: null,
+    maxIntSize: null,
+    maxBits: null,
+    maxBytes: null,
+    systemSubroutines: [],
+  });
 
   const init = buildInitializationOptions(
     {
@@ -267,6 +304,17 @@ export function run(): void {
         inlayHints: true,
         formatting: true,
         semanticTokens: false,
+      },
+      implementation: {
+        dialect: "test-target",
+        bitsInWord: 24,
+        bytesInWord: 3,
+        floatPrecision: 48,
+        fixedPrecision: 32,
+        maxIntSize: 24,
+        maxBits: 4096,
+        maxBytes: 512,
+        systemSubroutines: ["SYSIO"],
       },
     },
     [
@@ -347,6 +395,17 @@ export function run(): void {
         enableHugeFileFullParse: false,
         backgroundParseWorkerCount: 2,
       },
+      implementation: {
+        dialect: "test-target",
+        bitsInWord: 24,
+        bytesInWord: 3,
+        floatPrecision: 48,
+        fixedPrecision: 32,
+        maxIntSize: 24,
+        maxBits: 4096,
+        maxBytes: 512,
+        systemSubroutines: ["SYSIO"],
+      },
     },
   });
 
@@ -354,5 +413,8 @@ export function run(): void {
   assert.equal(sanitizeWorkspaceDiagnosticsMode("oops"), "errors");
   assert.equal(sanitizePositiveInt(7.9, 3), 7);
   assert.equal(sanitizePositiveInt(0, 3), 1);
+  assert.equal(sanitizeOptionalPositiveInt(12.8), 12);
+  assert.equal(sanitizeOptionalPositiveInt(0), 1);
+  assert.equal(sanitizeOptionalPositiveInt("12"), null);
   assert.deepEqual(sanitizeStringArray(["a", " ", 7, "b"]), ["a", "b"]);
 }

@@ -1,3 +1,5 @@
+(** Module overview: Top-level LSP event loop that dispatches client messages into workspace operations. *)
+
 val run : in_channel -> out_channel -> unit
 
 module Private_for_tests : sig

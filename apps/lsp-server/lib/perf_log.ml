@@ -1,3 +1,5 @@
+(* Module overview: Shared performance logging helpers for server scheduling and request timing. *)
+
 type parse_policy =
   | Forbid_sync_parse
   | Allow_sync_parse_if_small

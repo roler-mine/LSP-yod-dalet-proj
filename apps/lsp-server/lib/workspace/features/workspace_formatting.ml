@@ -1,3 +1,5 @@
+(* Module overview: Conservative document and range formatter for Jovial source text. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_lookup

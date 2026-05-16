@@ -1,3 +1,5 @@
+// Module overview: Centralizes workspace path ignore rules used by discovery, watching, and indexing.
+
 import {
   DEFAULT_JOVIAL_SOURCE_EXTENSIONS,
   hasJovialSourceExtension,

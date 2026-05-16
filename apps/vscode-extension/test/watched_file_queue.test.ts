@@ -1,3 +1,5 @@
+// Module overview: Tests for the watched file queue.test extension module.
+
 import assert from "node:assert/strict";
 
 import {

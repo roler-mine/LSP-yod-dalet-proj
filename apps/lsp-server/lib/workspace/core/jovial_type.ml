@@ -1,3 +1,5 @@
+(* Module overview: Jovial type representation, formatting, and compatibility helpers. *)
+
 type int_kind = Signed | Unsigned
 
 type status_value = {
@@ -352,6 +354,44 @@ and display (ty : t) =
         match returns with Some ret -> " RETURNS " ^ display ret | None -> ""
       in
       "PROC(" ^ param_text ^ ")" ^ ret_text
+
+let rec with_implementation_defaults (config : Implementation_config.t)
+    (ty : t) : t =
+  match ty with
+  | Float { precision = None } ->
+      Float { precision = config.float_precision }
+  | Fixed { scale = None; fraction = None } ->
+      Fixed { scale = None; fraction = config.fixed_precision }
+  | Pointer { target = Some target; typed } ->
+      Pointer { target = Some (with_implementation_defaults config target); typed }
+  | Table { dims; entry } ->
+      Table { dims; entry = with_implementation_defaults config entry }
+  | Block fields ->
+      Block
+        (List.map
+           (fun field ->
+             { field with ty = with_implementation_defaults config field.ty })
+           fields)
+  | Procedure sig_ ->
+      Procedure
+        {
+          sig_ with
+          params =
+            List.map
+              (fun param ->
+                {
+                  param with
+                  param_ty =
+                    with_implementation_defaults config param.param_ty;
+                })
+              sig_.params;
+          returns =
+            Option.map (with_implementation_defaults config) sig_.returns;
+        }
+  | _ -> ty
+
+let display_with_config (config : Implementation_config.t) (ty : t) =
+  display (with_implementation_defaults config ty)
 
 let rec numeric_like = function
   | Integer _ | Float _ | Fixed _ -> true

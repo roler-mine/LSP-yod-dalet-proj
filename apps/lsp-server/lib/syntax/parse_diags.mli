@@ -1,3 +1,5 @@
+(** Module overview: Converts lexer and parser failures into user-facing syntax diagnostics. *)
+
 type entry = Ast.Loc.t * string
 
 val clear : unit -> unit

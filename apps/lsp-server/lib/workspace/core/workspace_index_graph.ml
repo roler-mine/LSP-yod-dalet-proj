@@ -1,3 +1,5 @@
+(* Module overview: Builds and maintains the workspace dependency graph and root closure. *)
+
 module T = Lsp.Types
 open Workspace_foundation
 open Workspace_state
@@ -13,25 +15,29 @@ let ensure_index_started (ws : t) : unit =
   match (ws.root_path, ws.index) with
   | Some root, None ->
       let loaded =
-        Persistent_cache.load_or_build_source_index
-          ~source_extensions:ws.source_extensions ~root
-          ~paths:ws.source_file_paths
+        Perf_stats.time "index.startup.load_or_build_source" (fun () ->
+            Persistent_cache.load_or_build_source_index
+              ~source_extensions:ws.source_extensions ~root
+              ~paths:ws.source_file_paths)
       in
       let idx = loaded.Persistent_cache.index in
       ws.index_checkpoint_loaded <- loaded.loaded_from_cache;
       clear_module_summary_cache ws;
       let summary_cache =
-        Persistent_cache.load_module_summary_cache
-          ~source_extensions:ws.source_extensions ~root
-          ~paths:(Workspace_index.all_source_paths idx)
+        Perf_stats.time "index.startup.load_module_summaries" (fun () ->
+            Persistent_cache.load_module_summary_cache
+              ~source_extensions:ws.source_extensions ~root
+              ~paths:(Workspace_index.all_source_paths idx))
       in
       List.iter
         (install_module_summary_cache_entry ws)
         (Persistent_cache.module_summary_entries summary_cache);
       ws.module_summary_cache_loaded <- true;
-      Persistent_cache.save_source_index ~source_extensions:ws.source_extensions
-        ~root idx;
-      Workspace_persistent_index.save_workspace_index ~root idx;
+      Perf_stats.time "index.startup.save_source_index" (fun () ->
+          Persistent_cache.save_source_index
+            ~source_extensions:ws.source_extensions ~root idx);
+      Perf_stats.time "index.startup.save_legacy_index" (fun () ->
+          Workspace_persistent_index.save_workspace_index ~root idx);
       ws.index <- Some idx
   | _ -> ()
 
@@ -850,7 +856,11 @@ let schedule_nav_miss_reconcile (ws : t) ~(doc : Document.t)
         in
         add_candidates values;
         add_candidates types);
-    (if Hashtbl.length scheduled_paths = 0 then
+    (if
+       Hashtbl.length scheduled_paths = 0
+       && ws.startup_fully_nav_ready_ms = None
+     then Perf_stats.tick "nav.miss_reconcile_scan_deferred_startup"
+     else if Hashtbl.length scheduled_paths = 0 then
        let pat = "PROC " ^ key in
        let contains_pat (s : string) : bool =
          let n = String.length s in

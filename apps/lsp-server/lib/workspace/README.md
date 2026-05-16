@@ -11,6 +11,13 @@ Entry module:
 
 - `core/workspace.ml` (exposed as module `Workspace`)
 
+Staged architecture overview:
+
+- See `docs/architecture/staged-workspace-architecture.md` for the current
+  readiness tiers, query facade, module summaries, persistent cache authority,
+  fallback scan policy, CodeLens confidence labels, benchmark commands, and
+  debug-report interpretation.
+
 Compatibility boundary:
 
 - `features/workspace_navigation.ml` is a legacy facade kept for compatibility
@@ -45,8 +52,10 @@ Cross-module lookup order:
 - Definition, type-definition, and reference helpers prefer local semantic/nav
   bindings first, then semantic-store hits scoped to imported COMPOOLs, then
   cached/open module summaries, and only then the bounded fallback scans.
-- Fallbacks remain available for broken, cold, or partially indexed workspaces,
-  but they are counted as emergency paths via
+- Fallbacks remain available for broken, cold, or partially indexed workspaces.
+  Large-profile startup defers broad source-window scans until interactive
+  navigation readiness, while small/medium profiles keep compatibility fallback
+  behavior. Fallback attempts are counted via
   `query.cross_module.fallback_scan`. Related counters include
   `query.cross_module.semantic_hit`, `query.cross_module.summary_hit`,
   `query.cross_module.provisional_result`, and
@@ -144,8 +153,12 @@ to keep nav requests responsive while semantic rebuild is deferred to periodic f
 - `JOVIAL_DIDOPEN_DEFER_MIN_DOC_CHARS` (default `120000`)
 - `JOVIAL_DIDOPEN_ALWAYS_PROVISIONAL` (default `false`)
 - `JOVIAL_DIDOPEN_DISABLE_FOREGROUND_TICK` (default `true`)
-- `JOVIAL_STARTUP_TARGET_MS` (default `15000`)
-- `JOVIAL_STARTUP_AGGRESSIVE_WINDOW_MS` (default `3000`)
+- `JOVIAL_STARTUP_TARGET_MS` (default `1500`)
+- `JOVIAL_STARTUP_DIAG_HOVER_TARGET_MS` (default `1500`)
+- `JOVIAL_STARTUP_NAV_TARGET_MS` (default `1500`)
+- `JOVIAL_OPEN_DOC_READY_TARGET_MS` (default `1500`)
+- `JOVIAL_OPEN_DOC_HUGE_READY_TARGET_MS` (default `10000`, used for files over the huge-file threshold; default threshold is 15 MB)
+- `JOVIAL_STARTUP_AGGRESSIVE_WINDOW_MS` (default `500`)
 - `JOVIAL_STARTUP_AGGRESSIVE_BG_BUDGET_MS` (default `20`)
 - `JOVIAL_STARTUP_FAIR_TICK_MS` (default `2`)
 - `JOVIAL_DIAG_MIN_FAIR_TICK_MS` (default `1`)
@@ -162,10 +175,14 @@ to keep nav requests responsive while semantic rebuild is deferred to periodic f
 - `JOVIAL_BG_LARGE_PARSE_IDLE_QUIET_MS` (default `150`)
 - `JOVIAL_WORKSPACE_PROFILE_MODE` (default `auto`, supported: `auto|small|medium|large`)
 - `JOVIAL_NAV_SOFT_BUDGET_MS` (default `1800`)
+- `JOVIAL_NAV_SOFT_BUDGET_MS_MEDIUM` (default capped at `350`)
+- `JOVIAL_NAV_SOFT_BUDGET_MS_LARGE` (default capped at `120`)
+- `JOVIAL_NAV_STARTUP_SOFT_BUDGET_MS` (default capped at `80`)
 - `JOVIAL_NAV_QUICK_SCAN_FILES` (default `48`)
-- `JOVIAL_NAV_QUICK_SCAN_PER_FILE_BYTES` (default `262144`)
-- `JOVIAL_NAV_QUICK_SCAN_TOTAL_BYTES` (default `1572864`)
+- `JOVIAL_NAV_QUICK_SCAN_PER_FILE_BYTES` (default `65536`)
+- `JOVIAL_NAV_QUICK_SCAN_TOTAL_BYTES` (default `12582912`)
 - `JOVIAL_NAV_SOURCE_SCAN_FILES` (legacy fallback env; default `48` if `JOVIAL_NAV_QUICK_SCAN_FILES` is unset)
+- `JOVIAL_INDEX_HINT_PREFIX_BYTES` (default `8192`)
 - `JOVIAL_NAV_MISS_IMPORT_SCAN_MAX_CHARS` (default `262144`)
 - `JOVIAL_NAV_MISS_HIGH_ENQUEUE_CAP` (default `24`)
 - `JOVIAL_OPEN_DIAG_REVALIDATE_BATCH_SIZE` (default `8`)

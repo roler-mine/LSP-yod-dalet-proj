@@ -1,3 +1,5 @@
+// Module overview: Validates and normalizes LSIF index and delta payloads returned by the server.
+
 import { asRecord } from "./unknown_utils";
 
 export type LsifLocationData = {

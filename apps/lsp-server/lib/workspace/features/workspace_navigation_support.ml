@@ -1,3 +1,5 @@
+(* Module overview: Lower-level helpers for resolving symbol locations and import-aware navigation. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_index_graph
@@ -24,14 +26,39 @@ let adjust_nav_position (doc : Document.t) (pos : T.Position.t) : T.Position.t =
 
 type nav_budget = Workspace_budget.t
 
+let nav_soft_budget_for_ws (ws : t) : int =
+  let profile_budget =
+    match Workspace_runtime.workspace_profile_for_budget ws with
+    | Workspace_foundation.ProfileSmall -> nav_soft_budget_ms
+    | Workspace_foundation.ProfileMedium -> nav_soft_budget_medium_ms
+    | Workspace_foundation.ProfileLarge -> nav_soft_budget_large_ms
+  in
+  if ws.startup_fully_nav_ready_ms = None then
+    min profile_budget nav_startup_soft_budget_ms
+  else profile_budget
+
 let nav_budget_start (ws : t) : nav_budget =
-  Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms
+  let soft_budget_ms = nav_soft_budget_for_ws ws in
+  Workspace_foundation.Perf_stats.observe_ms "nav.budget_ms"
+    (float_of_int soft_budget_ms);
+  Workspace_budget.start ~ws ~soft_budget_ms
 
 let nav_budget_check ?(phase = "nav") (budget : nav_budget) : bool =
   Workspace_budget.should_stop ~phase budget
 
 let allow_fallback_for_ws (ws : t) (doc : Document.t) : bool =
-  allow_unscoped_fallback doc || ws.startup_fully_nav_ready_ms = None
+  let startup_allows_fallback =
+    match Workspace_runtime.workspace_profile_for_budget ws with
+    | Workspace_foundation.ProfileLarge ->
+        ws.allow_slow_query_fallback
+        || Workspace_runtime.quick_nav_index_complete ws
+    | Workspace_foundation.ProfileSmall | Workspace_foundation.ProfileMedium ->
+        true
+  in
+  let allowed = startup_allows_fallback && allow_unscoped_fallback doc in
+  if (not allowed) && allow_unscoped_fallback doc then
+    Workspace_foundation.Perf_stats.tick "query.slow_fallback_disabled";
+  allowed
 
 let prefer_local_defs_before_position (doc : Document.t) (pos : T.Position.t)
     (defs : def list) : def list =
@@ -62,12 +89,19 @@ let prefer_local_defs_before_position (doc : Document.t) (pos : T.Position.t)
           in
           [ best ])
 
-let occurrences_in_doc_fallback (doc : Document.t) ~(key : string) :
+let occurrences_in_doc_fallback ?budget (doc : Document.t) ~(key : string) :
     (T.DocumentUri.t * Ast.Loc.t) list =
   let text = doc.Document.text in
   let n = String.length text in
   let rec loop i acc =
     if i >= n then List.rev acc
+    else if
+      i mod 4096 = 0
+      &&
+      (match budget with
+      | Some budget -> nav_budget_check budget
+      | None -> false)
+    then List.rev acc
     else if is_ident_char text.[i] && (i = 0 || not (is_ident_char text.[i - 1]))
     then (
       let j = ref (i + 1) in
@@ -89,7 +123,7 @@ let occurrences_in_doc_fallback (doc : Document.t) ~(key : string) :
   in
   loop 0 []
 
-let occurrences_in_doc (doc : Document.t) ~(key : string) :
+let occurrences_in_doc ?budget (doc : Document.t) ~(key : string) :
     (T.DocumentUri.t * Ast.Loc.t) list =
   try
     Lexer.with_session_state (fun lexer ->
@@ -98,7 +132,15 @@ let occurrences_in_doc (doc : Document.t) ~(key : string) :
         | None -> ()
         | Some f ->
             lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with Lexing.pos_fname = f });
-        let rec loop acc =
+        let rec loop count acc =
+          if
+            count mod 512 = 0
+            &&
+            (match budget with
+            | Some budget -> nav_budget_check budget
+            | None -> false)
+          then List.rev acc
+          else
           let tok = Lexer.token lexer lexbuf in
           let sp = Lexing.lexeme_start_p lexbuf in
           let ep = Lexing.lexeme_end_p lexbuf in
@@ -108,11 +150,11 @@ let occurrences_in_doc (doc : Document.t) ~(key : string) :
               let loc =
                 Ast.Loc.of_lexing_positions sp ep ~file:doc.Document.file
               in
-              loop ((doc.Document.uri, loc) :: acc)
-          | _ -> loop acc
+              loop (count + 1) ((doc.Document.uri, loc) :: acc)
+          | _ -> loop (count + 1) acc
         in
-        loop [])
-  with _ -> occurrences_in_doc_fallback doc ~key
+        loop 0 [])
+  with _ -> occurrences_in_doc_fallback ?budget doc ~key
 
 let occurrences_for_docs_with_budget (budget : nav_budget)
     (docs : Document.t list) ~(key : string) :
@@ -121,7 +163,7 @@ let occurrences_for_docs_with_budget (budget : nav_budget)
   List.iter
     (fun d ->
       if not (nav_budget_check budget) then
-        acc := List.rev_append (occurrences_in_doc d ~key) !acc)
+        acc := List.rev_append (occurrences_in_doc ~budget d ~key) !acc)
     docs;
   List.rev !acc
 
@@ -235,12 +277,16 @@ let emit_reference_doc_stages (budget : nav_budget)
   let seen = Hashtbl.create 256 in
   let acc = ref [] in
   let emit_docs docs =
-    let occs =
-      docs |> List.concat_map (fun d -> occurrences_in_doc d ~key)
-      |> filter_declarations ~include_decl ~def_keys
-    in
-    let batch = emit_locations_stage budget seen ~emit occs in
-    acc := !acc @ batch
+    List.iter
+      (fun d ->
+        if not (nav_budget_check budget) then
+          let occs =
+            occurrences_in_doc ~budget d ~key
+            |> filter_declarations ~include_decl ~def_keys
+          in
+          let batch = emit_locations_stage budget seen ~emit occs in
+          acc := !acc @ batch)
+      docs
   in
   emit_docs current;
   emit_docs imported;

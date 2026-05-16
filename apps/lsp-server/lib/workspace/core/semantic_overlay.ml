@@ -1,3 +1,5 @@
+(* Module overview: Overlay layer for semantic information that can refresh independently of base indexes. *)
+
 type type_info = Symbol_index.type_info
 
 type binding_info = {

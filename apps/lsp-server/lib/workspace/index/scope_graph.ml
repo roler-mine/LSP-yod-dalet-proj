@@ -1,3 +1,5 @@
+(* Module overview: Models lexical and module scopes for symbol lookup across Jovial files. *)
+
 type symbol_id = string
 type import_id = int
 

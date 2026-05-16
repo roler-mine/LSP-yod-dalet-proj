@@ -1,3 +1,5 @@
+// Module overview: Builds the AST/CST webview commands used for syntax-tree inspection.
+
 import * as path from "path";
 import * as vscode from "vscode";
 

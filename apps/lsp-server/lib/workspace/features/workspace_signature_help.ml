@@ -1,3 +1,5 @@
+(* Module overview: Signature-help provider for procedure and function call sites. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_model

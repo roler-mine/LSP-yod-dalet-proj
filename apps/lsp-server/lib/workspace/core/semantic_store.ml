@@ -1,3 +1,5 @@
+(* Module overview: Mutable semantic store backing hover, navigation, and LSIF symbol metadata. *)
+
 module T = Lsp.Types
 
 module Snapshot = struct
@@ -66,6 +68,8 @@ type str_set = (string, bool) Hashtbl.t
 type t = {
   snapshot_by_uri : (string, Snapshot.t) Hashtbl.t;
   defs_by_sym_id : (string, Snapshot.nav_def list) Hashtbl.t;
+  defs_by_key_kind : (string, Snapshot.nav_def list) Hashtbl.t;
+  defs_by_uri_key : (string, Snapshot.nav_def list) Hashtbl.t;
   occs_by_sym_id : (string, Snapshot.nav_occ list) Hashtbl.t;
   sym_ids_by_key : (string, str_set) Hashtbl.t;
   reverse_imports_by_compool : (string, str_set) Hashtbl.t;
@@ -77,6 +81,8 @@ let create () : t =
   {
     snapshot_by_uri = Hashtbl.create 256;
     defs_by_sym_id = Hashtbl.create 1024;
+    defs_by_key_kind = Hashtbl.create 1024;
+    defs_by_uri_key = Hashtbl.create 1024;
     occs_by_sym_id = Hashtbl.create 2048;
     sym_ids_by_key = Hashtbl.create 1024;
     reverse_imports_by_compool = Hashtbl.create 512;
@@ -87,6 +93,8 @@ let create () : t =
 let reset (s : t) : unit =
   Hashtbl.clear s.snapshot_by_uri;
   Hashtbl.clear s.defs_by_sym_id;
+  Hashtbl.clear s.defs_by_key_kind;
+  Hashtbl.clear s.defs_by_uri_key;
   Hashtbl.clear s.occs_by_sym_id;
   Hashtbl.clear s.sym_ids_by_key;
   Hashtbl.clear s.reverse_imports_by_compool;
@@ -168,6 +176,68 @@ let rebuild_key_set (s : t) (key : string) : unit =
 let uri_keys_of_set (set : str_set) : string list =
   Hashtbl.fold (fun k _ acc -> k :: acc) set []
 
+let def_key_index_key (key : string) : string = normalize_key key
+
+let def_kind_index_key ~(key : string) ~(kind : int) : string =
+  normalize_key key ^ "\x1f" ^ string_of_int kind
+
+let direct_kind_indexed (kind : int) : bool =
+  (* LSP SymbolKind.Function. The direct kind index is only used to keep
+     procedure lookup from walking common item names. *)
+  kind = 12
+
+let def_uri_index_key ~(uri_key : string) ~(key : string) : string =
+  uri_key ^ "\x1f" ^ normalize_key key
+
+let unique_index_keys_of_nav_defs
+    (f : Snapshot.nav_def -> string option)
+    (defs : (string * Snapshot.nav_def) list) : string list =
+  let seen = Hashtbl.create 32 in
+  let out = ref [] in
+  List.iter
+    (fun (_, d) ->
+      match f d with
+      | Some k when k <> "" && not (Hashtbl.mem seen k) ->
+          Hashtbl.replace seen k true;
+          out := k :: !out
+      | _ -> ())
+    defs;
+  !out
+
+let remove_defs_for_uri (tbl : (string, Snapshot.nav_def list) Hashtbl.t)
+    ~(index_key : string) ~(uri_key_to_remove : string) : unit =
+  match Hashtbl.find_opt tbl index_key with
+  | None -> ()
+  | Some defs ->
+      let defs' =
+        List.filter
+          (fun (d : Snapshot.nav_def) -> uri_key d.uri <> uri_key_to_remove)
+          defs
+      in
+      if defs' = [] then Hashtbl.remove tbl index_key
+      else Hashtbl.replace tbl index_key defs'
+
+let add_def_bucket
+    (bucket : (string, Snapshot.nav_def list) Hashtbl.t)
+    ~(index_key : string) (defn : Snapshot.nav_def) : unit =
+  let prev =
+    match Hashtbl.find_opt bucket index_key with None -> [] | Some xs -> xs
+  in
+  Hashtbl.replace bucket index_key (defn :: prev)
+
+let flush_def_bucket
+    (tbl : (string, Snapshot.nav_def list) Hashtbl.t)
+    (bucket : (string, Snapshot.nav_def list) Hashtbl.t) : unit =
+  Hashtbl.iter
+    (fun index_key defs_rev ->
+      let defs = List.rev defs_rev in
+      let prev =
+        match Hashtbl.find_opt tbl index_key with None -> [] | Some xs -> xs
+      in
+      if prev = [] then Hashtbl.replace tbl index_key defs
+      else Hashtbl.replace tbl index_key (merge_defs prev defs))
+    bucket
+
 let remove_uri_key (s : t) (uk : string) : unit =
   match Hashtbl.find_opt s.snapshot_by_uri uk with
   | None -> ()
@@ -211,6 +281,25 @@ let remove_uri_key (s : t) (uk : string) : unit =
               if defs' = [] then Hashtbl.remove s.defs_by_sym_id sym_id
               else Hashtbl.replace s.defs_by_sym_id sym_id defs')
         old.nav_defs;
+
+      unique_index_keys_of_nav_defs
+        (fun d ->
+          let key = def_key_index_key d.key in
+          if key = "" || not (direct_kind_indexed d.kind) then None
+          else Some (def_kind_index_key ~key ~kind:d.kind))
+        old.nav_defs
+      |> List.iter (fun index_key ->
+             remove_defs_for_uri s.defs_by_key_kind ~index_key
+               ~uri_key_to_remove:uk);
+
+      unique_index_keys_of_nav_defs
+        (fun d ->
+          let key = def_key_index_key d.key in
+          if key = "" then None
+          else Some (def_uri_index_key ~uri_key:(uri_key d.uri) ~key))
+        old.nav_defs
+      |> List.iter (fun index_key ->
+             Hashtbl.remove s.defs_by_uri_key index_key);
 
       List.iter
         (fun (sym_id, _) ->
@@ -266,6 +355,23 @@ let upsert_snapshot (s : t) (snap : Snapshot.t) : unit =
         let set = set_for_key s.sym_ids_by_key key in
         set_add set sym_id)
     snap.nav_defs;
+
+  let defs_by_key_kind_bucket = Hashtbl.create 32 in
+  let defs_by_uri_key_bucket = Hashtbl.create 32 in
+  List.iter
+    (fun (_, (defn : Snapshot.nav_def)) ->
+      let key = def_key_index_key defn.key in
+      if key <> "" then (
+        if direct_kind_indexed defn.kind then
+          add_def_bucket defs_by_key_kind_bucket
+            ~index_key:(def_kind_index_key ~key ~kind:defn.kind)
+            defn;
+        add_def_bucket defs_by_uri_key_bucket
+          ~index_key:(def_uri_index_key ~uri_key:(uri_key defn.uri) ~key)
+          defn))
+    snap.nav_defs;
+  flush_def_bucket s.defs_by_key_kind defs_by_key_kind_bucket;
+  flush_def_bucket s.defs_by_uri_key defs_by_uri_key_bucket;
 
   List.iter
     (fun (sym_id, occs) ->
@@ -332,6 +438,27 @@ let defs_for_sym_id (s : t) (sym_id : string) : Snapshot.nav_def list =
   match Hashtbl.find_opt s.defs_by_sym_id sym_id with
   | None -> []
   | Some xs -> xs
+
+let defs_for_key_kind (s : t) ~(key : string) ~(kind : int) :
+    Snapshot.nav_def list =
+  let key = def_key_index_key key in
+  if key = "" then []
+  else
+    match Hashtbl.find_opt s.defs_by_key_kind (def_kind_index_key ~key ~kind) with
+    | None -> []
+    | Some xs -> xs
+
+let defs_for_key_in_uri (s : t) ~(uri : T.DocumentUri.t) ~(key : string) :
+    Snapshot.nav_def list =
+  let key = def_key_index_key key in
+  if key = "" then []
+  else
+    match
+      Hashtbl.find_opt s.defs_by_uri_key
+        (def_uri_index_key ~uri_key:(uri_key uri) ~key)
+    with
+    | None -> []
+    | Some xs -> xs
 
 let refs_for_sym_id (s : t) (sym_id : string) : Snapshot.nav_occ list =
   match Hashtbl.find_opt s.occs_by_sym_id sym_id with

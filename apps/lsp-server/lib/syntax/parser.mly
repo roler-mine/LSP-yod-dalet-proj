@@ -1,4 +1,5 @@
 %{
+  (* Module overview: Menhir grammar and interface for building the recoverable Jovial syntax tree. *)
   [@@@warning "-32"]
 
   open Ast
@@ -108,6 +109,7 @@
       | Ast.DConst x -> Ast.DConst { x with external_modifier = m }
       | Ast.DType x -> Ast.DType { x with external_modifier = m }
       | Ast.DProc p -> Ast.DProc (apply_external_modifier_to_proc m p)
+      | Ast.DOverlay _ as x -> x
       | Ast.DDirective _ as x -> x
     in
     { d with v }
@@ -125,16 +127,17 @@
     | Some (decls, _body_stmt) -> List.filter_map field_of_block_decl decls
 
   let empty_proc_header_info =
-    (false, false, None)
+    (false, false, false, None)
 
-  let merge_proc_header_info (a_rec, a_rent, a_ret) (b_rec, b_rent, b_ret) =
+  let merge_proc_header_info (a_rec, a_rent, a_inline, a_ret)
+      (b_rec, b_rent, b_inline, b_ret) =
     let ret =
       match a_ret, b_ret with
       | Some x, _ -> Some x
       | None, Some y -> Some y
       | None, None -> None
     in
-    (a_rec || b_rec, a_rent || b_rent, ret)
+    (a_rec || b_rec, a_rent || b_rent, a_inline || b_inline, ret)
 
   let for_step_stmt sp ep lhs (by_expr, then_expr) =
     match by_expr, then_expr with
@@ -157,7 +160,8 @@
 /* keywords */
 %token START TERM BEGIN END
 %token DEF REF PROC
-%token ITEM TABLE STATIC CONSTANT
+%token ITEM TABLE STATIC CONSTANT READONLY
+%token INLINE OVERLAY
 %token IF ELSE WHILE FOR BY THEN
 %token CASE DEFAULT FALLTHRU
 %token EXIT GOTO RETURN ABORT STOP
@@ -289,11 +293,84 @@ module_item:
 decl_item:
   | d=directive_decl { [d] }
   | ds=group_decl    { ds }
-  | ds=data_decl     { ds }
+  | ds=inline_proc_decl { ds }
   | ds=proc_decl     { ds }
+  | ds=inline_invalid_data_decl { ds }
+  | ds=data_decl     { ds }
   | ds=define_decl   { ds }
   | ds=type_decl     { ds }
   | ds=block_decl    { ds }
+  | ds=overlay_decl  { ds }
+  ;
+
+inline_invalid_data_decl:
+  | INLINE ITEM nm=ident st=static_opt ty=type_spec init=item_init_opt attrs=item_attrs_opt _t=terminator
+      {
+        Parse_diags.add (loc $startpos $endpos)
+          "INLINE applies only to PROC declarations; ignoring INLINE on data declaration.";
+        let storage = if st then Ast.Static else Ast.Automatic in
+        [n $startpos $endpos
+          (Ast.DVar {
+            name = nm;
+            dtype = ty;
+            init;
+            storage;
+            external_modifier = Ast.LocalDecl;
+            data_decl_kind = Ast.DataItem;
+            is_readonly = attrs;
+          })]
+      }
+  | INLINE TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
+      {
+        Parse_diags.add (loc $startpos $endpos)
+          "INLINE applies only to PROC declarations; ignoring INLINE on data declaration.";
+        let storage = if st then Ast.Static else Ast.Automatic in
+        let ty =
+          mk_table_type $startpos $endpos dims elem_ty_opt recopt_before
+            recopt_after
+        in
+        [n $startpos $endpos
+          (Ast.DVar {
+            name = nm;
+            dtype = ty;
+            init = preset;
+            storage;
+            external_modifier = Ast.LocalDecl;
+            data_decl_kind = Ast.DataTable;
+            is_readonly = false;
+          })]
+      }
+  ;
+
+inline_proc_decl:
+  | INLINE PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator body=proc_body_opt
+      {
+        let seen_rec, seen_rent, _seen_inline, ret =
+          merge_proc_header_info pre post
+        in
+        let use_attr = proc_use_from_flags seen_rec seen_rent in
+        let params = formals in
+        let locals, body_stmt =
+          match body with
+          | None -> ([], mk_block $startpos $endpos [])
+          | Some (ds, st) -> (ds, st)
+        in
+        let proc =
+          n $startpos $endpos
+            {
+              Ast.name = nm;
+              params;
+              returns = ret;
+              use_attr;
+              locals;
+              body = body_stmt;
+              external_modifier = Ast.LocalDecl;
+              has_body = body <> None;
+              is_inline = true;
+            }
+        in
+        [n $startpos $endpos (Ast.DProc proc)]
+      }
   ;
 
 /* Directives: !NAME [args] ;  (and allow COMPOOL/ICOMPOOL without ! too) */
@@ -504,6 +581,7 @@ block_decl:
               storage;
               external_modifier = external_modifier_of_string_opt mod_;
               data_decl_kind = Ast.DataBlock;
+              is_readonly = false;
             })
         in
         match mod_ with
@@ -544,9 +622,67 @@ group_decl:
       }
   ;
 
+overlay_decl:
+  | OVERLAY nm=ident pos=overlay_pos_opt _eq=overlay_eq_opt items=overlay_items_clause _t=terminator_opt
+      {
+        [n $startpos $endpos
+          (Ast.DOverlay {
+            overlay_name = nm;
+            overlay_items = items;
+            overlay_pos = pos;
+          })]
+      }
+  ;
+
+overlay_eq_opt:
+  | /* empty */ { () }
+  | EQ { () }
+  ;
+
+overlay_pos_opt:
+  | /* empty */ { None }
+  | POS LPAREN e=expr RPAREN { Some e }
+  ;
+
+overlay_items_clause:
+  | LPAREN items=overlay_items_opt RPAREN { items }
+  | BEGIN items=overlay_items_opt END { items }
+  ;
+
+overlay_items_opt:
+  | /* empty */ { [] }
+  | xs=overlay_items { xs }
+  ;
+
+overlay_items:
+  | x=overlay_item { [x] }
+  | x=overlay_item COMMA xs=overlay_items { x :: xs }
+  ;
+
+overlay_item:
+  | id=ident
+      { n $startpos $endpos (Ast.OverlayTarget id) }
+  | id=ident LPAREN e=expr RPAREN
+      {
+        let key = String.uppercase_ascii id.v in
+        if key = "SPACER" || key = "SPACE" then
+          n $startpos $endpos (Ast.OverlaySpacer e)
+        else (
+          Parse_diags.add id.loc
+            (Printf.sprintf
+               "Unknown OVERLAY item constructor %S; expected SPACER(...)."
+               id.v);
+          n $startpos $endpos (Ast.OverlayTarget id))
+      }
+  | STAR e=expr
+      { n $startpos $endpos (Ast.OverlaySpacer e) }
+  | LPAREN items=overlay_items_opt RPAREN
+      { n $startpos $endpos (Ast.OverlayGroup items) }
+  ;
+
 /* ITEM name type [ - init ] ; */
 data_decl:
-  | mod_=modifier_opt ITEM nm=ident st=static_opt ty=type_spec init=item_init_opt _attrs=item_attrs_opt _t=terminator
+  | mod_=modifier_opt ro=readonly_opt ITEM nm=ident st=static_opt ty=type_spec init=item_init_opt attrs=item_attrs_opt _t=terminator
       {
         let storage =
           match mod_ with
@@ -568,6 +704,7 @@ data_decl:
               storage;
               external_modifier;
               data_decl_kind = Ast.DataItem;
+              is_readonly = ro || attrs;
             })
         in
         match mod_ with
@@ -583,7 +720,7 @@ data_decl:
             [md; var]
       }
 
-  | mod_=modifier_opt CONSTANT ITEM nm=ident st=static_opt ty=type_spec value=const_item_init _attrs=item_attrs_opt _t=terminator
+  | mod_=modifier_opt _ro=readonly_opt CONSTANT ITEM nm=ident st=static_opt ty=type_spec value=const_item_init _attrs=item_attrs_opt _t=terminator
       {
         let storage =
           match mod_ with
@@ -624,7 +761,7 @@ data_decl:
             [md; c]
       }
 
-  | mod_=modifier_opt CONSTANT TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
+  | mod_=modifier_opt _ro=readonly_opt CONSTANT TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
       {
         let _storage =
           match mod_ with
@@ -664,7 +801,7 @@ data_decl:
             [md; c]
       }
 
-  | mod_=modifier_opt CONSTANT TABLE nm=ident st=static_opt dims=table_dims_opt BEGIN fs=field_decl_list END _tail=terminator_opt
+  | mod_=modifier_opt _ro=readonly_opt CONSTANT TABLE nm=ident st=static_opt dims=table_dims_opt BEGIN fs=field_decl_list END _tail=terminator_opt
       {
         let _storage =
           match mod_ with
@@ -698,7 +835,7 @@ data_decl:
       }
 
   /* TABLE name [ (dims) ] [elem-type] [ - preset ] [ , BEGIN fielddecls END ] ; [BEGIN fielddecls END] */
-  | mod_=modifier_opt TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
+  | mod_=modifier_opt ro=readonly_opt TABLE nm=ident st=static_opt dims=table_dims_opt elem_ty_opt=table_elem_type_opt preset=table_preset_opt recopt_before=record_opt _t=terminator recopt_after=table_record_after_term_opt
       {
         let storage =
           match mod_ with
@@ -728,6 +865,7 @@ data_decl:
               storage;
               external_modifier;
               data_decl_kind = Ast.DataTable;
+              is_readonly = ro;
             })
         in
         match mod_ with
@@ -742,6 +880,11 @@ data_decl:
             in
             [md; var]
       }
+  ;
+
+readonly_opt:
+  | /* empty */ { false }
+  | READONLY { true }
   ;
 
 static_opt:
@@ -761,20 +904,21 @@ item_init_opt:
   ;
 
 item_attrs_opt:
-  | /* empty */ { () }
-  | _xs=item_attrs { () }
+  | /* empty */ { false }
+  | xs=item_attrs { xs }
   ;
 
 item_attrs:
-  | _x=item_attr { () }
-  | _x=item_attr _xs=item_attrs { () }
+  | x=item_attr { x }
+  | x=item_attr xs=item_attrs { x || xs }
   ;
 
 item_attr:
-  | STATIC { () }
-  | _id=ident { () }
-  | _id=ident _p=attr_paren_payload { () }
-  | _p=attr_paren_payload { () }
+  | STATIC { false }
+  | READONLY { true }
+  | _id=ident { false }
+  | _id=ident _p=attr_paren_payload { false }
+  | _p=attr_paren_payload { false }
   ;
 
 attr_paren_payload:
@@ -910,6 +1054,21 @@ field_attr:
   ;
 
 type_spec:
+  | base=ident size=type_size LPAREN values=status_value_list RPAREN
+      {
+        if String.uppercase_ascii base.v = "STATUS" then
+          n $startpos $endpos (Ast.TStatus values)
+        else
+          let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
+          let dims =
+            size
+            :: List.map
+                 (fun (value : Ast.status_value Ast.node) ->
+                   Ast.node ~loc:value.loc (Ast.EName value.v.sv_name))
+                 values
+          in
+          n $startpos $endpos (Ast.TArray { elem; dims })
+      }
   | base=ident LPAREN values=status_value_list RPAREN
       {
         if String.uppercase_ascii base.v = "STATUS" then
@@ -976,9 +1135,9 @@ type_size:
   ;
 
 proc_decl:
-  | mod_=modifier_opt PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator body=proc_body_opt
+  | mod_=modifier_opt inline_prefix=inline_opt PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator body=proc_body_opt
       {
-        let seen_rec, seen_rent, ret =
+        let seen_rec, seen_rent, seen_inline, ret =
           merge_proc_header_info pre post
         in
         let use_attr = proc_use_from_flags seen_rec seen_rent in
@@ -999,6 +1158,7 @@ proc_decl:
               body = body_stmt;
               external_modifier = external_modifier_of_string_opt mod_;
               has_body = body <> None;
+              is_inline = inline_prefix || seen_inline;
             }
         in
         let dproc = n $startpos $endpos (Ast.DProc proc) in
@@ -1016,6 +1176,11 @@ proc_decl:
       }
   ;
 
+inline_opt:
+  | /* empty */ { false }
+  | INLINE { true }
+  ;
+
 proc_header_tail_opt:
   | /* empty */ { empty_proc_header_info }
   | xs=proc_header_tail { xs }
@@ -1027,23 +1192,39 @@ proc_header_tail:
   ;
 
 proc_header_atom:
-  | ty=type_spec
+  | INLINE { (false, false, true, None) }
+  | ty=proc_header_type_spec
       {
         match ty.v with
         | Ast.TName id ->
             let k = String.uppercase_ascii id.v in
             if k = "REC" || k = "RECURSIVE" then
-              (true, false, None)
+              (true, false, false, None)
             else if k = "RENT" || k = "REENTRANT" then
-              (false, true, None)
+              (false, true, false, None)
             else
-              (false, false, Some ty)
+              (false, false, false, Some ty)
         | _ ->
-            (false, false, Some ty)
+            (false, false, false, Some ty)
       }
   | _i=INTLIT { empty_proc_header_info }
   | _f=FLOATLIT { empty_proc_header_info }
   | _s=STRINGLIT { empty_proc_header_info }
+  ;
+
+proc_header_type_spec:
+  | base=ident sizes=type_sizes_opt
+      {
+        match String.uppercase_ascii base.v, sizes with
+        | "P", [{ v = Ast.EName pointed; loc = pointed_loc; _ }] ->
+            let inner = Ast.node ~loc:pointed_loc (Ast.TName pointed) in
+            n $startpos $endpos (Ast.TPointer inner)
+        | _, [] ->
+            n $startpos $endpos (Ast.TName base)
+        | _, dims ->
+            let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
+            n $startpos $endpos (Ast.TArray { elem; dims })
+      }
   ;
 
 formals_opt:
@@ -1106,6 +1287,7 @@ rev_decl_section:
   | xs=rev_decl_section ds=define_decl { ds :: xs }
   | xs=rev_decl_section ds=type_decl   { ds :: xs }
   | xs=rev_decl_section ds=block_decl  { ds :: xs }
+  | xs=rev_decl_section ds=overlay_decl { ds :: xs }
   ;
 
 /* =========================================================
@@ -1567,6 +1749,9 @@ module Debug = struct
     | PROC -> "PROC"
     | ITEM -> "ITEM"
     | TABLE -> "TABLE"
+    | READONLY -> "READONLY"
+    | INLINE -> "INLINE"
+    | OVERLAY -> "OVERLAY"
     | STATIC -> "STATIC"
     | CONSTANT -> "CONSTANT"
     | IF -> "IF"
@@ -1652,6 +1837,9 @@ let expected_candidates : token list =
     TABLE;
     STATIC;
     CONSTANT;
+    READONLY;
+    INLINE;
+    OVERLAY;
     PROGRAM;
     COMPOOL;
     ICOMPOOL;

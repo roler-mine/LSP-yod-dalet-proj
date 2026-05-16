@@ -1,3 +1,5 @@
+// Module overview: Normalizes workspace filesystem paths and root relationships across platforms.
+
 import * as path from "path";
 
 function pathLibForPlatform(platform: NodeJS.Platform): typeof path.win32 {

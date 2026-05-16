@@ -1,3 +1,5 @@
+(* Module overview: Reporting endpoints for symbols, semantic tokens, LSIF export, diagnostics, and debug data. *)
+
 module T = Lsp.Types
 open Ast
 open Workspace_foundation
@@ -13,6 +15,17 @@ open Workspace_tuning
 
 module Lsif_delta = Workspace_foundation.Lsif_delta
 module Perf_stats = Workspace_foundation.Perf_stats
+
+let nav_soft_budget_for_ws (ws : t) : int =
+  let profile_budget =
+    match workspace_profile_for_budget ws with
+    | ProfileSmall -> nav_soft_budget_ms
+    | ProfileMedium -> nav_soft_budget_medium_ms
+    | ProfileLarge -> nav_soft_budget_large_ms
+  in
+  if ws.startup_fully_nav_ready_ms = None then
+    min profile_budget nav_startup_soft_budget_ms
+  else profile_budget
 
 type semantic_token = {
   st_line : int;
@@ -134,6 +147,7 @@ let semantic_type_of_metadata (m : Workspace_symbol_metadata.jovial_symbol_metad
   | Workspace_symbol_metadata.JovialTable
   | Workspace_symbol_metadata.JovialConstantItem
   | Workspace_symbol_metadata.JovialConstantTable
+  | Workspace_symbol_metadata.JovialOverlay
   | Workspace_symbol_metadata.JovialStatusConstant
   | Workspace_symbol_metadata.JovialParameter
   | Workspace_symbol_metadata.JovialLabel ->
@@ -149,7 +163,9 @@ let semantic_type_of_metadata (m : Workspace_symbol_metadata.jovial_symbol_metad
 let semantic_mods_for_occurrence ~(decl : def) ~(occ_uri : T.DocumentUri.t)
     ~(occ_loc : Ast.Loc.t) : int =
   let mods =
-    if decl.kind = sym_kind_const || decl.metadata.is_constant then
+    if decl.kind = sym_kind_const || decl.metadata.is_constant
+       || decl.metadata.is_readonly
+    then
       sem_mod_readonly
     else 0
   in
@@ -181,7 +197,7 @@ let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
     | Ast.DProc p ->
         List.iter walk_decl p.v.locals;
         walk_stmt p.v.body
-    | Ast.DVar _ | Ast.DConst _ | Ast.DType _ -> ()
+    | Ast.DVar _ | Ast.DConst _ | Ast.DType _ | Ast.DOverlay _ -> ()
   and walk_stmt (s : Ast.stmt Ast.node) : unit =
     match s.v with
     | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _
@@ -266,11 +282,13 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
   | Parser.STRINGLIT _ -> Some (sem_tt_string, 0)
   | Parser.START | Parser.TERM | Parser.BEGIN | Parser.END | Parser.DEF
   | Parser.REF | Parser.PROC | Parser.ITEM | Parser.TABLE | Parser.STATIC
-  | Parser.CONSTANT | Parser.IF | Parser.ELSE | Parser.WHILE | Parser.FOR
-  | Parser.BY | Parser.THEN | Parser.CASE | Parser.DEFAULT | Parser.FALLTHRU
-  | Parser.EXIT | Parser.GOTO | Parser.RETURN | Parser.ABORT | Parser.STOP
-  | Parser.NOT | Parser.AND | Parser.OR | Parser.XOR | Parser.EQV | Parser.MOD
-  | Parser.TRUE | Parser.FALSE | Parser.PROGRAM | Parser.COMPOOL
+  | Parser.CONSTANT | Parser.READONLY | Parser.INLINE | Parser.OVERLAY
+  | Parser.IF | Parser.ELSE | Parser.WHILE
+  | Parser.FOR | Parser.BY | Parser.THEN | Parser.CASE | Parser.DEFAULT
+  | Parser.FALLTHRU | Parser.EXIT | Parser.GOTO | Parser.RETURN
+  | Parser.ABORT | Parser.STOP | Parser.NOT | Parser.AND | Parser.OR
+  | Parser.XOR | Parser.EQV | Parser.MOD | Parser.TRUE | Parser.FALSE
+  | Parser.PROGRAM | Parser.COMPOOL
   | Parser.ICOMPOOL | Parser.DEFINE | Parser.TYPE | Parser.BLOCK | Parser.POS ->
       Some (sem_tt_keyword, 0)
   | Parser.EQ | Parser.NE | Parser.LT | Parser.LE | Parser.GT | Parser.GE
@@ -407,7 +425,9 @@ let semantic_tokens_for_doc ?budget (ws : t) (doc : Document.t)
     match budget with
     | Some _ as budget -> budget
     | None ->
-        Some (Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms)
+        Some
+          (Workspace_budget.start ~ws
+             ~soft_budget_ms:(nav_soft_budget_for_ws ws))
   in
   let norm_range = Option.map normalize_range_order range in
   let in_range tok =
@@ -574,7 +594,18 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
       | Ast.UseRec -> " REC"
       | Ast.UseRent -> " RENT"
     in
-    "(" ^ params ^ ")" ^ ret ^ attr
+    let inline = if p.v.is_inline then " INLINE" else "" in
+    "(" ^ params ^ ")" ^ ret ^ attr ^ inline
+  in
+  let overlay_target_names (items : Ast.overlay_item Ast.node list) :
+      string list =
+    let rec item acc (it : Ast.overlay_item Ast.node) =
+      match it.v with
+      | Ast.OverlayTarget id -> id.v :: acc
+      | Ast.OverlaySpacer _ -> acc
+      | Ast.OverlayGroup nested -> List.fold_left item acc nested
+    in
+    List.rev (List.fold_left item [] items)
   in
   let rec of_decl (d : Ast.decl Ast.node) : doc_symbol list =
     match d.v with
@@ -629,6 +660,24 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
             ~selection:p.v.name.loc
             ~detail:(Some (proc_detail p))
             ~children:(param_children @ local_children);
+        ]
+    | Ast.DOverlay overlay ->
+        let targets = overlay_target_names overlay.overlay_items in
+        let detail =
+          match targets with
+          | [] -> Some "overlay"
+          | _ -> Some ("overlay " ^ String.concat ", " targets)
+        in
+        let children =
+          targets
+          |> List.map (fun name ->
+                 mk_symbol ~name ~kind:sym_kind_var ~range:d.loc
+                   ~selection:overlay.overlay_name.loc ~detail:(Some "target")
+                   ~children:[])
+        in
+        [
+          mk_symbol ~name:overlay.overlay_name.v ~kind:sym_kind_var ~range:d.loc
+            ~selection:overlay.overlay_name.loc ~detail ~children;
         ]
     | Ast.DDirective { name; args } -> (
         let key = normalize_name name.v in
@@ -938,6 +987,60 @@ let debug_memory_json (ws : t) : Yojson.Safe.t =
       ("semanticTokensCacheEntries", `Int (Hashtbl.length ws.semantic_tokens_cache));
     ]
 
+let layout_debug_json (doc : Document.t) : Yojson.Safe.t =
+  let config = Jovial_layout.config_from_env () in
+  let env = Jovial_compile_time.empty_env () in
+  let register_decl (d : Ast.decl Ast.node) =
+    match d.v with
+    | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ }
+    | Ast.DVar { name; _ }
+    | Ast.DType { name; _ } ->
+        Jovial_compile_time.add_non_constant env name.v
+    | Ast.DConst { name; value; _ } ->
+        Jovial_compile_time.add_constant env name.v value
+    | Ast.DOverlay overlay ->
+        Jovial_compile_time.add_non_constant env overlay.overlay_name.v
+    | Ast.DProc p -> Jovial_compile_time.add_non_constant env p.v.name.v
+    | Ast.DDirective _ -> ()
+  in
+  let rec collect_decl acc (d : Ast.decl Ast.node) =
+    let add_layout acc name ty =
+      match Jovial_layout.table_layout_of_type ~config env ty with
+      | None -> acc
+      | Some layout ->
+          `Assoc
+            [
+              ("name", `String name);
+              ("layout", Jovial_layout.table_layout_to_yojson layout);
+            ]
+          :: acc
+    in
+    match d.v with
+    | Ast.DVar { name; dtype; _ } -> add_layout acc name.v dtype
+    | Ast.DConst { name; dtype = Some dtype; _ } -> add_layout acc name.v dtype
+    | Ast.DType { name; defn; _ } -> add_layout acc name.v defn
+    | Ast.DProc p -> List.fold_left collect_decl acc p.v.locals
+    | Ast.DConst { dtype = None; _ } | Ast.DOverlay _ | Ast.DDirective _ -> acc
+  in
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } ->
+      List.iter
+        (function
+          | Ast.TopDecl d -> register_decl d
+          | Ast.TopStmt _ -> ())
+        prog;
+      let layouts =
+        prog
+        |> List.fold_left
+             (fun acc -> function
+               | Ast.TopDecl d -> collect_decl acc d
+               | Ast.TopStmt _ -> acc)
+             []
+        |> List.rev
+      in
+      `Assoc [ ("tables", `List layouts) ]
+  | _ -> `Assoc [ ("tables", `List []) ]
+
 let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
     Yojson.Safe.t =
   match Hashtbl.find_opt ws.docs uri with
@@ -1170,6 +1273,8 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
                   `String
                     (startup_priority_mode_to_string ws.startup_priority_mode) );
                 ("features", feature_flags_json_for_report ws);
+                ( "implementation",
+                  Implementation_config.to_yojson ws.implementation_config );
               ] );
           ("startup", startup_readiness_json_for_report ws);
           ("compools", compools);
@@ -1177,6 +1282,7 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
           ("includeTargets", `List includes);
           ("reverseIncludeUsers", `List reverse_include_users);
           ("background", background);
+          ("layout", layout_debug_json doc);
           ( "query",
             Workspace_query.debug_report_json ws doc );
           ( "semanticGraph",
@@ -1627,7 +1733,9 @@ let semantic_tokens_for (ws : t) ~(uri : T.DocumentUri.t)
         ~uri:(Uri_path.docuri_to_string uri)
         ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev;
       let budget =
-        Some (Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms)
+        Some
+          (Workspace_budget.start ~ws
+             ~soft_budget_ms:(nav_soft_budget_for_ws ws))
       in
       let data =
         semantic_tokens_for_doc ?budget ws doc ~range
@@ -1693,7 +1801,9 @@ let semantic_tokens_delta_for (ws : t) ~(uri : T.DocumentUri.t)
   | None -> None
   | Some doc ->
       let budget =
-        Some (Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms)
+        Some
+          (Workspace_budget.start ~ws
+             ~soft_budget_ms:(nav_soft_budget_for_ws ws))
       in
       let new_data =
         semantic_tokens_for_doc ?budget ws doc ~range:None

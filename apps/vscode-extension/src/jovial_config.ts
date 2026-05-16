@@ -1,3 +1,5 @@
+// Module overview: Reads VS Code settings and converts them into typed Jovial client/server initialization options.
+
 import {
   sanitizeSourceExtensions,
   sourceExtensionsWithDefaults,
@@ -28,6 +30,18 @@ export type JovialFeatureFlags = {
   inlayHints: boolean;
   formatting: boolean;
   semanticTokens: boolean;
+};
+
+export type JovialImplementationConfig = {
+  dialect: string;
+  bitsInWord: number | null;
+  bytesInWord: number | null;
+  floatPrecision: number | null;
+  fixedPrecision: number | null;
+  maxIntSize: number | null;
+  maxBits: number | null;
+  maxBytes: number | null;
+  systemSubroutines: string[];
 };
 
 export type JovialPassiveFeatureOverrides = {
@@ -76,6 +90,7 @@ export type JovialConfig = {
   extraSourceFileExtensions: string[];
   sourceExtensions: string[];
   features: JovialFeatureFlags;
+  implementation: JovialImplementationConfig;
 };
 
 export type JovialSourceFileSet = {
@@ -242,6 +257,7 @@ export type JovialInitializationOptions = {
       enableHugeFileFullParse: boolean;
       backgroundParseWorkerCount: number;
     };
+    implementation: JovialImplementationConfig;
   };
 };
 
@@ -358,12 +374,21 @@ export function sanitizePositiveInt(value: unknown, fallback: number): number {
   return Math.max(1, Math.trunc(value));
 }
 
+export function sanitizeOptionalPositiveInt(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.max(1, Math.trunc(value));
+}
+
 export function sanitizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+}
+
+function sanitizeOptionalString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 export function sanitizeCustomEnabledFeatures(
@@ -461,6 +486,35 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
     formatting: passiveFeatures.formatting,
     semanticTokens: passiveFeatures.semanticTokens,
   };
+  const implementation: JovialImplementationConfig = {
+    dialect: sanitizeOptionalString(
+      source.get<unknown>("implementation.dialect", ""),
+    ),
+    bitsInWord: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.bitsInWord", null),
+    ),
+    bytesInWord: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.bytesInWord", null),
+    ),
+    floatPrecision: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.floatPrecision", null),
+    ),
+    fixedPrecision: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.fixedPrecision", null),
+    ),
+    maxIntSize: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.maxIntSize", null),
+    ),
+    maxBits: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.maxBits", null),
+    ),
+    maxBytes: sanitizeOptionalPositiveInt(
+      source.get<unknown>("implementation.maxBytes", null),
+    ),
+    systemSubroutines: sanitizeStringArray(
+      source.get<unknown>("implementation.systemSubroutines", []),
+    ),
+  };
 
   return {
     serverPath: source.get<string>("server.path", ""),
@@ -498,16 +552,16 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
       131072,
     ),
     hugeFileThresholdBytes: sanitizePositiveInt(
-      source.get<unknown>("performance.hugeFileThresholdBytes", 20971520),
-      20971520,
+      source.get<unknown>("performance.hugeFileThresholdBytes", 15728640),
+      15728640,
     ),
     fullSemanticTokensMaxBytes: sanitizePositiveInt(
       source.get<unknown>("performance.fullSemanticTokensMaxBytes", 1048576),
       1048576,
     ),
     fullParseMaxBytes: sanitizePositiveInt(
-      source.get<unknown>("performance.fullParseMaxBytes", 5242880),
-      5242880,
+      source.get<unknown>("performance.fullParseMaxBytes", 15728640),
+      15728640,
     ),
     enableHugeFileFullParse: source.get<boolean>(
       "performance.enableHugeFileFullParse",
@@ -518,8 +572,8 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
       2,
     ),
     parseMaxFileBytes: sanitizePositiveInt(
-      source.get<unknown>("server.parseMaxFileBytes", 5242880),
-      5242880,
+      source.get<unknown>("server.parseMaxFileBytes", 15728640),
+      15728640,
     ),
     pressureSoftMb: sanitizePositiveInt(
       source.get<unknown>("server.pressureSoftMb", 512),
@@ -540,6 +594,7 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
     extraSourceFileExtensions,
     sourceExtensions,
     features,
+    implementation,
   };
 }
 
@@ -587,6 +642,7 @@ export function buildInitializationOptions(
         enableHugeFileFullParse: config.enableHugeFileFullParse,
         backgroundParseWorkerCount: config.backgroundParseWorkerCount,
       },
+      implementation: config.implementation,
     },
   };
 }

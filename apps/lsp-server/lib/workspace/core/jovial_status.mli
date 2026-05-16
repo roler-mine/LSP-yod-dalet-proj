@@ -1,3 +1,5 @@
+(** Module overview: Status and diagnostic helpers for Jovial semantic analysis results. *)
+
 type value = {
   name : string;
   key : string;

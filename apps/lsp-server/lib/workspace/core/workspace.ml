@@ -1,3 +1,5 @@
+(* Module overview: Facade that exposes the workspace API used by the LSP server. *)
+
 module T = Lsp.Types
 
 type t = Workspace_foundation.t
@@ -25,6 +27,11 @@ let drain_pending_diag_updates = Workspace_background.drain_pending_diag_updates
 let drain_open_diag_revalidate_uris =
   Workspace_background.drain_open_diag_revalidate_uris
 
+let drain_open_parse_results_now ws =
+  Workspace_background.drain_parse_worker_results ~open_only:true ws
+    ~max_items:16;
+  Workspace_runtime.update_startup_ready_state ws
+
 let finish_open_doc_now_if_needed =
   Workspace_background.finish_open_doc_now_if_needed
 
@@ -38,9 +45,11 @@ let startup_background_budget_ms = Workspace_runtime.startup_background_budget_m
 let feature_flags = Workspace_runtime.feature_flags
 let startup_priority_mode = Workspace_runtime.startup_priority_mode
 let startup_navigation_ready_now = Workspace_runtime.startup_navigation_ready_now
+let quick_nav_index_complete = Workspace_runtime.quick_nav_index_complete
 let startup_diag_hover_ready_now = Workspace_runtime.startup_diag_hover_ready_now
 let startup_is_ready_now = Workspace_runtime.startup_is_ready_now
 let open_doc_count = Workspace_runtime.open_doc_count
+let background_work_pending = Workspace_runtime.background_work_pending
 let startup_readiness_json_for_report =
   Workspace_runtime.startup_readiness_json_for_report
 
@@ -52,6 +61,7 @@ let request_cancelled = Workspace_runtime.request_cancelled
 let with_request_cancel_checker = Workspace_runtime.with_request_cancel_checker
 let diagnostics_for = Workspace_state.diagnostics_for
 let document_version = Workspace_state.document_version
+let document_text_length = Workspace_state.document_text_length
 let diagnostics_snapshot_for = Workspace_state.diagnostics_snapshot_for
 let ast_dump_for = Workspace_state.ast_dump_for
 let cst_dump_for = Workspace_state.cst_dump_for
@@ -73,6 +83,9 @@ let document_symbols_for = Workspace_reporting.document_symbols_for
 let workspace_symbols_for = Workspace_symbols.workspace_symbols_for
 let workspace_symbols_stream = Workspace_symbols.workspace_symbols_stream
 let hover_for = Workspace_query.hover_for
+let explain_symbol_resolution_json =
+  Workspace_query.explain_symbol_resolution_json
+
 let signature_help_for = Workspace_signature_help.signature_help_for
 let prepare_rename_for = Workspace_rename.prepare_rename_for
 let rename_for = Workspace_rename.rename_for
@@ -93,10 +106,11 @@ let debug_report_for = Workspace_reporting.debug_report_for
 let debug_scheduler_json = Workspace_reporting.debug_scheduler_json
 let debug_memory_json = Workspace_reporting.debug_memory_json
 let snapshot = Workspace_snapshot.of_workspace
+let cached_snapshot = Workspace_snapshot.cached_for_workspace
 
 let publish_snapshot ws =
   let snap = Workspace_snapshot.of_workspace ws in
-  Workspace_snapshot.publish snap;
+  Workspace_snapshot.publish_for_workspace ws snap;
   match ws.Workspace_foundation.root_path with
   | None -> ()
   | Some root -> Workspace_persistent_index.save_snapshot_index ~root snap

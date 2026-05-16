@@ -1,3 +1,5 @@
+(* Module overview: Normalizes Jovial source-file extensions and filename matching rules. *)
+
 let default_extensions = [ ".jov"; ".j73"; ".jvl" ]
 
 let is_extension_char = function

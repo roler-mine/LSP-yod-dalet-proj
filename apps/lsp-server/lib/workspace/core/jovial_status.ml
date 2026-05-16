@@ -1,3 +1,5 @@
+(* Module overview: Status and diagnostic helpers for Jovial semantic analysis results. *)
+
 let normalize name = String.uppercase_ascii (String.trim name)
 
 type value = {
@@ -128,7 +130,7 @@ let rec owners_of_decl (d : Ast.decl Ast.node) : owner list =
       owners_of_type_expr ~owner_name:name.v ~owner_loc:name.loc dtype
   | Ast.DConst { name; dtype = Some dtype; _ } ->
       owners_of_type_expr ~owner_name:name.v ~owner_loc:name.loc dtype
-  | Ast.DConst { dtype = None; _ } | Ast.DDirective _ -> []
+  | Ast.DConst { dtype = None; _ } | Ast.DOverlay _ | Ast.DDirective _ -> []
   | Ast.DProc p ->
       List.concat_map owners_of_decl p.v.locals @ owners_of_stmt p.v.body
 

@@ -1,3 +1,5 @@
+(* Module overview: Produces code actions from diagnostics and workspace context. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_lookup

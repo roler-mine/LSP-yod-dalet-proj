@@ -1,3 +1,5 @@
+(** Module overview: Filesystem-backed workspace index for source discovery and dependency lookup. *)
+
 type t
 type file_change_kind = Created | Changed | Deleted
 

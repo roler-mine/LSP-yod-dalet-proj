@@ -1,0 +1,220 @@
+{
+  "tool": "jovial-vscode-e2e-perf",
+  "generatedAt": "2026-05-16T19:56:07.487Z",
+  "note": "Measures VS Code extension-host UX path: extension activation, LanguageClient processing, stdio JSON-RPC, real OCaml LSP server processing, provider command results, and unsaved edit-to-diagnostics latency.",
+  "workspacePath": "C:\\Users\\IDAN\\AppData\\Local\\Temp\\jovial-vscode-e2e-unulQd\\workspace",
+  "samplePath": "C:\\Users\\IDAN\\AppData\\Local\\Temp\\jovial-vscode-e2e-unulQd\\workspace\\MAIN.j73",
+  "serverPath": "C:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\lsp-server\\_build-win32-x64\\install\\default\\bin\\jovial-lsp.exe",
+  "profile": "huge",
+  "sampleBytes": 4194344,
+  "hugeThresholdBytes": 3145728,
+  "fullParseMaxBytes": 5242880,
+  "commandSamples": 3,
+  "providerRange": {
+    "start": {
+      "line": 0,
+      "character": 0
+    },
+    "end": {
+      "line": 29,
+      "character": 36
+    }
+  },
+  "activation": {
+    "name": "openDocument.extensionActivate.serverInitialize",
+    "durationMs": 677.784
+  },
+  "commands": [
+    {
+      "name": "documentSymbols",
+      "iterations": 3,
+      "durationsMs": [
+        916.88,
+        4.429,
+        1.433
+      ],
+      "stats": {
+        "minMs": 1.433,
+        "p50Ms": 4.429,
+        "p95Ms": 916.88,
+        "p99Ms": 916.88,
+        "maxMs": 916.88,
+        "avgMs": 307.581
+      },
+      "resultSummary": {
+        "kind": "undefined"
+      },
+      "errors": []
+    },
+    {
+      "name": "hover",
+      "iterations": 3,
+      "durationsMs": [
+        176.459,
+        183.916,
+        189.878
+      ],
+      "stats": {
+        "minMs": 176.459,
+        "p50Ms": 183.916,
+        "p95Ms": 189.878,
+        "p99Ms": 189.878,
+        "maxMs": 189.878,
+        "avgMs": 183.418
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "definition",
+      "iterations": 3,
+      "durationsMs": [
+        250.311,
+        188.589,
+        1606.275
+      ],
+      "stats": {
+        "minMs": 188.589,
+        "p50Ms": 250.311,
+        "p95Ms": 1606.275,
+        "p99Ms": 1606.275,
+        "maxMs": 1606.275,
+        "avgMs": 681.725
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "references",
+      "iterations": 3,
+      "durationsMs": [
+        4.779,
+        4.916,
+        5.073
+      ],
+      "stats": {
+        "minMs": 4.779,
+        "p50Ms": 4.916,
+        "p95Ms": 5.073,
+        "p99Ms": 5.073,
+        "maxMs": 5.073,
+        "avgMs": 4.923
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "inlayHints",
+      "iterations": 3,
+      "durationsMs": [
+        2.985,
+        4.949,
+        4.894
+      ],
+      "stats": {
+        "minMs": 2.985,
+        "p50Ms": 4.894,
+        "p95Ms": 4.949,
+        "p99Ms": 4.949,
+        "maxMs": 4.949,
+        "avgMs": 4.276
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "semanticTokens.range",
+      "iterations": 3,
+      "durationsMs": [
+        8.275,
+        7.745,
+        2.913
+      ],
+      "stats": {
+        "minMs": 2.913,
+        "p50Ms": 7.745,
+        "p95Ms": 8.275,
+        "p99Ms": 8.275,
+        "maxMs": 8.275,
+        "avgMs": 6.311
+      },
+      "resultSummary": {
+        "kind": "semanticTokens",
+        "dataLength": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "completion",
+      "iterations": 3,
+      "durationsMs": [
+        81.26,
+        68.681,
+        66.818
+      ],
+      "stats": {
+        "minMs": 66.818,
+        "p50Ms": 68.681,
+        "p95Ms": 81.26,
+        "p99Ms": 81.26,
+        "maxMs": 81.26,
+        "avgMs": 72.253
+      },
+      "resultSummary": {
+        "kind": "objectWithItems",
+        "length": 10001
+      },
+      "errors": []
+    }
+  ],
+  "diagnostics": {
+    "baseline": {
+      "name": "diagnostics.baselineStable",
+      "durationMs": 559.013,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "brokenEdit": {
+      "name": "diagnostics.afterBrokenEdit",
+      "durationMs": 60052.602,
+      "count": 0,
+      "fingerprint": "",
+      "messages": [],
+      "error": "Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/IDAN/AppData/Local/Temp/jovial-vscode-e2e-unulQd/workspace/MAIN.j73\n\tat waitForDiagnosticsChange (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:231:11)\n\tat async captureDiagnosticStep (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:266:24)\n\tat async measureDiagnostics (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:276:20)\n\tat async runBenchmark (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:309:25)\n\tat async Object.run (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:358:5)"
+    },
+    "restoredEdit": {
+      "name": "diagnostics.afterRestoreEdit",
+      "durationMs": 60081.824,
+      "count": 0,
+      "fingerprint": "",
+      "messages": [],
+      "error": "Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/IDAN/AppData/Local/Temp/jovial-vscode-e2e-unulQd/workspace/MAIN.j73\n\tat waitForDiagnosticsChange (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:231:11)\n\tat async captureDiagnosticStep (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:266:24)\n\tat async measureDiagnostics (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:278:22)\n\tat async runBenchmark (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:309:25)\n\tat async Object.run (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:358:5)"
+    },
+    "restoredMatchesBaseline": true,
+    "errors": [
+      "diagnostics.afterBrokenEdit: Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/IDAN/AppData/Local/Temp/jovial-vscode-e2e-unulQd/workspace/MAIN.j73\n\tat waitForDiagnosticsChange (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:231:11)\n\tat async captureDiagnosticStep (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:266:24)\n\tat async measureDiagnostics (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:276:20)\n\tat async runBenchmark (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:309:25)\n\tat async Object.run (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:358:5)",
+      "diagnostics.afterRestoreEdit: Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/IDAN/AppData/Local/Temp/jovial-vscode-e2e-unulQd/workspace/MAIN.j73\n\tat waitForDiagnosticsChange (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:231:11)\n\tat async captureDiagnosticStep (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:266:24)\n\tat async measureDiagnostics (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:278:22)\n\tat async runBenchmark (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:309:25)\n\tat async Object.run (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:358:5)"
+    ]
+  },
+  "summary": {
+    "commandErrors": [],
+    "diagnosticsRestoredToBaseline": true,
+    "diagnosticErrors": [
+      "diagnostics.afterBrokenEdit: Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/IDAN/AppData/Local/Temp/jovial-vscode-e2e-unulQd/workspace/MAIN.j73\n\tat waitForDiagnosticsChange (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:231:11)\n\tat async captureDiagnosticStep (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:266:24)\n\tat async measureDiagnostics (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:276:20)\n\tat async runBenchmark (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:309:25)\n\tat async Object.run (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:358:5)",
+      "diagnostics.afterRestoreEdit: Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/IDAN/AppData/Local/Temp/jovial-vscode-e2e-unulQd/workspace/MAIN.j73\n\tat waitForDiagnosticsChange (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:231:11)\n\tat async captureDiagnosticStep (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:266:24)\n\tat async measureDiagnostics (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:278:22)\n\tat async runBenchmark (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:309:25)\n\tat async Object.run (c:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:358:5)"
+    ]
+  }
+}

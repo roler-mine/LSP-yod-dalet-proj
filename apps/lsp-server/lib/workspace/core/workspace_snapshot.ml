@@ -1,3 +1,5 @@
+(* Module overview: Immutable workspace snapshot model used by persistent indexes and LSIF export. *)
+
 module UriMap = Map.Make (String)
 
 type file_state = {
@@ -34,6 +36,7 @@ let empty () =
 
 let latest_mtx = Mutex.create ()
 let latest = ref (empty ())
+let workspace_cache : (int, snapshot) Hashtbl.t = Hashtbl.create 16
 
 let current () =
   Mutex.lock latest_mtx;
@@ -45,6 +48,22 @@ let publish snap =
   Mutex.lock latest_mtx;
   if snap.generation >= (!latest).generation then latest := snap;
   Mutex.unlock latest_mtx
+
+let cached_for_workspace (ws : Workspace_foundation.t) : snapshot option =
+  if ws.Workspace_foundation.ide_snapshot_dirty then None
+  else (
+    Mutex.lock latest_mtx;
+    let snap = Hashtbl.find_opt workspace_cache ws.workspace_id in
+    Mutex.unlock latest_mtx;
+    snap)
+
+let publish_for_workspace (ws : Workspace_foundation.t) (snap : snapshot) =
+  Mutex.lock latest_mtx;
+  Hashtbl.replace workspace_cache ws.workspace_id snap;
+  if snap.generation >= (!latest).generation then latest := snap;
+  Mutex.unlock latest_mtx;
+  ws.ide_snapshot_generation <- snap.generation;
+  ws.ide_snapshot_dirty <- false
 
 let skeleton_of_doc (doc : Document.t) : Skeleton_index.skeleton_file option =
   Skeleton_index.of_document doc
@@ -117,37 +136,39 @@ let ensure_system_scope scopes =
        })
 
 let of_workspace (ws : Workspace_foundation.t) : snapshot =
-  let symbols = Symbol_index.empty () in
-  let scopes = Scope_graph.empty () in
-  let refs = Reference_index.empty () in
-  let deps = Dependency_graph.empty () in
-  ensure_system_scope scopes;
-  let files = ref UriMap.empty in
-  let seen = Hashtbl.create 128 in
-  let add_doc doc =
-    let state = file_state_of_doc ws doc in
-    if not (Hashtbl.mem seen state.uri) then (
-      Hashtbl.replace seen state.uri true;
-      files := UriMap.add state.uri state !files;
-      match state.skeleton with
-      | None -> ()
-      | Some sk ->
-          let file_symbols = Symbol_index.of_skeleton sk in
-          Symbol_index.all file_symbols |> List.iter (Symbol_index.add symbols);
-          let file_refs = Reference_index.of_skeleton file_symbols sk in
-          Reference_index.all file_refs |> List.iter (Reference_index.add refs);
-          merge_scope_into scopes (Scope_graph.of_skeleton sk);
-          merge_deps_into deps (Dependency_graph.of_skeleton sk))
-  in
-  Hashtbl.iter (fun _ doc -> add_doc doc) ws.docs;
-  Hashtbl.iter (fun _ doc -> add_doc doc) ws.files;
-  {
-    generation = Semantic_store.global_rev ws.semantic_store;
-    files = !files;
-    symbols;
-    scopes;
-    refs;
-    deps;
-  }
+  Workspace_foundation.Perf_stats.time "snapshot.of_workspace_ms" (fun () ->
+      let symbols = Symbol_index.empty () in
+      let scopes = Scope_graph.empty () in
+      let refs = Reference_index.empty () in
+      let deps = Dependency_graph.empty () in
+      ensure_system_scope scopes;
+      let files = ref UriMap.empty in
+      let seen = Hashtbl.create 128 in
+      let add_doc doc =
+        let state = file_state_of_doc ws doc in
+        if not (Hashtbl.mem seen state.uri) then (
+          Hashtbl.replace seen state.uri true;
+          files := UriMap.add state.uri state !files;
+          match state.skeleton with
+          | None -> ()
+          | Some sk ->
+              let file_symbols = Symbol_index.of_skeleton sk in
+              Symbol_index.all file_symbols
+              |> List.iter (Symbol_index.add symbols);
+              let file_refs = Reference_index.of_skeleton file_symbols sk in
+              Reference_index.all file_refs |> List.iter (Reference_index.add refs);
+              merge_scope_into scopes (Scope_graph.of_skeleton sk);
+              merge_deps_into deps (Dependency_graph.of_skeleton sk))
+      in
+      Hashtbl.iter (fun _ doc -> add_doc doc) ws.docs;
+      Hashtbl.iter (fun _ doc -> add_doc doc) ws.files;
+      {
+        generation = Semantic_store.global_rev ws.semantic_store;
+        files = !files;
+        symbols;
+        scopes;
+        refs;
+        deps;
+      })
 
 let file snap ~(uri : string) = UriMap.find_opt uri snap.files

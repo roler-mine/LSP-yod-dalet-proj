@@ -1,3 +1,5 @@
+(* Module overview: Reference lookup and streaming reference results for large workspaces. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_model

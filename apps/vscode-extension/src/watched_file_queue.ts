@@ -1,3 +1,5 @@
+// Module overview: Coalesces file watcher events before they are sent to the language server.
+
 import { watchPathKey } from "./workspace_paths";
 import { DEFAULT_JOVIAL_SOURCE_EXTENSIONS } from "./source_extensions";
 import { shouldIgnoreSourcePath } from "./ignored_paths";

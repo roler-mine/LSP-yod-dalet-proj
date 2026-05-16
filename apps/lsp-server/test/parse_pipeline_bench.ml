@@ -1,3 +1,5 @@
+(* Module overview: Test support and regression coverage for parse pipeline bench. *)
+
 module T = Lsp.Types
 module Lib = Jovial_lsp_lib
 

@@ -1,3 +1,5 @@
+(* Module overview: Maps internal Jovial symbol categories to LSP symbol-kind values. *)
+
 module T = Lsp.Types
 
 open Workspace_nav_model
@@ -42,7 +44,8 @@ let lsp_symbol_kind_of_metadata
   | Metadata.JovialDefine | Metadata.JovialConstantItem
   | Metadata.JovialConstantTable | Metadata.JovialStatusConstant ->
       T.SymbolKind.Constant
-  | Metadata.JovialItem | Metadata.JovialTable | Metadata.JovialParameter ->
+  | Metadata.JovialItem | Metadata.JovialTable | Metadata.JovialOverlay
+  | Metadata.JovialParameter ->
       T.SymbolKind.Variable
   | Metadata.JovialUnknownSymbol -> fallback
 
@@ -81,8 +84,8 @@ let completion_kind_of_metadata
   | Metadata.JovialDefine | Metadata.JovialConstantItem
   | Metadata.JovialConstantTable | Metadata.JovialStatusConstant ->
       T.CompletionItemKind.Constant
-  | Metadata.JovialItem | Metadata.JovialTable | Metadata.JovialParameter
-  | Metadata.JovialLabel ->
+  | Metadata.JovialItem | Metadata.JovialTable | Metadata.JovialOverlay
+  | Metadata.JovialParameter | Metadata.JovialLabel ->
       T.CompletionItemKind.Variable
   | Metadata.JovialUnknownSymbol -> fallback
 

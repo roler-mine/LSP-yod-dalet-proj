@@ -1,3 +1,5 @@
+// Module overview: Integration test suite that exercises the extension inside a VS Code test host.
+
 import { strict as assert } from "assert";
 import * as fs from "fs";
 import * as path from "path";

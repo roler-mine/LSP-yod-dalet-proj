@@ -1,3 +1,5 @@
+(* Module overview: Tuning constants and policy helpers for parsing, indexing, navigation, and memory pressure. *)
+
 type parse_policy = Perf_log.parse_policy =
   | Forbid_sync_parse
   | Allow_sync_parse_if_small
@@ -20,7 +22,7 @@ let has_current_parse = Document.has_current_parse
 type file_mode = Small | Normal | Large | Huge
 
 let file_mode_of_size (ws : Workspace_foundation.t) ~(bytes : int) : file_mode =
-  if bytes >= ws.Workspace_foundation.huge_file_threshold_bytes then Huge
+  if bytes > ws.Workspace_foundation.huge_file_threshold_bytes then Huge
   else if bytes >= ws.Workspace_foundation.full_semantic_tokens_max_bytes then
     Large
   else if bytes >= ws.Workspace_foundation.large_file_threshold_bytes then
@@ -42,7 +44,15 @@ let full_parse_allowed_for_size (ws : Workspace_foundation.t) ~(bytes : int) :
   bytes <= ws.Workspace_foundation.full_parse_max_bytes
   &&
   (ws.Workspace_foundation.enable_huge_file_full_parse
-  || bytes < ws.Workspace_foundation.huge_file_threshold_bytes)
+  || bytes <= ws.Workspace_foundation.huge_file_threshold_bytes)
+
+let open_doc_ready_target_ms =
+  max 1 (Env_utils.nonneg_int "JOVIAL_OPEN_DOC_READY_TARGET_MS" ~default:1500)
+
+let open_doc_huge_ready_target_ms =
+  max open_doc_ready_target_ms
+    (Env_utils.nonneg_int "JOVIAL_OPEN_DOC_HUGE_READY_TARGET_MS"
+       ~default:10000)
 
 let index_bootstrap_dirs = 64
 let index_bootstrap_files = 6000
@@ -138,6 +148,21 @@ let bg_seed_paths_per_tick =
 let nav_soft_budget_ms =
   max 1 (Env_utils.nonneg_int "JOVIAL_NAV_SOFT_BUDGET_MS" ~default:1800)
 
+let nav_soft_budget_medium_ms =
+  max 1
+    (Env_utils.nonneg_int "JOVIAL_NAV_SOFT_BUDGET_MS_MEDIUM"
+       ~default:(min nav_soft_budget_ms 350))
+
+let nav_soft_budget_large_ms =
+  max 1
+    (Env_utils.nonneg_int "JOVIAL_NAV_SOFT_BUDGET_MS_LARGE"
+       ~default:(min nav_soft_budget_ms 120))
+
+let nav_startup_soft_budget_ms =
+  max 1
+    (Env_utils.nonneg_int "JOVIAL_NAV_STARTUP_SOFT_BUDGET_MS"
+       ~default:(min nav_soft_budget_ms 80))
+
 let nav_quick_scan_files =
   match Sys.getenv_opt "JOVIAL_NAV_QUICK_SCAN_FILES" with
   | Some _ -> Env_utils.nonneg_int "JOVIAL_NAV_QUICK_SCAN_FILES" ~default:48
@@ -148,7 +173,7 @@ let nav_quick_scan_total_bytes =
     ~default:(12 * 1024 * 1024)
 
 let nav_quick_scan_per_file_bytes =
-  Env_utils.nonneg_int "JOVIAL_NAV_QUICK_SCAN_PER_FILE_BYTES" ~default:262144
+  Env_utils.nonneg_int "JOVIAL_NAV_QUICK_SCAN_PER_FILE_BYTES" ~default:65536
 
 let nav_miss_import_scan_max_chars =
   max 4096

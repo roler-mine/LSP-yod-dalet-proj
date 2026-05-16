@@ -1,3 +1,5 @@
+(** Module overview: In-memory document model with text indexes, parse caches, diagnostics, and versions. *)
+
 module T = Lsp.Types
 
 type t = private {
@@ -109,6 +111,8 @@ val with_parse_skipped : T.Diagnostic.t list -> t -> t
 val diagnostics : t -> T.Diagnostic.t list
 val lsp_version : t -> int option
 val with_lsp_version : int option -> t -> t
+val with_identity :
+  ?lsp_version:int -> uri:T.DocumentUri.t -> file:string option -> t -> t
 val ast_dump : ?max_depth:int -> ?max_nodes:int -> t -> string option
 val imports : t -> Preprocess.import list
 val text : t -> string

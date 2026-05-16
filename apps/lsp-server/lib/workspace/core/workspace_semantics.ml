@@ -1,3 +1,5 @@
+(* Module overview: Semantic validation and type-aware symbol metadata extraction. *)
+
 module T = Lsp.Types
 open Ast
 open Workspace_foundation
@@ -276,8 +278,11 @@ let block_proc_names_of_program (prog : Ast.program) : (string, bool) Hashtbl.t
     prog;
   out
 
-let sem_exports_of_program (prog : Ast.program) : sem_exports =
-  let out = sem_scope_empty () in
+let sem_exports_of_program_with_base ?(base : sem_scope option)
+    (prog : Ast.program) : sem_exports =
+  let out =
+    match base with None -> sem_scope_empty () | Some s -> sem_scope_copy s
+  in
   let block_names = block_proc_names_of_program prog in
   let is_block_proc (p : Ast.proc Ast.node) : bool =
     Hashtbl.mem block_names (normalize_name p.v.name.v)
@@ -288,7 +293,7 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
     | Ast.DProc p ->
         if in_block || is_block_proc p then
           List.iter (collect_types_decl ~in_block:true) p.v.locals
-    | Ast.DVar _ | Ast.DConst _ | Ast.DDirective _ -> ()
+    | Ast.DVar _ | Ast.DConst _ | Ast.DOverlay _ | Ast.DDirective _ -> ()
   in
   let rec collect_values_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit
       =
@@ -302,7 +307,7 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
           | None -> TyUnknown
         in
         sem_add_value out name.v (SVConst ty)
-    | Ast.DType _ -> ()
+    | Ast.DType _ | Ast.DOverlay _ -> ()
     | Ast.DProc p ->
         if not in_block then
           sem_add_value out p.v.name.v
@@ -322,6 +327,9 @@ let sem_exports_of_program (prog : Ast.program) : sem_exports =
       | Ast.TopStmt _ -> ())
     prog;
   out
+
+let sem_exports_of_program (prog : Ast.program) : sem_exports =
+  sem_exports_of_program_with_base prog
 
 let rich_proc_sig_of_proc (scope : rich_scope) (p : Ast.proc Ast.node) :
     rich_proc_sig =
@@ -365,8 +373,11 @@ let rich_proc_sig_of_proc (scope : rich_scope) (p : Ast.proc Ast.node) :
   let ret_ty = Option.map (rich_ty_of_type_expr proc_scope) p.v.returns in
   { rich_param_tys = param_tys; rich_ret_ty = ret_ty; rich_use_attr = p.v.use_attr }
 
-let rich_exports_of_program (prog : Ast.program) : rich_scope =
-  let out = rich_scope_empty () in
+let rich_exports_of_program_with_base ?(base : rich_scope option)
+    (prog : Ast.program) : rich_scope =
+  let out =
+    match base with None -> rich_scope_empty () | Some s -> rich_scope_copy s
+  in
   let block_names = block_proc_names_of_program prog in
   let is_block_proc (p : Ast.proc Ast.node) : bool =
     Hashtbl.mem block_names (normalize_name p.v.name.v)
@@ -377,7 +388,7 @@ let rich_exports_of_program (prog : Ast.program) : rich_scope =
     | Ast.DProc p ->
         if in_block || is_block_proc p then
           List.iter (collect_types_decl ~in_block:true) p.v.locals
-    | Ast.DVar _ | Ast.DConst _ | Ast.DDirective _ -> ()
+    | Ast.DVar _ | Ast.DConst _ | Ast.DOverlay _ | Ast.DDirective _ -> ()
   in
   let rec collect_values_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit
       =
@@ -391,7 +402,7 @@ let rich_exports_of_program (prog : Ast.program) : rich_scope =
           | None -> Jovial_type.Unknown
         in
         rich_add_value out name.v (RichConst ty)
-    | Ast.DType _ -> ()
+    | Ast.DType _ | Ast.DOverlay _ -> ()
     | Ast.DProc p ->
         if not in_block then
           rich_add_value out p.v.name.v
@@ -412,6 +423,9 @@ let rich_exports_of_program (prog : Ast.program) : rich_scope =
     prog;
   out
 
+let rich_exports_of_program (prog : Ast.program) : rich_scope =
+  rich_exports_of_program_with_base prog
+
 let sem_exports_of_doc (doc : Document.t) : sem_exports =
   let doc = Document.ensure_parsed doc in
   match Document.current_parse doc with
@@ -423,6 +437,61 @@ let rich_exports_of_doc (doc : Document.t) : rich_scope =
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } -> rich_exports_of_program prog
   | _ -> rich_scope_empty ()
+
+let semantic_export_cache_limit = 512
+let sem_exports_with_import_cache : (string, sem_exports) Hashtbl.t =
+  Hashtbl.create 128
+
+let rich_exports_with_import_cache : (string, rich_scope) Hashtbl.t =
+  Hashtbl.create 128
+
+let doc_text_hash_for_export_cache (ws : t) (doc : Document.t) : string =
+  match
+    Semantic_store.snapshot_for_uri ws.semantic_store ~uri:doc.Document.uri
+  with
+  | Some snap
+    when snap.Semantic_store.Snapshot.doc_rev = doc.Document.parse_rev ->
+      snap.Semantic_store.Snapshot.text_hash
+  | _ -> Digest.to_hex (Digest.string doc.Document.text)
+
+let export_cache_key (ws : t) (doc : Document.t) ~(kind : string) : string =
+  Printf.sprintf "%s|wid:%d|store:%d|rev:%d|parse:%d|uri:%s|hash:%s" kind
+    ws.workspace_id
+    (Semantic_store.global_rev ws.semantic_store)
+    doc.Document.rev doc.Document.parse_rev
+    (Uri_path.docuri_to_string doc.Document.uri)
+    (doc_text_hash_for_export_cache ws doc)
+
+let clear_export_cache_if_large tbl =
+  if Hashtbl.length tbl > semantic_export_cache_limit then Hashtbl.clear tbl
+
+let cached_sem_exports_with_imports (ws : t) (doc : Document.t)
+    (compute : unit -> sem_exports) : sem_exports =
+  let key = export_cache_key ws doc ~kind:"sem" in
+  match Hashtbl.find_opt sem_exports_with_import_cache key with
+  | Some exp ->
+      Perf_stats.tick "diag.semantic_exports_cache_hit";
+      exp
+  | None ->
+      Perf_stats.tick "diag.semantic_exports_cache_miss";
+      let exp = compute () in
+      clear_export_cache_if_large sem_exports_with_import_cache;
+      Hashtbl.replace sem_exports_with_import_cache key exp;
+      exp
+
+let cached_rich_exports_with_imports (ws : t) (doc : Document.t)
+    (compute : unit -> rich_scope) : rich_scope =
+  let key = export_cache_key ws doc ~kind:"rich" in
+  match Hashtbl.find_opt rich_exports_with_import_cache key with
+  | Some exp ->
+      Perf_stats.tick "diag.rich_exports_cache_hit";
+      exp
+  | None ->
+      Perf_stats.tick "diag.rich_exports_cache_miss";
+      let exp = compute () in
+      clear_export_cache_if_large rich_exports_with_import_cache;
+      Hashtbl.replace rich_exports_with_import_cache key exp;
+      exp
 
 let add_compool_hint (tbl : (string, string list) Hashtbl.t)
     ~(symbol_key : string) ~(compool_key : string) : unit =
@@ -465,38 +534,42 @@ let build_symbol_hint_index (ws : t) :
                 if k = "" then None else Some k))
   in
 
+  let add_skeleton_hints compool (doc : Document.t) : unit =
+    match Skeleton_index.of_document doc with
+    | None -> ()
+    | Some sk ->
+        Skeleton_index.symbols sk
+        |> List.iter (fun (sym : Skeleton_index.symbol_decl) ->
+               match sym.metadata.Metadata.jovial_kind with
+               | Metadata.JovialType | Metadata.JovialBuiltinType ->
+                   add_compool_hint types ~symbol_key:sym.normalized_name
+                     ~compool_key:compool
+               | Metadata.JovialItem | Metadata.JovialTable
+               | Metadata.JovialBlock | Metadata.JovialProcedure
+               | Metadata.JovialFunction | Metadata.JovialConstantItem
+               | Metadata.JovialConstantTable
+               | Metadata.JovialStatusConstant ->
+                   add_compool_hint values ~symbol_key:sym.normalized_name
+                     ~compool_key:compool
+               | _ -> ())
+  in
+
   let add_doc_hints (doc : Document.t) : unit =
     match hint_compool_key_of_doc doc with
     | None -> ()
     | Some compool ->
-        let exp = sem_exports_of_doc doc in
-        Hashtbl.iter
-          (fun sym _v ->
-            add_compool_hint values ~symbol_key:sym ~compool_key:compool)
-          exp.values;
-        Hashtbl.iter
-          (fun sym _ ->
-            add_compool_hint types ~symbol_key:sym ~compool_key:compool)
-          exp.types;
-        (match Skeleton_index.of_document doc with
-        | None -> ()
-        | Some sk ->
-            Skeleton_index.symbols sk
-            |> List.iter (fun (sym : Skeleton_index.symbol_decl) ->
-                   match sym.metadata.Metadata.jovial_kind with
-                   | Metadata.JovialType | Metadata.JovialBuiltinType ->
-                       add_compool_hint types
-                         ~symbol_key:sym.normalized_name
-                         ~compool_key:compool
-                   | Metadata.JovialItem | Metadata.JovialTable
-                   | Metadata.JovialBlock | Metadata.JovialProcedure
-                   | Metadata.JovialFunction | Metadata.JovialConstantItem
-                   | Metadata.JovialConstantTable
-                   | Metadata.JovialStatusConstant ->
-                       add_compool_hint values
-                         ~symbol_key:sym.normalized_name
-                         ~compool_key:compool
-                   | _ -> ()))
+        if String.length doc.Document.text <= ws.large_file_threshold_bytes then (
+          let exp = sem_exports_of_doc doc in
+          Hashtbl.iter
+            (fun sym _v ->
+              add_compool_hint values ~symbol_key:sym ~compool_key:compool)
+            exp.values;
+          Hashtbl.iter
+            (fun sym _ ->
+              add_compool_hint types ~symbol_key:sym ~compool_key:compool)
+            exp.types)
+        else Perf_stats.tick "bg.hint_large_doc_skeleton_only";
+        add_skeleton_hints compool doc
   in
 
   let add_path_hints (p : string) : unit =
@@ -678,18 +751,19 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         emit_diag diag
       in
       let emit_import_hint (loc : Ast.Loc.t) ~(kind : string) ~(symbol : string)
-          ~(compools : string list) =
+          ~(compools : string list) ~(selected_imported : bool) =
         let k =
-          Printf.sprintf "%s|%d|%d|import|%s|%s|%s"
+          Printf.sprintf "%s|%d|%d|import|%s|%s|%b|%s"
             (match loc.file with Some f -> f | None -> "")
-            loc.start_pos.line loc.start_pos.col kind symbol
+            loc.start_pos.line loc.start_pos.col kind symbol selected_imported
             (String.concat "," compools)
         in
         if not (Hashtbl.mem seen k) then (
           Hashtbl.replace seen k true;
           out :=
             DiagAuth.cross_module_authoritative
-              (diag_missing_import_hint ~loc ~kind ~symbol ~compools)
+              (diag_missing_import_hint ~selected_imported ~loc ~kind ~symbol
+                 ~compools)
             :: !out)
       in
 
@@ -810,7 +884,19 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
       let suggest_missing_import ~(loc : Ast.Loc.t) ~(kind : string)
           ~(is_type : bool) ~(symbol : string) : unit =
         let compools = hint_compools_for ~is_type symbol in
-        if compools <> [] then emit_import_hint loc ~kind ~symbol ~compools
+        let selected_compools =
+          compools
+          |> List.filter (fun c ->
+                 match Hashtbl.find_opt imported_compools (normalize_name c) with
+                 | Some `Selected -> true
+                 | Some `All | None -> false)
+        in
+        if selected_compools <> [] then
+          emit_import_hint loc ~kind ~symbol ~compools:selected_compools
+            ~selected_imported:true
+        else if compools <> [] then
+          emit_import_hint loc ~kind ~symbol ~compools
+            ~selected_imported:false
       in
 
       let has_import_hint ~(is_type : bool) (symbol : string) : bool =
@@ -826,31 +912,101 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             Hashtbl.replace doc_cache key x;
             x
       in
-      let get_exports_for_compool (name : string) : sem_exports option =
+      let merge_sem_import (base : sem_scope) (imp : compool_import_dir)
+          (exp : sem_exports) : unit =
+        if imp.selected = [] then (
+          Hashtbl.iter
+            (fun k v -> sem_add_value ~overwrite:false base k v)
+            exp.values;
+          Hashtbl.iter
+            (fun k v -> sem_add_type ~overwrite:false base k v)
+            exp.types)
+        else
+          List.iter
+            (fun (nm, _loc) ->
+              let key = normalize_name nm in
+              (match Hashtbl.find_opt exp.values key with
+              | Some v -> sem_add_value ~overwrite:false base key v
+              | None -> ());
+              match Hashtbl.find_opt exp.types key with
+              | Some t -> sem_add_type ~overwrite:false base key t
+              | None -> ())
+            imp.selected
+      in
+      let merge_rich_import (base : rich_scope) (imp : compool_import_dir)
+          (exp : rich_scope) : unit =
+        if imp.selected = [] then (
+          Hashtbl.iter
+            (fun k v -> rich_add_value ~overwrite:false base k v)
+            exp.rich_values;
+          Hashtbl.iter
+            (fun k v -> rich_add_type ~overwrite:false base k v)
+            exp.rich_types)
+        else
+          List.iter
+            (fun (nm, _loc) ->
+              let key = normalize_name nm in
+              (match Hashtbl.find_opt exp.rich_values key with
+              | Some v -> rich_add_value ~overwrite:false base key v
+              | None -> ());
+              match Hashtbl.find_opt exp.rich_types key with
+              | Some t -> rich_add_type ~overwrite:false base key t
+              | None -> ())
+            imp.selected
+      in
+      let rec get_exports_for_compool (name : string) : sem_exports option =
         let key = normalize_name name in
         match Hashtbl.find_opt exports_cache key with
         | Some x -> x
         | None ->
+            Hashtbl.replace exports_cache key None;
             let x =
               match get_doc_for_compool key with
               | None -> None
-              | Some d -> Some (sem_exports_of_doc d)
+              | Some d -> Some (sem_exports_of_doc_with_imports d)
             in
             Hashtbl.replace exports_cache key x;
             x
+      and sem_exports_of_doc_with_imports (d : Document.t) : sem_exports =
+        cached_sem_exports_with_imports ws d (fun () ->
+            let d = Document.ensure_parsed d in
+            match Document.current_parse d with
+            | Some { Document.parsed_ast = Some prog; _ } ->
+                let base = sem_scope_empty () in
+                sem_import_dirs d
+                |> List.iter (fun imp ->
+                       match get_exports_for_compool imp.compool with
+                       | None -> ()
+                       | Some exp -> merge_sem_import base imp exp);
+                sem_exports_of_program_with_base ~base prog
+            | _ -> sem_scope_empty ())
       in
-      let get_rich_exports_for_compool (name : string) : rich_scope option =
+      let rec get_rich_exports_for_compool (name : string) : rich_scope option =
         let key = normalize_name name in
         match Hashtbl.find_opt rich_exports_cache key with
         | Some x -> x
         | None ->
+            Hashtbl.replace rich_exports_cache key None;
             let x =
               match get_doc_for_compool key with
               | None -> None
-              | Some d -> Some (rich_exports_of_doc d)
+              | Some d -> Some (rich_exports_of_doc_with_imports d)
             in
             Hashtbl.replace rich_exports_cache key x;
             x
+      and rich_exports_of_doc_with_imports (d : Document.t) : rich_scope =
+        cached_rich_exports_with_imports ws d (fun () ->
+            let d = Document.ensure_parsed d in
+            match Document.current_parse d with
+            | Some { Document.parsed_ast = Some prog; _ } ->
+                let base = rich_scope_empty () in
+                sem_import_dirs d
+                |> List.iter (fun imp ->
+                       match get_rich_exports_for_compool imp.compool with
+                       | None -> ()
+                       | Some exp -> merge_rich_import base imp exp);
+                rich_exports_of_program_with_base ~base prog
+            | _ -> rich_scope_empty ())
       in
 
       let selected_import_contains (imp : compool_import_dir) (key : string) :
@@ -871,11 +1027,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                  List.mem (normalize_name imp.compool) (Lazy.force hinted_compools)
                in
                match get_exports_for_compool imp.compool with
-               | None -> imp.selected = [] || selected
-               | Some exp ->
-                   let exported =
-                     if is_type then Hashtbl.mem exp.types key
-                     else Hashtbl.mem exp.values key
+                | None ->
+                    if imp.selected = [] then hinted else selected
+                | Some exp ->
+                    let exported =
+                      if is_type then Hashtbl.mem exp.types key
+                      else Hashtbl.mem exp.values key
                    in
                    let visible = exported || hinted in
                    if imp.selected = [] then visible else selected && visible)
@@ -904,20 +1061,28 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                          import_dirs
             in
             qualified_import_match
-            || List.exists
-                 (fun imp ->
-                   let selected_match =
-                     List.exists (fun (nm, _loc) -> nm = key) imp.selected
-                   in
-                   match get_exports_for_compool imp.compool with
-                   | None -> true
-                   | Some exp ->
-                       let exported =
-                         if is_type then Hashtbl.mem exp.types key
-                         else Hashtbl.mem exp.values key
-                       in
-                       if imp.selected = [] then exported else selected_match)
-                 import_dirs
+            ||
+            let hinted_compools = lazy (raw_hint_compools_for ~is_type name) in
+            let import_matches_hint imp =
+              List.mem (normalize_name imp.compool) (Lazy.force hinted_compools)
+              && (imp.selected = [] || selected_import_contains imp key)
+            in
+            List.exists import_matches_hint import_dirs
+            ||
+            List.exists
+              (fun imp ->
+                let selected_match =
+                  List.exists (fun (nm, _loc) -> nm = key) imp.selected
+                in
+                match get_exports_for_compool imp.compool with
+                | None -> selected_match
+                | Some exp ->
+                    let exported =
+                      if is_type then Hashtbl.mem exp.types key
+                      else Hashtbl.mem exp.values key
+                    in
+                    if imp.selected = [] then exported else selected_match)
+              import_dirs
       in
       let should_suppress_cross_module_unresolved ~(is_type : bool)
           ~(name : string) : bool =
@@ -944,57 +1109,10 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         else emit loc message
       in
 
-      let scope = sem_scope_copy (sem_exports_of_program prog) in
-      let rich_scope = rich_scope_copy (rich_exports_of_program prog) in
-      List.iter
-        (fun imp ->
-          match get_exports_for_compool imp.compool with
-          | None -> ()
-          | Some exp ->
-              if imp.selected = [] then (
-                Hashtbl.iter
-                  (fun k v -> sem_add_value ~overwrite:false scope k v)
-                  exp.values;
-                Hashtbl.iter
-                  (fun k v -> sem_add_type ~overwrite:false scope k v)
-                  exp.types)
-              else (
-                List.iter
-                  (fun (nm, _loc) ->
-                    match Hashtbl.find_opt exp.values nm with
-                    | Some v -> sem_add_value ~overwrite:false scope nm v
-                    | None -> ())
-                  imp.selected;
-                List.iter
-                  (fun (nm, _loc) ->
-                    match Hashtbl.find_opt exp.types nm with
-                    | Some t -> sem_add_type ~overwrite:false scope nm t
-                    | None -> ())
-                  imp.selected))
-        import_dirs;
-      List.iter
-        (fun imp ->
-          match get_rich_exports_for_compool imp.compool with
-          | None -> ()
-          | Some exp ->
-              if imp.selected = [] then (
-                Hashtbl.iter
-                  (fun k v -> rich_add_value ~overwrite:false rich_scope k v)
-                  exp.rich_values;
-                Hashtbl.iter
-                  (fun k v -> rich_add_type ~overwrite:false rich_scope k v)
-                  exp.rich_types)
-              else
-                List.iter
-                  (fun (nm, _loc) ->
-                    match Hashtbl.find_opt exp.rich_values nm with
-                    | Some v -> rich_add_value ~overwrite:false rich_scope nm v
-                    | None -> (
-                        match Hashtbl.find_opt exp.rich_types nm with
-                        | Some t -> rich_add_type ~overwrite:false rich_scope nm t
-                        | None -> ()))
-                  imp.selected)
-        import_dirs;
+      let scope = sem_scope_copy (sem_exports_of_doc_with_imports doc) in
+      let rich_scope =
+        rich_scope_copy (rich_exports_of_doc_with_imports doc)
+      in
 
       let sem_lookup_value (scp : sem_scope) (name : string) : sem_value option
           =
@@ -1005,6 +1123,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         let k = normalize_name name in
         k = "__CONV__" || k = "__PRESET__" || k = "__POW__" || k = "__RANGE__"
         || is_builtin_function_name k
+        || Implementation_config.is_system_subroutine ws.implementation_config k
       in
 
       let register_ctf_decl_symbol (ctf_env : Jovial_compile_time.env)
@@ -1016,17 +1135,25 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             Jovial_compile_time.add_constant ctf_env name.v value
         | Ast.DVar { name; _ } | Ast.DType { name; _ } ->
             Jovial_compile_time.add_non_constant ctf_env name.v
+        | Ast.DOverlay overlay ->
+            Jovial_compile_time.add_non_constant ctf_env
+              overlay.overlay_name.v
         | Ast.DProc p ->
             Jovial_compile_time.add_non_constant ctf_env p.v.name.v
         | Ast.DDirective _ -> ()
       in
 
       let top_ctf_env = Jovial_compile_time.empty_env () in
+      Jovial_compile_time.add_implementation_config top_ctf_env
+        ws.implementation_config;
       List.iter
         (function
           | Ast.TopDecl d -> register_ctf_decl_symbol top_ctf_env d
           | Ast.TopStmt _ -> ())
         prog;
+      let layout_config =
+        Jovial_layout.config_of_implementation_config ws.implementation_config
+      in
 
       let emit_compile_time_required ?message
           (ctf_env : Jovial_compile_time.env) (e : Ast.expr Ast.node) : unit =
@@ -1131,6 +1258,16 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           fields
       in
 
+      let emit_layout_issues (ctf_env : Jovial_compile_time.env)
+          (t : Ast.type_expr Ast.node) : unit =
+        match Jovial_layout.table_layout_of_type ~config:layout_config ctf_env t with
+        | None -> ()
+        | Some layout ->
+            Jovial_layout.issues_for_layout layout
+            |> List.iter (fun (issue : Jovial_layout.issue) ->
+                   emit issue.loc issue.message)
+      in
+
       let emit_invalid_dimension (loc : Ast.Loc.t) (msg : string) =
         emit loc ("Invalid table dimension: " ^ msg)
       in
@@ -1198,10 +1335,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.TName _ -> ()
         | Ast.TArray { elem; dims } ->
             List.iter (check_compile_time_dim ctf_env) dims;
+            emit_layout_issues ctf_env t;
             check_compile_time_type_expr ctf_env elem
         | Ast.TSpecifiedTable { elem; dims; kind } ->
             List.iter (check_compile_time_dim ctf_env) dims;
             check_specified_table_layout ctf_env ~kind elem;
+            emit_layout_issues ctf_env t;
             check_compile_time_type_expr ctf_env elem
         | Ast.TPointer inner -> check_compile_time_type_expr ctf_env inner
         | Ast.TStatus values ->
@@ -1242,13 +1381,16 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             let k = normalize_name id.v in
             if
               k <> ""
+              && k <> "__IMPLICIT__"
               && (not (sem_is_builtin_type k))
               && not (Hashtbl.mem scp.types k)
             then
               if maybe_visible_through_import ~is_type:true ~name:id.v then ()
-              else
+              else if has_import_hint ~is_type:true id.v then
                 suggest_missing_import ~loc:id.loc ~kind:"Type" ~is_type:true
                   ~symbol:id.v
+              else
+                emit id.loc (Printf.sprintf "Undefined type %S." id.v)
         | Ast.TPointer inner -> check_type_import_hints scp inner
         | Ast.TArray { elem; _ } | Ast.TSpecifiedTable { elem; _ } ->
             check_type_import_hints scp elem
@@ -1297,14 +1439,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             other
       in
 
-      let sem_field_ty_in (field_name : string) (ty : sem_ty) : sem_ty option =
+      let rec sem_field_ty_in (field_name : string) (ty : sem_ty) :
+          sem_ty option =
         match ty with
         | TyRecord fields -> sem_find_record_field fields field_name
         | TyArray (TyRecord fields) -> sem_find_record_field fields field_name
-        | TyArray inner -> (
-            match inner with
-            | TyRecord fields -> sem_find_record_field fields field_name
-        | _ -> None)
+        | TyArray inner -> sem_field_ty_in field_name inner
         | _ -> None
       in
 
@@ -1420,6 +1560,14 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                   (match sig_.param_tys with
                   | None -> ()
                   | Some pts ->
+                      let expected_count = List.length pts in
+                      let actual_count = List.length args in
+                      if actual_count <> expected_count then
+                        emit callee.loc
+                          (Printf.sprintf
+                             "Argument count mismatch in call to %S: expected \
+                              %d, provided %d."
+                             callee.v expected_count actual_count);
                       let rec check_pairs ps xs =
                         match (ps, xs) with
                         | pty :: pst, arg :: xst ->
@@ -1434,8 +1582,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                                    (sem_ty_to_mismatch_string aty));
                             check_pairs pst xst
                         | _, [] -> ()
-                        | [], _ :: xst ->
-                            (* Extra args: parse them, but avoid noisy count errors for now. *)
+                        | [], xst ->
                             List.iter
                               (fun a -> ignore (ty_of_expr scp current_proc a))
                               xst
@@ -1549,8 +1696,10 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                 match sem_field_ty_in id.v qualified_target with
                 | Some ty -> ty
                 | None ->
-                    emit id.loc
-                      (Printf.sprintf "Unknown field %S for @ access." id.v);
+                    if has_import_hint ~is_type:false id.v then ()
+                    else
+                      emit id.loc
+                        (Printf.sprintf "Unknown field %S for @ access." id.v);
                     TyUnknown))
         | Ast.EDeref { ptr } ->
             let pt = ty_of_expr scp current_proc ptr in
@@ -1668,15 +1817,23 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
       let constant_table_keys : (string, Ast.ident) Hashtbl.t =
         Hashtbl.create 32
       in
+      let readonly_data_keys : (string, Ast.ident) Hashtbl.t =
+        Hashtbl.create 32
+      in
       let rec collect_constant_table_decl (d : Ast.decl Ast.node) : unit =
         match d.v with
         | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ } ->
             let key = normalize_name name.v in
             if key <> "" then Hashtbl.replace constant_table_keys key name
+        | Ast.DVar { name; is_readonly = true; _ } ->
+            let key = normalize_name name.v in
+            if key <> "" then Hashtbl.replace readonly_data_keys key name
         | Ast.DProc p ->
             List.iter collect_constant_table_decl p.v.locals;
             collect_constant_table_stmt p.v.body
-        | Ast.DVar _ | Ast.DConst _ | Ast.DType _ | Ast.DDirective _ -> ()
+        | Ast.DVar _ | Ast.DConst _ | Ast.DType _ | Ast.DOverlay _
+        | Ast.DDirective _ ->
+            ()
       and collect_constant_table_stmt (s : Ast.stmt Ast.node) : unit =
         match s.v with
         | Ast.SDecl d -> collect_constant_table_decl d
@@ -1710,6 +1867,22 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             constant_table_lvalue base
         | Ast.EAt { field; _ } -> constant_table_lvalue field
         | Ast.EParen inner -> constant_table_lvalue inner
+        | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _
+        | Ast.EPreset _ | Ast.ERange _ | Ast.EDeref _ ->
+            None
+      in
+
+      let rec readonly_data_lvalue (e : Ast.expr Ast.node) :
+          Ast.ident option =
+        match e.v with
+        | Ast.EName id | Ast.ECall { callee = id; _ } ->
+            if Hashtbl.mem readonly_data_keys (normalize_name id.v) then
+              Some id
+            else None
+        | Ast.EIndex { base; _ } | Ast.EField { base; _ } ->
+            readonly_data_lvalue base
+        | Ast.EAt { field; _ } -> readonly_data_lvalue field
+        | Ast.EParen inner -> readonly_data_lvalue inner
         | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _
         | Ast.EPreset _ | Ast.ERange _ | Ast.EDeref _ ->
             None
@@ -1992,6 +2165,55 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | _ -> ()
       in
 
+      let validate_overlay_decl (scp : sem_scope)
+          (ctf_env : Jovial_compile_time.env)
+          (overlay : Ast.overlay_decl) : unit =
+        let seen_targets : (string, Ast.ident) Hashtbl.t = Hashtbl.create 16 in
+        let check_target (id : Ast.ident) =
+          let key = normalize_name id.v in
+          if key <> "" then (
+            (match Hashtbl.find_opt seen_targets key with
+            | Some first ->
+                emit id.loc
+                  (Printf.sprintf
+                     "Duplicate OVERLAY target %S; first listed at line %d."
+                     id.v first.loc.Ast.Loc.start_pos.line)
+            | None -> Hashtbl.add seen_targets key id);
+            match sem_lookup_value scp id.v with
+            | Some _ -> ()
+            | None ->
+                emit id.loc
+                  (Printf.sprintf
+                     "Unknown OVERLAY target %S. Declare the item, table, or block before using it in an OVERLAY."
+                     id.v))
+        in
+        let check_spacer (expr : Ast.expr Ast.node) =
+          match
+            ctf_int_required_value
+              ~message:"Invalid OVERLAY spacer expression" ctf_env expr
+          with
+          | Some n when n < 0L ->
+              emit expr.loc
+                (Printf.sprintf
+                   "Invalid OVERLAY spacer expression: spacer size must be non-negative, got %Ld."
+                   n)
+          | _ -> ()
+        in
+        let rec check_item (item : Ast.overlay_item Ast.node) =
+          match item.v with
+          | Ast.OverlayTarget id -> check_target id
+          | Ast.OverlaySpacer expr -> check_spacer expr
+          | Ast.OverlayGroup items -> List.iter check_item items
+        in
+        (match overlay.overlay_pos with
+        | None -> ()
+        | Some pos ->
+            ignore
+              (ctf_int_required_value
+                 ~message:"Invalid OVERLAY POS expression" ctf_env pos));
+        List.iter check_item overlay.overlay_items
+      in
+
       let add_decl_symbol (scp : sem_scope) (d : Ast.decl Ast.node) : unit =
         match d.v with
         | Ast.DType { name; defn; _ } -> sem_add_type scp name.v defn
@@ -2008,7 +2230,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.DProc p ->
             sem_add_value scp p.v.name.v
               (SVProc (sem_proc_sig_of_proc scp.types p))
-        | Ast.DDirective _ -> ()
+        | Ast.DOverlay _ | Ast.DDirective _ -> ()
       in
 
       let rich_add_decl_symbol (rscp : rich_scope) (d : Ast.decl Ast.node) :
@@ -2028,7 +2250,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.DProc p ->
             rich_add_value rscp p.v.name.v
               (RichProc (rich_proc_sig_of_proc rscp p))
-        | Ast.DDirective _ -> ()
+        | Ast.DOverlay _ | Ast.DDirective _ -> ()
       in
 
       let rec collect_label_depths_for_stmt (out : (string, int) Hashtbl.t)
@@ -2104,6 +2326,14 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                 emit lhs.loc
                   (Printf.sprintf
                      "Cannot assign to constant table %S; CONSTANT TABLE \
+                      declarations are readonly."
+                     id.v));
+            (match readonly_data_lvalue lhs with
+            | None -> ()
+            | Some id ->
+                emit lhs.loc
+                  (Printf.sprintf
+                     "Cannot assign to readonly data %S; READONLY \
                       declarations are readonly."
                      id.v));
             let lhs_ty = ty_of_lvalue scp current_proc lhs in
@@ -2347,6 +2577,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.DType { defn; _ } ->
             check_type_import_hints scp defn;
             check_compile_time_type_expr ctf_env defn
+        | Ast.DOverlay overlay -> validate_overlay_decl scp ctf_env overlay
         | Ast.DDirective _ -> ()
         | Ast.DProc p ->
             let proc_scope = sem_scope_copy scp in

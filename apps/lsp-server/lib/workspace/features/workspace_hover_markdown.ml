@@ -1,3 +1,5 @@
+(* Module overview: Markdown rendering helpers for hover responses. *)
+
 module T = Lsp.Types
 
 let hover_markdown ?range (value : string) : T.Hover.t =

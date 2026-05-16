@@ -1,3 +1,5 @@
+(** Module overview: Menhir grammar and interface for building the recoverable Jovial syntax tree. *)
+
 (** Public syntax parser API.
 
     Menhir owns the implementation in [parser.mly]. This source interface keeps
@@ -22,11 +24,13 @@ type token =
   | RPAREN
   | RETURN
   | REF
+  | READONLY
   | PROGRAM
   | PROC
   | POW
   | POS
   | PLUS
+  | OVERLAY
   | OR
   | NOT
   | NE
@@ -37,6 +41,7 @@ type token =
   | LE
   | ITEM
   | INTLIT of string
+  | INLINE
   | IF
   | ID of string
   | ICOMPOOL

@@ -1,3 +1,5 @@
+(* Module overview: Top-level LSP event loop that dispatches client messages into workspace operations. *)
+
 module T = Lsp.Types
 module Req = Lsp_request
 module Resp = Lsp_response
@@ -5,30 +7,14 @@ module Perf_stats = Workspace_foundation.Perf_stats
 
 let json_obj = Resp.json_obj
 let index_health_check_interval_ms = 15_000.0
+let interactive_background_grace_ms = 50.0
 
-let get_assoc (j : Yojson.Safe.t) : (string * Yojson.Safe.t) list option =
-  match j with `Assoc xs -> Some xs | _ -> None
-
-let find_field (k : string) (xs : (string * Yojson.Safe.t) list) =
-  List.assoc_opt k xs
-
-let method_of_msg (j : Yojson.Safe.t) : string option =
-  match get_assoc j with
-  | None -> None
-  | Some xs -> (
-      match find_field "method" xs with Some (`String m) -> Some m | _ -> None)
-
-let id_of_msg (j : Yojson.Safe.t) : Yojson.Safe.t option =
-  match get_assoc j with None -> None | Some xs -> find_field "id" xs
-
-let params_of_msg (j : Yojson.Safe.t) : Yojson.Safe.t =
-  match get_assoc j with
-  | None -> `Null
-  | Some xs -> (
-      match find_field "params" xs with Some p -> p | None -> `Null)
-
-let is_request (j : Yojson.Safe.t) : bool =
-  match id_of_msg j with Some _ -> true | None -> false
+let get_assoc = Req.get_assoc
+let find_field = Req.find_field
+let method_of_msg = Req.method_of_msg
+let id_of_msg = Req.id_of_msg
+let params_of_msg = Req.params_of_msg
+let is_request = Req.is_request
 
 let respond = Resp.respond
 let respond_error = Resp.respond_error
@@ -110,6 +96,18 @@ let finish_document_diagnostics_now_if_needed (ws : Workspace.t)
   if Workspace.open_doc_converged ws ~uri then false
   else Workspace.finish_open_doc_now_if_needed ws ~uri
 
+let should_finish_document_diagnostics_inline (ws : Workspace.t) ~(text_len : int)
+    : bool =
+  text_len <= 256_000 && Workspace.startup_diag_hover_ready_now ws
+
+let maybe_finish_document_diagnostics_inline (ws : Workspace.t)
+    ~(uri : T.DocumentUri.t) ~(text_len : int) : bool =
+  if should_finish_document_diagnostics_inline ws ~text_len then
+    finish_document_diagnostics_now_if_needed ws ~uri
+  else (
+    Perf_stats.tick "diag.open.finish_deferred";
+    false)
+
 let initialize_result_json = Resp.initialize_result_json
 
 let file_of_uri (u : T.DocumentUri.t) : string option =
@@ -144,20 +142,27 @@ let publish_partial_diagnostics_on_failure (ws : Workspace.t) (oc : out_channel)
     changed)
   else false
 
-let parse_uri_arg (arg : Yojson.Safe.t) : T.DocumentUri.t option =
-  match arg with
-  | `String s -> Uri_path.docuri_of_string s
-  | `Assoc xs -> (
-      match List.assoc_opt "uri" xs with
-      | Some (`String s) -> Uri_path.docuri_of_string s
-      | _ -> None)
-  | _ -> None
+let parse_uri_arg = Req.parse_uri_arg
+let parse_int_arg = Req.parse_int_arg
 
-let parse_int_arg (arg : Yojson.Safe.t) : int option =
-  match arg with
-  | `Int n -> Some n
-  | `Intlit s -> ( try Some (int_of_string s) with _ -> None)
-  | _ -> None
+let parse_position_arg (arg : Yojson.Safe.t) : T.Position.t option =
+  let int_field key xs =
+    match find_field key xs with
+    | Some (`Int n) -> Some n
+    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
+    | _ -> None
+  in
+  match get_assoc arg with
+  | None -> None
+  | Some xs -> (
+      let fields =
+        match find_field "position" xs with
+        | Some (`Assoc pxs) -> pxs
+        | _ -> xs
+      in
+      match (int_field "line" fields, int_field "character" fields) with
+      | Some line, Some character -> Some { T.Position.line; character }
+      | _ -> None)
 
 let parse_did_open_payload (params : Yojson.Safe.t) :
     (T.DocumentUri.t * int option * string) option =
@@ -180,61 +185,9 @@ let parse_did_open_payload (params : Yojson.Safe.t) :
           | _ -> None)
       | _ -> None)
 
-let parse_text_document_uri (params : Yojson.Safe.t) : T.DocumentUri.t option =
-  match get_assoc params with
-  | None -> None
-  | Some xs -> (
-      match find_field "textDocument" xs with
-      | Some (`Assoc tdxs) -> (
-          match find_field "uri" tdxs with
-          | Some (`String s) -> Uri_path.docuri_of_string s
-          | _ -> None)
-      | _ -> None)
-
-let parse_position (params : Yojson.Safe.t) : T.Position.t option =
-  let int_field key xs =
-    match find_field key xs with
-    | Some (`Int n) -> Some n
-    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
-    | _ -> None
-  in
-  match get_assoc params with
-  | None -> None
-  | Some xs -> (
-      match find_field "position" xs with
-      | Some (`Assoc pxs) -> (
-          match (int_field "line" pxs, int_field "character" pxs) with
-          | Some line, Some character -> Some { T.Position.line; character }
-          | _ -> None)
-      | _ -> None)
-
-let parse_position_obj (j : Yojson.Safe.t) : T.Position.t option =
-  let int_field key xs =
-    match find_field key xs with
-    | Some (`Int n) -> Some n
-    | Some (`Intlit s) -> ( try Some (int_of_string s) with _ -> None)
-    | _ -> None
-  in
-  match get_assoc j with
-  | None -> None
-  | Some xs -> (
-      match (int_field "line" xs, int_field "character" xs) with
-      | Some line, Some character -> Some { T.Position.line; character }
-      | _ -> None)
-
-let parse_range (params : Yojson.Safe.t) : T.Range.t option =
-  match get_assoc params with
-  | None -> None
-  | Some xs -> (
-      match find_field "range" xs with
-      | Some (`Assoc rxs) -> (
-          match (find_field "start" rxs, find_field "end" rxs) with
-          | Some s, Some e -> (
-              match (parse_position_obj s, parse_position_obj e) with
-              | Some start, Some end_ -> Some { T.Range.start; end_ }
-              | _ -> None)
-          | _ -> None)
-      | _ -> None)
+let parse_text_document_uri = Req.parse_text_document_uri
+let parse_position = Req.parse_position
+let parse_range = Req.parse_range
 
 let parse_formatting_options (params : Yojson.Safe.t) :
     Workspace_formatting.options =
@@ -263,30 +216,9 @@ let parse_formatting_options (params : Yojson.Safe.t) :
           }
       | _ -> default)
 
-let parse_new_name (params : Yojson.Safe.t) : string option =
-  match get_assoc params with
-  | None -> None
-  | Some xs -> (
-      match find_field "newName" xs with
-      | Some (`String s) -> Some s
-      | _ -> None)
-
-let parse_include_declaration (params : Yojson.Safe.t) : bool =
-  match get_assoc params with
-  | None -> true
-  | Some xs -> (
-      match find_field "context" xs with
-      | Some (`Assoc cxs) -> (
-          match find_field "includeDeclaration" cxs with
-          | Some (`Bool b) -> b
-          | _ -> true)
-      | _ -> true)
-
-let parse_workspace_symbol_query (params : Yojson.Safe.t) : string =
-  match get_assoc params with
-  | None -> ""
-  | Some xs -> (
-      match find_field "query" xs with Some (`String s) -> s | _ -> "")
+let parse_new_name = Req.parse_new_name
+let parse_include_declaration = Req.parse_include_declaration
+let parse_workspace_symbol_query = Req.parse_workspace_symbol_query
 
 let progress_token_of_json = function
   | `String s -> Some (`String s)
@@ -303,68 +235,12 @@ let parse_partial_result_token (params : Yojson.Safe.t) :
       | None -> None
       | Some token -> progress_token_of_json token)
 
-let parse_cancel_request_id (params : Yojson.Safe.t) : Yojson.Safe.t option =
-  match get_assoc params with None -> None | Some xs -> find_field "id" xs
-
-let parse_root_uri (params : Yojson.Safe.t) : T.DocumentUri.t option =
-  match get_assoc params with
-  | None -> None
-  | Some xs -> (
-      match find_field "rootUri" xs with
-      | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
-      | _ -> (
-          match find_field "workspaceFolders" xs with
-          | Some (`List (`Assoc f0 :: _)) -> (
-              match find_field "uri" f0 with
-              | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
-              | _ -> None)
-          | _ -> None))
-
-let parse_workspace_folder_roots (params : Yojson.Safe.t) : T.DocumentUri.t list
-    =
-  match get_assoc params with
-  | None -> []
-  | Some xs -> (
-      match find_field "workspaceFolders" xs with
-      | Some (`List folders) ->
-          folders
-          |> List.filter_map (function
-            | `Assoc fxs -> (
-                match find_field "uri" fxs with
-                | Some (`String s) when s <> "" -> Uri_path.docuri_of_string s
-                | _ -> None)
-            | _ -> None)
-      | _ -> [])
-
-let parse_root_uris (params : Yojson.Safe.t) : T.DocumentUri.t list =
-  let roots = parse_workspace_folder_roots params in
-  if roots <> [] then roots
-  else match parse_root_uri params with Some u -> [ u ] | None -> []
-
-let parse_root_path (params : Yojson.Safe.t) : string option =
-  match get_assoc params with
-  | None -> None
-  | Some xs -> (
-      match find_field "rootPath" xs with
-      | Some (`String s) when s <> "" -> Some s
-      | _ -> None)
-
-let parse_semantic_tokens_refresh_support (params : Yojson.Safe.t) : bool =
-  match get_assoc params with
-  | None -> false
-  | Some xs -> (
-      match find_field "capabilities" xs with
-      | Some (`Assoc cxs) -> (
-          match find_field "workspace" cxs with
-          | Some (`Assoc wxs) -> (
-              match find_field "semanticTokens" wxs with
-              | Some (`Assoc stxs) -> (
-                  match find_field "refreshSupport" stxs with
-                  | Some (`Bool b) -> b
-                  | _ -> false)
-              | _ -> false)
-          | _ -> false)
-      | _ -> false)
+let parse_cancel_request_id = Req.parse_cancel_request_id
+let parse_root_uri = Req.parse_root_uri
+let parse_root_uris = Req.parse_root_uris
+let parse_root_path = Req.parse_root_path
+let parse_semantic_tokens_refresh_support =
+  Req.parse_semantic_tokens_refresh_support
 
 let parse_diagnostic_pull_support (params : Yojson.Safe.t) : bool =
   match get_assoc params with
@@ -397,38 +273,7 @@ let parse_diagnostic_refresh_support (params : Yojson.Safe.t) : bool =
           | _ -> false)
       | _ -> false)
 
-let parse_watched_file_changes (params : Yojson.Safe.t) :
-    bool * int * (string * [ `Created | `Changed | `Deleted ]) list =
-  let parse_kind = function
-    | `Int 1 | `Intlit "1" -> Some `Created
-    | `Int 2 | `Intlit "2" -> Some `Changed
-    | `Int 3 | `Intlit "3" -> Some `Deleted
-    | _ -> None
-  in
-  match get_assoc params with
-  | None -> (false, 0, [])
-  | Some xs -> (
-      match find_field "changes" xs with
-      | Some (`List changes) ->
-          let parsed =
-            changes
-            |> List.filter_map (function
-              | `Assoc cxs -> (
-                  match (find_field "uri" cxs, find_field "type" cxs) with
-                  | Some (`String u), Some kind_json -> (
-                      match
-                        (Uri_path.docuri_of_string u, parse_kind kind_json)
-                      with
-                      | Some uri, Some kind -> (
-                          match file_of_uri uri with
-                          | Some path -> Some (path, kind)
-                          | None -> None)
-                      | _ -> None)
-                  | _ -> None)
-              | _ -> None)
-          in
-          (true, List.length changes, parsed)
-      | _ -> (false, 0, []))
+let parse_watched_file_changes = Req.parse_watched_file_changes
 
 let runtime_settings : Lsp_runtime_settings.t ref =
   ref (Lsp_runtime_settings.from_env ())
@@ -522,6 +367,42 @@ let diagnostic_pull_report_json (ws : Workspace.t) ~(uri : T.DocumentUri.t)
           ("resultId", `String result_id);
           ("items", Resp.yojson_of_diagnostics diags);
         ]
+
+let parse_diagnostic_refresh_uris (params : Yojson.Safe.t) :
+    T.DocumentUri.t list =
+  let add_uri seen out raw =
+    match Uri_path.docuri_of_string raw with
+    | None -> out
+    | Some uri ->
+        let key = Uri_path.docuri_to_string uri in
+        if Hashtbl.mem seen key then out
+        else (
+          Hashtbl.replace seen key true;
+          uri :: out)
+  in
+  let seen = Hashtbl.create 64 in
+  match get_assoc params with
+  | None -> []
+  | Some xs ->
+      let out =
+        match find_field "uris" xs with
+        | Some (`List uris) ->
+            List.fold_left
+              (fun acc -> function
+                | `String raw -> add_uri seen acc raw
+                | _ -> acc)
+              [] uris
+        | _ -> []
+      in
+      let out =
+        match find_field "textDocument" xs with
+        | Some (`Assoc tdxs) -> (
+            match find_field "uri" tdxs with
+            | Some (`String raw) -> add_uri seen out raw
+            | _ -> out)
+        | _ -> out
+      in
+      List.rev out
 
 let startup_open_diag_batch_size (ws : Workspace.t) ~(base : int) : int =
   let base = max 1 base in
@@ -815,6 +696,7 @@ let build_workspace_settings (overrides : Lsp_runtime_settings.client_overrides)
       pressure_soft_mb = overrides.pressure_soft_mb;
       pressure_critical_mb = overrides.pressure_critical_mb;
       startup_priority_mode = overrides.startup_priority_mode;
+      implementation_config = overrides.implementation_config;
     }
 
 let handle_initialize (roots_state : roots_state)
@@ -1032,6 +914,33 @@ let handle_execute_command (roots_state : roots_state)
               | _ -> j
             in
             respond oc ~id ~result:j)
+    | "jovial.explainSymbolResolution" -> (
+        let uri_opt, pos_opt =
+          match p.arguments with
+          | Some (a0 :: a1 :: a2 :: _) ->
+              let pos =
+                match (parse_int_arg a1, parse_int_arg a2) with
+                | Some line, Some character ->
+                    Some { T.Position.line; character }
+                | _ -> parse_position_arg a1
+              in
+              (parse_uri_arg a0, pos)
+          | Some (a0 :: a1 :: _) ->
+              (parse_uri_arg a0, parse_position_arg a1)
+          | Some (a0 :: _) ->
+              (parse_uri_arg a0, parse_position_arg a0)
+          | _ -> (None, None)
+        in
+        match (uri_opt, pos_opt) with
+        | Some uri, Some pos ->
+            let ws = ws_for_uri roots_state uri in
+            respond oc ~id
+              ~result:(Workspace.explain_symbol_resolution_json ws ~uri ~pos)
+        | _ ->
+            respond_error oc ~id ~code:(-32602)
+              ~message:
+                "explainSymbolResolution: missing uri, line, and character \
+                 arguments")
     | "jovial.debugPerfStats" ->
         respond oc ~id
           ~result:(Workspace.perf_stats_json roots_state.default_ws)
@@ -1095,6 +1004,40 @@ let handle_notification (roots_state : roots_state)
       match parse_cancel_request_id params with
       | Some id -> mark_cancelled id
       | None -> ())
+  | "jovial/refreshDiagnostics" ->
+      (* VS Code already receives diagnostics through publishDiagnostics. This
+         extension-owned notification is the cheap catch-up path: it forces
+         revalidation and publishes only changed diagnostics, avoiding the
+         duplicate response payload from textDocument/diagnostic. *)
+      parse_diagnostic_refresh_uris params
+      |> List.iter (fun uri ->
+             let ws = ws_for_document_uri roots_state uri in
+             try
+               let refreshed =
+                 if finish_document_diagnostics_now_if_needed ws ~uri then true
+                 else Workspace.refresh_closed_doc_diagnostics_now ws ~uri
+               in
+               let open_doc = Workspace.document_text_length ws ~uri <> None in
+               let changed =
+                 publish_doc_diagnostics ws oc published_diags
+                   ~push:!diagnostic_push_enabled
+                   ~provisional:
+                     (open_doc && not (Workspace.open_doc_converged ws ~uri))
+                   ~uri
+               in
+               if refreshed && not changed then
+                 Perf_stats.tick "diag.refresh.no_publish_change";
+               request_diagnostic_refresh_if_needed changed
+             with exn ->
+               Perf_stats.tick "diag.refresh.handler_exception";
+               prerr_endline
+                 (Printf.sprintf "diagnostic refresh failed for %s: %s"
+                    (Uri_path.docuri_to_string uri)
+                    (Printexc.to_string exn));
+               publish_partial_diagnostics_on_failure ws oc published_diags
+                 ~push:!diagnostic_push_enabled ~uri
+                 ~phase:"refreshDiagnostics" ~exn
+               |> request_diagnostic_refresh_if_needed)
   | "textDocument/didOpen" -> (
       try
         match parse_did_open_payload params with
@@ -1121,10 +1064,24 @@ let handle_notification (roots_state : roots_state)
                     Perf_stats.tick "diag.open.preview_publish";
                     if !diagnostic_push_enabled then flush oc
                     else request_diagnostic_refresh_if_needed true));
-              Workspace.open_doc ?lsp_version ~inline_catch_up:false ws ~uri
-                ~file ~text;
+              Workspace.open_doc ?lsp_version ~inline_catch_up:false
+                ~defer_cross_module_semantics:true ws ~uri ~file ~text;
+              (if Workspace.open_doc_converged ws ~uri then
+                 Perf_stats.tick "didopen.readiness_kick_skipped_ready"
+               else
+                 try
+                   Workspace.background_tick ws ~budget_ms:16
+                     ~mode:Workspace.BgTickInteractive ~idle_quiet_ms:0
+                     ~last_message_ms:(Perf_stats.now_ms ())
+                 with exn ->
+                   Perf_stats.tick "loop.bg_exception";
+                   prerr_endline
+                     (Printf.sprintf "didOpen readiness kick failed: %s"
+                        (Printexc.to_string exn)));
               bind_open_document roots_state uri ws;
-              ignore (finish_document_diagnostics_now_if_needed ws ~uri);
+              ignore
+                (maybe_finish_document_diagnostics_inline ws ~uri
+                   ~text_len:(String.length text));
               publish_doc_diagnostics ws oc published_diags
                 ~push:!diagnostic_push_enabled
                 ~provisional:(not (Workspace.open_doc_converged ws ~uri))
@@ -1161,7 +1118,12 @@ let handle_notification (roots_state : roots_state)
         try
           Workspace.change_doc ~lsp_version:p.textDocument.version ws ~uri
             ~changes:p.contentChanges;
-          ignore (finish_document_diagnostics_now_if_needed ws ~uri);
+          let text_len =
+            Option.value (Workspace.document_text_length ws ~uri)
+              ~default:(256_001)
+          in
+          ignore
+            (maybe_finish_document_diagnostics_inline ws ~uri ~text_len);
           publish_doc_diagnostics ws oc published_diags
             ~push:!diagnostic_push_enabled
             ~provisional:(not (Workspace.open_doc_converged ws ~uri))
@@ -1285,34 +1247,44 @@ let snapshot_document_symbols_for (ws : Workspace.t) ~(uri : T.DocumentUri.t)
     [ `DocumentSymbol of T.DocumentSymbol.t
     | `SymbolInformation of T.SymbolInformation.t ]
     list =
-  let snap = Workspace.snapshot ws in
-  Ide_query.document_symbols snap ~uri:(uri_string uri)
-  |> List.map (fun symbol -> `DocumentSymbol symbol)
+  match Workspace.cached_snapshot ws with
+  | None -> []
+  | Some snap ->
+      Ide_query.document_symbols snap ~uri:(uri_string uri)
+      |> List.map (fun symbol -> `DocumentSymbol symbol)
 
 let snapshot_workspace_symbols_for (ws : Workspace.t) ~(query : string) :
     T.SymbolInformation.t list =
-  let snap = Workspace.snapshot ws in
-  Ide_query.workspace_symbols snap ~query
+  match Workspace.cached_snapshot ws with
+  | None -> []
+  | Some snap -> Ide_query.workspace_symbols snap ~query
 
 let snapshot_hover_for (ws : Workspace.t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Hover.t option =
-  let snap = Workspace.snapshot ws in
-  Ide_query.hover snap ~uri:(uri_string uri) ~pos
+  Perf_stats.tick "query.snapshot.hover_fallback";
+  match Workspace.cached_snapshot ws with
+  | None -> None
+  | Some snap -> Ide_query.hover snap ~uri:(uri_string uri) ~pos
 
 let snapshot_completion_items_for (ws : Workspace.t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.CompletionItem.t list =
-  let snap = Workspace.snapshot ws in
-  Ide_query.completion snap ~uri:(uri_string uri) ~pos
+  match Workspace.cached_snapshot ws with
+  | None -> []
+  | Some snap -> Ide_query.completion snap ~uri:(uri_string uri) ~pos
 
 let snapshot_definition_locations_for (ws : Workspace.t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Location.t list =
-  let snap = Workspace.snapshot ws in
-  Ide_query.definition snap ~uri:(uri_string uri) ~pos
+  Perf_stats.tick "query.snapshot.definition_fallback";
+  match Workspace.cached_snapshot ws with
+  | None -> []
+  | Some snap -> Ide_query.definition snap ~uri:(uri_string uri) ~pos
 
 let snapshot_reference_locations_for (ws : Workspace.t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Location.t list =
-  let snap = Workspace.snapshot ws in
-  Ide_query.references snap ~uri:(uri_string uri) ~pos |> List.of_seq
+  Perf_stats.tick "query.snapshot.references_fallback";
+  match Workspace.cached_snapshot ws with
+  | None -> []
+  | Some snap -> Ide_query.references snap ~uri:(uri_string uri) ~pos |> List.of_seq
 
 let respond_cancelled (oc : out_channel) ~(id : Yojson.Safe.t) : unit =
   respond_error oc ~id ~code:(-32800) ~message:"Request cancelled"
@@ -1321,7 +1293,6 @@ type request_priority =
   | Critical
   | Interactive
   | Visible
-  | Navigation
   | Medium
   | Background
 
@@ -1329,27 +1300,25 @@ let request_priority_rank = function
   | Critical -> 0
   | Interactive -> 1
   | Visible -> 2
-  | Navigation -> 3
-  | Medium -> 4
-  | Background -> 5
+  | Medium -> 3
+  | Background -> 4
 
 let request_priority_of_method = function
   | "initialize" | "shutdown" -> Critical
   | "textDocument/completion" | "textDocument/hover"
-  | "textDocument/signatureHelp" ->
+  | "textDocument/signatureHelp" | "textDocument/definition"
+  | "textDocument/declaration" | "textDocument/typeDefinition"
+  | "textDocument/implementation" ->
       Interactive
   | "textDocument/semanticTokens/range" | "textDocument/documentSymbol"
   | "textDocument/codeLens" | "textDocument/inlayHint"
-  | "textDocument/formatting" | "textDocument/rangeFormatting" ->
+  | "textDocument/formatting" | "textDocument/rangeFormatting"
+  | "textDocument/diagnostic" ->
       Visible
-  | "textDocument/definition" | "textDocument/declaration"
-  | "textDocument/typeDefinition" | "textDocument/implementation" ->
-      Navigation
   | "textDocument/references" | "textDocument/prepareRename"
   | "textDocument/rename" | "textDocument/codeAction" | "codeLens/resolve" ->
       Medium
-  | "workspace/symbol" | "textDocument/diagnostic"
-  | "textDocument/semanticTokens/full"
+  | "workspace/symbol" | "textDocument/semanticTokens/full"
   | "textDocument/semanticTokens/full/delta" ->
       Background
   | _ -> Medium
@@ -1370,6 +1339,7 @@ let handle_request (roots_state : roots_state)
     if is_cancelled () then respond_cancelled oc ~id else respond oc ~id ~result
   in
   let with_cancel_ws (ws : Workspace.t) f =
+    Workspace.drain_open_parse_results_now ws;
     Workspace.with_request_cancel_checker ws is_cancelled f
   in
   if is_cancelled () then respond_cancelled oc ~id
@@ -1569,15 +1539,17 @@ let handle_request (roots_state : roots_state)
             if not flags.hover then respond_result `Null
             else
               let j =
-                with_cancel_ws ws (fun () ->
+                Perf_stats.time "hover.request_compute_json_ms" (fun () ->
+                    with_cancel_ws ws (fun () ->
                     let hover =
                       match Workspace.hover_for ws ~uri ~pos with
                       | Some _ as hit -> hit
                       | None -> snapshot_hover_for ws ~uri ~pos
                     in
-                    Resp.yojson_of_hover_opt hover)
+                    Resp.yojson_of_hover_opt hover))
               in
-              respond_result j
+              Perf_stats.time "hover.response_write_ms" (fun () ->
+                  respond_result j)
         | _ ->
             respond_error oc ~id ~code:(-32602)
               ~message:"hover: invalid textDocument or position")
@@ -2118,7 +2090,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let next_index_health_check_ms =
     ref (Perf_stats.now_ms () +. index_health_check_interval_ms)
   in
-  let max_inbound_msg_bytes = 16 * 1024 * 1024 in
+  let max_inbound_msg_bytes = 128 * 1024 * 1024 in
   let wake_r, wake_w = Unix.pipe () in
   let wake_nonblock =
     let ok = ref true in
@@ -2239,6 +2211,15 @@ let run (ic : in_channel) (oc : out_channel) : unit =
 
   let all_workspaces_now () = all_workspaces roots_state in
 
+  let background_should_stop () =
+    !reader_done || (not (inbox_is_empty box))
+    || not (request_scheduler_is_empty scheduler)
+  in
+
+  let background_grace_elapsed () =
+    Perf_stats.now_ms () -. !last_message_ms >= interactive_background_grace_ms
+  in
+
   let request_diagnostic_refresh_if_needed changed =
     if changed && not !diagnostic_push_enabled then
       request_diagnostic_refresh oc
@@ -2321,7 +2302,10 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   in
 
   let run_background_tick () : unit =
-    let wss = all_workspaces_now () in
+    let wss =
+      all_workspaces_now ()
+      |> List.filter Workspace.background_work_pending
+    in
     let n = max 1 (List.length wss) in
     let settings = !runtime_settings in
     let base_budget = max 1 (settings.bg_tick_budget_ms / n) in
@@ -2337,6 +2321,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
               ~base_budget_ms:startup_budget
           in
           Workspace.background_tick ws ~budget_ms:per_ws_budget
+            ~should_stop:background_should_stop
             ~mode:Workspace.BgTickIdle
             ~idle_quiet_ms:settings.bg_large_parse_idle_quiet_ms
             ~last_message_ms:!last_message_ms
@@ -2351,7 +2336,9 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let run_startup_fair_tick_if_needed () : unit =
     let pending =
       all_workspaces_now ()
-      |> List.filter (fun ws -> not (Workspace.startup_is_ready_now ws))
+      |> List.filter (fun ws ->
+             Workspace.background_work_pending ws
+             && not (Workspace.startup_is_ready_now ws))
     in
     if pending = [] then ()
     else
@@ -2382,6 +2369,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                   ~base_budget_ms:startup_budget
               in
               Workspace.background_tick ws ~budget_ms:per_ws_budget
+                ~should_stop:background_should_stop
                 ~mode:Workspace.BgTickInteractive
                 ~idle_quiet_ms:settings.bg_large_parse_idle_quiet_ms
                 ~last_message_ms:!last_message_ms
@@ -2413,22 +2401,37 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let publish_background_for_all () : unit =
     all_workspaces_now ()
     |> List.iter (fun ws ->
+        let stop_requested = background_should_stop () in
+        if stop_requested then Perf_stats.tick "loop.publish_deferred";
         try
           let open_diag_batch_size =
             startup_open_diag_batch_size ws
               ~base:!runtime_settings.open_diag_revalidate_batch_size
           in
           let open_changed =
-            publish_open_diag_revalidate_updates ws oc published_diags
-              ~push:!diagnostic_push_enabled ~max_items:open_diag_batch_size
+            if stop_requested then false
+            else
+              publish_open_diag_revalidate_updates ws oc published_diags
+                ~push:!diagnostic_push_enabled ~max_items:open_diag_batch_size
+          in
+          let bg_diag_batch_size =
+            if stop_requested then
+              max 1 (min 8 !runtime_settings.bg_diag_batch_size)
+            else !runtime_settings.bg_diag_batch_size
           in
           let bg_changed =
             publish_background_diag_updates ws oc published_diags
-              ~push:!diagnostic_push_enabled
-              ~max_items:!runtime_settings.bg_diag_batch_size
+              ~push:!diagnostic_push_enabled ~max_items:bg_diag_batch_size
           in
           request_diagnostic_refresh_if_needed (open_changed || bg_changed);
-          Workspace.publish_snapshot ws
+          if background_should_stop () then
+            Perf_stats.tick "loop.publish_snapshot_deferred"
+          else if
+            Workspace.open_doc_count ws > 0
+            && Workspace.startup_is_ready_now ws
+            && Workspace.cached_snapshot ws = None
+          then
+            Perf_stats.tick "loop.publish_snapshot_skipped_eager"
         with exn ->
           Perf_stats.tick "loop.publish_exception";
           prerr_endline
@@ -2516,11 +2519,33 @@ let run (ic : in_channel) (oc : out_channel) : unit =
               drain_wake_pipe ~nonblock:wake_nonblock wake_r;
             inbox_drain box)
       in
-      if items <> [] then last_message_ms := Perf_stats.now_ms ();
-      (if items = [] then (
-         if readable = [] && request_scheduler_is_empty scheduler then (
+      let items =
+        if items <> [] then items
+        else (
+          Thread.delay 0.001;
+          Perf_stats.time "idle.msg_redrain_after_yield" (fun () ->
+              inbox_drain box))
+      in
+      let items = ref items in
+      let ran_idle_background = ref false in
+      if !items <> [] then last_message_ms := Perf_stats.now_ms ();
+      (if !items = [] then (
+         if
+           readable = [] && request_scheduler_is_empty scheduler
+           && background_grace_elapsed ()
+         then (
            Perf_stats.tick "idle.bg_tick";
-           run_background_tick ()))
+           run_background_tick ();
+           ran_idle_background := true;
+           Thread.delay 0.005;
+           (try drain_wake_pipe ~nonblock:wake_nonblock wake_r with _ -> ());
+           let late_items =
+             Perf_stats.time "idle.msg_drain_after_bg" (fun () ->
+                 inbox_drain box)
+           in
+           if late_items <> [] then (
+             items := late_items;
+             last_message_ms := Perf_stats.now_ms ())))
        else
          List.iter
            (function
@@ -2531,9 +2556,12 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                       "invalid LSP frame received; terminating session: %s" msg);
                  reader_done := true
              | InboxEof -> reader_done := true)
-           items);
-      let dispatched = dispatch_one_scheduled_request () in
-      (if items <> [] || dispatched then
+           !items);
+      let dispatched =
+        if inbox_is_empty box then dispatch_one_scheduled_request () else false
+      in
+      if !items <> [] || dispatched then last_message_ms := Perf_stats.now_ms ();
+      (if !items <> [] || dispatched then
          try flush oc
          with exn -> (
            match exn with
@@ -2560,9 +2588,14 @@ let run (ic : in_channel) (oc : out_channel) : unit =
         || not (request_scheduler_is_empty scheduler)
       in
       if should_continue then (
-        if (not !reader_done) && items = [] && not dispatched then (
-          run_index_health_check_if_due ();
-          run_startup_fair_tick_if_needed ();
+        if
+          (not !reader_done) && !items = [] && not dispatched
+          && inbox_is_empty box && request_scheduler_is_empty scheduler
+          && background_grace_elapsed ()
+        then (
+          if not !ran_idle_background then (
+            run_index_health_check_if_due ();
+            run_startup_fair_tick_if_needed ());
           publish_background_for_all ();
           notify_startup_phase_events ();
           notify_startup_miss_events ();

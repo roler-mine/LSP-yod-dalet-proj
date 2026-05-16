@@ -1,4 +1,7 @@
+(* Module overview: Hover provider that combines syntax, semantic, type, and navigation metadata. *)
+
 module T = Lsp.Types
+open Workspace_foundation
 open Workspace_state
 open Workspace_imports
 open Workspace_nav_model
@@ -11,14 +14,37 @@ module Perf_stats = Workspace_foundation.Perf_stats
 
 type nav_budget = Workspace_budget.t
 
+let nav_soft_budget_for_ws (ws : t) : int =
+  let profile_budget =
+    match Workspace_runtime.workspace_profile_for_budget ws with
+    | ProfileSmall -> nav_soft_budget_ms
+    | ProfileMedium -> nav_soft_budget_medium_ms
+    | ProfileLarge -> nav_soft_budget_large_ms
+  in
+  if ws.startup_fully_nav_ready_ms = None then
+    min profile_budget nav_startup_soft_budget_ms
+  else profile_budget
+
 let nav_budget_start (ws : t) : nav_budget =
-  Workspace_budget.start ~ws ~soft_budget_ms:nav_soft_budget_ms
+  let soft_budget_ms = nav_soft_budget_for_ws ws in
+  Perf_stats.observe_ms "nav.budget_ms" (float_of_int soft_budget_ms);
+  Workspace_budget.start ~ws ~soft_budget_ms
 
 let nav_budget_check (budget : nav_budget) : bool =
   Workspace_budget.should_stop ~phase:"hover" budget
 
 let allow_fallback_for_ws (ws : t) (doc : Document.t) : bool =
-  allow_unscoped_fallback doc || ws.startup_fully_nav_ready_ms = None
+  let startup_allows_fallback =
+    match Workspace_runtime.workspace_profile_for_budget ws with
+    | ProfileLarge ->
+        ws.allow_slow_query_fallback
+        || Workspace_runtime.quick_nav_index_complete ws
+    | ProfileSmall | ProfileMedium -> true
+  in
+  let allowed = startup_allows_fallback && allow_unscoped_fallback doc in
+  if (not allowed) && allow_unscoped_fallback doc then
+    Perf_stats.tick "query.slow_fallback_disabled";
+  allowed
 
 let prefer_local_defs_before_position (doc : Document.t) (pos : T.Position.t)
     (defs : def list) : def list =
@@ -49,6 +75,192 @@ let prefer_local_defs_before_position (doc : Document.t) (pos : T.Position.t)
           in
           [ best ])
 
+let is_fast_scoped_hover_target (d : def) : bool =
+  d.kind <> sym_kind_field && d.kind <> sym_kind_module
+
+let is_fast_scoped_hover_kind (kind : int) : bool =
+  kind <> sym_kind_field && kind <> sym_kind_module
+
+let fast_local_defs_before_position (ws : t) (doc : Document.t) (pos : T.Position.t)
+    ~(key : string) : def list =
+  if key = "" then []
+  else
+    let matching defs =
+      defs
+      |> List.filter (fun d ->
+             same_uri d.uri doc.Document.uri && d.key = key
+             && is_fast_scoped_hover_target d)
+    in
+    let parsed_authoritative =
+      match Document.current_parse doc with
+      | Some { Document.parsed_ast = Some _; parsed_diags = []; _ } -> true
+      | _ -> false
+    in
+    let prefer_doc_defs = String.length doc.Document.text <= 262_144 in
+    let doc_defs = if prefer_doc_defs then matching (collect_doc_defs doc) else [] in
+    let semantic_defs =
+      if doc_defs <> [] || prefer_doc_defs || not ws.sem_store_enabled then []
+      else
+        let cursor_off =
+          Text_index.offset_of_line_col doc.Document.index
+            ~line:pos.T.Position.line ~col:pos.T.Position.character
+        in
+        let best_before : Semantic_store.Snapshot.nav_def option ref =
+          ref None
+        in
+        let fallback = ref [] in
+        Semantic_store.defs_for_key_in_uri ws.semantic_store
+          ~uri:doc.Document.uri ~key
+        |> List.iter (fun (d : Semantic_store.Snapshot.nav_def) ->
+               if
+                 same_uri d.uri doc.Document.uri && d.key = key
+                 && is_fast_scoped_hover_kind d.kind
+               then
+                 match cursor_off with
+                 | Some off when d.loc.Ast.Loc.start_pos.offset <= off -> (
+                     match !best_before with
+                     | None -> best_before := Some d
+                     | Some prev
+                       when d.loc.Ast.Loc.start_pos.offset
+                            > prev.loc.Ast.Loc.start_pos.offset ->
+                         best_before := Some d
+                     | Some _ -> ())
+                 | _ -> fallback := d :: !fallback);
+        (match !best_before with
+        | Some d -> [ def_of_snapshot_def d ]
+        | None -> !fallback |> List.rev_map def_of_snapshot_def)
+    in
+    let defs =
+      if doc_defs <> [] then doc_defs
+      else if semantic_defs <> [] then semantic_defs
+      else if prefer_doc_defs then []
+      else matching (collect_doc_defs doc)
+    in
+    let defs =
+      if defs <> [] || parsed_authoritative then defs
+      else matching (fallback_line_defs doc)
+    in
+    defs |> prefer_local_defs_before_position doc pos
+
+let fast_imported_defs_for_key (ws : t) (doc : Document.t) ~(key : string) :
+    def list =
+  if key = "" then []
+  else
+    let filter = List.filter is_fast_scoped_hover_target in
+    let rec take n acc = function
+      | [] -> List.rev acc
+      | _ when n <= 0 -> List.rev acc
+      | x :: tl -> take (n - 1) (x :: acc) tl
+    in
+    let semantic_hits =
+      semantic_defs_for_imported_compools ~max_defs:4 ws doc ~key |> filter
+    in
+    if semantic_hits <> [] then semantic_hits
+    else
+      let summary_hits =
+        summary_defs_for_imported_compools ~max_defs:4 ws doc ~key |> filter
+      in
+      if summary_hits <> [] then summary_hits
+      else prefix_defs_for_imported_compools ws doc ~key |> filter |> take 4 []
+
+let fast_global_proc_defs_for_key (ws : t) ~(key : string) : def list =
+  if key = "" then []
+  else (
+    Perf_stats.tick "query.fast_global_proc_lookup";
+    let line_hits =
+      Perf_stats.time "query.fast_global_proc_line_ms" (fun () ->
+          Hashtbl.fold
+            (fun _ doc acc ->
+              if String.length doc.Document.text > 262_144 then acc
+              else
+                fallback_line_defs doc
+                |> List.filter (fun d -> d.key = key && d.kind = sym_kind_func)
+                |> List.rev_append acc)
+            ws.files [])
+    in
+    let semantic_hits =
+      if line_hits <> [] || not ws.sem_store_enabled then []
+      else
+        Perf_stats.time "query.fast_global_proc_semantic_ms" (fun () ->
+            Semantic_store.defs_for_key_kind ws.semantic_store ~key
+              ~kind:sym_kind_func
+            |> List.map def_of_snapshot_def
+            |> List.filter (fun d -> d.key = key && d.kind = sym_kind_func))
+    in
+    let hits =
+      Perf_stats.time "query.fast_global_proc_rank_ms" (fun () ->
+          if line_hits <> [] then line_hits |> prefer_non_ref_targets |> uniq_defs
+          else
+            semantic_hits
+            |> prefer_real_definition_targets ws
+            |> prefer_non_ref_targets
+            |> uniq_defs)
+    in
+    if hits <> [] then Perf_stats.tick "query.fast_global_proc_hit";
+    hits)
+
+let fast_type_origin_label = function
+  | Metadata.BuiltinType -> "built-in type"
+  | Metadata.UserDefinedType _ -> "user-defined type"
+  | Metadata.InferredType -> "inferred type"
+  | Metadata.UnknownType -> "unknown type"
+
+let fast_local_hover_body (doc : Document.t) (d : def) : string =
+  let metadata = d.metadata in
+  let kind =
+    match metadata.Metadata.jovial_kind with
+    | Metadata.JovialUnknownSymbol -> Workspace_symbol_kinds.role_of_def_kind d.kind
+    | kind -> Metadata.symbol_kind_label kind
+  in
+  let type_facts =
+    match metadata.type_info with
+    | None -> []
+    | Some ti ->
+        [ Printf.sprintf "Type: `%s`" ti.Metadata.display ]
+        @ [ Printf.sprintf "Type origin: %s" (fast_type_origin_label ti.origin) ]
+        @
+        (match ti.explanation with
+        | None -> []
+        | Some e ->
+            [ Printf.sprintf "Resolved type: `%s` - %s" ti.display e ])
+  in
+  let facts =
+    [
+      Printf.sprintf "Classification: %s" kind;
+      Printf.sprintf "Declaration role: %s"
+        (Metadata.decl_role_label metadata.decl_role);
+    ]
+    @ type_facts
+    @ [
+        Printf.sprintf "Constant: %s"
+          (if metadata.is_constant then "yes" else "no");
+        Printf.sprintf "Readonly: %s"
+          (if metadata.is_constant || metadata.is_readonly then "yes" else "no");
+      ]
+    @
+    (match d.container with
+    | None -> []
+    | Some c -> [ Printf.sprintf "Scope: `%s`" c ])
+    @ [
+        source_path_fact_for_def d;
+        declaration_location_fact_for_def d;
+        Printf.sprintf "Symbol key: `%s`" d.key;
+      ]
+  in
+  let decl_block =
+    match line_text_in_doc doc ~line1:d.loc.Ast.Loc.start_pos.line with
+    | None -> ""
+    | Some line ->
+        let line = truncate_text 600 line in
+        if String.trim line = "" then ""
+        else hover_code_section "Declaration" line
+  in
+  let sections =
+    if String.trim decl_block = "" then [] else [ decl_block ]
+  in
+  hover_panel ~name:d.name ~summary:(Metadata.metadata_summary metadata) ~facts
+    ~sections
+
 let hover_current_file_fact (doc : Document.t) : string =
   match doc.Document.file with
   | Some p -> Printf.sprintf "Current file: `%s`" p
@@ -56,13 +268,17 @@ let hover_current_file_fact (doc : Document.t) : string =
       Printf.sprintf "Current file: `%s`"
         (Uri_path.docuri_to_string doc.Document.uri)
 
-let builtin_type_hover_at (doc : Document.t) (pos : T.Position.t) :
-    T.Hover.t option =
+let builtin_type_hover_at ?implementation_config (doc : Document.t)
+    (pos : T.Position.t) : T.Hover.t option =
+  let implementation_config : Implementation_config.t option =
+    implementation_config
+  in
   match word_at_position doc pos with
   | None -> None
   | Some (name, loc) ->
       if
         (not (Metadata.is_builtin_type_name name))
+        || is_navigation_literal_like doc name loc
         || not (is_builtin_type_context_at_loc doc name loc)
       then None
       else
@@ -108,8 +324,21 @@ let builtin_type_hover_at (doc : Document.t) (pos : T.Position.t) :
               in
               (display, dims)
         in
+        let key = normalize_name name in
+        let display, dims =
+          match (key, dims, implementation_config) with
+          | "F", [], Some { Implementation_config.float_precision = Some n; _ }
+            ->
+              let dim = string_of_int n in
+              (name ^ " " ^ dim, [ dim ])
+          | "A", [], Some { Implementation_config.fixed_precision = Some n; _ }
+            ->
+              let fraction = string_of_int n in
+              (name ^ " ?," ^ fraction, [ "?"; fraction ])
+          | _ -> (display, dims)
+        in
         let cls, meaning =
-          match normalize_name name with
+          match key with
           | "U" ->
               ( "unsigned integer",
                 match dims with
@@ -155,7 +384,7 @@ let builtin_type_hover_at (doc : Document.t) (pos : T.Position.t) :
           ]
         in
         let facts =
-          match (normalize_name name, dims) with
+          match (key, dims) with
           | ("U" | "S" | "B"), n :: _ ->
               (Printf.sprintf "Size: %s bits" n) :: facts
           | "C", n :: _ -> (Printf.sprintf "Size: %s characters" n) :: facts
@@ -171,6 +400,44 @@ let builtin_type_hover_at (doc : Document.t) (pos : T.Position.t) :
              (hover_panel ~name:display
                 ~summary:(Printf.sprintf "JOVIAL built-in %s type" cls)
                 ~facts:(List.rev facts) ~sections:[]))
+
+let system_subroutine_hover_at (ws : t) (doc : Document.t)
+    (pos : T.Position.t) : T.Hover.t option =
+  match nav_word_at_position doc pos with
+  | None -> None
+  | Some (name, loc) ->
+      if
+        not
+          (Implementation_config.is_system_subroutine ws.implementation_config
+             name)
+      then None
+      else
+        let metadata = Metadata.system_subroutine_metadata in
+        let facts =
+          [
+            Printf.sprintf "Classification: %s"
+              (Metadata.symbol_kind_label metadata.jovial_kind);
+            Printf.sprintf "Declaration role: %s"
+              (Metadata.decl_role_label metadata.decl_role);
+            Printf.sprintf "External kind: %s"
+              (Metadata.external_label metadata.external_kind);
+            hover_current_file_fact doc;
+          ]
+          @
+          match ws.implementation_config.Implementation_config.dialect with
+          | None -> []
+          | Some dialect -> [ Printf.sprintf "Dialect/profile: `%s`" dialect ]
+        in
+        let body =
+          hover_panel ~name ~summary:"JOVIAL system procedure" ~facts
+            ~sections:
+              [
+                hover_inline_section "Configuration"
+                  "This routine is supplied by the active implementation \
+                   profile, so unresolved-reference diagnostics are suppressed.";
+              ]
+        in
+        Some (hover_markdown ~range:(Lsp_conv.range_of_loc loc) body)
 
 let type_origin_label = function
   | Metadata.BuiltinType -> "built-in type"
@@ -252,7 +519,10 @@ let type_resolution_facts ws doc (ti : Metadata.jovial_type_info) =
           in
           let type_defs =
             let scoped = find_type_defs (docs_for_lookup ws doc) in
-            if scoped <> [] then scoped else find_type_defs (docs_for_rename ws doc)
+            if scoped <> [] then scoped
+            else if allow_fallback_for_ws ws doc then
+              find_type_defs (docs_for_rename ws doc)
+            else []
           in
           (match type_defs with
           | target0 :: _ ->
@@ -374,7 +644,62 @@ let specified_table_facts_of_type (ty : Ast.type_expr Ast.node) : string list =
       @ entry_fact @ dim_fact @ field_position_facts
   | _ -> []
 
-let specified_table_facts_for_def doc (d : def) : string list =
+let layout_facts_of_type ws (ty : Ast.type_expr Ast.node) : string list =
+  let env = Jovial_compile_time.empty_env () in
+  Jovial_compile_time.add_implementation_config env ws.implementation_config;
+  match
+    Jovial_layout.table_layout_of_type
+      ~config:
+        (Jovial_layout.config_of_implementation_config
+           ws.implementation_config)
+      env ty
+  with
+  | None -> []
+  | Some layout ->
+      let entry_fact =
+        [
+          Printf.sprintf "Layout entry size: `%s`"
+            (Jovial_layout.size_display layout.entry_size_bits);
+        ]
+      in
+      let total_fact =
+        match layout.total_size_bits with
+        | Jovial_layout.UnknownBits _ -> []
+        | size ->
+            [
+              Printf.sprintf "Layout total size: `%s`"
+                (Jovial_layout.size_display size);
+            ]
+      in
+      let field_fact =
+        let field_text =
+          layout.fields
+          |> List.filter_map (fun (field : Jovial_layout.field_layout) ->
+                 match field.absolute_bit_offset with
+                 | Some offset -> (
+                     match field.size_bits with
+                     | Jovial_layout.KnownBits bits ->
+                         Some
+                           (Printf.sprintf "%s @ bit %Ld + %Ld bits"
+                              field.field_name offset bits)
+                     | Jovial_layout.UnknownBits reason ->
+                         Some
+                           (Printf.sprintf "%s @ bit %Ld + unknown (%s)"
+                              field.field_name offset reason))
+                 | None -> None)
+          |> take_first 8
+        in
+        match field_text with
+        | [] -> []
+        | fields ->
+            [
+              Printf.sprintf "Field layout: `%s`"
+                (String.concat "`, `" fields);
+            ]
+      in
+      entry_fact @ total_fact @ field_fact
+
+let specified_table_facts_for_def ws doc (d : def) : string list =
   let type_for_decl (decl : Ast.decl Ast.node) : Ast.type_expr Ast.node option =
     match decl.v with
     | Ast.DVar { name; dtype; _ }
@@ -400,8 +725,53 @@ let specified_table_facts_for_def doc (d : def) : string list =
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } -> (
       match find_decl prog with
-      | Some ty -> specified_table_facts_of_type ty
+      | Some ty -> specified_table_facts_of_type ty @ layout_facts_of_type ws ty
       | None -> [])
+  | _ -> []
+
+let overlay_facts_for_def doc (d : def) : string list =
+  let rec target_names acc (item : Ast.overlay_item Ast.node) =
+    match item.v with
+    | Ast.OverlayTarget id -> id.v :: acc
+    | Ast.OverlaySpacer _ -> acc
+    | Ast.OverlayGroup items -> List.fold_left target_names acc items
+  in
+  let facts_of_overlay (overlay : Ast.overlay_decl) =
+    let targets =
+      List.rev (List.fold_left target_names [] overlay.overlay_items)
+    in
+    let target_fact =
+      match targets with
+      | [] -> []
+      | _ ->
+          [
+            Printf.sprintf "Overlay targets: `%s`"
+              (targets |> take_first 12 |> String.concat "`, `");
+          ]
+    in
+    let pos_fact =
+      match overlay.overlay_pos with
+      | None -> []
+      | Some pos ->
+          [
+            Printf.sprintf "Overlay POS: `%s`" (Metadata.expr_display pos);
+          ]
+    in
+    target_fact @ pos_fact
+  in
+  let rec find_decl = function
+    | [] -> None
+    | Ast.TopDecl { v = Ast.DOverlay overlay; _ } :: _rest
+      when normalize_name overlay.overlay_name.v = d.key
+           && same_loc_span overlay.overlay_name.loc d.loc ->
+        Some overlay
+    | Ast.TopDecl { v = Ast.DProc p; _ } :: rest ->
+        find_decl (List.map (fun d -> Ast.TopDecl d) p.v.locals @ rest)
+    | _ :: rest -> find_decl rest
+  in
+  match Document.current_parse doc with
+  | Some { Document.parsed_ast = Some prog; _ } -> (
+      match find_decl prog with Some overlay -> facts_of_overlay overlay | None -> [])
   | _ -> []
 
 let hover_def_facts ws doc d =
@@ -441,15 +811,23 @@ let hover_def_facts ws doc d =
         facts @ owner_fact @ context_fact
     | _ -> facts
   in
-  let facts = facts @ specified_table_facts_for_def doc d in
+  let facts = facts @ specified_table_facts_for_def ws doc d in
+  let facts =
+    match metadata.jovial_kind with
+    | Metadata.JovialOverlay -> facts @ overlay_facts_for_def doc d
+    | _ -> facts
+  in
   let facts =
     facts
     @ [
         Printf.sprintf "Constant: %s"
           (if metadata.is_constant then "yes" else "no");
         Printf.sprintf "Readonly: %s"
-          (if metadata.is_constant then "yes" else "no");
+          (if metadata.is_constant || metadata.is_readonly then "yes" else "no");
       ]
+  in
+  let facts =
+    if metadata.is_inline then facts @ [ "Inline: yes" ] else facts
   in
   let facts =
     match metadata.storage with
@@ -479,12 +857,22 @@ let hover_summary_for_def ws d =
   | Metadata.ExternalSystem -> Printf.sprintf "JOVIAL system %s" kind
   | Metadata.ExternalLocal -> Metadata.metadata_summary d.metadata
 
-let hover_body_for_def ws doc d =
+let hover_cache_key (doc : Document.t) (d : def) : string =
+  Printf.sprintf "%s|%d|%s|%s|%d:%d-%d:%d|%d"
+    (Uri_path.docuri_to_string d.uri)
+    doc.Document.parse_rev d.key d.name d.loc.Ast.Loc.start_pos.line
+    d.loc.Ast.Loc.start_pos.col d.loc.Ast.Loc.end_pos.line
+    d.loc.Ast.Loc.end_pos.col d.kind
+
+let hover_body_for_def_uncached ws doc d =
   let sig_line = proc_signature_for_def ws d in
   let src_line = source_line_for_def ws d in
   let navigation_section =
     if d.kind = sym_kind_func then
-      let targets = proc_real_defs_by_key ws doc ~key:d.key in
+      let targets =
+        if allow_fallback_for_ws ws doc then proc_real_defs_by_key ws doc ~key:d.key
+        else proc_index_real_defs_by_key ws doc ~key:d.key
+      in
       match
         targets
         |> List.filter (fun target ->
@@ -558,6 +946,28 @@ let hover_body_for_def ws doc d =
   hover_panel ~name:d.name
     ~summary:(hover_summary_for_def ws d)
     ~facts:(hover_def_facts ws doc d) ~sections
+
+let hover_body_for_def ?budget ws doc d =
+  let key = hover_cache_key doc d in
+  match Hashtbl.find_opt ws.hover_body_cache key with
+  | Some body ->
+      Perf_stats.tick "hover.body_cache_hit";
+      body
+  | None ->
+      Perf_stats.tick "hover.body_cache_miss";
+      let budget_exhausted =
+        match budget with None -> false | Some budget -> nav_budget_check budget
+      in
+      if budget_exhausted then fast_local_hover_body doc d
+      else
+        let body =
+          Perf_stats.time "hover.body_for_def_ms" (fun () ->
+              hover_body_for_def_uncached ws doc d)
+        in
+        if Hashtbl.length ws.hover_body_cache > 4096 then
+          Hashtbl.clear ws.hover_body_cache;
+        Hashtbl.replace ws.hover_body_cache key body;
+        body
 
 let hover_macro_expansion_for ws doc (exp : Macro_graph.expansion) :
     T.Hover.t =
@@ -645,9 +1055,34 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
     T.Hover.t option =
   let budget = nav_budget_start ws in
   let macro_graph = lazy (Macro_graph.of_document doc) in
+  let fast_local_hover () =
+    match nav_word_at_position doc pos with
+    | None -> None
+    | Some (nm, loc) ->
+        let key = normalize_name nm in
+        let defs = fast_local_defs_before_position ws doc pos ~key in
+        if defs = [] then None
+        else
+          let lines =
+            defs
+            |> List.map (hover_body_for_def ~budget ws doc)
+            |> List.filter (fun line -> String.trim line <> "")
+          in
+          let body = String.concat "\n\n---\n\n" lines in
+          Some (hover_markdown ~range:(Lsp_conv.range_of_loc loc) body)
+  in
   let compute () =
     if nav_budget_check budget then None
     else
+      match
+        Macro_graph.macro_use_at_position (Lazy.force macro_graph)
+          ~uri:doc.Document.uri ~pos
+      with
+      | Some exp -> Some (hover_macro_expansion_for ws doc exp)
+      | None ->
+      match fast_local_hover () with
+      | Some _ as hover -> hover
+      | None ->
       let import_text =
         match import_under_cursor doc pos with
         | None -> None
@@ -697,9 +1132,12 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                            external DEF/REF declarations.";
                       ])
       in
-      match builtin_type_hover_at doc pos with
+      match builtin_type_hover_at ~implementation_config:ws.implementation_config doc pos with
       | Some hover -> Some hover
       | None -> (
+          match system_subroutine_hover_at ws doc pos with
+          | Some hover -> Some hover
+          | None -> (
           match
             Macro_graph.macro_use_at_position (Lazy.force macro_graph)
               ~uri:doc.Document.uri ~pos
@@ -754,9 +1192,41 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                    (hover_panel ~name:d.name ~summary:"JOVIAL define"
                       ~facts:(hover_def_facts ws doc d) ~sections))
           | Some _ | None ->
+              let word = nav_word_at_position doc pos in
+              let fast_defs =
+                match word with
+                | None -> []
+                | Some (nm, _) ->
+                    let key = normalize_name nm in
+                    let local_defs =
+                      fast_local_defs_before_position ws doc pos ~key
+                    in
+                    if local_defs <> [] then local_defs
+                    else
+                      let global_proc_defs = fast_global_proc_defs_for_key ws ~key in
+                      if global_proc_defs <> [] then global_proc_defs
+                      else fast_imported_defs_for_key ws doc ~key
+              in
+              if fast_defs <> [] then
+                let lines =
+                  fast_defs
+                  |> List.map (fun d -> hover_body_for_def ~budget ws doc d)
+                  |> List.filter (fun line -> String.trim line <> "")
+                in
+                let body = String.concat "\n\n---\n\n" lines in
+                let range =
+                  match word with
+                  | Some (_, loc) -> Some (Lsp_conv.range_of_loc loc)
+                  | None -> None
+                in
+                Some (hover_markdown ?range body)
+              else if word = None then (
+                match import_text with
+                | Some txt -> Some (hover_markdown txt)
+                | None -> None)
+              else
               let cache : (string, doc_nav) Hashtbl.t = Hashtbl.create 32 in
               let nav = nav_for_doc_cached ws cache doc in
-              let word = nav_word_at_position doc pos in
               let resolved =
                 symbol_at_position_in_nav nav ~uri:doc.Document.uri ~pos
               in
@@ -837,7 +1307,14 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                     in
                     if hovering_decl then defs
                     else
-                      let real_defs = proc_real_defs_by_key ws doc ~key:d.key in
+                      let real_defs =
+                        if
+                          ws.startup_fully_nav_ready_ms = None
+                          || not (allow_fallback_for_ws ws doc)
+                        then
+                          proc_index_real_defs_by_key ws doc ~key:d.key
+                        else proc_real_defs_by_key ws doc ~key:d.key
+                      in
                       if real_defs = [] then defs else real_defs
                 | [] -> (
                     match word with
@@ -848,6 +1325,11 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                           key = "" || (not (allow_fallback_for_ws ws doc))
                           || nav_budget_check budget
                         then []
+                        else if
+                          ws.startup_fully_nav_ready_ms = None
+                          || not (allow_fallback_for_ws ws doc)
+                        then
+                          proc_index_real_defs_by_key ws doc ~key
                         else proc_real_defs_by_key ws doc ~key)
                 | _ -> defs
               in
@@ -880,12 +1362,19 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                                        DEF/REF pair.";
                                   ])))
               else
-                let rec top_lines acc = function
-                  | [] -> List.rev acc
-                  | _ when nav_budget_check budget -> List.rev acc
-                  | d :: tl -> top_lines (hover_body_for_def ws doc d :: acc) tl
+                let top_lines =
+                  match defs with
+                  | [] -> []
+                  | d :: tl ->
+                      let first = hover_body_for_def ~budget ws doc d in
+                      let rec rest acc = function
+                        | [] -> List.rev acc
+                        | _ when nav_budget_check budget -> List.rev acc
+                        | d :: tl ->
+                            rest (hover_body_for_def ~budget ws doc d :: acc) tl
+                      in
+                      rest [ first ] tl
                 in
-                let top_lines = top_lines [] defs in
                 let lines =
                   match import_text with
                   | None -> top_lines
@@ -893,7 +1382,7 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                 in
                 let body = String.concat "\n\n---\n\n" lines in
                 let range = Option.map Lsp_conv.range_of_loc hover_loc in
-                Some (hover_markdown ?range body)))
+                Some (hover_markdown ?range body))))
   in
   let out = compute () in
   ignore (nav_budget_check budget);
@@ -942,7 +1431,7 @@ let skeleton_symbol_at_position (doc : Document.t) (pos : T.Position.t) :
       (match by_position with
       | Some _ as hit -> hit
       | None -> (
-          match word_at_position doc pos with
+          match nav_word_at_position doc pos with
           | None -> None
           | Some (word, _) ->
               let key = normalize_name word in
@@ -993,29 +1482,38 @@ let fast_hover_fallback (ws : t) (doc : Document.t) (pos : T.Position.t) :
       in
       Some (hover_markdown ~range:(Lsp_conv.range_of_loc sym.sk_loc) body)
   | None -> (
-      match word_at_position doc pos with
+      match nav_word_at_position doc pos with
       | None -> None
       | Some (name, loc) ->
-          let body =
-            hover_panel ~name ~summary:"Unresolved JOVIAL symbol"
-              ~facts:
-                [
-                  "Status: semantic analysis pending";
-                  "Status: no visible declaration was found for this reference.";
-                  hover_current_file_fact doc;
-                  Printf.sprintf "Position: line %d, column %d"
-                    loc.Ast.Loc.start_pos.line
-                    (loc.Ast.Loc.start_pos.col + 1);
-                ]
-              ~sections:
-                [
-                  hover_inline_section "Next check"
-                    "Confirm the symbol is declared in scope, imported from \
-                     the expected COMPOOL, or available through the expected \
-                     external DEF/REF pair.";
-                ]
-          in
-          Some (hover_markdown ~range:(Lsp_conv.range_of_loc loc) body))
+          if
+            Implementation_config.is_system_subroutine ws.implementation_config
+              name
+          then system_subroutine_hover_at ws doc pos
+          else
+            let body =
+              hover_panel ~name ~summary:"Unresolved JOVIAL symbol"
+                ~facts:
+                  [
+                    "Status: semantic analysis pending";
+                    "Status: no visible declaration was found for this reference.";
+                    hover_current_file_fact doc;
+                    Printf.sprintf "Position: line %d, column %d"
+                      loc.Ast.Loc.start_pos.line
+                      (loc.Ast.Loc.start_pos.col + 1);
+                  ]
+                ~sections:
+                  [
+                    hover_inline_section "Next check"
+                      "Confirm the symbol is declared in scope, imported from \
+                       the expected COMPOOL, or available through the expected \
+                       external DEF/REF pair.";
+                  ]
+            in
+            Some (hover_markdown ~range:(Lsp_conv.range_of_loc loc) body))
+
+let hover_skeleton_fallback_for (ws : t) (doc : Document.t)
+    ~(pos : T.Position.t) : T.Hover.t option =
+  fast_hover_fallback ws doc pos
 
 let hover_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
     T.Hover.t option =
@@ -1023,15 +1521,11 @@ let hover_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
   | None -> None
   | Some doc ->
       let hover_t0 = Perf_log.now_ms () in
-      Perf_log.log_event "hover_received"
-        ~uri:(Uri_path.docuri_to_string uri)
-        ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev;
+      Perf_stats.tick "hover.received";
       let finish result =
-        Perf_log.log_event "hover_responded"
-          ~uri:(Uri_path.docuri_to_string uri)
-          ~bytes:(String.length doc.Document.text) ~rev:doc.Document.rev
-          ~ms:(max 0.0 (Perf_log.now_ms () -. hover_t0))
-          ~queue:(background_queue_length ws);
+        Perf_stats.observe_ms "hover.responded_ms"
+          (max 0.0 (Perf_log.now_ms () -. hover_t0));
+        ignore (background_queue_length ws);
         result
       in
       if doc.Document.parse_rev <> doc.Document.rev then

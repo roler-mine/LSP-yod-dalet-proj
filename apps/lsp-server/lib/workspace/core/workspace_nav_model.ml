@@ -1,3 +1,5 @@
+(* Module overview: Navigation result model shared by definition, reference, and LSIF export code. *)
+
 module T = Lsp.Types
 open Ast
 open Workspace_foundation
@@ -68,6 +70,7 @@ let sym_kind_var = 13
 let sym_kind_const = 14
 
 let metadata ?(type_info = None) ?storage ?(is_constant = false)
+    ?(is_readonly = false) ?(is_inline = false)
     ?(source_keyword = None) ?has_body ~jovial_kind ~external_modifier () =
   let external_kind = Metadata.external_kind_of_ast external_modifier in
   {
@@ -77,6 +80,8 @@ let metadata ?(type_info = None) ?storage ?(is_constant = false)
     type_info;
     storage;
     is_constant;
+    is_readonly = is_readonly || is_constant;
+    is_inline;
     is_imported =
       (match external_kind with Metadata.ExternalRef -> true | _ -> false);
     is_exported =
@@ -85,49 +90,72 @@ let metadata ?(type_info = None) ?storage ?(is_constant = false)
     has_body;
   }
 
-let metadata_for_var ?(is_constant = false) ~(external_modifier : Ast.external_modifier)
+let metadata_for_var ?implementation_config ?(is_constant = false)
+    ?(is_readonly = false)
+    ~(external_modifier : Ast.external_modifier)
     ~(data_decl_kind : Ast.data_decl_kind) ~(dtype : Ast.type_expr Ast.node option)
     ~(storage : Ast.storage option) () =
-  let type_info = Option.map Metadata.type_info_of_type_expr dtype in
-  metadata ~type_info ?storage ~is_constant
+  let type_info =
+    Option.map (Metadata.type_info_of_type_expr ?implementation_config) dtype
+  in
+  metadata ~type_info ?storage ~is_constant ~is_readonly
     ~source_keyword:(Some (Metadata.keyword_of_data_kind data_decl_kind))
     ~jovial_kind:(Metadata.jovial_kind_of_data_kind ~is_constant data_decl_kind)
     ~external_modifier ()
 
-let metadata_for_type ~(external_modifier : Ast.external_modifier)
+let metadata_for_type ?implementation_config
+    ~(external_modifier : Ast.external_modifier)
     ~(defn : Ast.type_expr Ast.node) () =
-  metadata ~type_info:(Some (Metadata.type_info_of_type_expr defn))
+  metadata
+    ~type_info:(Some (Metadata.type_info_of_type_expr ?implementation_config defn))
     ~source_keyword:(Some "TYPE") ~jovial_kind:Metadata.JovialType
     ~external_modifier ()
 
-let metadata_for_proc ~(external_modifier : Ast.external_modifier)
-    ~(returns : Ast.type_expr Ast.node option) ~(has_body : bool) () =
+let metadata_for_proc ?implementation_config
+    ~(external_modifier : Ast.external_modifier)
+    ~(returns : Ast.type_expr Ast.node option) ~(has_body : bool)
+    ~(is_inline : bool) () =
   let jovial_kind =
     match returns with
     | None -> Metadata.JovialProcedure
     | Some _ -> Metadata.JovialFunction
   in
-  metadata ~type_info:(Option.map Metadata.type_info_of_type_expr returns)
-    ~source_keyword:(Some "PROC") ~has_body ~jovial_kind
+  metadata
+    ~type_info:
+      (Option.map
+         (Metadata.type_info_of_type_expr ?implementation_config)
+         returns)
+    ~source_keyword:(Some "PROC") ~has_body ~is_inline ~jovial_kind
     ~external_modifier ()
 
-let metadata_for_field ~(ftype : Ast.type_expr Ast.node) () =
+let metadata_for_field ?implementation_config ~(ftype : Ast.type_expr Ast.node)
+    () =
   {
     Metadata.default_metadata with
     jovial_kind = Metadata.JovialField;
-    type_info = Some (Metadata.type_info_of_type_expr ftype);
+    type_info =
+      Some (Metadata.type_info_of_type_expr ?implementation_config ftype);
     source_keyword = Some "ITEM";
   }
 
-let metadata_for_parameter ~(ptype : Ast.type_expr Ast.node) () =
+let metadata_for_parameter ?implementation_config
+    ~(ptype : Ast.type_expr Ast.node) () =
   {
     Metadata.default_metadata with
     jovial_kind = Metadata.JovialParameter;
-    type_info = Some (Metadata.type_info_of_type_expr ptype);
+    type_info =
+      Some (Metadata.type_info_of_type_expr ?implementation_config ptype);
   }
 
 let metadata_for_label =
   { Metadata.default_metadata with jovial_kind = Metadata.JovialLabel }
+
+let metadata_for_overlay =
+  {
+    Metadata.default_metadata with
+    jovial_kind = Metadata.JovialOverlay;
+    source_keyword = Some "OVERLAY";
+  }
 
 let metadata_for_define =
   {
@@ -216,6 +244,7 @@ let classify_fallback_decl ~(line : string) (tokens : (string * int * int) list)
     | "PROC" -> Some (kw_idx, kw, sym_kind_func)
     | "DEFINE" -> Some (kw_idx, kw, sym_kind_const)
     | "BLOCK" -> Some (kw_idx, kw, sym_kind_module)
+    | "OVERLAY" -> Some (kw_idx, kw, sym_kind_var)
     | "COMPOOL" ->
         if preceded_by_bang line kw_col then None
         else Some (kw_idx, kw, sym_kind_module)
@@ -342,6 +371,9 @@ let fallback_metadata_for_line ~(kw : string) ~(kind : int)
   | "BLOCK" ->
       metadata ~source_keyword:(Some "BLOCK") ~jovial_kind:Metadata.JovialBlock
         ~external_modifier ()
+  | "OVERLAY" ->
+      metadata ~source_keyword:(Some "OVERLAY")
+        ~jovial_kind:Metadata.JovialOverlay ~external_modifier ()
   | "TYPE" ->
       metadata ~source_keyword:(Some "TYPE") ~jovial_kind:Metadata.JovialType
         ~external_modifier ()
@@ -405,7 +437,8 @@ let metadata_of_skeleton_symbol (symbol : Syntax_cache.skeleton_symbol) =
     | Syntax_cache.SkModule -> metadata_for_module ()
     | Syntax_cache.SkCompool -> metadata_for_module ~compool:true ()
     | Syntax_cache.SkProcedure ->
-        metadata_for_proc ~external_modifier ~returns:None ~has_body:false ()
+        metadata_for_proc ~external_modifier ~returns:None ~has_body:false
+          ~is_inline:false ()
     | Syntax_cache.SkFunction ->
         metadata
           ~type_info:(Some Metadata.unknown_type_info)
@@ -529,12 +562,21 @@ let rec collect_stmt_defs ~(uri : T.DocumentUri.t) ~(container : string option)
 and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
     (acc : def list) (d : Ast.decl Ast.node) : def list =
   match d.v with
-  | Ast.DVar { name; dtype; storage; external_modifier; data_decl_kind; _ } ->
+  | Ast.DVar
+      {
+        name;
+        dtype;
+        storage;
+        external_modifier;
+        data_decl_kind;
+        is_readonly;
+        _;
+      } ->
       let acc =
         add_ident_def
           ~metadata:
             (metadata_for_var ~external_modifier ~data_decl_kind
-               ~dtype:(Some dtype) ~storage:(Some storage) ())
+               ~dtype:(Some dtype) ~storage:(Some storage) ~is_readonly ())
           acc ~uri ~id:name ~kind:sym_kind_var ~container
       in
       collect_type_defs ~uri ~container:(Some name.v) acc dtype
@@ -563,7 +605,8 @@ and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
         add_ident_def
           ~metadata:
             (metadata_for_proc ~external_modifier:pv.external_modifier
-               ~returns:pv.returns ~has_body:pv.has_body ())
+               ~returns:pv.returns ~has_body:pv.has_body
+               ~is_inline:pv.is_inline ())
           acc ~uri ~id:pv.name ~kind:sym_kind_func ~container
       in
       let in_proc = Some proc_name in
@@ -584,6 +627,9 @@ and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
         List.fold_left (collect_decl_defs ~uri ~container:in_proc) acc pv.locals
       in
       collect_stmt_defs ~uri ~container:in_proc acc pv.body
+  | Ast.DOverlay overlay ->
+      add_ident_def ~metadata:metadata_for_overlay acc ~uri
+        ~id:overlay.overlay_name ~kind:sym_kind_var ~container
   | Ast.DDirective _ -> acc
 
 let find_compool_loc_in_doc (doc : Document.t) (key : string) : Ast.Loc.t option
@@ -1116,7 +1162,10 @@ let docs_for_rename (ws : t) (doc : Document.t) : Document.t list =
   if has_unscoped_fallback_context doc then
     Hashtbl.iter (fun _ d -> add_doc d) ws.files;
   Hashtbl.iter (fun _ d -> add_doc d) ws.docs;
-  List.rev !out
+  let docs = List.rev !out in
+  Perf_stats.observe_ms "query.docs_for_rename_count"
+    (float_of_int (List.length docs));
+  docs
 
 let compare_pos (a : T.Position.t) (b : T.Position.t) : int =
   if a.line < b.line then -1
@@ -1294,6 +1343,17 @@ let nav_add_decl (nav : doc_nav) (d : def) : nav_binding option =
     Hashtbl.replace nav.defs_by_id sym_id d;
     nav_add_occurrence nav ~sym_id ~uri:d.uri ~loc:d.loc;
     Some { sym_id; decl = d }
+
+let upsert_semantic_snapshot_for_doc_with_skeleton (ws : t) (doc : Document.t) :
+    unit =
+  if ws.sem_store_enabled then
+    Perf_stats.time "snapshot.build.skeleton" (fun () ->
+        let nav = doc_nav_create () in
+        skeleton_defs doc
+        |> List.iter (fun d -> ignore (nav_add_decl nav d));
+        let snap = snapshot_for_doc ws doc nav in
+        Perf_stats.tick "query.cache.upsert_skeleton";
+        Semantic_store.upsert_snapshot ws.semantic_store snap)
 
 let nav_bind_value (scope : nav_scope) (b : nav_binding) : unit =
   match Hashtbl.find_opt scope.values b.decl.key with
@@ -1491,6 +1551,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   let nav = doc_nav_create () in
   let uri = doc.Document.uri in
   let root_scope = nav_scope_empty () in
+  let implementation_config = ws.implementation_config in
 
   let add_decl_binding ?metadata (scope : nav_scope) ~(id : Ast.ident)
       ~(kind : int) ~(container : string option)
@@ -1705,10 +1766,20 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   let rec prebind_decl (scope : nav_scope) ~(container : string option)
       (d : Ast.decl Ast.node) : unit =
     match d.v with
-    | Ast.DVar { name; dtype; storage; external_modifier; data_decl_kind; _ } ->
+    | Ast.DVar
+        {
+          name;
+          dtype;
+          storage;
+          external_modifier;
+          data_decl_kind;
+          is_readonly;
+          _;
+        } ->
         let metadata =
-          metadata_for_var ~external_modifier ~data_decl_kind
-            ~dtype:(Some dtype) ~storage:(Some storage) ()
+          metadata_for_var ~implementation_config ~external_modifier
+            ~data_decl_kind
+            ~dtype:(Some dtype) ~storage:(Some storage) ~is_readonly ()
           |> resolve_metadata_type scope
         in
         add_decl_default
@@ -1717,7 +1788,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         nav_bind_value_type scope name dtype
     | Ast.DConst { name; dtype; external_modifier; data_decl_kind; _ } ->
         let metadata =
-          metadata_for_var ~is_constant:true ~external_modifier
+          metadata_for_var ~implementation_config ~is_constant:true
+            ~external_modifier
             ~data_decl_kind ~dtype ~storage:None ()
           |> resolve_metadata_type scope
         in
@@ -1726,15 +1798,21 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         Option.iter (nav_bind_value_type scope name) dtype
     | Ast.DType { name; defn; external_modifier } ->
         add_decl_type
-          ~metadata:(metadata_for_type ~external_modifier ~defn ())
+          ~metadata:(metadata_for_type ~implementation_config ~external_modifier
+                       ~defn ())
           scope ~id:name ~kind:sym_kind_type ~container;
         nav_bind_type_expr scope name defn
     | Ast.DProc p ->
         add_decl_value
           ~metadata:
             (metadata_for_proc ~external_modifier:p.v.external_modifier
-               ~returns:p.v.returns ~has_body:p.v.has_body ())
+               ~implementation_config ~returns:p.v.returns
+               ~has_body:p.v.has_body
+               ~is_inline:p.v.is_inline ())
           scope ~id:p.v.name ~kind:sym_kind_func ~container
+    | Ast.DOverlay overlay ->
+        add_decl_default ~metadata:metadata_for_overlay scope
+          ~id:overlay.overlay_name ~kind:sym_kind_var ~container
     | Ast.DDirective _ -> ()
   and prebind_stmt (scope : nav_scope) ~(container : string option)
       (s : Ast.stmt Ast.node) : unit =
@@ -1774,7 +1852,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
           (fun f ->
             let fv = f.v in
             add_decl_field
-              ~metadata:(metadata_for_field ~ftype:fv.ftype ())
+              ~metadata:(metadata_for_field ~implementation_config
+                           ~ftype:fv.ftype ())
               scope ~id:fv.fname ~kind:sym_kind_field ~container;
             walk_type scope ~container fv.ftype;
             Option.iter
@@ -1788,7 +1867,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         List.iter
           (fun prm ->
             add_decl_value
-              ~metadata:(metadata_for_parameter ~ptype:prm.v.ptype ())
+              ~metadata:(metadata_for_parameter ~implementation_config
+                           ~ptype:prm.v.ptype ())
               fn_scope ~id:prm.v.pname ~kind:sym_kind_var
               ~container;
             walk_type fn_scope ~container prm.v.ptype)
@@ -1843,6 +1923,13 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         walk_expr scope ~container ptr
     | Ast.EDeref { ptr } -> walk_expr scope ~container ptr
     | Ast.EParen x -> walk_expr ?expected_status_owner scope ~container x
+  and walk_overlay_item (scope : nav_scope) ~(container : string option)
+      (item : Ast.overlay_item Ast.node) : unit =
+    match item.v with
+    | Ast.OverlayTarget id -> use_value scope id
+    | Ast.OverlaySpacer expr -> walk_expr scope ~container expr
+    | Ast.OverlayGroup items ->
+        List.iter (walk_overlay_item scope ~container) items
   and walk_decl (scope : nav_scope) ~(container : string option)
       (d : Ast.decl Ast.node) : unit =
     match d.v with
@@ -1875,12 +1962,15 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
           add_decl_value
             ~metadata:
               (metadata_for_proc ~external_modifier:p.v.external_modifier
-                 ~returns:p.v.returns ~has_body:p.v.has_body ())
+                 ~implementation_config ~returns:p.v.returns
+                 ~has_body:p.v.has_body
+                 ~is_inline:p.v.is_inline ())
             proc_scope ~id:p.v.name ~kind:sym_kind_func ~container;
         List.iter
           (fun prm ->
             add_decl_value
-              ~metadata:(metadata_for_parameter ~ptype:prm.v.ptype ())
+              ~metadata:(metadata_for_parameter ~implementation_config
+                           ~ptype:prm.v.ptype ())
               proc_scope ~id:prm.v.pname ~kind:sym_kind_var
               ~container:proc_container;
             nav_bind_value_type proc_scope prm.v.pname prm.v.ptype)
@@ -1895,6 +1985,9 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         | Some r -> walk_type proc_scope ~container:proc_container r);
         List.iter (walk_decl proc_scope ~container:proc_container) p.v.locals;
         walk_stmt proc_scope ~container:proc_container p.v.body
+    | Ast.DOverlay overlay ->
+        Option.iter (walk_expr scope ~container) overlay.overlay_pos;
+        List.iter (walk_overlay_item scope ~container) overlay.overlay_items
     | Ast.DDirective _ -> ()
   and walk_stmt (scope : nav_scope) ~(container : string option)
       (s : Ast.stmt Ast.node) : unit =
@@ -1962,6 +2055,9 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         match resolve_compool_doc_uncached ws ~name:imp.compool with
         | None -> ()
         | Some target ->
+            if String.length target.Document.text > ws.full_semantic_tokens_max_bytes
+            then Perf_stats.tick "nav.import_bind_deferred_large"
+            else
             let defs = exported_defs_for_import_scope target in
             if imp.selected = [] then
               List.iter

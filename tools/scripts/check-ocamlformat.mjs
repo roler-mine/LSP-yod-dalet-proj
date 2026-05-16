@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Module overview: Verifies that OCaml sources match the repository ocamlformat settings.
 
 import fs from "fs";
 import { spawnSync } from "child_process";

@@ -1,39 +1,10 @@
+(* Module overview: Resolves Jovial COMPOOL, ICOPY, and include relationships between files. *)
+
 module T = Lsp.Types
 open Ast
 open Workspace_foundation
 open Workspace_state
 open Workspace_index_graph
-
-let diag_parse_guard ~(file : string option) ~(max_bytes : int)
-    ~(actual_bytes : int) : T.Diagnostic.t =
-  let z = { Ast.Loc.line = 1; col = 0; offset = 0 } in
-  let loc = Ast.Loc.make ~file ~start_pos:z ~end_pos:z in
-  Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"parse"
-    ~message:
-      (Printf.sprintf "File parse skipped (%d bytes exceeds guard %d bytes)."
-         actual_bytes max_bytes)
-    loc
-
-let make_doc_with_parse_guard ?lsp_version (ws : t)
-    ~(uri : T.DocumentUri.t) ~(file : string option) ~(text : string)
-    ~(actual_bytes : int) : Document.t =
-  Perf_stats.tick "parse.large_file_guard";
-  Document.make_parse_skipped_versioned ~lsp_version ~uri ~file ~text
-    ~parse_diags:
-      [
-        diag_parse_guard ~file ~max_bytes:ws.parse_file_max_bytes ~actual_bytes;
-      ]
-
-let parse_guarded_document_make ?lsp_version
-    ?(profile = Parser.Interactive) (ws : t) ~(uri : T.DocumentUri.t)
-    ~(file : string option) ~(text : string) : Document.t =
-  if
-    is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
-      ~text_len:(String.length text)
-  then
-    make_doc_with_parse_guard ?lsp_version ws ~uri ~file ~text
-      ~actual_bytes:(String.length text)
-  else Document.make_with_profile_versioned ~lsp_version ~profile ~uri ~file ~text
 
 let diag_missing_compool (loc : Ast.Loc.t) (name : string) : T.Diagnostic.t =
   let key = normalize_name name in
@@ -121,6 +92,13 @@ let find_compool_path_fallback (ws : t) ~(key : string) : string option =
            | Some stem -> normalize_name stem = key
            | None -> false))
 
+let allow_import_fallback_scan (ws : t) : bool =
+  allow_fallback_scan ws
+  &&
+  match Workspace_runtime.workspace_profile_for_budget ws with
+  | ProfileLarge -> ws.startup_fully_nav_ready_ms <> None
+  | ProfileSmall | ProfileMedium -> true
+
 let find_open_compool_doc_by_key (ws : t) (key : string) : Document.t option =
   let found = ref None in
   Hashtbl.iter
@@ -142,14 +120,15 @@ let has_compool_target (ws : t) (name : string) : bool =
           match Workspace_index.find_compool idx ~name:key with
           | Some _ -> true
           | None ->
-              if allow_fallback_scan ws then
+              if allow_import_fallback_scan ws then
                 match find_compool_path_fallback ws ~key with
                 | Some _ -> true
                 | None -> false
               else false)
       | None -> (
-          match
-            if allow_fallback_scan ws then find_compool_path_fallback ws ~key
+         match
+            if allow_import_fallback_scan ws then
+              find_compool_path_fallback ws ~key
             else None
           with
           | Some _ -> true
@@ -160,14 +139,19 @@ type compool_import_dir = {
   selected : (string * Ast.Loc.t) list; (* imported element name + location *)
 }
 
-let diag_missing_import_hint ~(loc : Ast.Loc.t) ~(kind : string)
-    ~(symbol : string) ~(compools : string list) : T.Diagnostic.t =
+let diag_missing_import_hint ~(selected_imported : bool) ~(loc : Ast.Loc.t)
+    ~(kind : string) ~(symbol : string) ~(compools : string list) : T.Diagnostic.t =
   let targets =
     match compools with [] -> "" | [ c ] -> c | xs -> String.concat ", " xs
   in
   let msg =
     if targets = "" then
       Printf.sprintf "%s %S may require a COMPOOL import." kind symbol
+    else if selected_imported then
+      Printf.sprintf
+        "%s %S is available in COMPOOL %s but is not in the selective import \
+         list. Add it to !COMPOOL '%s'."
+        kind symbol targets (List.hd compools)
     else
       Printf.sprintf
         "%s %S is available in COMPOOL %s. Import it with !COMPOOL '%s' (or \
@@ -208,7 +192,7 @@ let is_control_stmt_keyword (name : string) : bool =
 let is_reserved_keyword (name : string) : bool =
   match normalize_name name with
   | "START" | "TERM" | "BEGIN" | "END" | "DEF" | "REF" | "STATIC" | "CONSTANT"
-  | "PROC" | "ITEM" | "TABLE" | "TYPE" | "IF" | "THEN" | "ELSE" | "WHILE"
+  | "READONLY" | "PROC" | "ITEM" | "TABLE" | "TYPE" | "IF" | "THEN" | "ELSE" | "WHILE"
   | "FOR" | "BY" | "CASE" | "DEFAULT" | "FALLTHRU" | "EXIT" | "GOTO" | "RETURN"
   | "ABORT" | "STOP" | "TRUE" | "FALSE" | "NOT" | "AND" | "OR" | "XOR" | "EQV"
   | "MOD" | "PROGRAM" | "COMPOOL" | "ICOMPOOL" | "DEFINE" | "BLOCK" | "ICOPY"
@@ -220,10 +204,118 @@ let is_reserved_keyword (name : string) : bool =
       true
   | _ -> false
 
+let trim_import_token (s : string) : string =
+  let s = String.trim s in
+  let n = String.length s in
+  if
+    n >= 2
+    && ((s.[0] = '\'' && s.[n - 1] = '\'')
+       || (s.[0] = '"' && s.[n - 1] = '"'))
+  then String.sub s 1 (n - 2)
+  else s
+
+let import_loc_of_cols (doc : Document.t) ~(line0 : int) ~(c0 : int) ~(c1 : int)
+    : Ast.Loc.t =
+  let base =
+    match Text_index.line_start_offset doc.Document.index ~line:line0 with
+    | Some n -> n
+    | None -> 0
+  in
+  let start_pos = { Ast.Loc.line = line0 + 1; col = c0; offset = base + c0 } in
+  let end_pos = { Ast.Loc.line = line0 + 1; col = c1; offset = base + c1 } in
+  Ast.Loc.make ~file:doc.Document.file ~start_pos ~end_pos
+
+let import_tokens_of_line ~(line0 : int) (line : string) :
+    (string * int * int * int) list =
+  let n = String.length line in
+  let is_delim = function
+    | ' ' | '\t' | '\r' | '\n' | '(' | ')' | ',' | ';' -> true
+    | _ -> false
+  in
+  let rec loop i acc =
+    if i >= n then List.rev acc
+    else if is_delim line.[i] then loop (i + 1) acc
+    else
+      let j = ref i in
+      while !j < n && not (is_delim line.[!j]) do
+        incr j
+      done;
+      loop !j ((String.sub line i (!j - i), line0, i, !j) :: acc)
+  in
+  loop 0 []
+
+let import_marker_key (token : string) : string =
+  let token = trim_import_token token in
+  let n = String.length token in
+  let token = if n > 0 && token.[0] = '!' then String.sub token 1 (n - 1) else token in
+  normalize_name token
+
+let text_compool_import_dirs (doc : Document.t) : compool_import_dir list =
+  let lines = String.split_on_char '\n' doc.Document.text in
+  let line_count = List.length lines in
+  let line_at i = try List.nth lines i with _ -> "" in
+  let line_has_marker line =
+    import_tokens_of_line ~line0:0 line
+    |> List.exists (fun (tok, _, _, _) ->
+           let k = import_marker_key tok in
+           k = "COMPOOL" || k = "ICOMPOOL")
+  in
+  let gather_directive start =
+    let rec loop i acc =
+      if i >= line_count || i >= start + 12 then acc
+      else
+        let line = line_at i in
+        let acc = acc @ import_tokens_of_line ~line0:i line in
+        if String.contains line ';' then acc else loop (i + 1) acc
+    in
+    loop start []
+  in
+  let dirs = ref [] in
+  lines
+  |> List.iteri (fun line0 line ->
+         if line_has_marker line then (
+           let tokens = gather_directive line0 in
+           let rec find_marker idx = function
+             | [] -> None
+             | (tok, _, _, _) :: rest ->
+                 let k = import_marker_key tok in
+                 if k = "COMPOOL" || k = "ICOMPOOL" then Some idx
+                 else find_marker (idx + 1) rest
+           in
+           match find_marker 0 tokens with
+           | None -> ()
+           | Some idx -> (
+               match List.nth_opt tokens (idx + 1) with
+               | None -> ()
+               | Some (raw_compool, _cline, _cc0, _cc1) ->
+                   let compool = normalize_name (trim_import_token raw_compool) in
+                   if compool <> "" then
+                     let selected =
+                       tokens
+                       |> List.mapi (fun i tok -> (i, tok))
+                       |> List.filter_map (fun (i, (raw, line0, c0, c1)) ->
+                              if i <= idx + 1 then None
+                              else
+                                let key = normalize_name (trim_import_token raw) in
+                                if key = "" || is_reserved_keyword key then None
+                                else
+                                  Some
+                                    ( key,
+                                      import_loc_of_cols doc ~line0 ~c0 ~c1 ))
+                     in
+                     dirs :=
+                       {
+                         compool;
+                         selected;
+                       }
+                       :: !dirs)));
+  List.rev !dirs
+
 let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
   let doc = Document.ensure_parsed doc in
-  match Document.current_parse doc with
-  | Some { Document.parsed_ast = Some prog; _ } ->
+  let ast_dirs =
+    match Document.current_parse doc with
+    | Some { Document.parsed_ast = Some prog; _ } ->
       let from_decl (d : Ast.decl Ast.node) : compool_import_dir option =
         match d.v with
         | Ast.DDirective { name; args = first :: rest } ->
@@ -246,7 +338,23 @@ let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
       |> List.filter_map (function
         | Ast.TopDecl d -> from_decl d
         | Ast.TopStmt _ -> None)
-  | _ -> []
+    | _ -> []
+  in
+  let text_dirs = text_compool_import_dirs doc in
+  match text_dirs with
+  | [] -> ast_dirs
+  | _ ->
+      let text_seen = Hashtbl.create 16 in
+      List.iter
+        (fun (d : compool_import_dir) ->
+          Hashtbl.replace text_seen (normalize_name d.compool) true)
+        text_dirs;
+      let ast_extras =
+        ast_dirs
+        |> List.filter (fun (d : compool_import_dir) ->
+               not (Hashtbl.mem text_seen (normalize_name d.compool)))
+      in
+      text_dirs @ ast_extras
 
 let read_file_text (path : string) : string option =
   try
@@ -328,6 +436,10 @@ let doc_from_path_cached (ws : t) (path : string) : Document.t option =
       in
       let d_opt =
         match file_size_bytes path with
+        | Some n when n >= ws.bg_large_file_bytes ->
+            Some
+              (Document.make_parse_skipped ~uri ~file:(Some path) ~text:""
+                 ~parse_diags:[])
         | Some n
           when is_parse_guard_exceeded ~max_bytes:ws.parse_file_max_bytes
                  ~text_len:n ->
@@ -369,11 +481,12 @@ let resolve_compool_doc_uncached (ws : t) ~(name : string) : Document.t option =
             match Workspace_index.find_compool idx ~name:key with
             | Some p -> Some p
             | None ->
-                if allow_fallback_scan ws then
+                if allow_import_fallback_scan ws then
                   find_compool_path_fallback ws ~key
                 else None)
         | None ->
-            if allow_fallback_scan ws then find_compool_path_fallback ws ~key
+            if allow_import_fallback_scan ws then
+              find_compool_path_fallback ws ~key
             else None
       in
       match path_opt with

@@ -1,3 +1,5 @@
+// Module overview: Small type guards for safely reading untyped JSON-like values.
+
 export function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v !== null && typeof v === "object"
     ? (v as Record<string, unknown>)

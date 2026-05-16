@@ -1,3 +1,5 @@
+(** Module overview: Case-insensitive Jovial keyword classification shared by the lexer and parser. *)
+
 type class_ = Hard | Soft
 
 val equal_upper_ascii : string -> string -> bool

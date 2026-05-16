@@ -1,3 +1,5 @@
+(* Module overview: In-memory document model with text indexes, parse caches, diagnostics, and versions. *)
+
 module T = Lsp.Types
 
 type t = {
@@ -179,6 +181,10 @@ let lsp_version (d : t) = d.lsp_version
 
 let with_lsp_version (lsp_version : int option) (d : t) : t =
   { d with lsp_version }
+
+let with_identity ?lsp_version ~(uri : T.DocumentUri.t) ~(file : string option)
+    (d : t) : t =
+  { d with uri; file; lsp_version }
 
 let ensure_parsed (d : t) : t =
   if d.parse_rev <> d.rev then (

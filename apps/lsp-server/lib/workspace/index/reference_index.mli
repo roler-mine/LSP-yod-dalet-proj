@@ -1,3 +1,5 @@
+(** Module overview: Collects symbol references for navigation, rename, codelens, and LSIF export. *)
+
 type occurrence_kind =
   | Declaration
   | Definition

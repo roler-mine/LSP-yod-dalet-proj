@@ -1,3 +1,5 @@
+(** Module overview: Cached parse/skeleton representation used by workspace indexing and features. *)
+
 type syntax_unit_kind =
   | Program
   | Module_item

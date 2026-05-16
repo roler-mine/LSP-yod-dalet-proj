@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Module overview: Builds the OCaml LSP server and stages runtime binaries for the VS Code extension package.
 
 const cp = require("child_process");
 const fs = require("fs");
@@ -50,6 +51,7 @@ function parseArgs(argv) {
   let target;
   let outPath;
   let allowArchMismatch = false;
+  let noBundle = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -73,10 +75,14 @@ function parseArgs(argv) {
     }
     if (arg === "--allow-arch-mismatch") {
       allowArchMismatch = true;
+      continue;
+    }
+    if (arg === "--no-bundle") {
+      noBundle = true;
     }
   }
 
-  return { target, outPath, allowArchMismatch };
+  return { target, outPath, allowArchMismatch, noBundle };
 }
 
 function inferHostTarget() {
@@ -138,7 +144,9 @@ function windowsPathToWslPath(windowsPath) {
   const resolved = path.resolve(windowsPath).replace(/\\/g, "/");
   const match = /^([A-Za-z]):\/(.*)$/.exec(resolved);
   if (!match) {
-    throw new Error(`failed to translate Windows path to WSL path: ${windowsPath}`);
+    throw new Error(
+      `failed to translate Windows path to WSL path: ${windowsPath}`,
+    );
   }
   return `/mnt/${match[1].toLowerCase()}/${match[2]}`;
 }
@@ -203,7 +211,9 @@ function buildServer(target) {
         "[build-server] WSL was not found. Install WSL with an OCaml toolchain and retry.\n",
       );
     } else {
-      process.stderr.write("[build-server] opam was not found. Install opam and retry.\n");
+      process.stderr.write(
+        "[build-server] opam was not found. Install opam and retry.\n",
+      );
     }
   } else {
     process.stderr.write(
@@ -304,7 +314,10 @@ function validateBinaryArchitecture(sourcePath, target, allowArchMismatch) {
   if (!expected) return;
 
   const actual = readBinaryInfo(sourcePath);
-  if (actual.format === expected.format && actual.machine === expected.machine) {
+  if (
+    actual.format === expected.format &&
+    actual.machine === expected.machine
+  ) {
     return;
   }
 
@@ -373,4 +386,8 @@ const destinationPath = args.outPath
 buildServer(target);
 const builtBinary = findBuiltBinary(target);
 validateBinaryArchitecture(builtBinary, target, args.allowArchMismatch);
+if (args.noBundle) {
+  process.stdout.write(`[build-server] built server: ${builtBinary}\n`);
+  process.exit(0);
+}
 bundleBinary(builtBinary, destinationPath, target);

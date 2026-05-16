@@ -1,3 +1,5 @@
+(* Module overview: Cached parse/skeleton representation used by workspace indexing and features. *)
+
 type syntax_unit_kind =
   | Program
   | Module_item
@@ -110,7 +112,8 @@ let is_boundary = function
 let is_decl_start = function
   | Parser.BANG | Parser.COMPOOL | Parser.ICOMPOOL | Parser.DEFINE
   | Parser.TYPE | Parser.BLOCK | Parser.DEF | Parser.REF | Parser.PROC
-  | Parser.ITEM | Parser.TABLE | Parser.STATIC | Parser.CONSTANT ->
+  | Parser.ITEM | Parser.TABLE | Parser.READONLY | Parser.INLINE
+  | Parser.OVERLAY | Parser.STATIC | Parser.CONSTANT ->
       true
   | _ -> false
 

@@ -1,3 +1,5 @@
+(** Module overview: Jovial compile-time expression evaluation helpers used by semantic checks. *)
+
 type ctf_value =
   | CtfInt of int64
   | CtfFloat of string
@@ -30,6 +32,7 @@ val copy_env : env -> env
 val add_constant : env -> string -> Ast.expr Ast.node -> unit
 val add_non_constant : env -> string -> unit
 val add_impl_param : env -> string -> ctf_value -> unit
+val add_implementation_config : env -> Implementation_config.t -> unit
 val eval_expr : ?env:env -> Ast.expr Ast.node -> ctf_result
 val int_value : ctf_result -> int64 option
 val is_definitely_non_constant : ctf_result -> bool

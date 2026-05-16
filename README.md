@@ -116,17 +116,20 @@ code --install-extension .\apps\vscode-extension\jovial-lsp-client-0.0.1.vsix
 - `jovial.server.parseMaxFileBytes`: parse-size guard sent through `initialize`
 - `jovial.server.pressureSoftMb`: soft memory pressure threshold sent through `initialize`
 - `jovial.server.pressureCriticalMb`: critical memory pressure threshold sent through `initialize`
+- `jovial.implementation.*`: optional target profile values such as dialect, word/byte size, default float/fixed precision, max-size hints, and configured system subroutines
 - `jovial.features.*`: per-feature booleans for diagnostics, nav, hover, symbols, completion, code actions, inlay hints, and semantic tokens
 - `Jovial: Refresh LSIF Cache`: manual command to rebuild LSIF cache when `jovial.lsif.fastPath` is enabled
 
 The supported runtime config path is now `initializationOptions.jovial` with
-five fixed groups:
+seven fixed groups:
 
 - `jovial.workspace`
 - `jovial.background`
 - `jovial.features`
 - `jovial.server`
 - `jovial.startup`
+- `jovial.performance`
+- `jovial.implementation`
 
 Environment variables remain as fallbacks and advanced escape hatches for
 manual runs, tests, and low-level tuning.
@@ -135,6 +138,17 @@ Startup behavior:
 
 - `balanced`: diagnostics and navigation warm together.
 - `infoFirst`: hover, goto, references, and other navigation features are prioritized first; diagnostics publish after navigation readiness is reached.
+- Open-file hover and navigation readiness targets are 1500 ms by default. Files over 15 MB use the huge-file path and a 10000 ms readiness target while full background indexing continues.
+
+Architecture and performance docs:
+
+- Staged readiness, query authority, module summaries, persistent cache
+  authority, fallback scans, CodeLens confidence, and debug-report reading:
+  `docs/architecture/staged-workspace-architecture.md`
+- Benchmark harness usage and report schema:
+  `docs/performance/benchmark-harness.md`
+- Symbol-resolution explanation and CodeLens confidence details:
+  `docs/architecture/symbol-resolution-debugging.md`
 
 ## Testing And CI
 

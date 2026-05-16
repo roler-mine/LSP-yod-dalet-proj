@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Module overview: Checks bundled language-server binaries for expected platform and architecture metadata.
 
 const fs = require("fs");
 const path = require("path");

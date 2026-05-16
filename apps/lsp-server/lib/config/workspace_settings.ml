@@ -1,3 +1,5 @@
+(* Module overview: Workspace configuration model for startup, diagnostics, feature flags, and limits. *)
+
 type workspace_diag_mode =
   | WorkspaceDiagsOff
   | WorkspaceDiagsErrors
@@ -97,6 +99,8 @@ type t = {
   root_closure_target_files : int;
   skeleton_prefix_bytes : int;
   sched_open_doc_min_share_pct : int;
+  allow_slow_query_fallback : bool;
+  implementation_config : Implementation_config.t;
 }
 
 type client_overrides = {
@@ -117,6 +121,7 @@ type client_overrides = {
   pressure_soft_mb : int option;
   pressure_critical_mb : int option;
   startup_priority_mode : startup_priority_mode option;
+  implementation_config : Implementation_config.client_overrides;
 }
 
 let empty_feature_overrides : feature_overrides =
@@ -159,21 +164,22 @@ let empty_client_overrides : client_overrides =
     pressure_soft_mb = None;
     pressure_critical_mb = None;
     startup_priority_mode = None;
+    implementation_config = Implementation_config.empty_client_overrides;
   }
 
 let pressure_soft_mb_default = 512
 let pressure_critical_mb_default = 768
-let startup_target_ms_default = 15000
-let startup_diag_hover_target_ms_default = 15000
-let startup_nav_target_ms_default = 30000
-let startup_aggressive_window_ms_default = 3000
+let startup_target_ms_default = 1500
+let startup_diag_hover_target_ms_default = 1500
+let startup_nav_target_ms_default = 1500
+let startup_aggressive_window_ms_default = 500
 let startup_aggressive_bg_budget_ms_default = 20
 let profile_small_max_bytes = 10 * 1024 * 1024
 let profile_medium_max_bytes = 40 * 1024 * 1024
 let large_file_threshold_bytes_default = 128 * 1024
-let huge_file_threshold_bytes_default = 20 * 1024 * 1024
+let huge_file_threshold_bytes_default = 15 * 1024 * 1024
 let full_semantic_tokens_max_bytes_default = 1024 * 1024
-let full_parse_max_bytes_default = 5 * 1024 * 1024
+let full_parse_max_bytes_default = 15 * 1024 * 1024
 
 let workspace_diag_mode_of_string (raw : string) : workspace_diag_mode option =
   match String.lowercase_ascii (String.trim raw) with
@@ -441,7 +447,7 @@ let from_env () : t =
       max 1 (Env_utils.nonneg_int "JOVIAL_CLOSED_DOC_LRU_MAX" ~default:256);
     parse_file_max_bytes =
       if enable_huge_file_full_parse then full_parse_max_bytes
-      else min full_parse_max_bytes (max 1 (huge_file_threshold_bytes - 1));
+      else min full_parse_max_bytes (max 1 huge_file_threshold_bytes);
     large_file_threshold_bytes;
     huge_file_threshold_bytes;
     full_semantic_tokens_max_bytes;
@@ -501,6 +507,9 @@ let from_env () : t =
       max 1024
         (Env_utils.nonneg_int "JOVIAL_SKELETON_PREFIX_BYTES" ~default:262144);
     sched_open_doc_min_share_pct;
+    allow_slow_query_fallback =
+      Env_utils.flag "JOVIAL_ALLOW_SLOW_QUERY_FALLBACK" ~default:false;
+    implementation_config = Implementation_config.from_env ();
   }
 
 let apply_client_overrides (settings : t) (overrides : client_overrides) : t =
@@ -545,7 +554,7 @@ let apply_client_overrides (settings : t) (overrides : client_overrides) : t =
   in
   let parse_file_max_bytes =
     if enable_huge_file_full_parse then full_parse_max_bytes
-    else min full_parse_max_bytes (max 1 (huge_file_threshold_bytes - 1))
+    else min full_parse_max_bytes (max 1 huge_file_threshold_bytes)
   in
   {
     settings with
@@ -601,4 +610,7 @@ let apply_client_overrides (settings : t) (overrides : client_overrides) : t =
       (match overrides.startup_priority_mode with
       | Some mode -> mode
       | None -> settings.startup_priority_mode);
+    implementation_config =
+      Implementation_config.apply_client_overrides settings.implementation_config
+        overrides.implementation_config;
   }

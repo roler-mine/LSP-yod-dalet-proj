@@ -1,3 +1,5 @@
+(* Module overview: High-level query API for hover, definition, references, AST/CST dumps, and debug output. *)
+
 module T = Lsp.Types
 open Workspace_foundation
 open Workspace_state
@@ -7,6 +9,7 @@ open Workspace_nav_lookup
 
 module R = Workspace_readiness
 module Perf_stats = Workspace_foundation.Perf_stats
+module Metadata = Workspace_symbol_metadata
 
 type query_context = {
   ws : t;
@@ -34,6 +37,11 @@ let context (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
   match Hashtbl.find_opt ws.docs uri with
   | None -> None
   | Some doc -> Some { ws; doc; pos }
+
+let startup_source_shape_looks_large (ws : t) : bool =
+  List.length ws.source_file_paths >= 320
+  || ws.source_bytes_estimate_count >= 320
+  || Option.value ws.source_bytes_estimate ~default:0 >= (64 * 1024 * 1024)
 
 let has_parse_skipped_diag (doc : Document.t) : bool =
   List.exists
@@ -73,6 +81,34 @@ let readiness_for_doc (ws : t) (doc : Document.t) : R.t * R.reason list =
 let doc_has_current_local_ast (doc : Document.t) : bool =
   doc.Document.parse_rev = doc.Document.rev && doc.Document.ast <> None
   && not (has_parse_skipped_diag doc)
+
+let doc_has_cached_nav_snapshot (ws : t) (doc : Document.t) : bool =
+  ws.sem_store_enabled
+  &&
+  match Semantic_store.snapshot_for_uri ws.semantic_store ~uri:doc.Document.uri with
+  | Some snap -> snap.Semantic_store.Snapshot.doc_rev = doc.Document.parse_rev
+  | None -> false
+
+let startup_large_workspace_skeletal (ws : t) (doc : Document.t) : bool =
+  (not (quick_nav_index_ready_for_startup ws))
+  && (not (doc_has_current_local_ast doc || doc_has_cached_nav_snapshot ws doc))
+  && (startup_source_shape_looks_large ws
+     ||
+     match workspace_profile_for_budget ws with
+     | ProfileLarge -> true
+     | ProfileSmall | ProfileMedium -> false)
+
+let startup_large_doc_semantic_deferred (ws : t) (doc : Document.t) : bool =
+  (* Large open files can have a current AST before workspace navigation is
+     ready. During startup, keep editor requests on skeleton/summary data and
+     leave macro/nav construction to the background path. *)
+  ws.startup_fully_nav_ready_ms = None
+  && String.length doc.Document.text >= ws.full_semantic_tokens_max_bytes
+  && (not (quick_nav_index_complete ws))
+  &&
+  match workspace_profile_for_budget ws with
+  | ProfileLarge -> true
+  | ProfileSmall | ProfileMedium -> startup_source_shape_looks_large ws
 
 let fallback_readiness_for_doc (doc : Document.t) : R.t =
   if doc.Document.syntax <> None || doc.Document.ast <> None then R.SkeletonReady
@@ -317,11 +353,33 @@ let hover_target_at_position ctx =
   symbol_at_position ctx |> record_result "hover_target_at_position"
 
 let definition_at_position ctx =
+  let summary_hits_before = perf_metric_calls "query.cross_module.summary_hit" in
   let value =
-    Workspace_definition.definition_locations_for ctx.ws
-      ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    Perf_stats.time "query.definition_core_ms" (fun () ->
+        Workspace_definition.definition_locations_for ctx.ws
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos)
   in
-  let readiness, authority, reasons = metadata_for_locations ctx value in
+  let summary_backed =
+    perf_metric_calls "query.cross_module.summary_hit" > summary_hits_before
+  in
+  let readiness, authority, reasons =
+    Perf_stats.time "query.definition_metadata_ms" (fun () ->
+        metadata_for_locations ctx value)
+  in
+  let cross_file =
+    List.exists
+      (fun (loc : T.Location.t) -> not (same_uri loc.uri ctx.doc.Document.uri))
+      value
+  in
+  let readiness, authority, reasons =
+    if summary_backed && cross_file then
+      let reasons =
+        if List.mem R.CrossModuleIndexWarming reasons then reasons
+        else R.CrossModuleIndexWarming :: reasons
+      in
+      (R.WorkspaceSemanticReady, R.Provisional, reasons)
+    else (readiness, authority, reasons)
+  in
   make_result ctx ~readiness ~authority ~reasons value |> record_result "definition"
 
 let references_at_position ~(include_declaration : bool) ctx =
@@ -338,13 +396,16 @@ let hover_at_position ctx =
     Workspace_hover.hover_for ctx.ws ~uri:ctx.doc.Document.uri ~pos:ctx.pos
   in
   let readiness, authority, reasons =
-    match hover_target_at_position ctx with
-    | { R.value = Some _; readiness; authority; reasons } ->
-        let readiness =
-          if value = None then readiness else R.max readiness R.LocalAstReady
-        in
-        (readiness, authority, reasons)
-    | { readiness; authority; reasons; _ } -> (readiness, authority, reasons)
+    match value with
+    | Some _ ->
+        let readiness, reasons = readiness_for_doc ctx.ws ctx.doc in
+        let readiness = R.max readiness R.LocalAstReady in
+        (readiness, authority_for readiness reasons, reasons)
+    | None -> (
+        match hover_target_at_position ctx with
+        | { R.value = Some _; readiness; authority; reasons } ->
+            (readiness, authority, reasons)
+        | { readiness; authority; reasons; _ } -> (readiness, authority, reasons))
   in
   make_result ctx ~readiness ~authority ~reasons value |> record_result "hover"
 
@@ -355,16 +416,31 @@ let none_result (ws : t) value =
   in
   { R.value = value; readiness; authority = R.Provisional; reasons }
 
+let startup_skeletal_result ctx value =
+  let readiness = fallback_readiness_for_doc ctx.doc in
+  make_result ctx ~readiness ~authority:R.Provisional
+    ~reasons:[ R.WorkspaceIndexWarming ] value
+
 let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Location.t list =
   match context ws ~uri ~pos with
   | None -> (none_result ws [] |> record_result "definition").value
+  | Some ctx when startup_large_doc_semantic_deferred ws ctx.doc ->
+      (startup_skeletal_result ctx [] |> record_result "definition").value
+  | Some ctx when startup_large_workspace_skeletal ws ctx.doc ->
+      (startup_skeletal_result ctx [] |> record_result "definition").value
   | Some ctx -> (definition_at_position ctx).value
 
 let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) ~(include_decl : bool) : T.Location.t list =
   match context ws ~uri ~pos with
   | None -> (none_result ws [] |> record_result "references").value
+  | Some ctx when startup_large_doc_semantic_deferred ws ctx.doc ->
+      ignore include_decl;
+      (startup_skeletal_result ctx [] |> record_result "references").value
+  | Some ctx when startup_large_workspace_skeletal ws ctx.doc ->
+      ignore include_decl;
+      (startup_skeletal_result ctx [] |> record_result "references").value
   | Some ctx ->
       (references_at_position ~include_declaration:include_decl ctx).value
 
@@ -372,7 +448,174 @@ let hover_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
     T.Hover.t option =
   match context ws ~uri ~pos with
   | None -> (none_result ws None |> record_result "hover").value
+  | Some ctx when startup_large_doc_semantic_deferred ws ctx.doc ->
+      let value =
+        Workspace_hover.hover_skeleton_fallback_for ws ctx.doc ~pos:ctx.pos
+      in
+      (startup_skeletal_result ctx value |> record_result "hover").value
+  | Some ctx when startup_large_workspace_skeletal ws ctx.doc ->
+      (startup_skeletal_result ctx None |> record_result "hover").value
   | Some ctx -> (hover_at_position ctx).value
+
+let position_json (pos : T.Position.t) : Yojson.Safe.t =
+  `Assoc [ ("line", `Int pos.line); ("character", `Int pos.character) ]
+
+let readiness_json (result : 'a query_result) : (string * Yojson.Safe.t) list =
+  [
+    ("readiness", `String (R.label result.readiness));
+    ("authority", `String (R.authority_label result.authority));
+    ( "reasons",
+      `List (List.map (fun reason -> `String (R.reason_label reason)) result.reasons)
+    );
+  ]
+
+let def_json (d : def) : Yojson.Safe.t =
+  `Assoc
+    [
+      ("name", `String d.name);
+      ("key", `String d.key);
+      ("kind", `String (Metadata.symbol_kind_label d.metadata.jovial_kind));
+      ("uri", `String (Uri_path.docuri_to_string d.uri));
+      ("location", location_json ~uri:d.uri d.loc);
+    ]
+
+let symbol_ref_json ~(uri : T.DocumentUri.t) (sym : symbol_ref option) :
+    Yojson.Safe.t =
+  match sym with
+  | None -> `Null
+  | Some sym ->
+      `Assoc
+        [
+          ("name", `String sym.name);
+          ("key", `String sym.key);
+          ( "symbolId",
+            match sym.symbol_id with Some id -> `String id | None -> `Null );
+          ("location", location_json ~uri sym.loc);
+          ("readiness", `String (R.label sym.readiness));
+          ("authority", `String (R.authority_label sym.authority));
+          ( "definition",
+            match sym.def with Some d -> def_json d | None -> `Null );
+        ]
+
+let target_definition_json (sym : symbol_ref option)
+    (definitions : T.Location.t list) : Yojson.Safe.t =
+  match sym with
+  | Some { def = Some d; _ } -> def_json d
+  | _ -> (
+      match definitions with
+      | loc :: _ -> T.Location.yojson_of_t loc
+      | [] -> `Null)
+
+let cache_source_for ctx (sym : symbol_ref option) definitions fallback_path_used =
+  match sym with
+  | Some { symbol_id = Some _; def = Some d; _ }
+    when same_uri d.uri ctx.doc.Document.uri ->
+      "document-navigation"
+  | Some { symbol_id = Some _; _ } when ctx.ws.sem_store_enabled ->
+      "semantic-store"
+  | Some { symbol_id = None; _ } when fallback_path_used -> "fallback-word"
+  | _ when definitions <> [] ->
+      if List.exists
+           (fun (loc : T.Location.t) -> not (same_uri loc.uri ctx.doc.Document.uri))
+           definitions
+      then "cross-module-index"
+      else "document-navigation"
+  | _ -> "none"
+
+let explain_symbol_resolution_json (ws : t) ~(uri : T.DocumentUri.t)
+    ~(pos : T.Position.t) : Yojson.Safe.t =
+  match context ws ~uri ~pos with
+  | None ->
+      `Assoc
+        [
+          ("symbol", `Null);
+          ("position", position_json pos);
+          ("readiness", `String (R.label R.LexicalOnly));
+          ("authority", `String (R.authority_label R.Provisional));
+          ("reasons", `List [ `String (R.reason_label R.SemanticStoreMiss) ]);
+          ("resolutionPath", `List [ `String "document: not open or not indexed" ]);
+          ("fallbackScanUsed", `Bool false);
+          ("fallbackPathUsed", `Bool false);
+          ("cacheSource", `String "none");
+          ("targetDefinition", `Null);
+        ]
+  | Some ctx ->
+      let fallback_before =
+        perf_metric_calls "query.cross_module.fallback_scan"
+      in
+      let symbol_result = symbol_at_position ctx in
+      let definition_result = definition_at_position ctx in
+      let fallback_after = perf_metric_calls "query.cross_module.fallback_scan" in
+      let fallback_scan_used = fallback_after > fallback_before in
+      let fallback_path_used =
+        fallback_scan_used
+        ||
+        match symbol_result.value with
+        | Some { symbol_id = None; _ } -> true
+        | _ -> false
+      in
+      let result_for_metadata =
+        if definition_result.value <> [] then definition_result
+        else
+          {
+            R.value = [];
+            readiness = symbol_result.readiness;
+            authority = symbol_result.authority;
+            reasons = symbol_result.reasons;
+          }
+      in
+      let symbol_step =
+        match symbol_result.value with
+        | None -> "symbolAtPosition: unresolved"
+        | Some sym ->
+            Printf.sprintf "symbolAtPosition: %s (%s)" sym.name sym.key
+      in
+      let target_step =
+        Printf.sprintf "definition: %d target%s"
+          (List.length definition_result.value)
+          (if List.length definition_result.value = 1 then "" else "s")
+      in
+      let fallback_step =
+        if fallback_scan_used then "fallbackScan: used"
+        else if fallback_path_used then "fallbackWord: used"
+        else "fallbackScan: not used"
+      in
+      let cache_source =
+        cache_source_for ctx symbol_result.value definition_result.value
+          fallback_path_used
+      in
+      `Assoc
+        ([
+           ("symbol", symbol_ref_json ~uri:ctx.doc.Document.uri symbol_result.value);
+           ("symbolName", (
+             match symbol_result.value with
+             | Some sym -> `String sym.name
+             | None -> `Null));
+           ("symbolKey", (
+             match symbol_result.value with
+             | Some sym -> `String sym.key
+             | None -> `Null));
+           ("position", position_json pos);
+         ]
+        @ readiness_json result_for_metadata
+        @ [
+            ( "resolutionPath",
+              `List
+                [
+                  `String
+                    ("documentReadiness: " ^ R.label symbol_result.readiness);
+                  `String symbol_step;
+                  `String target_step;
+                  `String fallback_step;
+                ] );
+            ("fallbackScanUsed", `Bool fallback_scan_used);
+            ("fallbackPathUsed", `Bool fallback_path_used);
+            ("fallbackScanCountBefore", `Int fallback_before);
+            ("fallbackScanCountAfter", `Int fallback_after);
+            ("cacheSource", `String cache_source);
+            ( "targetDefinition",
+              target_definition_json symbol_result.value definition_result.value );
+          ])
 
 let debug_report_json (ws : t) (doc : Document.t) : Yojson.Safe.t =
   let readiness, reasons = readiness_for_doc ws doc in

@@ -1,3 +1,5 @@
+(* Module overview: Reads and writes JSON-RPC/LSP messages over Content-Length framed stdio. *)
+
 let strip_cr (s : string) =
   let n = String.length s in
   if n > 0 && s.[n - 1] = '\r' then String.sub s 0 (n - 1) else s

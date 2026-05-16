@@ -1,3 +1,5 @@
+(** Module overview: Startup readiness state machine for navigation and diagnostics targets. *)
+
 type t =
   | LexicalOnly
   | SkeletonReady

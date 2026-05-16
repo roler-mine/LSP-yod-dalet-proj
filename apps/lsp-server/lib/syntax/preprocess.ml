@@ -1,3 +1,5 @@
+(* Module overview: Lightweight preprocessing pass for imports, defines, includes, and compool hints. *)
+
 module T = Lsp.Types
 
 type import_kind = Compool

@@ -1,3 +1,5 @@
+// Module overview: Tests for the provider race.test extension module.
+
 import assert from "node:assert/strict";
 
 import { raceServerWithFallback } from "../src/provider_race";
@@ -102,6 +104,7 @@ async function testMissingFallbackWaitsForServer(): Promise<void> {
 
   const result = await raceServerWithFallback<string | undefined>({
     budgetMs: 1,
+    lateBudgetMs: 25,
     token,
     server: () => delay(10, "server"),
     fallback: () => {
@@ -114,6 +117,29 @@ async function testMissingFallbackWaitsForServer(): Promise<void> {
   assert.equal(result, "server");
   assert.equal(fallbackCalls, 1);
   assert.equal(token.listenerCount(), 0);
+}
+
+async function testMissingFallbackStopsAtLateBudget(): Promise<void> {
+  const token = new TestCancellationToken();
+  let fallbackCalls = 0;
+  const started = Date.now();
+
+  const result = await raceServerWithFallback<string | undefined>({
+    budgetMs: 1,
+    lateBudgetMs: 5,
+    token,
+    server: () => delay(50, "server"),
+    fallback: () => {
+      fallbackCalls += 1;
+      return undefined;
+    },
+    hasResult,
+  });
+
+  assert.equal(result, undefined);
+  assert.equal(fallbackCalls, 1);
+  assert.equal(token.listenerCount(), 0);
+  assert.ok(Date.now() - started < 45);
 }
 
 async function testCancellationPreventsFallback(): Promise<void> {
@@ -163,6 +189,7 @@ export async function run(): Promise<void> {
   await testFallbackWinsAfterBudget();
   await testQuickEmptyServerFallsBack();
   await testMissingFallbackWaitsForServer();
+  await testMissingFallbackStopsAtLateBudget();
   await testCancellationPreventsFallback();
   await testServerFailureFallsBack();
 }

@@ -1,3 +1,5 @@
+(** Module overview: Stable symbol identifier helpers used by semantic and LSIF indexes. *)
+
 type t = private int
 
 val of_int : int -> t

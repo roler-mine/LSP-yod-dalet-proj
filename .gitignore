@@ -56,6 +56,7 @@ extension_proj/pnpm-debug.log*
 **/.ocamlinit
 
 # Workspace index + scratch files
+**/.jovial-lsp/
 .jovial-lsp-index-checkpoint.json
 .jovial-lsp-index-resume.txt
 apps/lsp-server/_tmp_*.txt
@@ -68,6 +69,7 @@ server_proj/_tmp_*.json
 server_proj/_tmp_*.log
 
 # Local packaged archives
+apps.zip
 apps/vscode-extension.zip
 extension_proj.zip
 

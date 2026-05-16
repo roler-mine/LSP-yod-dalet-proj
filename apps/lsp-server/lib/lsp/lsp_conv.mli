@@ -1,3 +1,5 @@
+(** Module overview: Converts between internal AST/text positions and LSP protocol shapes. *)
+
 module T = Lsp.Types
 
 val position_of_ast_pos : Ast.Loc.pos -> T.Position.t

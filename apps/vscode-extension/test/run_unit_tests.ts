@@ -1,3 +1,5 @@
+// Module overview: Minimal unit-test runner that loads compiled extension tests without VS Code.
+
 import { run as runConfigTests } from "./jovial_config.test";
 import { run as runProviderRaceTests } from "./provider_race.test";
 import { run as runWatchedFileQueueTests } from "./watched_file_queue.test";

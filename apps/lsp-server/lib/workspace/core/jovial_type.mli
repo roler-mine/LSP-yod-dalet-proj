@@ -1,3 +1,5 @@
+(** Module overview: Jovial type representation, formatting, and compatibility helpers. *)
+
 type int_kind = Signed | Unsigned
 
 type status_value = {
@@ -69,6 +71,7 @@ val add_type : type_env -> string -> Ast.type_expr Ast.node -> unit
 
 val of_ast_type_expr : type_env -> Ast.type_expr Ast.node -> t
 val display : t -> string
+val display_with_config : Implementation_config.t -> t -> string
 val compatible : lhs:t -> rhs:t -> bool
 val conversion_required : lhs:t -> rhs:t -> bool
 val field_type : t -> string -> t option

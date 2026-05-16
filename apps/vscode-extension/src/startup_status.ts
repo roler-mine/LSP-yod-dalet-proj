@@ -1,3 +1,5 @@
+// Module overview: Manages status-bar state and startup readiness notifications for diagnostics and navigation.
+
 import * as path from "path";
 import * as vscode from "vscode";
 
@@ -25,8 +27,8 @@ type RootStartupStatus = {
   navMissTargetMs?: number;
 };
 
-export const STARTUP_DIAG_TARGET_DEFAULT_MS = 15000;
-export const STARTUP_NAV_TARGET_DEFAULT_MS = 30000;
+export const STARTUP_DIAG_TARGET_DEFAULT_MS = 1500;
+export const STARTUP_NAV_TARGET_DEFAULT_MS = 1500;
 
 const startupStatusByRoot = new Map<string, RootStartupStatus>();
 
@@ -89,6 +91,8 @@ function normalizeStartupStage(value: unknown): StartupStage {
       return "WorkspaceSkeletonReady";
     case "WorkspaceSemanticReady":
     case "fullyNavigable":
+    case "quickNavComplete":
+    case "deepSemanticComplete":
       return "WorkspaceSemanticReady";
     default:
       return "WorkspaceSemanticReady";
@@ -100,7 +104,7 @@ function legacyStartupStageKey(stage: StartupStage): string {
     case "InteractiveReady":
       return "diagHoverReady";
     case "WorkspaceSemanticReady":
-      return "fullyNavigable";
+      return "deepSemanticComplete";
     default:
       return stage;
   }
@@ -287,7 +291,10 @@ export function bindStartupNotifications({
     const stages = asRecord(readiness?.["stages"]);
     const stagePayload =
       asRecord(stages?.[stage]) ??
-      asRecord(stages?.[legacyStartupStageKey(stage)]);
+      asRecord(stages?.[legacyStartupStageKey(stage)]) ??
+      (stage === "WorkspaceSemanticReady"
+        ? asRecord(stages?.["fullyNavigable"])
+        : undefined);
     const elapsedMs = asFiniteInt(
       stagePayload?.["elapsedMs"] ?? readiness?.["elapsedMs"],
     );

@@ -1,3 +1,5 @@
+// Module overview: Races authoritative server providers against responsive fallback providers with cancellation support.
+
 export type ProviderRaceDisposable = {
   dispose(): unknown;
 };
@@ -22,6 +24,7 @@ type ProviderRaceGate = {
 
 export type RaceServerWithFallbackOptions<T> = {
   budgetMs: number;
+  lateBudgetMs?: number;
   token: ProviderRaceCancellationToken;
   server: () => T | PromiseLike<T>;
   fallback: () => T | undefined;
@@ -159,9 +162,12 @@ export async function raceServerWithFallback<T>(
     return normalizeFallback(fallback as T);
   }
 
-  const cancellationGate = createRaceGate(options.token);
-  const late = await Promise.race([serverOutcome, cancellationGate.promise]);
-  cancellationGate.dispose();
+  const lateGate = createRaceGate(
+    options.token,
+    options.lateBudgetMs ?? options.budgetMs,
+  );
+  const late = await Promise.race([serverOutcome, lateGate.promise]);
+  lateGate.dispose();
 
   if (late.kind === "cancelled" || late.kind === "budget") {
     return undefined;

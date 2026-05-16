@@ -1,3 +1,5 @@
+(* Module overview: Shared workspace state types, queues, caches, and performance counters. *)
+
 module T = Lsp.Types
 
 module Perf_stats = struct
@@ -357,6 +359,7 @@ module Lsif_delta = struct
 end
 
 type t = {
+  workspace_id : int;
   docs : (T.DocumentUri.t, Document.t) Hashtbl.t;
   files : (string, Document.t) Hashtbl.t;
   mutable root_path : string option;
@@ -373,6 +376,9 @@ type t = {
   mutable lsif_snapshot_revision : int;
   mutable lsif_snapshot_payload : Yojson.Safe.t option;
   mutable lsif_snapshot_symbols : (string, Yojson.Safe.t) Hashtbl.t option;
+  mutable ide_snapshot_generation : int;
+  mutable ide_snapshot_dirty : bool;
+  hover_body_cache : (string, string) Hashtbl.t;
   workspace_diag_mode : workspace_diag_mode;
   feature_flags : Workspace_settings.feature_flags;
   bg_high_small_queue : string Queue.t;
@@ -417,8 +423,10 @@ type t = {
   mutable pressure_live_mb : int;
   mutable pressure_last_check_ms : float;
   mutable startup_started_ms : float;
-  startup_diag_hover_target_ms : int;
-  startup_nav_target_ms : int;
+  startup_diag_hover_default_target_ms : int;
+  startup_nav_default_target_ms : int;
+  mutable startup_diag_hover_target_ms : int;
+  mutable startup_nav_target_ms : int;
   mutable startup_diag_hover_ready_ms : float option;
   mutable startup_fully_nav_ready_ms : float option;
   mutable startup_diag_hover_notified : bool;
@@ -457,6 +465,8 @@ type t = {
   root_closure_target_files : int;
   skeleton_prefix_bytes : int;
   sched_open_doc_min_share_pct : int;
+  allow_slow_query_fallback : bool;
+  implementation_config : Implementation_config.t;
   quick_nav_index : (string, quick_nav_entry list) Hashtbl.t;
   module_summary_cache : (string, module_summary_cache_entry) Hashtbl.t;
   module_summary_compool_index : (string, string) Hashtbl.t;

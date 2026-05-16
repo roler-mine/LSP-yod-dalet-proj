@@ -1,3 +1,5 @@
+(* Module overview: Token stream cache used by syntax display, semantic tokens, and incremental features. *)
+
 type edit_summary = {
   full_sync : bool;
   start_off : int;
@@ -107,8 +109,8 @@ let is_safe_restart_token (tok : Parser.token) : bool =
   match tok with
   | Parser.SEMI | Parser.TERM | Parser.END | Parser.START | Parser.BEGIN
   | Parser.PROC | Parser.DEF | Parser.REF | Parser.ITEM | Parser.TABLE
-  | Parser.TYPE | Parser.BLOCK | Parser.COMPOOL | Parser.ICOMPOOL
-  | Parser.DEFINE ->
+  | Parser.READONLY | Parser.INLINE | Parser.OVERLAY | Parser.TYPE
+  | Parser.BLOCK | Parser.COMPOOL | Parser.ICOMPOOL | Parser.DEFINE ->
       true
   | _ -> false
 

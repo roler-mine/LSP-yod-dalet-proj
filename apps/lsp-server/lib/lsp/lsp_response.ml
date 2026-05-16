@@ -1,3 +1,5 @@
+(* Module overview: Builds JSON-RPC responses, notifications, diagnostics, and initialize capabilities. *)
+
 module T = Lsp.Types
 
 let json_obj (fields : (string * Yojson.Safe.t) list) : Yojson.Safe.t =
@@ -6,13 +8,15 @@ let json_obj (fields : (string * Yojson.Safe.t) list) : Yojson.Safe.t =
 let respond (oc : out_channel) ~(id : Yojson.Safe.t) ~(result : Yojson.Safe.t) :
     unit =
   Lsp_io.write_message oc
-    (json_obj [ ("jsonrpc", `String "2.0"); ("id", id); ("result", result) ])
+    (json_obj [ ("jsonrpc", `String "2.0"); ("id", id); ("result", result) ]);
+  flush oc
 
 let respond_error (oc : out_channel) ~(id : Yojson.Safe.t) ~(code : int)
     ~(message : string) : unit =
   let err = json_obj [ ("code", `Int code); ("message", `String message) ] in
   Lsp_io.write_message oc
-    (json_obj [ ("jsonrpc", `String "2.0"); ("id", id); ("error", err) ])
+    (json_obj [ ("jsonrpc", `String "2.0"); ("id", id); ("error", err) ]);
+  flush oc
 
 let notify (oc : out_channel) ~(method_ : string) ~(params : Yojson.Safe.t) :
     unit =
@@ -45,9 +49,44 @@ let yojson_of_document_symbols
 let yojson_of_symbol_infos (xs : T.SymbolInformation.t list) : Yojson.Safe.t =
   `List (List.map T.SymbolInformation.yojson_of_t xs)
 
+let yojson_of_position (p : T.Position.t) : Yojson.Safe.t =
+  json_obj [ ("line", `Int p.line); ("character", `Int p.character) ]
+
+let yojson_of_range (r : T.Range.t) : Yojson.Safe.t =
+  json_obj
+    [ ("start", yojson_of_position r.start); ("end", yojson_of_position r.end_) ]
+
+let yojson_of_markup_kind = function
+  | T.MarkupKind.Markdown -> `String "markdown"
+  | T.MarkupKind.PlainText -> `String "plaintext"
+
+let yojson_of_marked_string (s : T.MarkedString.t) : Yojson.Safe.t =
+  match s.language with
+  | None -> `String s.value
+  | Some language ->
+      json_obj [ ("language", `String language); ("value", `String s.value) ]
+
+let yojson_of_hover_contents = function
+  | `MarkupContent (content : T.MarkupContent.t) ->
+      json_obj
+        [
+          ("kind", yojson_of_markup_kind content.kind);
+          ("value", `String content.value);
+        ]
+  | `MarkedString (s : T.MarkedString.t) -> yojson_of_marked_string s
+  | `List (xs : T.MarkedString.t list) ->
+      `List (List.map yojson_of_marked_string xs)
+
 let yojson_of_hover_opt = function
   | None -> `Null
-  | Some hover -> T.Hover.yojson_of_t hover
+  | Some (hover : T.Hover.t) ->
+      let fields = [ ("contents", yojson_of_hover_contents hover.contents) ] in
+      let fields =
+        match hover.range with
+        | None -> fields
+        | Some range -> fields @ [ ("range", yojson_of_range range) ]
+      in
+      json_obj fields
 
 let yojson_of_signature_help_opt = function
   | None -> `Null
@@ -169,6 +208,8 @@ let initialize_result_json
   let capabilities = ref [] in
   let add field = capabilities := field :: !capabilities in
   let add_if enabled field = if enabled then add field in
+  (* change=2 advertises incremental sync, keeping live edits on the wire as
+     small ranges instead of full-document replacements. *)
   add
     ( "textDocumentSync",
       json_obj [ ("openClose", `Bool true); ("change", `Int 2) ] );
@@ -218,6 +259,7 @@ let initialize_result_json
                   `String "jovial.dumpLsifIndex";
                   `String "jovial.dumpLsifDelta";
                   `String "jovial.debugReport";
+                  `String "jovial.explainSymbolResolution";
                   `String "jovial.debugPerfStats";
                   `String "jovial.debugScheduler";
                   `String "jovial.debugMemory";

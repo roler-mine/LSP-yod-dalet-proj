@@ -1,3 +1,5 @@
+(** Module overview: Shared query helpers for IDE features that need symbol and position context. *)
+
 module T = Lsp.Types
 
 val hover :

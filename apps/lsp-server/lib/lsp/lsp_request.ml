@@ -1,3 +1,5 @@
+(* Module overview: Extracts common request fields from raw JSON-RPC messages. *)
+
 module T = Lsp.Types
 
 let get_assoc (j : Yojson.Safe.t) : (string * Yojson.Safe.t) list option =
@@ -311,6 +313,25 @@ let parse_client_overrides (params : Yojson.Safe.t) :
   let bool_field (json : Yojson.Safe.t option) : bool option =
     match json with Some (`Bool b) -> Some b | _ -> None
   in
+  let string_field (json : Yojson.Safe.t option) : string option =
+    match json with
+    | Some (`String s) ->
+        let trimmed = String.trim s in
+        if trimmed = "" then None else Some trimmed
+    | _ -> None
+  in
+  let string_list_field (json : Yojson.Safe.t option) : string list option =
+    match json with
+    | Some (`List xs) ->
+        Some
+          (xs
+          |> List.filter_map (function
+            | `String s ->
+                let trimmed = String.trim s in
+                if trimmed = "" then None else Some trimmed
+            | _ -> None))
+    | _ -> None
+  in
   let jovial =
     assoc_field "initializationOptions" params |> fun value ->
     Option.bind value (assoc_field "jovial")
@@ -322,6 +343,7 @@ let parse_client_overrides (params : Yojson.Safe.t) :
   let server = Option.bind jovial (assoc_field "server") in
   let startup = Option.bind jovial (assoc_field "startup") in
   let performance = Option.bind jovial (assoc_field "performance") in
+  let implementation = Option.bind jovial (assoc_field "implementation") in
   let workspace_diag_mode =
     Option.bind workspace (assoc_field "diagnosticsMode") |> function
     | Some (`String raw) -> Workspace_settings.workspace_diag_mode_of_string raw
@@ -435,6 +457,28 @@ let parse_client_overrides (params : Yojson.Safe.t) :
     pressure_critical_mb =
       int_field (Option.bind server (assoc_field "pressureCriticalMb"));
     startup_priority_mode;
+    implementation_config =
+      {
+        Implementation_config.dialect =
+          string_field (Option.bind implementation (assoc_field "dialect"));
+        bits_in_word =
+          int_field (Option.bind implementation (assoc_field "bitsInWord"));
+        bytes_in_word =
+          int_field (Option.bind implementation (assoc_field "bytesInWord"));
+        float_precision =
+          int_field (Option.bind implementation (assoc_field "floatPrecision"));
+        fixed_precision =
+          int_field (Option.bind implementation (assoc_field "fixedPrecision"));
+        max_int_size =
+          int_field (Option.bind implementation (assoc_field "maxIntSize"));
+        max_bits =
+          int_field (Option.bind implementation (assoc_field "maxBits"));
+        max_bytes =
+          int_field (Option.bind implementation (assoc_field "maxBytes"));
+        system_subroutines =
+          string_list_field
+            (Option.bind implementation (assoc_field "systemSubroutines"));
+      };
     bg_tick_budget_ms =
       int_field (Option.bind background (assoc_field "indexBudgetMs"));
     bg_diag_batch_size =

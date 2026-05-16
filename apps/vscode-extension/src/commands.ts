@@ -1,3 +1,5 @@
+// Module overview: Registers extension commands and connects UI actions to the running Jovial LSP client.
+
 import * as vscode from "vscode";
 
 import type { JovialConfig } from "./jovial_config";
@@ -25,6 +27,12 @@ type CommandDeps = {
     reason: string,
     preferredUri?: vscode.Uri,
   ) => Promise<void>;
+  refreshDiagnosticsNow: (
+    output: vscode.OutputChannel,
+    reason: string,
+    preferredUri?: vscode.Uri,
+  ) => Promise<void>;
+  pullDiagnosticsNow: (preferredUri: vscode.Uri) => Promise<unknown>;
   firstPreferredLsifUri: () => vscode.Uri | undefined;
   scheduleLsifRefresh: (
     output: vscode.OutputChannel,
@@ -38,6 +46,7 @@ type CommandDeps = {
   dumpAstUi: () => Promise<void>;
   dumpCstUi: () => Promise<void>;
   showSyntaxTreesUi: () => Promise<void>;
+  explainSymbolResolution: () => Promise<void>;
 };
 
 const serverRestartConfigKeys = [
@@ -101,6 +110,16 @@ const serverRestartConfigKeys = [
   "jovial.performance.fullParseMaxBytes",
   "jovial.performance.enableHugeFileFullParse",
   "jovial.performance.backgroundParseWorkerCount",
+  "jovial.implementation",
+  "jovial.implementation.dialect",
+  "jovial.implementation.bitsInWord",
+  "jovial.implementation.bytesInWord",
+  "jovial.implementation.floatPrecision",
+  "jovial.implementation.fixedPrecision",
+  "jovial.implementation.maxIntSize",
+  "jovial.implementation.maxBits",
+  "jovial.implementation.maxBytes",
+  "jovial.implementation.systemSubroutines",
 ] as const;
 
 const inlayHintConfigKeys = [
@@ -148,6 +167,8 @@ export function registerExtensionHooks({
   startClient,
   stopClient,
   refreshLsifIndex,
+  refreshDiagnosticsNow,
+  pullDiagnosticsNow,
   firstPreferredLsifUri,
   scheduleLsifRefresh,
   refreshStartupStatusBar,
@@ -156,6 +177,7 @@ export function registerExtensionHooks({
   dumpAstUi,
   dumpCstUi,
   showSyntaxTreesUi,
+  explainSymbolResolution,
 }: CommandDeps): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("jovial.dumpAstUi", async () => {
@@ -185,6 +207,22 @@ export function registerExtensionHooks({
         output.appendLine(`showSyntaxTrees failed: ${String(e)}`);
       }
     }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "jovial.explainSymbolResolution",
+      async () => {
+        try {
+          await explainSymbolResolution();
+        } catch (e) {
+          output.appendLine(`explainSymbolResolution failed: ${String(e)}`);
+          vscode.window.showWarningMessage(
+            "Jovial: symbol resolution explanation failed. Check the Jovial LSP output channel.",
+          );
+        }
+      },
+    ),
   );
 
   context.subscriptions.push(
@@ -222,6 +260,50 @@ export function registerExtensionHooks({
         );
       }
     }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "jovial.refreshDiagnostics",
+      async (target?: vscode.Uri | string) => {
+        try {
+          const preferredUri =
+            target instanceof vscode.Uri
+              ? target
+              : typeof target === "string"
+                ? vscode.Uri.parse(target)
+                : firstPreferredLsifUri();
+          await refreshDiagnosticsNow(
+            output,
+            "manual command",
+            preferredUri,
+          );
+        } catch (e) {
+          output.appendLine(`refreshDiagnostics failed: ${String(e)}`);
+          vscode.window.showWarningMessage(
+            "Jovial: diagnostics refresh failed. Check the Jovial LSP output channel.",
+          );
+        }
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "jovial.pullDiagnostics",
+      async (target?: vscode.Uri | string) => {
+        const preferredUri =
+          target instanceof vscode.Uri
+            ? target
+            : typeof target === "string"
+              ? vscode.Uri.parse(target)
+              : firstPreferredLsifUri();
+        if (!preferredUri) {
+          throw new Error("No Jovial document URI is available.");
+        }
+        return pullDiagnosticsNow(preferredUri);
+      },
+    ),
   );
 
   context.subscriptions.push(

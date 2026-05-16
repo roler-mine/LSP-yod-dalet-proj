@@ -1,3 +1,5 @@
+(* Module overview: Executable entrypoint that starts the Jovial LSP server on stdio. *)
+
 let initialize_stdio () =
   if Sys.win32 then (
     set_binary_mode_in stdin true;

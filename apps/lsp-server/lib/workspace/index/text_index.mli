@@ -1,3 +1,5 @@
+(** Module overview: Line and offset index for converting between byte offsets and LSP positions. *)
+
 type t
 
 val of_string : string -> t

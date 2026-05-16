@@ -1,3 +1,5 @@
+(* Module overview: Typechecker for Jovial expressions, declarations, calls, and assignments. *)
+
 module T = Lsp.Types
 module JT = Jovial_type
 

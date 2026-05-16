@@ -1,3 +1,5 @@
+(* Module overview: Shared navigation resolver used by definition, declaration, and references features. *)
+
 (* Compatibility facade for historical callers.
 
    New workspace or LSP logic should call Workspace_query when it needs the

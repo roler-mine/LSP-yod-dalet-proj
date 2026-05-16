@@ -2,7 +2,7 @@
   "name": "jovial-lsp-client",
   "displayName": "Jovial Language Support",
   "description": "VS Code client for the Jovial OCaml LSP server",
-  "version": "0.0.10",
+  "version": "0.0.12",
   "publisher": "roler-mine",
   "repository": "https://github.com/roler-mine/LSP-yod-dalet-proj",
   "config": {
@@ -19,8 +19,10 @@
     "onCommand:jovial.dumpAstUi",
     "onCommand:jovial.dumpCstUi",
     "onCommand:jovial.showSyntaxTrees",
+    "onCommand:jovial.explainSymbolResolution",
     "onCommand:jovial.restartServer",
-    "onCommand:jovial.refreshLsifCache"
+    "onCommand:jovial.refreshLsifCache",
+    "onCommand:jovial.refreshDiagnostics"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -61,12 +63,20 @@
         "title": "Jovial: Show AST/CST Viewer"
       },
       {
+        "command": "jovial.explainSymbolResolution",
+        "title": "Jovial: Explain Symbol Resolution"
+      },
+      {
         "command": "jovial.restartServer",
         "title": "Jovial: Restart Language Server"
       },
       {
         "command": "jovial.refreshLsifCache",
         "title": "Jovial: Refresh LSIF Cache"
+      },
+      {
+        "command": "jovial.refreshDiagnostics",
+        "title": "Jovial: Refresh Diagnostics"
       }
     ],
     "configuration": {
@@ -142,9 +152,9 @@
         },
         "jovial.performance.hugeFileThresholdBytes": {
           "type": "number",
-          "default": 20971520,
+          "default": 15728640,
           "minimum": 1,
-          "description": "File size where the server enters huge-file mode and disables full parsing by default."
+          "description": "File size above which the server enters huge-file mode and uses the 10s open-file readiness exception."
         },
         "jovial.performance.fullSemanticTokensMaxBytes": {
           "type": "number",
@@ -154,9 +164,9 @@
         },
         "jovial.performance.fullParseMaxBytes": {
           "type": "number",
-          "default": 5242880,
+          "default": 15728640,
           "minimum": 1,
-          "description": "Maximum file size the server will fully parse by default."
+          "description": "Maximum file size the server will fully parse by default; the default keeps files up to 15 MB parse-eligible."
         },
         "jovial.performance.enableHugeFileFullParse": {
           "type": "boolean",
@@ -168,6 +178,83 @@
           "default": 2,
           "minimum": 1,
           "description": "Number of background parse workers used for staged indexing."
+        },
+        "jovial.implementation.dialect": {
+          "type": "string",
+          "default": "",
+          "description": "Optional implementation dialect/profile name passed to the language server for target-specific conservative checks."
+        },
+        "jovial.implementation.bitsInWord": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Target word size in bits. Leave null when unknown."
+        },
+        "jovial.implementation.bytesInWord": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Target word size in bytes. Leave null when unknown."
+        },
+        "jovial.implementation.floatPrecision": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Default floating precision for unsized JOVIAL F types. Leave null when unknown."
+        },
+        "jovial.implementation.fixedPrecision": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Default fixed-point fraction precision for unsized JOVIAL A types. Leave null when unknown."
+        },
+        "jovial.implementation.maxIntSize": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Optional maximum integer size for the active implementation profile. Leave null when unknown."
+        },
+        "jovial.implementation.maxBits": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Optional maximum bit-string size for the active implementation profile. Leave null when unknown."
+        },
+        "jovial.implementation.maxBytes": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "description": "Optional maximum byte/string size for the active implementation profile. Leave null when unknown."
+        },
+        "jovial.implementation.systemSubroutines": {
+          "type": "array",
+          "default": [],
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          },
+          "description": "Machine-specific system subroutine names supplied by the active implementation profile. The server suppresses unresolved diagnostics and shows system-routine hover for these names."
         },
         "jovial.features.profile": {
           "type": "string",
@@ -478,7 +565,7 @@
         },
         "jovial.server.parseMaxFileBytes": {
           "type": "number",
-          "default": 5242880,
+          "default": 15728640,
           "minimum": 1,
           "description": "Legacy alias for jovial.performance.fullParseMaxBytes."
         },
@@ -508,17 +595,22 @@
     "build:server:win-arm64": "node ../../tools/scripts/build-server.js --target win32-arm64 --out runtime/server/win32-arm64/jovial-lsp.exe",
     "build:server:linux-x64": "node ../../tools/scripts/build-server.js --target linux-x64 --out runtime/server/linux-x64/jovial-lsp",
     "build:server:linux-arm64": "node ../../tools/scripts/build-server.js --target linux-arm64 --out runtime/server/linux-arm64/jovial-lsp",
+    "build:server:e2e": "node ../../tools/scripts/build-server.js --no-bundle",
     "verify:runtime": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64,linux-x64,linux-arm64",
     "verify:runtime:host": "node ../../tools/scripts/verify-runtime-binaries.js --targets host",
-    "check": "tsc -p . --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "check": "npm run check:src && tsc -p tsconfig.test.json --noEmit",
+    "check:src": "tsc -p . --noEmit",
     "lint": "eslint src test --ext .ts",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"test/fixtures/**/*.js\" \"*.json\" \"*.mjs\"",
-    "compile": "tsc -p .",
+    "bundle": "node esbuild.config.mjs",
+    "compile": "npm run check:src && npm run bundle",
     "compile:test": "tsc -p tsconfig.test.json",
     "test:unit": "npm run compile:test && node out-test/test/run_unit_tests.js",
     "test:integration": "npm run test:integration:pinned",
     "test:integration:pinned": "npm run compile && npm run compile:test && node out-test/test/run_integration_tests.js",
     "test:integration:ci": "npm run test:integration:pinned",
+    "test:e2e-perf": "npm run build:server:e2e && npm run compile && npm run compile:test && node out-test/test/run_e2e_perf.js",
+    "test:e2e-perf:huge": "npm run build:server:e2e && npm run compile && npm run compile:test && node out-test/test/run_e2e_perf.js --profile huge",
     "test": "npm run test:unit && npm run test:integration",
     "watch": "tsc -p . -w",
     "vscode:prepublish": "npm run compile",
@@ -527,20 +619,19 @@
     "package:vsix:release": "npm run verify:runtime && npx @vscode/vsce package",
     "package:vsix": "npm run package:vsix:dev"
   },
-  "dependencies": {
-    "@vscode/vsce": "^3.9.1",
-    "vsce": "^2.15.0",
-    "vscode-languageclient": "^9.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.19.35",
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^8.56.1",
     "@typescript-eslint/parser": "^8.56.1",
     "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.28.0",
     "eslint": "^10.0.3",
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.8.1",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vscode-languageclient": "^9.0.0"
   }
 }

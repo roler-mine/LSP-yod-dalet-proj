@@ -1,3 +1,5 @@
+(* Module overview: Helpers for reading typed runtime settings from environment variables. *)
+
 let flag (name : string) ~(default : bool) : bool =
   match Sys.getenv_opt name with
   | None -> default

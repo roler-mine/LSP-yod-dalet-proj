@@ -1,4 +1,5 @@
 {
+  (* Module overview: OCamllex scanner for Jovial tokens, comments, and DEFINE/COMPOOL quirks. *)
   open Parser
 
   exception Lex_error of string * Lexing.position * Lexing.position
@@ -142,12 +143,14 @@ rule token session = parse
 and dq_comment = parse
   | '"'                 { () }
   | nl                  { Lexing.new_line lexbuf; dq_comment lexbuf }
+  | [^ '"' '\n']+       { dq_comment lexbuf }
   | eof                 { error lexbuf "unterminated \"...\" comment" }
   | _                   { dq_comment lexbuf }
 
 and pct_comment = parse
   | '%'                 { () }
   | nl                  { Lexing.new_line lexbuf; pct_comment lexbuf }
+  | [^ '%' '\n']+       { pct_comment lexbuf }
   | eof                 { error lexbuf "unterminated %...% comment" }
   | _                   { pct_comment lexbuf }
 

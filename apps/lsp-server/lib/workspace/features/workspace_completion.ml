@@ -1,3 +1,5 @@
+(* Module overview: Completion provider for symbols, keywords, fields, and context-sensitive Jovial forms. *)
+
 module T = Lsp.Types
 open Workspace_state
 open Workspace_nav_model
@@ -18,6 +20,7 @@ let completion_item_kind_of_metadata (d : def) : int =
   | Metadata.JovialProgram | Metadata.JovialModule | Metadata.JovialCompool
   | Metadata.JovialCompoolImport | Metadata.JovialBlock ->
       9
+  | Metadata.JovialOverlay -> 6
   | Metadata.JovialType | Metadata.JovialBuiltinType -> 7
   | Metadata.JovialField -> 10
   | Metadata.JovialProcedure | Metadata.JovialFunction -> 3
@@ -36,6 +39,7 @@ let completion_keywords : (string * int * string option) list =
     ("REF", 14, None);
     ("STATIC", 14, None);
     ("CONSTANT", 14, None);
+    ("READONLY", 14, Some "readonly data declaration");
     ("PROC", 14, Some "procedure declaration");
     ("ITEM", 14, Some "item declaration");
     ("TABLE", 14, Some "table declaration");

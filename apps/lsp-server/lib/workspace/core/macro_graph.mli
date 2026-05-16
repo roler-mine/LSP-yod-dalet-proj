@@ -1,3 +1,5 @@
+(** Module overview: Tracks DEFINE macro relationships for dependency and change-impact analysis. *)
+
 module T = Lsp.Types
 
 type macro_actual = {

@@ -1,3 +1,5 @@
+(** Module overview: Computes and resolves CodeLens entries for references and change impact. *)
+
 module T = Lsp.Types
 
 val code_lenses_for :

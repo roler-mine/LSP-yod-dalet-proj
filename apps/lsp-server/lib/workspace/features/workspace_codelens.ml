@@ -1,3 +1,5 @@
+(* Module overview: Computes and resolves CodeLens entries for references and change impact. *)
+
 module T = Lsp.Types
 module Metadata = Workspace_symbol_metadata
 module R = Workspace_readiness
@@ -16,6 +18,20 @@ type count_context = {
 }
 
 let code_lens_budget_ms = 20
+
+type count_confidence =
+  | ExactAuthoritative
+  | Provisional
+  | LowerBound
+  | Pending
+
+type count_result = {
+  count : int option;
+  confidence : count_confidence;
+  readiness : R.t;
+  authority : R.authority;
+  reasons : R.reason list;
+}
 
 let same_def (a : def) (b : def) : bool =
   a.key = b.key && same_uri a.uri b.uri
@@ -144,18 +160,104 @@ let importer_count (ctx : count_context) ~(key : string) : int =
 let plural count singular plural =
   if count = 1 then singular else plural
 
-let provisional ctx =
-  ctx.ws.startup_fully_nav_ready_ms = None
-  || Workspace_budget.reason_if_stopped ctx.budget <> None
+let readiness_for_ctx ctx =
+  if ctx.ws.startup_fully_nav_ready_ms <> None then R.WorkspaceSemanticReady
+  else R.SkeletonReady
 
-let title_suffix ctx = if provisional ctx then " (provisional)" else ""
+let append_reason reason reasons =
+  if List.exists (( = ) reason) reasons then reasons else reasons @ [ reason ]
 
-let command_data ctx (d : def) ~(action : string) ~(reference_count : int option)
+let reasons_for_ctx ctx =
+  let reasons =
+    if ctx.ws.startup_fully_nav_ready_ms = None then
+      [ R.WorkspaceIndexWarming ]
+    else []
+  in
+  match Workspace_budget.reason_if_stopped ctx.budget with
+  | None -> reasons
+  | Some reason -> append_reason reason reasons
+
+let confidence_label = function
+  | ExactAuthoritative -> "exact-authoritative"
+  | Provisional -> "provisional"
+  | LowerBound -> "lower-bound"
+  | Pending -> "pending"
+
+let count_result_for ctx count : count_result =
+  match Workspace_budget.reason_if_stopped ctx.budget with
+  | Some reason ->
+      {
+        count = Some count;
+        confidence = LowerBound;
+        readiness = readiness_for_ctx ctx;
+        authority = R.Provisional;
+        reasons = append_reason reason (reasons_for_ctx ctx);
+      }
+  | None when ctx.ws.startup_fully_nav_ready_ms <> None ->
+      {
+        count = Some count;
+        confidence = ExactAuthoritative;
+        readiness = R.WorkspaceSemanticReady;
+        authority = R.Authoritative;
+        reasons = [];
+      }
+  | None ->
+      {
+        count = Some count;
+        confidence = Provisional;
+        readiness = R.SkeletonReady;
+        authority = R.Provisional;
+        reasons = reasons_for_ctx ctx;
+      }
+
+let pending_count ctx : count_result =
+  {
+    count = None;
+    confidence = Pending;
+    readiness = readiness_for_ctx ctx;
+    authority = R.Provisional;
+    reasons = reasons_for_ctx ctx;
+  }
+
+let counted ctx f : count_result =
+  match Workspace_budget.reason_if_stopped ctx.budget with
+  | Some _ -> pending_count ctx
+  | None ->
+      let count = f () in
+      count_result_for ctx count
+
+let count_phrase ?pending_label result singular plural_label =
+  match (result.confidence, result.count) with
+  | Pending, _ | _, None -> (
+      match pending_label with
+      | Some label -> label
+      | None -> plural_label ^ " pending")
+  | ExactAuthoritative, Some count ->
+      Printf.sprintf "%d %s" count (plural count singular plural_label)
+  | Provisional, Some count ->
+      Printf.sprintf "~%d %s" count (plural count singular plural_label)
+  | LowerBound, Some count ->
+      Printf.sprintf "%d+ %s" count (plural count singular plural_label)
+
+let provisional_from_count = function
+  | Some result -> result.authority <> R.Authoritative
+  | None -> true
+
+let command_data ctx (d : def) ~(action : string) ~(count : count_result option)
     : Yojson.Safe.t =
-  let reason =
-    match Workspace_budget.reason_if_stopped ctx.budget with
-    | None -> None
-    | Some reason -> Some (R.reason_label reason)
+  let readiness =
+    match count with Some c -> c.readiness | None -> readiness_for_ctx ctx
+  in
+  let authority =
+    match count with Some c -> c.authority | None -> R.Provisional
+  in
+  let confidence =
+    match count with
+    | Some c -> c.confidence
+    | None -> if authority = R.Authoritative then ExactAuthoritative else Pending
+  in
+  let reasons =
+    match count with Some c -> c.reasons | None -> reasons_for_ctx ctx
   in
   let base =
     [
@@ -165,24 +267,29 @@ let command_data ctx (d : def) ~(action : string) ~(reference_count : int option
       ("symbol", `String d.name);
       ("key", `String d.key);
       ("declarationKind", `String (Metadata.symbol_kind_label d.metadata.jovial_kind));
-      ("provisional", `Bool (provisional ctx));
-      ( "readiness",
-        `String
-          (if ctx.ws.startup_fully_nav_ready_ms <> None then
-             R.label R.WorkspaceSemanticReady
-           else R.label R.SkeletonReady) );
+      ("provisional", `Bool (provisional_from_count count));
+      ("confidence", `String (confidence_label confidence));
+      ("authority", `String (R.authority_label authority));
+      ("authoritative", `Bool (authority = R.Authoritative));
+      ("readiness", `String (R.label readiness));
+      ("reasons", `List (List.map (fun r -> `String (R.reason_label r)) reasons));
       ("impact", `String (Workspace_change_impact.change_impact_for_def ctx.ws d));
     ]
   in
   let fields =
-    match reference_count with
-    | Some count -> ("referenceCount", `Int count) :: base
-    | None -> base
+    match count with
+    | Some { count = Some count; confidence; _ } ->
+        ("referenceCount", `Int count)
+        :: ("countConfidence", `String (confidence_label confidence))
+        :: base
+    | Some { count = None; confidence; _ } ->
+        ("countConfidence", `String (confidence_label confidence)) :: base
+    | None -> ("countConfidence", `String (confidence_label confidence)) :: base
   in
   let fields =
-    match reason with
-    | Some reason -> ("reason", `String reason) :: fields
-    | None -> fields
+    match reasons with
+    | reason :: _ -> ("reason", `String (R.reason_label reason)) :: fields
+    | [] -> fields
   in
   `Assoc fields
 
@@ -192,66 +299,69 @@ let lens_command ~(title : string) (d : def) : T.Command.t =
     ()
 
 let make_lens ctx d ~(title : string) ~(action : string)
-    ?reference_count () : T.CodeLens.t =
-  let title = title ^ title_suffix ctx in
+    ?count () : T.CodeLens.t =
   T.CodeLens.create ~range:(Lsp_conv.range_of_loc d.loc)
     ~command:(lens_command ~title d)
-    ~data:(command_data ctx d ~action ~reference_count)
+    ~data:(command_data ctx d ~action ~count)
     ()
 
 let lens_for_def ctx (d : def) : T.CodeLens.t option =
-  if Workspace_budget.should_stop ~phase:"codelens.def" ctx.budget then None
-  else
-    match d.metadata.Metadata.jovial_kind with
+  match d.metadata.Metadata.jovial_kind with
     | Metadata.JovialProcedure | Metadata.JovialFunction ->
-        let refs = reference_count_for_def ctx d in
-        let ref_imports = proc_ref_count ctx ~key:d.key in
-        let impls = proc_impl_count ctx ~key:d.key in
+        let refs = counted ctx (fun () -> reference_count_for_def ctx d) in
+        let ref_imports = counted ctx (fun () -> proc_ref_count ctx ~key:d.key) in
+        let impls = counted ctx (fun () -> proc_impl_count ctx ~key:d.key) in
         let title =
-          Printf.sprintf "%d %s | %d REFs | %d %s | show impact" refs
-            (plural refs "reference" "references")
-            ref_imports impls
-            (plural impls "implementation" "implementations")
+          Printf.sprintf "%s | %s | %s | show impact"
+            (count_phrase ~pending_label:"references pending" refs "reference"
+               "references")
+            (count_phrase ~pending_label:"REFs pending" ref_imports "REF"
+               "REFs")
+            (count_phrase ~pending_label:"implementations pending" impls
+               "implementation" "implementations")
         in
         Some
           (make_lens ctx d ~title ~action:"procedureImpact"
-             ~reference_count:refs ())
+             ~count:refs ())
     | Metadata.JovialCompool ->
-        let importers = importer_count ctx ~key:d.key in
+        let importers = counted ctx (fun () -> importer_count ctx ~key:d.key) in
         let title =
-          Printf.sprintf "%d %s | show import graph" importers
-            (plural importers "importer" "importers")
+          Printf.sprintf "%s | show import graph"
+            (count_phrase ~pending_label:"importers pending" importers
+               "importer" "importers")
         in
         Some
           (make_lens ctx d ~title ~action:"compoolImportGraph"
-             ~reference_count:importers ())
+             ~count:importers ())
     | Metadata.JovialDefine ->
-        let uses = reference_count_for_def ctx d in
+        let uses = counted ctx (fun () -> reference_count_for_def ctx d) in
         let title =
-          Printf.sprintf "%d macro %s | expansion impact" uses
-            (plural uses "use" "uses")
+          Printf.sprintf "%s | expansion impact"
+            (count_phrase ~pending_label:"macro uses pending" uses
+               "macro use" "macro uses")
         in
         Some
           (make_lens ctx d ~title ~action:"defineExpansionImpact"
-             ~reference_count:uses ())
-    | Metadata.JovialTable | Metadata.JovialBlock
+             ~count:uses ())
+    | Metadata.JovialTable | Metadata.JovialBlock | Metadata.JovialOverlay
     | Metadata.JovialConstantTable ->
-        let refs = reference_count_for_def ctx d in
+        let refs = counted ctx (fun () -> reference_count_for_def ctx d) in
         let title =
-          Printf.sprintf "%d %s | layout impact" refs
-            (plural refs "reference" "references")
+          Printf.sprintf "%s | layout impact"
+            (count_phrase ~pending_label:"references pending" refs
+               "reference" "references")
         in
-        Some
-          (make_lens ctx d ~title ~action:"layoutImpact" ~reference_count:refs ())
+        Some (make_lens ctx d ~title ~action:"layoutImpact" ~count:refs ())
     | Metadata.JovialItem | Metadata.JovialConstantItem
     | Metadata.JovialStatusConstant ->
-        let refs = reference_count_for_def ctx d in
+        let refs = counted ctx (fun () -> reference_count_for_def ctx d) in
         let title =
-          Printf.sprintf "%d %s" refs (plural refs "reference" "references")
+          count_phrase ~pending_label:"references pending" refs
+            "reference" "references"
         in
         Some
           (make_lens ctx d ~title ~action:"referenceCount"
-             ~reference_count:refs ())
+             ~count:refs ())
     | _ -> None
 
 let code_lenses_for (ws : t) ~(uri : T.DocumentUri.t) : T.CodeLens.t list =
@@ -272,15 +382,15 @@ let code_lenses_for (ws : t) ~(uri : T.DocumentUri.t) : T.CodeLens.t list =
       let rec loop acc = function
         | [] -> List.rev acc
         | d :: rest ->
-            if Workspace_budget.should_stop ~phase:"codelens.loop" budget then
-              List.rev acc
-            else
-              let acc =
-                match lens_for_def ctx d with
-                | None -> acc
-                | Some lens -> lens :: acc
-              in
-              loop acc rest
+            let stopped =
+              Workspace_budget.should_stop ~phase:"codelens.loop" budget
+            in
+            let acc =
+              match lens_for_def ctx d with
+              | None -> acc
+              | Some lens -> lens :: acc
+            in
+            if stopped then List.rev acc else loop acc rest
       in
       loop [] defs
 

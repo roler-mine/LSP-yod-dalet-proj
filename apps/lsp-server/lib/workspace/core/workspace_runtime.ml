@@ -1,3 +1,5 @@
+(* Module overview: Runtime policy helpers for cancellation, feature flags, pressure, and readiness. *)
+
 module T = Lsp.Types
 open Workspace_foundation
 open Workspace_state
@@ -99,7 +101,15 @@ let with_request_cancel_checker (ws : t) (is_cancelled : unit -> bool)
   ws.request_cancel_checker <- Some is_cancelled;
   Fun.protect ~finally:(fun () -> ws.request_cancel_checker <- prev) f
 
-let startup_mark_started (ws : t) : unit =
+let clear_open_diag_revalidate_state (ws : t) : unit =
+  Hashtbl.clear ws.open_diag_revalidate_payloads;
+  Hashtbl.clear ws.open_diag_revalidate_set;
+  while not (Queue.is_empty ws.open_diag_revalidate_updates) do
+    ignore (Queue.pop ws.open_diag_revalidate_updates)
+  done
+
+let reset_startup_window ?(clear_open_diag_revalidate : bool = true) (ws : t) :
+    unit =
   ws.startup_started_ms <- Perf_stats.now_ms ();
   ws.startup_diag_hover_ready_ms <- None;
   ws.startup_fully_nav_ready_ms <- None;
@@ -117,23 +127,45 @@ let startup_mark_started (ws : t) : unit =
   ws.startup_phase_notified <- None;
   Perf_stats.tick "startup.phase_warming";
   ws.xmodule_diag_ready_prev <- false;
-  Hashtbl.clear ws.open_diag_revalidate_payloads;
-  Hashtbl.clear ws.open_diag_revalidate_set;
-  while not (Queue.is_empty ws.open_diag_revalidate_updates) do
-    ignore (Queue.pop ws.open_diag_revalidate_updates)
-  done;
+  if clear_open_diag_revalidate then clear_open_diag_revalidate_state ws;
   ws.index_reconcile_escalate_last_ms <- 0.0;
   ws.index_reconcile_escalations <- 0
 
+let startup_mark_started (ws : t) : unit =
+  ws.startup_diag_hover_target_ms <-
+    ws.startup_diag_hover_default_target_ms;
+  ws.startup_nav_target_ms <- ws.startup_nav_default_target_ms;
+  reset_startup_window ws
+
+let open_doc_target_for_size (ws : t) ~(bytes : int) ~(default_target_ms : int)
+    : int =
+  if bytes > ws.huge_file_threshold_bytes then open_doc_huge_ready_target_ms
+  else min (max 1 default_target_ms) open_doc_ready_target_ms
+
+let startup_mark_open_doc (ws : t) ~(bytes : int) : unit =
+  ws.startup_diag_hover_target_ms <-
+    open_doc_target_for_size ws ~bytes
+      ~default_target_ms:ws.startup_diag_hover_default_target_ms;
+  ws.startup_nav_target_ms <-
+    open_doc_target_for_size ws ~bytes
+      ~default_target_ms:ws.startup_nav_default_target_ms;
+  reset_startup_window ~clear_open_diag_revalidate:false ws
+
+let startup_open_doc_blocks_interactive_ready (ws : t) (doc : Document.t) :
+    bool =
+  doc.Document.parse_rev <> doc.Document.rev && not (is_huge_doc doc ws)
+
 let startup_open_docs_converged (ws : t) : bool =
   Hashtbl.fold
-    (fun _ doc acc -> acc && doc.Document.parse_rev = doc.Document.rev)
+    (fun _ doc acc ->
+      acc && not (startup_open_doc_blocks_interactive_ready ws doc))
     ws.docs true
 
 let startup_open_docs_pending_count (ws : t) : int =
   Hashtbl.fold
     (fun _ doc acc ->
-      if doc.Document.parse_rev = doc.Document.rev then acc else acc + 1)
+      if startup_open_doc_blocks_interactive_ready ws doc then acc + 1
+      else acc)
     ws.docs 0
 
 let startup_index_complete (ws : t) : bool =
@@ -160,6 +192,14 @@ let startup_high_queues_empty (ws : t) : bool =
             acc || kind = ParseJobHighLarge || kind = ParseJobRootLarge)
           ws.parse_worker_inflight false)
 
+let startup_interactive_queues_empty (ws : t) : bool =
+  Queue.is_empty ws.bg_high_small_queue
+  && Queue.is_empty ws.bg_high_large_queue
+  && not
+       (Hashtbl.fold
+          (fun _ kind acc -> acc || kind = ParseJobHighLarge)
+          ws.parse_worker_inflight false)
+
 let parse_worker_queues_empty (ws : t) : bool =
   Queue.is_empty ws.parse_worker_jobs
   && Queue.is_empty ws.parse_worker_results
@@ -172,6 +212,9 @@ let startup_queues_empty (ws : t) : bool =
   && Queue.is_empty ws.bg_pending_diag_updates
   && Hashtbl.length ws.bg_pending_diag_payloads = 0
   && parse_worker_queues_empty ws
+
+let profile_medium_min_files = 128
+let profile_large_min_files = 320
 
 let quick_nav_index_complete (ws : t) : bool =
   let no_pending =
@@ -191,8 +234,57 @@ let quick_nav_index_ready_for_startup (ws : t) : bool =
   if quick_nav_index_complete ws then true
   else if ws.quick_nav_index_total <= 0 then false
   else
-    let goal = min ws.quick_nav_index_total 64 in
+    (* Startup only needs enough quick-nav data to make interactive requests
+       useful. The remaining files continue indexing in the background. *)
+    let goal =
+      if ws.quick_nav_index_total >= 500 then 24
+      else if ws.quick_nav_index_total >= profile_large_min_files then 48
+      else 64
+    in
+    let goal = min ws.quick_nav_index_total goal in
     ws.quick_nav_index_done >= goal
+
+let interactive_nav_ready (ws : t) : bool =
+  quick_nav_index_ready_for_startup ws && startup_open_docs_converged ws
+
+let workspace_source_shape_estimate (ws : t) : int * int =
+  match ws.index with
+  | None ->
+      ( Option.value ws.source_bytes_estimate ~default:0,
+        max 0 ws.source_bytes_estimate_count )
+  | Some idx ->
+      let bytes = Workspace_index.source_total_bytes idx in
+      let count = Workspace_index.source_count idx in
+      ws.source_bytes_estimate <- Some bytes;
+      ws.source_bytes_estimate_count <- count;
+      (max 0 bytes, max 0 count)
+
+let workspace_profile_for_budget (ws : t) : workspace_profile =
+  match ws.workspace_profile_mode with
+  | ProfileModeSmall -> ProfileSmall
+  | ProfileModeMedium -> ProfileMedium
+  | ProfileModeLarge -> ProfileLarge
+  | ProfileModeAuto ->
+      let bytes, count = workspace_source_shape_estimate ws in
+      if bytes >= profile_medium_max_bytes || count >= profile_large_min_files
+      then ProfileLarge
+      else if bytes >= profile_small_max_bytes || count >= profile_medium_min_files
+      then ProfileMedium
+      else ProfileSmall
+
+let workspace_source_bytes_estimate (ws : t) : int =
+  fst (workspace_source_shape_estimate ws)
+
+let startup_requires_background_drain (ws : t) : bool =
+  (* Large workspaces must become usable before all normal/background queues
+     drain; otherwise cold startup scales with the whole repository. *)
+  match workspace_profile_for_budget ws with
+  | ProfileSmall | ProfileMedium -> true
+  | ProfileLarge -> false
+
+let startup_seed_ready (ws : t) : bool =
+  if startup_requires_background_drain ws then startup_seed_complete ws
+  else (not ws.graph_needs_refresh) && not ws.bg_seed_needs_refresh
 
 let startup_hints_ready (ws : t) : bool =
   ws.symbol_hints <> None
@@ -210,12 +302,23 @@ let startup_hints_ready (ws : t) : bool =
       && Queue.is_empty ws.bg_norm_large_queue
   | None -> false
 
+let startup_navigation_hints_ready (ws : t) : bool =
+  startup_hints_ready ws
+  || ((not (startup_requires_background_drain ws))
+     && quick_nav_index_ready_for_startup ws)
+
+let startup_root_closure_ready (ws : t) : bool =
+  if startup_requires_background_drain ws then
+    ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
+  else not ws.graph_needs_refresh
+
 let startup_nav_prereqs_ready (ws : t) : bool =
-  ws.graph_root_closure_cursor >= Array.length ws.graph_root_closure_paths
-  && (startup_hints_ready ws || quick_nav_index_ready_for_startup ws)
+  startup_root_closure_ready ws && startup_navigation_hints_ready ws
 
 let startup_open_docs_authoritative (ws : t) : bool =
-  startup_open_docs_converged ws && Hashtbl.length ws.open_parse_generation = 0
+  (* Huge open files keep provisional diagnostics while their full parse waits
+     for an idle window; they should not hold the editor in startup catch-up. *)
+  startup_open_docs_converged ws && not (has_pending_open_parse_work ws)
 
 let startup_open_diag_revalidate_empty (ws : t) : bool =
   Queue.is_empty ws.open_diag_revalidate_updates
@@ -240,13 +343,54 @@ let startup_is_diag_hover_ready (ws : t) : bool =
   || (xmodule_diag_prereqs_ready ws && startup_open_diag_revalidate_empty ws)
 
 let startup_is_fully_navigable (ws : t) : bool =
-  startup_nav_prereqs_ready ws && startup_is_diag_hover_ready ws
+  let strict_background = startup_requires_background_drain ws in
+  let startup_queues_ready =
+    if strict_background then startup_queues_empty ws
+    else true
+  in
+  let quick_nav_ready =
+    if strict_background then quick_nav_index_complete ws
+    else quick_nav_index_ready_for_startup ws
+  in
+  startup_index_complete ws
+  && (not (startup_index_reconcile_pending ws))
+  && startup_seed_ready ws
+  && startup_queues_ready
+  && startup_nav_prereqs_ready ws
+  && quick_nav_ready
+  && startup_open_docs_converged ws
+  && startup_open_docs_authoritative ws
+  &&
+  if strict_background then
+    startup_queues_empty ws && startup_hints_ready ws
+    && xmodule_diag_prereqs_ready ws
+  else true
 
 let startup_elapsed_ms_float (ws : t) : float =
   let now = Perf_stats.now_ms () in
   max 0.0 (now -. ws.startup_started_ms)
 
 let open_doc_count (ws : t) : int = Hashtbl.length ws.docs
+
+let background_work_pending (ws : t) : bool =
+  match ws.root_path with
+  | None -> Hashtbl.length ws.docs > 0
+  | Some _ ->
+      ws.startup_ready_ms = None || ws.bg_seed_needs_refresh
+      || ws.graph_needs_refresh
+      || not (Queue.is_empty ws.bg_high_small_queue)
+      || not (Queue.is_empty ws.bg_high_large_queue)
+      || not (Queue.is_empty ws.bg_root_small_queue)
+      || not (Queue.is_empty ws.bg_root_large_queue)
+      || not (Queue.is_empty ws.bg_norm_small_queue)
+      || not (Queue.is_empty ws.bg_norm_large_queue)
+      || not (Queue.is_empty ws.quick_nav_pending_paths)
+      || not (Queue.is_empty ws.parse_worker_jobs)
+      || not (Queue.is_empty ws.parse_worker_results)
+      || Hashtbl.length ws.parse_worker_inflight > 0
+      || Hashtbl.length ws.open_parse_generation > 0
+      || not (Queue.is_empty ws.bg_pending_diag_updates)
+      || not (Queue.is_empty ws.open_diag_revalidate_updates)
 
 let startup_update_phase (ws : t) : unit =
   let next_phase =
@@ -280,15 +424,17 @@ let startup_ready_components (ws : t) :
     * bool
     * bool
     * bool
+    * bool
     * bool =
   ( startup_index_complete ws,
     not (startup_index_reconcile_pending ws),
     startup_seed_complete ws,
     startup_high_queues_empty ws,
+    startup_interactive_queues_empty ws,
     startup_queues_empty ws,
     startup_hints_ready ws,
     startup_nav_prereqs_ready ws,
-    quick_nav_index_complete ws,
+    quick_nav_index_ready_for_startup ws,
     startup_open_docs_converged ws,
     startup_open_docs_authoritative ws,
     xmodule_diag_prereqs_ready ws,
@@ -297,22 +443,29 @@ let startup_ready_components (ws : t) :
 let startup_is_ready (ws : t) : bool =
   let ( index_complete,
         index_reconcile_clear,
-        seed_complete,
+        _seed_complete,
         _high_queues_empty,
+        _interactive_queues_empty,
         queues_empty,
         hints_ready,
         nav_prereqs_ready,
-        quick_nav_index_complete,
+        quick_nav_index_ready,
         open_docs_converged,
         open_docs_authoritative,
         xmodule_ready,
         open_diag_revalidate_empty ) =
     startup_ready_components ws
   in
-  index_complete && index_reconcile_clear && seed_complete && queues_empty
-  && hints_ready && nav_prereqs_ready && quick_nav_index_complete
-  && open_docs_converged && open_docs_authoritative && xmodule_ready
-  && open_diag_revalidate_empty
+  ignore
+    ( queues_empty,
+      hints_ready,
+      xmodule_ready,
+      open_diag_revalidate_empty,
+      quick_nav_index_ready,
+      nav_prereqs_ready,
+      open_docs_converged,
+      open_docs_authoritative );
+  index_complete && index_reconcile_clear && startup_is_fully_navigable ws
 
 let startup_elapsed_ms (ws : t) : int =
   max 0 (int_of_float (startup_elapsed_ms_float ws))
@@ -383,6 +536,7 @@ let startup_readiness_json (ws : t) : Yojson.Safe.t =
         index_reconcile_clear,
         seed_complete,
         high_queues_empty,
+        interactive_queues_empty,
         queues_empty,
         hints_ready,
         nav_prereqs_ready,
@@ -398,6 +552,9 @@ let startup_readiness_json (ws : t) : Yojson.Safe.t =
   let pending_open_diag_revalidate =
     Queue.length ws.open_diag_revalidate_updates
   in
+  let interactive_nav_ready = interactive_nav_ready ws in
+  let quick_nav_complete = quick_nav_index_complete ws in
+  let deep_semantic_complete = startup_is_fully_navigable ws in
   let ready_diag_ms =
     match ws.startup_diag_hover_ready_ms with
     | Some ready -> max 0 (int_of_float (ready -. ws.startup_started_ms))
@@ -438,7 +595,16 @@ let startup_readiness_json (ws : t) : Yojson.Safe.t =
                   ( "readyWithinTarget",
                     `Bool (ready_diag_ms <= ws.startup_diag_hover_target_ms) );
                 ] );
-            ( "fullyNavigable",
+            ( "interactiveNavReady",
+              `Assoc
+                [
+                  ("targetMs", `Int ws.startup_nav_target_ms);
+                  ("elapsedMs", `Int ready_nav_ms);
+                  ("isReady", `Bool interactive_nav_ready);
+                  ( "readyWithinTarget",
+                    `Bool (ready_nav_ms <= ws.startup_nav_target_ms) );
+                ] );
+            ( "deepSemanticComplete",
               `Assoc
                 [
                   ("targetMs", `Int ws.startup_nav_target_ms);
@@ -454,12 +620,21 @@ let startup_readiness_json (ws : t) : Yojson.Safe.t =
             ("indexComplete", `Bool index_complete);
             ("indexReconcilePending", `Bool index_reconcile_pending);
             ("seedComplete", `Bool seed_complete);
+            ("seedReady", `Bool (startup_seed_ready ws));
             ("highQueuesEmpty", `Bool high_queues_empty);
+            ("interactiveQueuesEmpty", `Bool interactive_queues_empty);
             ("queuesEmpty", `Bool queues_empty);
+            ( "backgroundDrainRequired",
+              `Bool (startup_requires_background_drain ws) );
             ("hintsReady", `Bool hints_ready);
+            ("rootClosureReady", `Bool (startup_root_closure_ready ws));
             ("navPrereqsReady", `Bool nav_prereqs_ready);
+            ("interactiveNavReady", `Bool interactive_nav_ready);
+            ("quickNavComplete", `Bool quick_nav_complete);
+            ("deepSemanticComplete", `Bool deep_semantic_complete);
+            ("fullyNavigable", `Bool deep_semantic_complete);
             ("quickNavIndexReady", `Bool quick_nav_ready);
-            ("quickNavIndexComplete", `Bool (quick_nav_index_complete ws));
+            ("quickNavIndexComplete", `Bool quick_nav_complete);
             ("quickNavIndexed", `Int ws.quick_nav_index_done);
             ("quickNavTotal", `Int ws.quick_nav_index_total);
             ("quickNavPending", `Int (Queue.length ws.quick_nav_pending_paths));
@@ -510,7 +685,7 @@ let consume_workspace_ready_event_json (ws : t) : Yojson.Safe.t option =
           (`Assoc
              [
                ("rootUri", root_uri_json);
-               ("stage", `String "fullyNavigable");
+               ("stage", `String "deepSemanticComplete");
                ("readiness", startup_readiness_json ws);
              ]))
       else None
@@ -572,7 +747,7 @@ let consume_startup_miss_event_json (ws : t) : Yojson.Safe.t option =
           (`Assoc
              [
                ("rootUri", root_uri_json);
-               ("stage", `String "fullyNavigable");
+               ("stage", `String "deepSemanticComplete");
                ("phase", `String (startup_phase_to_string ws.startup_phase));
                ("elapsedMs", `Int (startup_elapsed_ms ws));
                ("targetMs", `Int ws.startup_nav_target_ms);
@@ -590,26 +765,6 @@ let startup_background_budget_ms (ws : t) ~(base_budget_ms : int) : int =
           (max ws.startup_aggressive_bg_budget_ms ws.bg_high_large_budget_ms)
     | StartupCold | StartupWarming | StartupReady ->
         max base ws.bg_high_large_budget_ms
-
-let workspace_source_bytes_estimate (ws : t) : int =
-  match ws.index with
-  | None -> 0
-  | Some idx ->
-      let bytes = Workspace_index.source_total_bytes idx in
-      ws.source_bytes_estimate <- Some bytes;
-      ws.source_bytes_estimate_count <- Workspace_index.source_count idx;
-      max 0 bytes
-
-let workspace_profile_for_budget (ws : t) : workspace_profile =
-  match ws.workspace_profile_mode with
-  | ProfileModeSmall -> ProfileSmall
-  | ProfileModeMedium -> ProfileMedium
-  | ProfileModeLarge -> ProfileLarge
-  | ProfileModeAuto ->
-      let bytes = workspace_source_bytes_estimate ws in
-      if bytes >= profile_medium_max_bytes then ProfileLarge
-      else if bytes >= profile_small_max_bytes then ProfileMedium
-      else ProfileSmall
 
 let effective_bg_tick_budget_ms (ws : t) ~(base_budget_ms : int) : int =
   let base = max 1 base_budget_ms in

@@ -1,3 +1,5 @@
+(* Module overview: Jovial AST data model with locations, recovery metadata, and debug renderers. *)
+
 (* lib/ast.ml *)
 
 module T = Lsp.Types
@@ -158,6 +160,17 @@ and field_decl = {
 and param_mode = In | Out | InOut
 and param = { pname : ident; pmode : param_mode; ptype : type_expr node }
 
+and overlay_item =
+  | OverlayTarget of ident
+  | OverlaySpacer of expr node
+  | OverlayGroup of overlay_item node list
+
+and overlay_decl = {
+  overlay_name : ident;
+  overlay_items : overlay_item node list;
+  overlay_pos : expr node option;
+}
+
 and expr =
   | EName of ident
   | ELit of literal
@@ -207,6 +220,7 @@ and decl =
       storage : storage;
       external_modifier : external_modifier;
       data_decl_kind : data_decl_kind;
+      is_readonly : bool;
     }
   | DConst of {
       name : ident;
@@ -221,6 +235,7 @@ and decl =
       external_modifier : external_modifier;
     }
   | DProc of proc node
+  | DOverlay of overlay_decl
   | DDirective of { name : ident; args : string node list }
 
 and proc = {
@@ -232,6 +247,7 @@ and proc = {
   body : stmt node;
   external_modifier : external_modifier;
   has_body : bool;
+  is_inline : bool;
 }
 
 type toplevel = TopDecl of decl node | TopStmt of stmt node
@@ -413,6 +429,22 @@ module Debug = struct
         (pp_type_expr opts b (depth + 1))
         x.ptype (pp_loc_if opts) p.loc
 
+  and pp_overlay_item opts b depth fmt (item : overlay_item node) =
+    if not (take_node b) then Format.pp_print_string fmt "<...>"
+    else
+      match item.v with
+      | OverlayTarget id ->
+          Format.fprintf fmt "OverlayTarget(%a)%a" pp_ident id
+            (pp_loc_if opts) item.loc
+      | OverlaySpacer expr ->
+          Format.fprintf fmt "OverlaySpacer(%a)%a"
+            (pp_expr opts b (depth + 1))
+            expr (pp_loc_if opts) item.loc
+      | OverlayGroup items ->
+          Format.fprintf fmt "@[OverlayGroup([%a])@]%a"
+            (pp_list (pp_overlay_item opts b (depth + 1)))
+            items (pp_loc_if opts) item.loc
+
   and pp_expr opts b depth fmt (e : expr node) =
     if not (take_node b) then Format.pp_print_string fmt "<...>"
     else if over_depth opts depth then
@@ -569,13 +601,21 @@ module Debug = struct
     else
       match d.v with
       | DVar
-          { name; dtype; init; storage; external_modifier; data_decl_kind } ->
+          {
+            name;
+            dtype;
+            init;
+            storage;
+            external_modifier;
+            data_decl_kind;
+            is_readonly;
+          } ->
           Format.fprintf fmt
-            "@[DVar(%a : %a; storage=%a; external=%a; data_kind=%a; init=%a)@]%a"
+            "@[DVar(%a : %a; storage=%a; external=%a; data_kind=%a; readonly=%b; init=%a)@]%a"
             pp_ident name
             (pp_type_expr opts b (depth + 1))
             dtype pp_storage storage pp_external_modifier external_modifier
-            pp_data_decl_kind data_decl_kind
+            pp_data_decl_kind data_decl_kind is_readonly
             (pp_opt (pp_expr opts b (depth + 1)))
             init (pp_loc_if opts) d.loc
       | DConst { name; dtype; value; external_modifier; data_decl_kind } ->
@@ -592,6 +632,13 @@ module Debug = struct
             (pp_type_expr opts b (depth + 1))
             defn pp_external_modifier external_modifier (pp_loc_if opts) d.loc
       | DProc p -> pp_proc opts b (depth + 1) fmt p
+      | DOverlay overlay ->
+          Format.fprintf fmt "@[DOverlay(%a; pos=%a; items=[%a])@]%a"
+            pp_ident overlay.overlay_name
+            (pp_opt (pp_expr opts b (depth + 1)))
+            overlay.overlay_pos
+            (pp_list (pp_overlay_item opts b (depth + 1)))
+            overlay.overlay_items (pp_loc_if opts) d.loc
       | DDirective { name; args } ->
           Format.fprintf fmt "@[DDirective(%a, [%a])@]%a" pp_ident name
             (pp_list pp_string_node) args (pp_loc_if opts) d.loc
@@ -601,9 +648,9 @@ module Debug = struct
     else
       let x = p.v in
       Format.fprintf fmt
-        "@[DProc(name=%a; use=%a; external=%a; has_body=%b; params=[%a]; \
+        "@[DProc(name=%a; use=%a; inline=%b; external=%a; has_body=%b; params=[%a]; \
          returns=%a; locals=[%a]; body=%a)@]%a"
-        pp_ident x.name pp_proc_use x.use_attr
+        pp_ident x.name pp_proc_use x.use_attr x.is_inline
         pp_external_modifier x.external_modifier x.has_body
         (pp_list (pp_param opts b (depth + 1)))
         x.params

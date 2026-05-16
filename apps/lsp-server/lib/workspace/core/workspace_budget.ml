@@ -1,3 +1,5 @@
+(* Module overview: Budget helpers that keep background work within interactive latency targets. *)
+
 type check_result =
   | Continue
   | Stop of Workspace_readiness.reason

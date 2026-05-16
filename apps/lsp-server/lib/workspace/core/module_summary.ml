@@ -1,3 +1,5 @@
+(* Module overview: Summarizes parsed modules and compools for change detection and indexing. *)
+
 type public_symbol = {
   name : string;
   key : string;
@@ -108,7 +110,8 @@ let canonical_tokens (tokens : Preprocess.lex_tok array) ~(start_i : int)
 let is_decl_start = function
   | Parser.BANG | Parser.COMPOOL | Parser.ICOMPOOL | Parser.DEFINE
   | Parser.TYPE | Parser.BLOCK | Parser.DEF | Parser.REF | Parser.PROC
-  | Parser.ITEM | Parser.TABLE | Parser.STATIC | Parser.CONSTANT ->
+  | Parser.ITEM | Parser.TABLE | Parser.READONLY | Parser.INLINE
+  | Parser.OVERLAY | Parser.STATIC | Parser.CONSTANT ->
       true
   | _ -> false
 

@@ -1,0 +1,214 @@
+{
+  "tool": "jovial-vscode-e2e-perf",
+  "generatedAt": "2026-05-16T20:03:33.032Z",
+  "note": "Measures VS Code extension-host UX path: extension activation, LanguageClient processing, stdio JSON-RPC, real OCaml LSP server processing, provider command results, and unsaved edit-to-diagnostics latency.",
+  "workspacePath": "C:\\Users\\IDAN\\AppData\\Local\\Temp\\jovial-vscode-e2e-DtksHY\\workspace",
+  "samplePath": "C:\\Users\\IDAN\\AppData\\Local\\Temp\\jovial-vscode-e2e-DtksHY\\workspace\\MAIN.j73",
+  "serverPath": "C:\\Users\\IDAN\\Documents\\GitHub\\LSP-yod-dalet-proj\\apps\\lsp-server\\_build-win32-x64\\install\\default\\bin\\jovial-lsp.exe",
+  "profile": "huge",
+  "sampleBytes": 16777274,
+  "hugeThresholdBytes": 15728640,
+  "fullParseMaxBytes": 17825792,
+  "commandSamples": 3,
+  "providerRange": {
+    "start": {
+      "line": 0,
+      "character": 0
+    },
+    "end": {
+      "line": 29,
+      "character": 36
+    }
+  },
+  "activation": {
+    "name": "openDocument.extensionActivate.serverInitialize",
+    "durationMs": 1237.35
+  },
+  "commands": [
+    {
+      "name": "documentSymbols",
+      "iterations": 3,
+      "durationsMs": [
+        9849.278,
+        0.517,
+        0.354
+      ],
+      "stats": {
+        "minMs": 0.354,
+        "p50Ms": 0.517,
+        "p95Ms": 9849.278,
+        "p99Ms": 9849.278,
+        "maxMs": 9849.278,
+        "avgMs": 3283.383
+      },
+      "resultSummary": {
+        "kind": "undefined"
+      },
+      "errors": []
+    },
+    {
+      "name": "hover",
+      "iterations": 3,
+      "durationsMs": [
+        1188.029,
+        167.935,
+        231.536
+      ],
+      "stats": {
+        "minMs": 167.935,
+        "p50Ms": 231.536,
+        "p95Ms": 1188.029,
+        "p99Ms": 1188.029,
+        "maxMs": 1188.029,
+        "avgMs": 529.167
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "definition",
+      "iterations": 3,
+      "durationsMs": [
+        1596.263,
+        1598.878,
+        1598.013
+      ],
+      "stats": {
+        "minMs": 1596.263,
+        "p50Ms": 1598.013,
+        "p95Ms": 1598.878,
+        "p99Ms": 1598.878,
+        "maxMs": 1598.878,
+        "avgMs": 1597.718
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "references",
+      "iterations": 3,
+      "durationsMs": [
+        1.761,
+        1.26,
+        1.791
+      ],
+      "stats": {
+        "minMs": 1.26,
+        "p50Ms": 1.761,
+        "p95Ms": 1.791,
+        "p99Ms": 1.791,
+        "maxMs": 1.791,
+        "avgMs": 1.604
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "inlayHints",
+      "iterations": 3,
+      "durationsMs": [
+        1.631,
+        1.51,
+        1.304
+      ],
+      "stats": {
+        "minMs": 1.304,
+        "p50Ms": 1.51,
+        "p95Ms": 1.631,
+        "p99Ms": 1.631,
+        "maxMs": 1.631,
+        "avgMs": 1.482
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "semanticTokens.range",
+      "iterations": 3,
+      "durationsMs": [
+        1.965,
+        1.547,
+        1.329
+      ],
+      "stats": {
+        "minMs": 1.329,
+        "p50Ms": 1.547,
+        "p95Ms": 1.965,
+        "p99Ms": 1.965,
+        "maxMs": 1.965,
+        "avgMs": 1.614
+      },
+      "resultSummary": {
+        "kind": "semanticTokens",
+        "dataLength": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "completion",
+      "iterations": 3,
+      "durationsMs": [
+        86.273,
+        68.022,
+        61.933
+      ],
+      "stats": {
+        "minMs": 61.933,
+        "p50Ms": 68.022,
+        "p95Ms": 86.273,
+        "p99Ms": 86.273,
+        "maxMs": 86.273,
+        "avgMs": 72.076
+      },
+      "resultSummary": {
+        "kind": "objectWithItems",
+        "length": 10001
+      },
+      "errors": []
+    }
+  ],
+  "diagnostics": {
+    "baseline": {
+      "name": "diagnostics.baselineStable",
+      "durationMs": 544.728,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "brokenEdit": {
+      "name": "diagnostics.afterBrokenEdit",
+      "durationMs": 18790.052,
+      "count": 1,
+      "fingerprint": "0|parse||Expected START before source text; full diagnostics are updating in the background.|0|0|0|1",
+      "messages": [
+        "Expected START before source text; full diagnostics are updating in the background."
+      ]
+    },
+    "restoredEdit": {
+      "name": "diagnostics.afterRestoreEdit",
+      "durationMs": 14209.667,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "restoredMatchesBaseline": true,
+    "errors": []
+  },
+  "summary": {
+    "commandErrors": [],
+    "diagnosticsRestoredToBaseline": true,
+    "diagnosticErrors": []
+  }
+}

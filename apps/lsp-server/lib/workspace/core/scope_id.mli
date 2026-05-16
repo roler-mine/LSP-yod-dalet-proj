@@ -1,3 +1,5 @@
+(** Module overview: Stable scope identifier helpers for semantic graph entries. *)
+
 type t = private int
 
 val of_int : int -> t

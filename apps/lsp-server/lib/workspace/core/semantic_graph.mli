@@ -1,3 +1,5 @@
+(** Module overview: Semantic graph representation of symbols, scopes, definitions, and references. *)
+
 module T = Lsp.Types
 
 type symbol = {

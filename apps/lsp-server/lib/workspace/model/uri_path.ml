@@ -1,3 +1,5 @@
+(* Module overview: URI and filesystem path conversions shared by the workspace and LSP layers. *)
+
 module T = Lsp.Types
 
 let starts_with ~(s : string) ~(prefix : string) : bool =

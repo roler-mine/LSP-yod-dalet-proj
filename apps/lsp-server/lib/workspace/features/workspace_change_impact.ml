@@ -1,3 +1,5 @@
+(* Module overview: Computes likely downstream effects of edits, renames, and type changes. *)
+
 module Metadata = Workspace_symbol_metadata
 open Workspace_nav_model
 open Workspace_nav_lookup
@@ -21,7 +23,7 @@ let change_impact_for_def ws (d : def) =
           "Macro expansion changes can affect every use site, including code \
            that only sees the DEFINE through imported or included declarations. \
            Run Find References before changing this declaration."
-      | Metadata.JovialTable | Metadata.JovialBlock
+      | Metadata.JovialTable | Metadata.JovialBlock | Metadata.JovialOverlay
       | Metadata.JovialConstantTable ->
           "Type, size, layout, or name changes can affect assignments, formulas, \
            table/block layout, COMPOOL users, and external DEF/REF users. Run \

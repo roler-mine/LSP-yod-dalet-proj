@@ -1,3 +1,5 @@
+(* Module overview: Constructs and owns the mutable workspace state record. *)
+
 module T = Lsp.Types
 open Workspace_foundation
 open Workspace_tuning
@@ -6,10 +8,16 @@ type t = Workspace_foundation.t
 
 let profile_small_max_bytes = 10 * 1024 * 1024
 let profile_medium_max_bytes = 40 * 1024 * 1024
+let next_workspace_id = ref 0
+
+let fresh_workspace_id () =
+  incr next_workspace_id;
+  !next_workspace_id
 
 let create ?(settings = Workspace_settings.from_env ()) () : t =
   let now = Perf_stats.now_ms () in
   {
+    workspace_id = fresh_workspace_id ();
     docs = Hashtbl.create 32;
     files = Hashtbl.create 64;
     root_path = None;
@@ -25,6 +33,9 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     lsif_snapshot_revision = 0;
     lsif_snapshot_payload = None;
     lsif_snapshot_symbols = None;
+    ide_snapshot_generation = 0;
+    ide_snapshot_dirty = true;
+    hover_body_cache = Hashtbl.create 512;
     workspace_diag_mode = settings.workspace_diag_mode;
     feature_flags = settings.feature_flags;
     bg_high_small_queue = Queue.create ();
@@ -68,6 +79,8 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     pressure_live_mb = 0;
     pressure_last_check_ms = 0.0;
     startup_started_ms = now;
+    startup_diag_hover_default_target_ms = settings.startup_diag_hover_target_ms;
+    startup_nav_default_target_ms = settings.startup_nav_target_ms;
     startup_diag_hover_target_ms = settings.startup_diag_hover_target_ms;
     startup_nav_target_ms = settings.startup_nav_target_ms;
     startup_diag_hover_ready_ms = None;
@@ -108,6 +121,8 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     root_closure_target_files = settings.root_closure_target_files;
     skeleton_prefix_bytes = settings.skeleton_prefix_bytes;
     sched_open_doc_min_share_pct = settings.sched_open_doc_min_share_pct;
+    allow_slow_query_fallback = settings.allow_slow_query_fallback;
+    implementation_config = settings.implementation_config;
     quick_nav_index = Hashtbl.create 2048;
     module_summary_cache = Hashtbl.create 2048;
     module_summary_compool_index = Hashtbl.create 512;
@@ -134,7 +149,9 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
   }
 
 let invalidate_lsif_snapshot (ws : t) : unit =
-  ws.lsif_snapshot_revision <- ws.lsif_snapshot_revision + 1
+  ws.lsif_snapshot_revision <- ws.lsif_snapshot_revision + 1;
+  ws.ide_snapshot_dirty <- true;
+  if Hashtbl.length ws.hover_body_cache > 0 then Hashtbl.clear ws.hover_body_cache
 
 let normalize_name (s : string) : string =
   String.uppercase_ascii (String.trim s)
@@ -341,6 +358,7 @@ let open_doc_parse_pending_for_path_key (ws : t) ~(path_key : string) : bool =
          acc
          ||
          (doc.Document.parse_rev <> doc.Document.rev
+         && not (is_huge_doc doc ws)
          &&
          match doc.Document.file with
          | Some p ->
@@ -354,6 +372,7 @@ let has_pending_open_parse_work (ws : t) : bool =
       acc
       ||
       (doc.Document.parse_rev <> doc.Document.rev
+      && not (is_huge_doc doc ws)
       &&
       match doc.Document.file with
       | Some p ->
@@ -526,9 +545,9 @@ let enqueue_pending_open_doc_parses ?(reason_group : string = "open_doc")
       else acc)
     ws.docs 0
 
-let dequeue_bg_path (ws : t) ~(mode : bg_tick_mode) ~(allow_normal_large : bool)
-    ~(allow_root_large : bool) ~(open_only : bool) ~(prefer_open : bool) :
-    (string * bg_queue_kind) option =
+let dequeue_bg_path (ws : t) ~(mode : bg_tick_mode) ~(allow_high_large : bool)
+    ~(allow_normal_large : bool) ~(allow_root_large : bool) ~(open_only : bool)
+    ~(prefer_open : bool) : (string * bg_queue_kind) option =
   let pop_from_queue (q : string Queue.t) ~(expect : bg_queue_kind) :
       (string * bg_queue_kind) option =
     let skipped = Queue.create () in
@@ -562,7 +581,8 @@ let dequeue_bg_path (ws : t) ~(mode : bg_tick_mode) ~(allow_normal_large : bool)
     pop_from_queue ws.bg_high_small_queue ~expect:BgQueueHighSmall
   in
   let pop_high_large () =
-    pop_from_queue ws.bg_high_large_queue ~expect:BgQueueHighLarge
+    if not allow_high_large then None
+    else pop_from_queue ws.bg_high_large_queue ~expect:BgQueueHighLarge
   in
   let pop_root_small () =
     pop_from_queue ws.bg_root_small_queue ~expect:BgQueueRootSmall
@@ -779,6 +799,9 @@ let set_root_path (ws : t) (root : string option) : unit =
     clear_module_summary_cache ws;
     ws.root_path <- root;
     ws.startup_started_ms <- Perf_stats.now_ms ();
+    ws.startup_diag_hover_target_ms <-
+      ws.startup_diag_hover_default_target_ms;
+    ws.startup_nav_target_ms <- ws.startup_nav_default_target_ms;
     ws.startup_diag_hover_ready_ms <- None;
     ws.startup_fully_nav_ready_ms <- None;
     ws.startup_diag_hover_notified <- false;
@@ -822,12 +845,17 @@ let set_source_files (ws : t) (paths : string list) : bool =
   in
   if source_paths <> ws.source_file_paths then (
     ws.source_file_paths <- source_paths;
+    ws.source_bytes_estimate <- None;
+    ws.source_bytes_estimate_count <- List.length source_paths;
     ws.index <- None;
     clear_module_summary_cache ws;
     mark_graph_dirty ws;
     ws.bg_seed_needs_refresh <- true;
     true)
-  else false
+  else (
+    if ws.source_bytes_estimate_count < 0 then
+      ws.source_bytes_estimate_count <- List.length source_paths;
+    false)
 
 let is_import_word_char = function
   | 'A' .. 'Z' | '0' .. '9' | '_' -> true
@@ -910,6 +938,11 @@ let document_version (ws : t) ~(uri : T.DocumentUri.t) : int option =
   match Hashtbl.find_opt ws.docs uri with
   | None -> None
   | Some doc -> Document.lsp_version doc
+
+let document_text_length (ws : t) ~(uri : T.DocumentUri.t) : int option =
+  match Hashtbl.find_opt ws.docs uri with
+  | None -> None
+  | Some doc -> Some (String.length doc.Document.text)
 
 let diagnostics_snapshot_for (ws : t) ~(uri : T.DocumentUri.t) :
     int option * T.Diagnostic.t list =

@@ -1,3 +1,5 @@
+(** Module overview: Immutable workspace snapshot model used by persistent indexes and LSIF export. *)
+
 module UriMap : Map.S with type key = string
 
 type file_state = {
@@ -26,4 +28,6 @@ val empty : unit -> snapshot
 val of_workspace : Workspace_foundation.t -> snapshot
 val current : unit -> snapshot
 val publish : snapshot -> unit
+val cached_for_workspace : Workspace_foundation.t -> snapshot option
+val publish_for_workspace : Workspace_foundation.t -> snapshot -> unit
 val file : snapshot -> uri:string -> file_state option

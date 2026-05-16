@@ -1,3 +1,5 @@
+(* Module overview: Models include targets and normalized include keys for workspace graphing. *)
+
 type source_map_record = {
   expanded_range : Ast.Loc.t;
   original_source_file : string option;

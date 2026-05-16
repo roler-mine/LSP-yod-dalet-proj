@@ -1,3 +1,5 @@
+(* Module overview: Converts lexer and parser failures into user-facing syntax diagnostics. *)
+
 (* lib/parse_diags.ml *)
 
 type entry = Ast.Loc.t * string

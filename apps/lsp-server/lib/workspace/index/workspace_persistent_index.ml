@@ -1,3 +1,5 @@
+(* Module overview: Loads and saves persistent workspace index snapshots between server runs. *)
+
 type file_fingerprint = {
   uri : string;
   size : int;
