@@ -112,8 +112,8 @@
         },
         "jovial.lsif.fastPath": {
           "type": "boolean",
-          "default": false,
-          "description": "Enable LSIF cache as a fallback for definition/implementation/references/hover when the server has no result yet. Disabled by default."
+          "default": true,
+          "description": "Enable LSIF cache as a fallback for definition/implementation/references/hover when the server has no result yet."
         },
         "jovial.workspaceDiagnostics.mode": {
           "type": "string",
@@ -175,7 +175,7 @@
         },
         "jovial.performance.backgroundParseWorkerCount": {
           "type": "number",
-          "default": 2,
+          "default": 4,
           "minimum": 1,
           "description": "Number of background parse workers used for staged indexing."
         },
@@ -563,6 +563,14 @@
           },
           "description": "Additional JOVIAL source file extensions to scan and watch, for example .j for projects that use it."
         },
+        "jovial.workspace.extraAssemblyFileExtensions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional assembly file extensions whose labels can satisfy JOVIAL procedure linkage, for example .s."
+        },
         "jovial.server.parseMaxFileBytes": {
           "type": "number",
           "default": 15728640,
@@ -571,13 +579,13 @@
         },
         "jovial.server.pressureSoftMb": {
           "type": "number",
-          "default": 512,
+          "default": 1536,
           "minimum": 64,
           "description": "Soft memory pressure threshold in MB for server background work."
         },
         "jovial.server.pressureCriticalMb": {
           "type": "number",
-          "default": 768,
+          "default": 2048,
           "minimum": 64,
           "description": "Critical memory pressure threshold in MB for server background work."
         },
@@ -596,7 +604,9 @@
     "build:server:linux-x64": "node ../../tools/scripts/build-server.js --target linux-x64 --out runtime/server/linux-x64/jovial-lsp",
     "build:server:linux-arm64": "node ../../tools/scripts/build-server.js --target linux-arm64 --out runtime/server/linux-arm64/jovial-lsp",
     "build:server:e2e": "node ../../tools/scripts/build-server.js --no-bundle",
-    "verify:runtime": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64,linux-x64,linux-arm64",
+    "verify:runtime": "npm run verify:runtime:x64",
+    "verify:runtime:x64": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,linux-x64",
+    "verify:runtime:all": "node ../../tools/scripts/verify-runtime-binaries.js --targets win32-x64,win32-arm64,linux-x64,linux-arm64",
     "verify:runtime:host": "node ../../tools/scripts/verify-runtime-binaries.js --targets host",
     "check": "npm run check:src && tsc -p tsconfig.test.json --noEmit",
     "check:src": "tsc -p . --noEmit",
@@ -616,7 +626,8 @@
     "vscode:prepublish": "npm run compile",
     "package:vsix:dev": "npm run build:server:host && npm run verify:runtime:host && npx @vscode/vsce package",
     "package:vsix:host": "npm run build:server:host && npm run verify:runtime:host && npx @vscode/vsce package",
-    "package:vsix:release": "npm run verify:runtime && npx @vscode/vsce package",
+    "package:vsix:release": "npm run verify:runtime:x64 && npx @vscode/vsce package",
+    "package:vsix:release:all": "npm run verify:runtime:all && npx @vscode/vsce package",
     "package:vsix": "npm run package:vsix:dev"
   },
   "dependencies": {},

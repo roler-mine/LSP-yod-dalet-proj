@@ -17,8 +17,12 @@ type query_context = {
   pos : T.Position.t;
 }
 
+type symbol_ref_id =
+  | LegacySymbolId of string
+  | CrossFileSymbolId of Cross_file_index.symbol_id
+
 type symbol_ref = {
-  symbol_id : string option;
+  symbol_id : symbol_ref_id option;
   name : string;
   key : string;
   loc : Ast.Loc.t;
@@ -287,9 +291,50 @@ let perf_metric_calls (name : string) : int =
       | _ -> 0)
   | _ -> 0
 
-let lookup_symbol_ref ctx : symbol_ref option query_result =
-  let cache = Hashtbl.create 8 in
-  let nav = nav_for_doc_cached ctx.ws cache ctx.doc in
+let cross_index_current_for_ctx (ctx : query_context) : bool =
+  Cross_file_index.file_current_for_doc ctx.ws.cross_file_index ctx.doc
+
+let loc_for_cross_symbol_decl (hit : Cross_file_index.symbol_hit) : Ast.Loc.t =
+  let file_path = Uri_path.file_path_of_uri hit.file.Cross_file_index.uri in
+  Cross_file_index.LineIndex.loc_of_range ~file:file_path
+    hit.file.Cross_file_index.line_index
+    hit.symbol.Cross_file_index.name_range
+
+let nav_kind_of_cross_symbol (sym : Cross_file_index.symbol_record) : int =
+  match sym.Cross_file_index.kind with
+  | Cross_file_index.Compool | Cross_file_index.Block -> sym_kind_module
+  | Cross_file_index.Type -> sym_kind_type
+  | Cross_file_index.Proc | Cross_file_index.Function
+  | Cross_file_index.AsmExternal ->
+      sym_kind_func
+  | Cross_file_index.Define | Cross_file_index.ConstantItem
+  | Cross_file_index.StatusValue | Cross_file_index.Builtin ->
+      sym_kind_const
+  | Cross_file_index.Item | Cross_file_index.Table
+  | Cross_file_index.FormalParam | Cross_file_index.ExternalDef
+  | Cross_file_index.ExternalRef | Cross_file_index.Label
+  | Cross_file_index.UnknownSymbol ->
+      sym_kind_var
+
+let cross_symbol_key (ctx : query_context)
+    (sym : Cross_file_index.symbol_record) : string =
+  Cross_file_index.NameTable.text
+    (Cross_file_index.name_table ctx.ws.cross_file_index)
+    sym.Cross_file_index.name_id
+  |> Option.value ~default:(normalize_name sym.Cross_file_index.spelling)
+
+let def_of_cross_hit ctx (hit : Cross_file_index.symbol_hit) : def =
+  {
+    uri = hit.file.Cross_file_index.uri;
+    name = hit.symbol.Cross_file_index.spelling;
+    key = cross_symbol_key ctx hit.symbol;
+    loc = loc_for_cross_symbol_decl hit;
+    kind = nav_kind_of_cross_symbol hit.symbol;
+    container = None;
+    metadata = hit.symbol.Cross_file_index.metadata;
+  }
+
+let lookup_symbol_ref_from_nav ctx nav =
   match symbol_at_position_in_nav nav ~uri:ctx.doc.Document.uri ~pos:ctx.pos with
   | Some (sym_id, loc) ->
       let def =
@@ -330,7 +375,15 @@ let lookup_symbol_ref ctx : symbol_ref option query_result =
       in
       let value =
         Some
-          { symbol_id = Some sym_id; name; key; loc; def; readiness; authority }
+          {
+            symbol_id = Some (LegacySymbolId sym_id);
+            name;
+            key;
+            loc;
+            def;
+            readiness;
+            authority;
+          }
       in
       make_result ctx ~readiness ~authority ~reasons value
   | None -> (
@@ -346,6 +399,42 @@ let lookup_symbol_ref ctx : symbol_ref option query_result =
           in
           result_for_fallback_word ctx value)
 
+let lookup_symbol_ref ctx : symbol_ref option query_result =
+  if cross_index_current_for_ctx ctx then
+    match
+      Cross_file_index.symbol_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    with
+    | Some hit ->
+        let def = def_of_cross_hit ctx hit in
+        let readiness =
+          if same_uri def.uri ctx.doc.Document.uri then R.LocalAstReady
+          else R.CrossModuleSemanticReady
+        in
+        let value =
+          Some
+            {
+              symbol_id =
+                Some
+                  (CrossFileSymbolId hit.symbol.Cross_file_index.symbol_id);
+              name = def.name;
+              key = def.key;
+              loc = hit.Cross_file_index.loc;
+              def = Some def;
+              readiness;
+              authority = R.Authoritative;
+            }
+        in
+        make_result ctx ~readiness ~authority:R.Authoritative ~reasons:[] value
+    | None ->
+        let cache = Hashtbl.create 8 in
+        let nav = nav_for_doc_cached ctx.ws cache ctx.doc in
+        lookup_symbol_ref_from_nav ctx nav
+  else
+    let cache = Hashtbl.create 8 in
+    let nav = nav_for_doc_cached ctx.ws cache ctx.doc in
+    lookup_symbol_ref_from_nav ctx nav
+
 let symbol_at_position ctx =
   lookup_symbol_ref ctx |> record_result "symbol_at_position"
 
@@ -353,14 +442,40 @@ let hover_target_at_position ctx =
   symbol_at_position ctx |> record_result "hover_target_at_position"
 
 let definition_at_position ctx =
-  let summary_hits_before = perf_metric_calls "query.cross_module.summary_hit" in
-  let value =
-    Perf_stats.time "query.definition_core_ms" (fun () ->
-        Workspace_definition.definition_locations_for ctx.ws
-          ~uri:ctx.doc.Document.uri ~pos:ctx.pos)
+  let external_ref_under_cursor () =
+    match (symbol_at_position ctx).value with
+    | Some { def = Some d; _ } -> Metadata.is_external_ref d.metadata
+    | _ -> false
   in
-  let summary_backed =
-    perf_metric_calls "query.cross_module.summary_hit" > summary_hits_before
+  let direct =
+    if cross_index_current_for_ctx ctx then
+      Cross_file_index.definition_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    else None
+  in
+  let summary_hits_before = perf_metric_calls "query.cross_module.summary_hit" in
+  let value, summary_backed =
+    match direct with
+    | Some value ->
+        Perf_stats.tick "query.cross_file_index.definition_hit";
+        (value, false)
+    | None ->
+        let value =
+          Perf_stats.time "query.definition_core_ms" (fun () ->
+              Workspace_definition.definition_locations_for ctx.ws
+                ~uri:ctx.doc.Document.uri ~pos:ctx.pos)
+        in
+        let summary_backed =
+          perf_metric_calls "query.cross_module.summary_hit" > summary_hits_before
+        in
+        (value, summary_backed)
+  in
+  let value =
+    if value = [] && external_ref_under_cursor () then (
+      Perf_stats.tick "query.definition.external_ref_asm_fallback";
+      Workspace_implementation.implementation_locations_for ctx.ws
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos)
+    else value
   in
   let readiness, authority, reasons =
     Perf_stats.time "query.definition_metadata_ms" (fun () ->
@@ -382,18 +497,80 @@ let definition_at_position ctx =
   in
   make_result ctx ~readiness ~authority ~reasons value |> record_result "definition"
 
-let references_at_position ~(include_declaration : bool) ctx =
+let implementation_at_position ctx =
+  let direct =
+    if cross_index_current_for_ctx ctx then
+      Cross_file_index.implementation_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    else None
+  in
   let value =
-    Workspace_references.references_locations_for ctx.ws
-      ~uri:ctx.doc.Document.uri ~pos:ctx.pos
-      ~include_decl:include_declaration
+    match direct with
+    | Some value ->
+        Perf_stats.tick "query.cross_file_index.implementation_hit";
+        value
+    | None ->
+        Workspace_implementation.implementation_locations_for ctx.ws
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+  in
+  let readiness, authority, reasons = metadata_for_locations ctx value in
+  make_result ctx ~readiness ~authority ~reasons value
+  |> record_result "implementation"
+
+let type_definition_at_position ctx =
+  let direct =
+    if cross_index_current_for_ctx ctx then
+      Cross_file_index.type_definition_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    else None
+  in
+  let value =
+    match direct with
+    | Some value ->
+        Perf_stats.tick "query.cross_file_index.type_definition_hit";
+        value
+    | None ->
+        Workspace_type_definition.type_definition_locations_for ctx.ws
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+  in
+  let readiness, authority, reasons = metadata_for_locations ctx value in
+  make_result ctx ~readiness ~authority ~reasons value
+  |> record_result "type_definition"
+
+let references_at_position ~(include_declaration : bool) ctx =
+  let direct =
+    if cross_index_current_for_ctx ctx then
+      Cross_file_index.references_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos ~include_declaration
+    else None
+  in
+  let value =
+    match direct with
+    | Some value ->
+        Perf_stats.tick "query.cross_file_index.references_hit";
+        value
+    | None ->
+        Workspace_references.references_locations_for ctx.ws
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+          ~include_decl:include_declaration
   in
   let readiness, authority, reasons = metadata_for_locations ctx value in
   make_result ctx ~readiness ~authority ~reasons value |> record_result "references"
 
 let hover_at_position ctx =
+  let direct =
+    if cross_index_current_for_ctx ctx then
+      Cross_file_index.hover_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    else None
+  in
   let value =
-    Workspace_hover.hover_for ctx.ws ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    match direct with
+    | Some _ as hover ->
+        Perf_stats.tick "query.cross_file_index.hover_hit";
+        hover
+    | None ->
+        Workspace_hover.hover_for ctx.ws ~uri:ctx.doc.Document.uri ~pos:ctx.pos
   in
   let readiness, authority, reasons =
     match value with
@@ -401,13 +578,61 @@ let hover_at_position ctx =
         let readiness, reasons = readiness_for_doc ctx.ws ctx.doc in
         let readiness = R.max readiness R.LocalAstReady in
         (readiness, authority_for readiness reasons, reasons)
-    | None -> (
-        match hover_target_at_position ctx with
-        | { R.value = Some _; readiness; authority; reasons } ->
-            (readiness, authority, reasons)
-        | { readiness; authority; reasons; _ } -> (readiness, authority, reasons))
+    | None ->
+        let readiness, reasons = readiness_for_doc ctx.ws ctx.doc in
+        (readiness, authority_for readiness reasons, reasons)
   in
   make_result ctx ~readiness ~authority ~reasons value |> record_result "hover"
+
+let completions_at_position ctx =
+  let direct =
+    if cross_index_current_for_ctx ctx then
+      Cross_file_index.completions_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    else None
+  in
+  let value =
+    match direct with
+    | Some items when items <> [] ->
+        Perf_stats.tick "query.cross_file_index.completion_hit";
+        items
+    | _ ->
+        Workspace_completion.completion_items_for ctx.ws
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+  in
+  let readiness, reasons = readiness_for_doc ctx.ws ctx.doc in
+  make_result ctx ~readiness ~authority:(authority_for readiness reasons)
+    ~reasons value
+  |> record_result "completion"
+
+let diagnostics_for_file (ws : t) ~(uri : T.DocumentUri.t) :
+    T.Diagnostic.t list =
+  match Hashtbl.find_opt ws.docs uri with
+  | Some _ -> diagnostics_for ws ~uri
+  | None -> (
+      match Cross_file_index.diagnostics_for_file ws.cross_file_index ~uri with
+      | Some diags -> diags
+      | None -> diagnostics_for ws ~uri)
+
+let document_symbols_for_file (ws : t) ~(uri : T.DocumentUri.t) =
+  Cross_file_index.document_symbols_for_file ws.cross_file_index ~uri
+
+let workspace_symbols_for (ws : t) ~(query : string) :
+    T.SymbolInformation.t list =
+  match Cross_file_index.workspace_symbols ws.cross_file_index ~query with
+  | Some symbols ->
+      Perf_stats.tick "query.cross_file_index.workspace_symbols_hit";
+      symbols
+  | None -> Workspace_symbols.workspace_symbols_for ws ~query
+
+let workspace_symbols_stream (ws : t) ~(query : string)
+    ~(emit : T.SymbolInformation.t list -> unit) : T.SymbolInformation.t list =
+  match Cross_file_index.workspace_symbols ws.cross_file_index ~query with
+  | Some symbols ->
+      Perf_stats.tick "query.cross_file_index.workspace_symbols_hit";
+      if symbols <> [] then emit symbols;
+      symbols
+  | None -> Workspace_symbols.workspace_symbols_stream ws ~query ~emit
 
 let none_result (ws : t) value =
   let readiness = R.LexicalOnly in
@@ -425,22 +650,24 @@ let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Location.t list =
   match context ws ~uri ~pos with
   | None -> (none_result ws [] |> record_result "definition").value
-  | Some ctx when startup_large_doc_semantic_deferred ws ctx.doc ->
-      (startup_skeletal_result ctx [] |> record_result "definition").value
-  | Some ctx when startup_large_workspace_skeletal ws ctx.doc ->
-      (startup_skeletal_result ctx [] |> record_result "definition").value
   | Some ctx -> (definition_at_position ctx).value
+
+let type_definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
+    ~(pos : T.Position.t) : T.Location.t list =
+  match context ws ~uri ~pos with
+  | None -> (none_result ws [] |> record_result "type_definition").value
+  | Some ctx -> (type_definition_at_position ctx).value
+
+let implementation_locations_for (ws : t) ~(uri : T.DocumentUri.t)
+    ~(pos : T.Position.t) : T.Location.t list =
+  match context ws ~uri ~pos with
+  | None -> (none_result ws [] |> record_result "implementation").value
+  | Some ctx -> (implementation_at_position ctx).value
 
 let references_locations_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) ~(include_decl : bool) : T.Location.t list =
   match context ws ~uri ~pos with
   | None -> (none_result ws [] |> record_result "references").value
-  | Some ctx when startup_large_doc_semantic_deferred ws ctx.doc ->
-      ignore include_decl;
-      (startup_skeletal_result ctx [] |> record_result "references").value
-  | Some ctx when startup_large_workspace_skeletal ws ctx.doc ->
-      ignore include_decl;
-      (startup_skeletal_result ctx [] |> record_result "references").value
   | Some ctx ->
       (references_at_position ~include_declaration:include_decl ctx).value
 
@@ -456,6 +683,80 @@ let hover_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t) :
   | Some ctx when startup_large_workspace_skeletal ws ctx.doc ->
       (startup_skeletal_result ctx None |> record_result "hover").value
   | Some ctx -> (hover_at_position ctx).value
+
+let completion_items_for (ws : t) ~(uri : T.DocumentUri.t)
+    ~(pos : T.Position.t) : T.CompletionItem.t list =
+  match context ws ~uri ~pos with
+  | None -> (none_result ws [] |> record_result "completion").value
+  | Some ctx -> (completions_at_position ctx).value
+
+let loc_contains_loc (outer : Ast.Loc.t) (inner : Ast.Loc.t) : bool =
+  outer.Ast.Loc.start_pos.offset <= inner.Ast.Loc.start_pos.offset
+  && inner.Ast.Loc.end_pos.offset <= outer.Ast.Loc.end_pos.offset
+
+let loc_in_macro_expansion (graph : Macro_graph.t) (loc : Ast.Loc.t) : bool =
+  Macro_graph.expansions graph
+  |> List.exists (fun (exp : Macro_graph.expansion) ->
+         match exp.expanded_loc with
+         | Some expanded -> loc_contains_loc expanded loc
+         | None -> false)
+
+let generated_macro_symbol_at_position (ctx : query_context) : bool =
+  if not (cross_index_current_for_ctx ctx) then false
+  else
+    match
+      Cross_file_index.symbol_at_position ctx.ws.cross_file_index
+        ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+    with
+    | None -> false
+    | Some hit -> (
+        let graph = Macro_graph.of_document ctx.doc in
+        if not (loc_in_macro_expansion graph hit.Cross_file_index.loc) then false
+        else
+          match
+            Macro_graph.source_loc_for_generated_loc graph
+              hit.Cross_file_index.loc
+          with
+          | None -> true
+          | Some source ->
+              source.Ast.Loc.start_pos.offset
+              <> hit.Cross_file_index.loc.Ast.Loc.start_pos.offset
+              || source.Ast.Loc.end_pos.offset
+                 <> hit.Cross_file_index.loc.Ast.Loc.end_pos.offset)
+
+let prepare_rename_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
+    :
+    [ `Range of T.Range.t | `RangeWithPlaceholder of T.Range.t * string ] option
+    =
+  match context ws ~uri ~pos with
+  | Some ctx
+    when cross_index_current_for_ctx ctx
+         && not (generated_macro_symbol_at_position ctx) -> (
+      match
+        Cross_file_index.prepare_rename_at_position ctx.ws.cross_file_index
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos
+      with
+      | Some _ as prepared ->
+          Perf_stats.tick "query.cross_file_index.prepare_rename_hit";
+          prepared
+      | None -> Workspace_rename.prepare_rename_for ws ~uri ~pos)
+  | _ -> Workspace_rename.prepare_rename_for ws ~uri ~pos
+
+let rename_for (ws : t) ~(uri : T.DocumentUri.t) ~(pos : T.Position.t)
+    ~(new_name : string) : T.WorkspaceEdit.t option =
+  match context ws ~uri ~pos with
+  | Some ctx
+    when cross_index_current_for_ctx ctx
+         && not (generated_macro_symbol_at_position ctx) -> (
+      match
+        Cross_file_index.rename_at_position ctx.ws.cross_file_index
+          ~uri:ctx.doc.Document.uri ~pos:ctx.pos ~new_name
+      with
+      | Some _ as edit ->
+          Perf_stats.tick "query.cross_file_index.rename_hit";
+          edit
+      | None -> Workspace_rename.rename_for ws ~uri ~pos ~new_name)
+  | _ -> Workspace_rename.rename_for ws ~uri ~pos ~new_name
 
 let position_json (pos : T.Position.t) : Yojson.Safe.t =
   `Assoc [ ("line", `Int pos.line); ("character", `Int pos.character) ]
@@ -479,6 +780,13 @@ let def_json (d : def) : Yojson.Safe.t =
       ("location", location_json ~uri:d.uri d.loc);
     ]
 
+let symbol_ref_id_json = function
+  | None -> `Null
+  | Some (LegacySymbolId id) ->
+      `Assoc [ ("kind", `String "legacy"); ("id", `String id) ]
+  | Some (CrossFileSymbolId id) ->
+      `Assoc [ ("kind", `String "crossFile"); ("id", `Int id) ]
+
 let symbol_ref_json ~(uri : T.DocumentUri.t) (sym : symbol_ref option) :
     Yojson.Safe.t =
   match sym with
@@ -488,8 +796,7 @@ let symbol_ref_json ~(uri : T.DocumentUri.t) (sym : symbol_ref option) :
         [
           ("name", `String sym.name);
           ("key", `String sym.key);
-          ( "symbolId",
-            match sym.symbol_id with Some id -> `String id | None -> `Null );
+          ("symbolId", symbol_ref_id_json sym.symbol_id);
           ("location", location_json ~uri sym.loc);
           ("readiness", `String (R.label sym.readiness));
           ("authority", `String (R.authority_label sym.authority));
@@ -628,11 +935,21 @@ let debug_report_json (ws : t) (doc : Document.t) : Yojson.Safe.t =
     | None -> `Null
     | Some entry -> `String (module_summary_authority_label entry.msc_authority)
   in
+  let parse_output =
+    match doc.Document.syntax with
+    | None -> None
+    | Some syntax -> Some syntax.Syntax_cache.parse
+  in
+  let semantic_suppressed =
+    not (Diagnostic_gate.semantic_analysis_allowed ?parse_output ())
+  in
   `Assoc
     [
       ("documentReadiness", `String (R.label readiness));
       ("authority", `String (R.authority_label authority));
       ("reasons", `List (List.map (fun r -> `String (R.reason_label r)) reasons));
+      ( "parseStatus",
+        Diagnostic_gate.status_json ?parse_output ~semantic_suppressed () );
       ("semanticStoreEnabled", `Bool ws.sem_store_enabled);
       ("semanticStoreRevision", `Int (Semantic_store.global_rev ws.semantic_store));
       ( "semanticSnapshotCached",
@@ -677,5 +994,6 @@ let debug_report_json (ws : t) (doc : Document.t) : Yojson.Safe.t =
                 (perf_metric_calls
                    "query.cross_module.authoritative_result") );
           ] );
+      ("crossFileIndex", Cross_file_index.stats_json ws.cross_file_index);
       ("counters", perf_stats_json ws);
     ]

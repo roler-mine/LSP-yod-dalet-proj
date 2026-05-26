@@ -721,6 +721,11 @@ let specified_table_facts_for_def ws doc (d : def) : string list =
             | Ast.DProc p -> find_decl (List.map (fun d -> Ast.TopDecl d) p.v.locals @ rest)
             | _ -> find_decl rest))
     | Ast.TopStmt _ :: rest -> find_decl rest
+    | Ast.TopError _ :: rest -> find_decl rest
+    | Ast.TopModule m :: rest -> (
+        match find_decl m.v.module_items with
+        | Some _ as found -> found
+        | None -> find_decl rest)
   in
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } -> (
@@ -767,6 +772,10 @@ let overlay_facts_for_def doc (d : def) : string list =
         Some overlay
     | Ast.TopDecl { v = Ast.DProc p; _ } :: rest ->
         find_decl (List.map (fun d -> Ast.TopDecl d) p.v.locals @ rest)
+    | Ast.TopModule m :: rest -> (
+        match find_decl m.v.module_items with
+        | Some _ as found -> found
+        | None -> find_decl rest)
     | _ :: rest -> find_decl rest
   in
   match Document.current_parse doc with
@@ -919,7 +928,7 @@ let hover_body_for_def_uncached ws doc d =
         let preview = truncate_text 2000 preview in
         if String.trim preview = "" then ""
         else hover_code_section "Implementation preview" preview
-  in
+  (* in
   let impact =
     hover_inline_section "Change impact"
       (Workspace_change_impact.change_impact_for_def ws d)
@@ -936,12 +945,12 @@ let hover_body_for_def_uncached ws doc d =
           "This DEF is the exported external declaration. Calls and matching \
            REFs may resolve here; an implementation preview appears when a \
            body is available."
-    | _ -> ""
+    | _ -> "" *)
   in
   let sections =
     List.filter
       (fun section -> String.trim section <> "")
-      [ decl_block; source_block; preview_block; navigation_section; meaning; impact ]
+      [ decl_block; source_block; preview_block; navigation_section;]
   in
   hover_panel ~name:d.name
     ~summary:(hover_summary_for_def ws d)
@@ -1339,28 +1348,7 @@ let hover_semantic_for (ws : t) (doc : Document.t) ~(pos : T.Position.t) :
                 | None -> (
                     match word with
                     | None -> None
-                    | Some (nm, word_loc) ->
-                        Some
-                          (hover_markdown ~range:(Lsp_conv.range_of_loc word_loc)
-                             (hover_panel ~name:nm
-                                ~summary:"Unresolved JOVIAL symbol"
-                                ~facts:
-                                  [
-                                    "Status: no visible declaration was found for \
-                                     this reference.";
-                                    hover_current_file_fact doc;
-                                    Printf.sprintf "Position: line %d, column %d"
-                                      word_loc.Ast.Loc.start_pos.line
-                                      (word_loc.Ast.Loc.start_pos.col + 1);
-                                  ]
-                                ~sections:
-                                  [
-                                    hover_inline_section "Next check"
-                                      "Confirm the symbol is declared in scope, \
-                                       imported from the expected COMPOOL, or \
-                                       available through the expected external \
-                                       DEF/REF pair.";
-                                  ])))
+                    | Some _ -> None)
               else
                 let top_lines =
                   match defs with
@@ -1484,32 +1472,24 @@ let fast_hover_fallback (ws : t) (doc : Document.t) (pos : T.Position.t) :
   | None -> (
       match nav_word_at_position doc pos with
       | None -> None
-      | Some (name, loc) ->
+      | Some (name, _loc) ->
           if
             Implementation_config.is_system_subroutine ws.implementation_config
               name
           then system_subroutine_hover_at ws doc pos
           else
             let body =
-              hover_panel ~name ~summary:"Unresolved JOVIAL symbol"
-                ~facts:
-                  [
-                    "Status: semantic analysis pending";
-                    "Status: no visible declaration was found for this reference.";
-                    hover_current_file_fact doc;
-                    Printf.sprintf "Position: line %d, column %d"
-                      loc.Ast.Loc.start_pos.line
-                      (loc.Ast.Loc.start_pos.col + 1);
-                  ]
+              hover_panel ~name
+                ~summary:"JOVIAL identifier - syntax snapshot"
+                ~facts:[ "Status: semantic analysis pending" ]
                 ~sections:
                   [
-                    hover_inline_section "Next check"
-                      "Confirm the symbol is declared in scope, imported from \
-                       the expected COMPOOL, or available through the expected \
-                       external DEF/REF pair.";
+                    hover_inline_section "Details"
+                      "The open document has changed and semantic analysis is \
+                       still catching up.";
                   ]
             in
-            Some (hover_markdown ~range:(Lsp_conv.range_of_loc loc) body))
+            Some (hover_markdown ~range:(Lsp_conv.range_of_loc _loc) body))
 
 let hover_skeleton_fallback_for (ws : t) (doc : Document.t)
     ~(pos : T.Position.t) : T.Hover.t option =

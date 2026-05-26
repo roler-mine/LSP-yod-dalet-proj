@@ -41,9 +41,9 @@ jobs:
           path: dist/win32-x64/jovial-lsp.exe
           if-no-files-found: error
 
-  build-server-win-arm64:
-    name: Build Server (win32-arm64)
-    runs-on: [self-hosted, Windows, ARM64]
+  build-server-linux-x64:
+    name: Build Server (linux-x64)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,18 +63,18 @@ jobs:
         run: opam install . --deps-only -y
 
       - name: Build server binary
-        run: node .\tools\scripts\build-server.js --target win32-arm64 --out .\dist\win32-arm64\jovial-lsp.exe
+        run: node ./tools/scripts/build-server.js --target linux-x64 --out ./dist/linux-x64/jovial-lsp
 
-      - name: Upload server artifact (win32-arm64)
+      - name: Upload server artifact (linux-x64)
         uses: actions/upload-artifact@v4
         with:
-          name: server-win32-arm64
-          path: dist/win32-arm64/jovial-lsp.exe
+          name: server-linux-x64
+          path: dist/linux-x64/jovial-lsp
           if-no-files-found: error
 
   package-vsix:
-    name: Package Universal VSIX
-    needs: [build-server-win-x64, build-server-win-arm64]
+    name: Package VSIX
+    needs: [build-server-win-x64, build-server-linux-x64]
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -97,11 +97,11 @@ jobs:
           name: server-win32-x64
           path: apps/vscode-extension/runtime/server/win32-x64
 
-      - name: Download win32-arm64 server
+      - name: Download linux-x64 server
         uses: actions/download-artifact@v4
         with:
-          name: server-win32-arm64
-          path: apps/vscode-extension/runtime/server/win32-arm64
+          name: server-linux-x64
+          path: apps/vscode-extension/runtime/server/linux-x64
 
       - name: Package VSIX
         run: npm --prefix .\apps\vscode-extension run package:vsix:release
@@ -115,7 +115,7 @@ jobs:
           if (-not $vsix) { throw "VSIX file was not produced." }
           certutil -hashfile $vsix.FullName SHA256 > .\dist\vsix.sha256.txt
           certutil -hashfile .\apps\vscode-extension\runtime\server\win32-x64\jovial-lsp.exe SHA256 > .\dist\server-win32-x64.sha256.txt
-          certutil -hashfile .\apps\vscode-extension\runtime\server\win32-arm64\jovial-lsp.exe SHA256 > .\dist\server-win32-arm64.sha256.txt
+          certutil -hashfile .\apps\vscode-extension\runtime\server\linux-x64\jovial-lsp SHA256 > .\dist\server-linux-x64.sha256.txt
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4

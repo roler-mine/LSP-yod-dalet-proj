@@ -87,6 +87,7 @@ let string_list_of_json = function
 
 let token_payload = function
   | Parser.ID s -> "ID:" ^ normalize_name s
+  | Parser.FIXED_A s -> "ID:" ^ normalize_name s
   | Parser.INTLIT s -> "INT:" ^ String.trim s
   | Parser.FLOATLIT s -> "FLOAT:" ^ String.trim s
   | Parser.STRINGLIT s -> "STRING:" ^ s
@@ -108,7 +109,9 @@ let canonical_tokens (tokens : Preprocess.lex_tok array) ~(start_i : int)
     String.concat " " (List.rev !parts)
 
 let is_decl_start = function
-  | Parser.BANG | Parser.COMPOOL | Parser.ICOMPOOL | Parser.DEFINE
+  | Parser.BANG | Parser.COMPOOL | Parser.ICOMPOOL | Parser.LINKAGE
+  | Parser.ILINKAGE
+  | Parser.DEFINE
   | Parser.TYPE | Parser.BLOCK | Parser.DEF | Parser.REF | Parser.PROC
   | Parser.ITEM | Parser.TABLE | Parser.READONLY | Parser.INLINE
   | Parser.OVERLAY | Parser.STATIC | Parser.CONSTANT ->
@@ -208,25 +211,40 @@ let signature_for_symbol (tokens : Preprocess.lex_tok array)
 
 let icopy_targets_of_tokens (tokens : Preprocess.lex_tok array) : string list =
   let len = Array.length tokens in
+  let copy_marker_at i =
+    if i < 0 || i >= len then None
+    else
+      match tokens.(i).Parser.tok with
+      | Parser.BANG when i + 1 < len -> (
+          match tokens.(i + 1).Parser.tok with
+          | Parser.ID raw | Parser.FIXED_A raw
+            when Preprocess.canonical_directive_name raw = "COPY" ->
+              Some (i + 1)
+          | _ -> None)
+      | Parser.ID raw | Parser.FIXED_A raw
+        when normalize_name raw = "ICOPY" ->
+          Some i
+      | _ -> None
+  in
   let rec find_target i steps =
     if i >= len || steps > 16 then None
     else
       match tokens.(i).Parser.tok with
       | Parser.LPAREN | Parser.RPAREN | Parser.COMMA ->
           find_target (i + 1) (steps + 1)
-      | Parser.ID raw | Parser.STRINGLIT raw -> Some raw
+      | Parser.ID raw | Parser.FIXED_A raw | Parser.STRINGLIT raw -> Some raw
       | Parser.SEMI | Parser.TERM | Parser.EOF -> None
       | _ -> find_target (i + 1) (steps + 1)
   in
   let out = ref [] in
   for i = 0 to len - 1 do
-    match tokens.(i).Parser.tok with
-    | Parser.ID raw when normalize_name raw = "ICOPY" -> (
-        match find_target (i + 1) 0 with
+    match copy_marker_at i with
+    | Some marker_i -> (
+        match find_target (marker_i + 1) 0 with
         | None -> ()
         | Some raw ->
             out := (raw |> normalize_include_target |> normalize_name) :: !out)
-    | _ -> ()
+    | None -> ()
   done;
   sort_uniq_strings (List.rev !out)
 

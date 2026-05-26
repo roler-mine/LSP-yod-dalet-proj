@@ -150,7 +150,7 @@ function parseRunnerOptions(argv: readonly string[]): RunnerOptions {
     parseOptionalBoolean(
       argValue(argv, "--inject-diagnostics") ??
         process.env.JOVIAL_E2E_INJECT_DIAGNOSTICS,
-    ) ?? profile === "mixed";
+    ) ?? (profile === "mixed" && workspaceRoot === undefined);
 
   return {
     profile,
@@ -391,6 +391,18 @@ function writeLines(filePath: string, lines: readonly string[]): void {
   fs.writeFileSync(filePath, `${lines.join("\n")}\n`, "utf8");
 }
 
+function removeDiagnosticSeedWorkspace(workspacePath: string): void {
+  const staleSeedFiles = [
+    "AA_E2E_DIAG_TYPES.j73",
+    "AA_E2E_DIAGNOSTICS.j73",
+    "ZZ_E2E_DIAG_TYPES.j73",
+    "ZZ_E2E_DIAGNOSTICS.j73",
+  ];
+  for (const name of staleSeedFiles) {
+    fs.rmSync(path.join(workspacePath, name), { force: true });
+  }
+}
+
 function stressProcedureText(index: number): string {
   const suffix = index.toString().padStart(6, "0");
   return [
@@ -497,13 +509,7 @@ function writeBenchmarkWorkspace(
 
 function writeDiagnosticSeedWorkspace(workspacePath: string): DiagnosticSeed {
   ensureDir(workspacePath);
-  const staleSeedFiles = [
-    "ZZ_E2E_DIAG_TYPES.j73",
-    "ZZ_E2E_DIAGNOSTICS.j73",
-  ];
-  for (const name of staleSeedFiles) {
-    fs.rmSync(path.join(workspacePath, name), { force: true });
-  }
+  removeDiagnosticSeedWorkspace(workspacePath);
 
   const compoolPath = path.join(workspacePath, "AA_E2E_DIAG_TYPES.j73");
   const samplePath = path.join(workspacePath, "AA_E2E_DIAGNOSTICS.j73");
@@ -518,10 +524,10 @@ function writeDiagnosticSeedWorkspace(workspacePath: string): DiagnosticSeed {
 
   writeLines(samplePath, [
     "START",
-    "PROC E2E'MIXED(BYVAL'COUNT: BYREF'FLAGS) RENT;",
+    "PROC E2E'MIXED(COUNT'ARG, FLAGS'ARG);",
     "BEGIN",
-    "  ITEM BYVAL'COUNT U 10;",
-    "  ITEM BYREF'FLAGS B 4;",
+    "  ITEM COUNT'ARG U 10;",
+    "  ITEM FLAGS'ARG B 4;",
     "END",
     "TYPE E2E'RECORD TABLE;",
     "BEGIN",
@@ -539,7 +545,7 @@ function writeDiagnosticSeedWorkspace(workspacePath: string): DiagnosticSeed {
     "  E2E'MIXED(TEXT: FLAGS);",
     "  E2E'MIXED(COUNT: FLAGS, TEXT);",
     "  E2E'UNREFD'PROC(COUNT);",
-    "  E2E_IMPORTED_PROC;",
+    "  E2E_IMPORTED_PROC();",
     "  COUNT = GOODFIELD @ REC'PTR;",
     "  COUNT = MISSINGFIELD @ REC'PTR;",
     "  COUNT = @ COUNT;",
@@ -580,6 +586,13 @@ function pickExistingWorkspaceSample(workspacePath: string): string {
   if (sources.length === 0) {
     throw new Error(`No JOVIAL source files were found in ${workspacePath}`);
   }
+
+  const preferredNames = ["MAIN000.j73", "MAIN.j73"];
+  for (const name of preferredNames) {
+    const preferred = path.join(workspacePath, name);
+    if (sources.includes(preferred)) return preferred;
+  }
+
   const ranked = sources
     .map((filePath) => ({
       filePath,
@@ -588,7 +601,7 @@ function pickExistingWorkspaceSample(workspacePath: string): string {
     }))
     .sort((a, b) => {
       if (a.main !== b.main) return a.main ? -1 : 1;
-      if (a.bytes !== b.bytes) return b.bytes - a.bytes;
+      if (a.bytes !== b.bytes) return a.bytes - b.bytes;
       return a.filePath.localeCompare(b.filePath);
     });
   return ranked[0].filePath;
@@ -673,6 +686,9 @@ async function main(): Promise<void> {
   if (options.workspaceRoot && !fs.existsSync(options.workspaceRoot)) {
     throw new Error(`Configured workspace root does not exist: ${options.workspaceRoot}`);
   }
+  if (!options.injectDiagnostics) {
+    removeDiagnosticSeedWorkspace(workspacePath);
+  }
   const samplePath =
     options.workspaceRoot !== undefined
       ? options.samplePath ?? pickExistingWorkspaceSample(workspacePath)
@@ -754,7 +770,7 @@ async function main(): Promise<void> {
     "jovial.server.preferBundled": false,
     "jovial.trace": "off",
     "jovial.autostart": true,
-    "jovial.workspaceDiagnostics.mode": "all",
+    "jovial.workspaceDiagnostics.mode": hugeLike ? "off" : "all",
     "jovial.workspace.profileMode": hugeLike ? "large" : "small",
     "jovial.workspace.rootModel": "manual",
     "jovial.workspace.manualRootFiles": manualRootFiles,
@@ -767,7 +783,7 @@ async function main(): Promise<void> {
     "jovial.performance.enableHugeFileFullParse": enableHugeFullParse,
     "jovial.performance.backgroundParseWorkerCount": 2,
     "jovial.server.parseMaxFileBytes": fullParseMaxBytes,
-    "jovial.background.indexBudgetMs": 8,
+    "jovial.background.indexBudgetMs": hugeLike ? 50 : 8,
     "jovial.background.diagBatchSize": 16,
     "editor.inlayHints.enabled": "on",
   });
@@ -775,6 +791,27 @@ async function main(): Promise<void> {
   const extensionTestsEnv = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: undefined,
+    JOVIAL_STARTUP_DIAG_HOVER_TARGET_MS:
+      process.env.JOVIAL_STARTUP_DIAG_HOVER_TARGET_MS ??
+      (options.profile === "mixed" ? "30000" : undefined),
+    JOVIAL_STARTUP_NAV_TARGET_MS:
+      process.env.JOVIAL_STARTUP_NAV_TARGET_MS ??
+      (options.profile === "mixed" ? "30000" : undefined),
+    JOVIAL_STARTUP_PRIORITY_MODE:
+      process.env.JOVIAL_STARTUP_PRIORITY_MODE ??
+      (hugeLike ? "navigationFirst" : undefined),
+    JOVIAL_WORKSPACE_PROFILE_MODE:
+      process.env.JOVIAL_WORKSPACE_PROFILE_MODE ??
+      (hugeLike ? "large" : undefined),
+    JOVIAL_WORKSPACE_DIAGS_MODE:
+      process.env.JOVIAL_WORKSPACE_DIAGS_MODE ??
+      (hugeLike ? "off" : undefined),
+    JOVIAL_LARGE_FILE_THRESHOLD_BYTES:
+      process.env.JOVIAL_LARGE_FILE_THRESHOLD_BYTES ??
+      (hugeLike ? "131072" : undefined),
+    JOVIAL_BG_LARGE_FILE_BYTES:
+      process.env.JOVIAL_BG_LARGE_FILE_BYTES ??
+      (hugeLike ? "131072" : undefined),
     JOVIAL_E2E_WORKSPACE: workspacePath,
     JOVIAL_E2E_SAMPLE: samplePath,
     JOVIAL_E2E_REPORT: reportPath,

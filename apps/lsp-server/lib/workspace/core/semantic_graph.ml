@@ -494,6 +494,18 @@ let nearest_ancestor_scope (graph : t) (scope_id : Scope_id.t)
   |> List.find_opt (fun (scope : scope) -> scope.kind = kind)
 
 let attach_unscoped_symbols_by_location (graph : t) : unit =
+  let scope_has_same_line_key_kind (scope : scope) (sym : symbol) : bool =
+    List.exists
+      (fun id ->
+        match find_symbol graph id with
+        | Some other ->
+            other.key = sym.key
+            && other.kind = sym.kind
+            && other.decl_loc.Ast.Loc.start_pos.line
+               = sym.decl_loc.Ast.Loc.start_pos.line
+        | None -> false)
+      scope.declarations
+  in
   symbols graph
   |> List.iter (fun (sym : symbol) ->
          if not (symbol_is_declared graph sym.id) then
@@ -512,7 +524,9 @@ let attach_unscoped_symbols_by_location (graph : t) : unit =
                in
                match find_scope graph scope_id with
                | None -> ()
-               | Some scope -> declare_symbol graph scope sym.id))
+               | Some scope ->
+                   if not (scope_has_same_line_key_kind scope sym) then
+                     declare_symbol graph scope sym.id))
 
 let json_of_loc (loc : Ast.Loc.t) : Yojson.Safe.t =
   `Assoc
@@ -580,7 +594,7 @@ let type_contains_field_scope (t : Ast.type_expr Ast.node) : bool =
     | Ast.TFunc { params; returns } ->
         List.exists (fun p -> go p.v.ptype) params
         || (match returns with None -> false | Some r -> go r)
-    | Ast.TName _ | Ast.TStatus _ -> false
+    | Ast.TName _ | Ast.TScalar _ | Ast.TStatus _ -> false
   in
   go t
 
@@ -606,7 +620,7 @@ let rec declare_type_fields (graph : t) (scope : scope) ~(uri : T.DocumentUri.t)
       (match returns with
       | None -> ()
       | Some ret -> declare_type_fields graph scope ~uri ret)
-  | Ast.TName _ | Ast.TStatus _ -> ()
+  | Ast.TName _ | Ast.TScalar _ | Ast.TStatus _ -> ()
 
 let add_type_member_scope_if_needed (graph : t) (parent : scope)
     ~(kind : scope_kind) ~(range : Ast.Loc.t)
@@ -663,6 +677,7 @@ let build_ast_scopes (graph : t) (doc : Document.t) (prog : Ast.program) : unit 
   let rec walk_decl (scope : scope) (proc_scope : scope option)
       (d : Ast.decl Ast.node) : unit =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DVar { name; dtype; data_decl_kind; _ } ->
         let owner_symbol = declare_ident graph scope ~uri name in
         let scope_kind =
@@ -723,7 +738,7 @@ let build_ast_scopes (graph : t) (doc : Document.t) (prog : Ast.program) : unit 
   and walk_stmt (scope : scope) (proc_scope : scope option)
       (s : Ast.stmt Ast.node) : unit =
     match s.v with
-    | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
+    | Ast.SEmpty | Ast.SError _ | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
     | Ast.SGoto _ ->
         ()
     | Ast.SDecl d -> walk_decl scope proc_scope d
@@ -739,17 +754,24 @@ let build_ast_scopes (graph : t) (doc : Document.t) (prog : Ast.program) : unit 
         (match init with None -> () | Some i -> walk_stmt scope proc_scope i);
         (match step with None -> () | Some st -> walk_stmt scope proc_scope st);
         walk_stmt scope proc_scope body
+    | Ast.SCase { options; _ } ->
+        List.iter
+          (fun (opt : Ast.case_option Ast.node) ->
+            walk_stmt scope proc_scope opt.v.case_body)
+          options
     | Ast.SLabel { label; body } ->
         let label_scope = match proc_scope with Some p -> p | None -> scope in
         ignore (declare_ident graph label_scope ~uri label);
         walk_stmt scope proc_scope body
   in
 
-  List.iter
-    (function
-      | Ast.TopDecl d -> walk_decl module_scope None d
-      | Ast.TopStmt s -> walk_stmt module_scope None s)
-    prog
+  let rec walk_top = function
+    | Ast.TopDecl d -> walk_decl module_scope None d
+    | Ast.TopStmt s -> walk_stmt module_scope None s
+    | Ast.TopModule m -> List.iter walk_top m.v.module_items
+    | Ast.TopError _ -> ()
+  in
+  List.iter walk_top prog
 
 let of_defs (defs : Workspace_nav_model.def list) : t =
   let graph = create () in

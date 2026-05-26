@@ -1,10 +1,23 @@
-(* Module overview: Resolves Jovial COMPOOL, ICOPY, and include relationships between files. *)
+(* Module overview: Resolves Jovial COMPOOL, !COPY, and include relationships between files. *)
 
 module T = Lsp.Types
 open Ast
 open Workspace_foundation
 open Workspace_state
 open Workspace_index_graph
+open Workspace_tuning
+
+let large_workspace_startup_quiet_active (ws : t) : bool =
+  (ws.quick_nav_index_total >= 320
+  || ws.source_bytes_estimate_count >= 320
+  || List.length ws.source_file_paths >= 320)
+  &&
+  match ws.startup_fully_nav_ready_ms with
+  | None -> true
+  | Some ready_ms ->
+      post_startup_large_parse_idle_quiet_ms > 0
+      && Perf_stats.now_ms () -. ready_ms
+         < float_of_int post_startup_large_parse_idle_quiet_ms
 
 let diag_missing_compool (loc : Ast.Loc.t) (name : string) : T.Diagnostic.t =
   let key = normalize_name name in
@@ -29,7 +42,7 @@ let diag_unresolved_icopy
   in
   {
     (Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"include"
-       ~message:("Unresolved ICOPY target: " ^ display)
+       ~message:("Unresolved !COPY target: " ^ display)
        target.target_loc)
     with
     T.Diagnostic.data =
@@ -49,7 +62,7 @@ let diag_cyclic_icopy
   in
   {
     (Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"include"
-       ~message:("Cyclic ICOPY include detected for " ^ display)
+       ~message:("Cyclic !COPY include detected for " ^ display)
        target.directive_loc)
     with
     T.Diagnostic.data =
@@ -199,6 +212,9 @@ let is_reserved_keyword (name : string) : bool =
   | "ISKIP" | "IBEGIN" | "IEND" | "ILINKAGE" | "ITRACE" | "IINTERFERENCE"
   | "IREDUCIBLE" | "ILIST" | "INOLIST" | "IEJECT" | "IBASE" | "IISBASE"
   | "IDROP" | "ILEFTRIGHT" | "IREARRANGE" | "IINITIALIZE" | "IORDER" | "REC"
+  | "COPY" | "SKIP" | "LIST" | "NOLIST" | "EJECT" | "BASE" | "ISBASE"
+  | "DROP" | "LEFTRIGHT" | "REARRANGE" | "INITIALIZE" | "ORDER" | "LINKAGE"
+  | "TRACE" | "INTERFERENCE" | "REDUCIBLE"
   | "RENT" | "LISTEXP" | "LISTINV" | "LISTBOTH" | "INLINE" | "INSTANCE"
   | "LABEL" | "LIKE" | "OVERLAY" | "PARALLEL" | "POS" | "NULL" ->
       true
@@ -246,9 +262,7 @@ let import_tokens_of_line ~(line0 : int) (line : string) :
 
 let import_marker_key (token : string) : string =
   let token = trim_import_token token in
-  let n = String.length token in
-  let token = if n > 0 && token.[0] = '!' then String.sub token 1 (n - 1) else token in
-  normalize_name token
+  Preprocess.canonical_directive_name token
 
 let text_compool_import_dirs (doc : Document.t) : compool_import_dir list =
   let lines = String.split_on_char '\n' doc.Document.text in
@@ -258,7 +272,7 @@ let text_compool_import_dirs (doc : Document.t) : compool_import_dir list =
     import_tokens_of_line ~line0:0 line
     |> List.exists (fun (tok, _, _, _) ->
            let k = import_marker_key tok in
-           k = "COMPOOL" || k = "ICOMPOOL")
+           k = "COMPOOL")
   in
   let gather_directive start =
     let rec loop i acc =
@@ -279,7 +293,7 @@ let text_compool_import_dirs (doc : Document.t) : compool_import_dir list =
              | [] -> None
              | (tok, _, _, _) :: rest ->
                  let k = import_marker_key tok in
-                 if k = "COMPOOL" || k = "ICOMPOOL" then Some idx
+                 if k = "COMPOOL" then Some idx
                  else find_marker (idx + 1) rest
            in
            match find_marker 0 tokens with
@@ -319,8 +333,8 @@ let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
       let from_decl (d : Ast.decl Ast.node) : compool_import_dir option =
         match d.v with
         | Ast.DDirective { name; args = first :: rest } ->
-            let dn = normalize_name name.v in
-            if dn = "COMPOOL" || dn = "ICOMPOOL" then
+            let dn = Preprocess.canonical_directive_name name.v in
+            if dn = "COMPOOL" then
               let compool = normalize_name first.v in
               if compool = "" then None
               else
@@ -334,10 +348,13 @@ let extract_compool_import_dirs (doc : Document.t) : compool_import_dir list =
             else None
         | _ -> None
       in
-      prog
-      |> List.filter_map (function
-        | Ast.TopDecl d -> from_decl d
-        | Ast.TopStmt _ -> None)
+      let rec from_toplevel = function
+        | Ast.TopDecl d -> (
+            match from_decl d with None -> [] | Some dir -> [ dir ])
+        | Ast.TopStmt _ | Ast.TopError _ -> []
+        | Ast.TopModule m -> List.concat_map from_toplevel m.v.module_items
+      in
+      List.concat_map from_toplevel prog
     | _ -> []
   in
   let text_dirs = text_compool_import_dirs doc in
@@ -435,7 +452,12 @@ let doc_from_path_cached (ws : t) (path : string) : Document.t option =
             | exception _ -> T.DocumentUri.t_of_yojson (`String "file:///"))
       in
       let d_opt =
-        match file_size_bytes path with
+        if large_workspace_startup_quiet_active ws then
+          Some
+            (Document.make_parse_skipped ~uri ~file:(Some path) ~text:""
+               ~parse_diags:[])
+        else
+          match file_size_bytes path with
         | Some n when n >= ws.bg_large_file_bytes ->
             Some
               (Document.make_parse_skipped ~uri ~file:(Some path) ~text:""

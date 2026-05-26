@@ -25,6 +25,7 @@ export function run(): void {
     "workspace.manualRootFiles": ["main.j73", " ", 7, "ops.j73"],
     "workspace.maxStartupFiles": 2500.8,
     "workspace.extraSourceFileExtensions": [".j", "bad/ext", "J"],
+    "workspace.extraAssemblyFileExtensions": [".s", "bad/ext", "S"],
     "background.indexBudgetMs": 0.8,
     "background.diagBatchSize": -4,
     "performance.largeFileThresholdBytes": 131072.9,
@@ -70,7 +71,9 @@ export function run(): void {
     manualRootFiles: ["main.j73", "ops.j73"],
     maxStartupFiles: 2500,
     extraSourceFileExtensions: [".j"],
+    extraAssemblyFileExtensions: [".s"],
     sourceExtensions: [".jov", ".j73", ".jvl", ".j"],
+    assemblyExtensions: [".asm", ".s"],
     backgroundIndexBudgetMs: 1,
     backgroundDiagBatchSize: 1,
     largeFileThresholdBytes: 131072,
@@ -217,6 +220,7 @@ export function run(): void {
       return defaultValue;
     },
   });
+  assert.equal(defaultCfg.lsifFastPath, true);
   assert.equal(defaultCfg.maxStartupFiles, 1000);
   assert.equal(defaultCfg.hugeFileThresholdBytes, 15728640);
   assert.equal(defaultCfg.fullParseMaxBytes, 15728640);
@@ -247,7 +251,9 @@ export function run(): void {
       manualRootFiles: ["main.j73"],
       maxStartupFiles: 1234,
       extraSourceFileExtensions: [],
+      extraAssemblyFileExtensions: [],
       sourceExtensions: [".jov", ".j73", ".jvl"],
+      assemblyExtensions: [".asm"],
       backgroundIndexBudgetMs: 11,
       backgroundDiagBatchSize: 23,
       largeFileThresholdBytes: 131072,
@@ -321,6 +327,7 @@ export function run(): void {
       {
         rootUri: "file:///repo",
         fileUris: ["file:///repo/main.j73"],
+        assemblyFileUris: ["file:///repo/impl.asm"],
         searchTruncated: false,
       },
     ],
@@ -336,10 +343,12 @@ export function run(): void {
         maxStartupFiles: 1234,
         sourceDiscoveryTruncated: false,
         extraSourceFileExtensions: [],
+        assemblySourceFileExtensions: [".asm"],
         sourceFileSets: [
           {
             rootUri: "file:///repo",
             fileUris: ["file:///repo/main.j73"],
+            assemblyFileUris: ["file:///repo/impl.asm"],
             searchTruncated: false,
           },
         ],

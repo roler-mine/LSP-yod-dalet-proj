@@ -51,7 +51,11 @@ import {
   pickBestWorkspaceRoot,
   watchPathKey,
 } from "./workspace_paths";
-import { watcherGlobForSourceExtensions } from "./source_extensions";
+import {
+  DEFAULT_JOVIAL_SOURCE_EXTENSIONS,
+  hasJovialSourceExtension,
+  watcherGlobForSourceExtensions,
+} from "./source_extensions";
 import { sourceDiscoveryExcludeGlob } from "./ignored_paths";
 import { resolveServerPath } from "./server_path";
 import { registerExtensionHooks } from "./commands";
@@ -74,6 +78,8 @@ import {
 // and background queues that are torn down together on stop.
 let client: LanguageClient | undefined;
 let fileWatcher: vscode.FileSystemWatcher | undefined;
+let serverProcess: cp.ChildProcess | undefined;
+let serverProcessGeneration = 0;
 
 // Timing and chunk-size guardrails keep large-workspace background work from
 // monopolizing the extension host.
@@ -83,19 +89,23 @@ const WATCH_FORCE_FLUSH_SIZE = 2000;
 const AUTO_RESTART_DELAY_MS = 1200;
 const AUTO_RESTART_WINDOW_MS = 120000;
 const AUTO_RESTART_MAX_ATTEMPTS = 5;
+const SERVER_STOP_TIMEOUT_MS = 30000;
+const SERVER_KILL_TIMEOUT_MS = 15000;
 const LSIF_REFRESH_DEBOUNCE_MS = 800;
 const LSIF_REFRESH_MIN_INTERVAL_MS = 1200;
 const LSIF_MAX_FAST_RESULTS = 300;
-const LSIF_FALLBACK_RACE_BUDGET_MS = 75;
-const LSIF_HOVER_FALLBACK_RACE_BUDGET_MS = 250;
+const LSIF_FALLBACK_RACE_BUDGET_MS = 1000;
+const LSIF_HOVER_FALLBACK_RACE_BUDGET_MS = 1000;
+const LSIF_FALLBACK_SERVER_GRACE_MS = 0;
 const PROVIDER_LATE_BUDGET_MS = 1500;
 const DIAGNOSTIC_REFRESH_INTERVAL_MS = 30000;
-const DIAGNOSTIC_REFRESH_STARTUP_DELAY_MS = 5000;
+const DIAGNOSTIC_REFRESH_STARTUP_DELAY_MS = 1000;
 const DIAGNOSTIC_REFRESH_EDITOR_DELAY_MS = 1000;
-const DIAGNOSTIC_REFRESH_EDIT_DELAY_MS = 400;
+const DIAGNOSTIC_REFRESH_EDIT_DELAY_MS = 200;
 const DIAGNOSTIC_REFRESH_SOURCE_CHUNK_SIZE = 64;
 const DIAGNOSTIC_REFRESH_PENDING_CHUNK_SIZE = 128;
 const DIAGNOSTIC_REFRESH_NOTIFY_CHUNK_SIZE = 96;
+const JOVIAL_SOURCE_PROBE_BYTES = 16384;
 
 // File watching and diagnostics receive bursty input, so this module coalesces
 // events before forwarding them to the language server.
@@ -112,11 +122,7 @@ let diagnosticRefreshInFlight = false;
 let diagnosticRefreshPending = false;
 let diagnosticSourceRefreshCursor = 0;
 const pendingDiagnosticRefreshUris = new Set<string>();
-let liveEditDiagnosticCollection:
-  | vscode.DiagnosticCollection
-  | undefined;
-const LIVE_EDIT_PARSE_MESSAGE =
-  "Expected START before source text; full diagnostics are updating in the background.";
+let liveEditDiagnosticCollection: vscode.DiagnosticCollection | undefined;
 
 // The LSIF cache is shaped for fast editor-provider lookups: resolve a position
 // to a symbol id, then use that symbol's precomputed navigation locations.
@@ -388,79 +394,14 @@ function isJovialDiagnosticDocument(doc: vscode.TextDocument): boolean {
   );
 }
 
-type SignificantLine = {
-  line: number;
-  character: number;
-  text: string;
-};
-
-function firstSignificantLine(
-  text: string,
-  maxScanChars = 8192,
-): SignificantLine | undefined {
-  const scanLimit = Math.min(text.length, maxScanChars);
-  let line = 0;
-  let start = 0;
-  while (start < scanLimit) {
-    let end = text.indexOf("\n", start);
-    if (end < 0 || end > scanLimit) end = scanLimit;
-    const raw = text.slice(start, end);
-    const trimmed = raw.trim();
-    if (trimmed && !trimmed.startsWith("%") && !trimmed.startsWith('"')) {
-      const character = raw.length - raw.trimStart().length;
-      return { line, character, text: trimmed };
-    }
-    line += 1;
-    start = end + 1;
-  }
-  return undefined;
-}
-
-function firstWordUpper(text: string): string {
-  const end = text.search(/[ \t\r\n;()]/);
-  return text.slice(0, end < 0 ? text.length : end).toUpperCase();
-}
-
 function updateHugeLiveEditDiagnostics(doc: vscode.TextDocument): void {
   const collection = liveEditDiagnosticCollection;
   if (!collection) return;
-  if (!isJovialDiagnosticDocument(doc)) {
-    collection.delete(doc.uri);
-    return;
-  }
-
-  const text = doc.getText();
-  if (text.length <= getConfig().hugeFileThresholdBytes) {
-    collection.delete(doc.uri);
-    return;
-  }
-
-  const first = firstSignificantLine(text);
-  if (!first || firstWordUpper(first.text) === "START") {
-    collection.delete(doc.uri);
-    return;
-  }
-
-  const start = new vscode.Position(first.line, first.character);
-  const diagnostic = new vscode.Diagnostic(
-    new vscode.Range(start, start.translate(0, 1)),
-    LIVE_EDIT_PARSE_MESSAGE,
-    vscode.DiagnosticSeverity.Error,
-  );
-  diagnostic.source = "jovial-live";
-  collection.set(doc.uri, [diagnostic]);
+  collection.delete(doc.uri);
 }
 
 function reconcileLiveEditDiagnostics(uri: vscode.Uri): void {
-  const collection = liveEditDiagnosticCollection;
-  if (!collection || (collection.get(uri) ?? []).length === 0) return;
-  const hasServerParseDiag = vscode.languages
-    .getDiagnostics(uri)
-    .some(
-      (diag) =>
-        diag.source === "parse" && diag.message === LIVE_EDIT_PARSE_MESSAGE,
-    );
-  if (hasServerParseDiag) collection.delete(uri);
+  liveEditDiagnosticCollection?.delete(uri);
 }
 
 // Diagnostics are refreshed in priority order: open editors first, then files
@@ -601,7 +542,12 @@ async function refreshDiagnosticsNow(
   preferredUri?: vscode.Uri,
 ): Promise<void> {
   if (preferredUri) {
-    pendingDiagnosticRefreshUris.add(preferredUri.toString());
+    const c = client;
+    if (!c) return;
+    const uri = normalizeNavUri(preferredUri).toString();
+    pendingDiagnosticRefreshUris.delete(uri);
+    await sendDiagnosticRefreshNotifications(c, output, reason, [uri]);
+    return;
   }
   await refreshOpenDocumentDiagnostics(output, reason);
 }
@@ -698,10 +644,11 @@ async function flushWatchedFileChanges(
   const cfg = getConfig();
   try {
     while (client && pendingWatchedFileChanges.size > 0) {
-      const batch = takeWatchedFileBatch(
+      const rawBatch = takeWatchedFileBatch(
         pendingWatchedFileChanges,
         WATCH_CHUNK_SIZE,
       );
+      const batch = await filterWatchedSourceChanges(rawBatch, cfg, output);
       if (batch.length === 0) break;
       lastSentUri = vscode.Uri.file(batch[0].fsPath);
       if (!sourceFileSetRefreshReason) {
@@ -765,8 +712,25 @@ function getConfig() {
   return readJovialConfig(vscode.workspace.getConfiguration("jovial"));
 }
 
-function isHugeDocument(document: vscode.TextDocument): boolean {
-  return document.getText().length > getConfig().hugeFileThresholdBytes;
+function ensureServerExecutable(
+  filePath: string,
+  output: vscode.OutputChannel,
+): void {
+  if (process.platform === "win32") return;
+
+  try {
+    const stat = fs.statSync(filePath);
+    if ((stat.mode & 0o111) !== 0) return;
+
+    fs.chmodSync(filePath, stat.mode | 0o755);
+    output.appendLine(
+      `Set executable permission on server binary: ${filePath}`,
+    );
+  } catch (err) {
+    output.appendLine(
+      `Warning: failed to ensure server executable permission: ${String(err)}`,
+    );
+  }
 }
 
 function parseFileUriFsPath(raw: string | undefined): string | undefined {
@@ -806,27 +770,40 @@ function sourceFileSetContainsPath(
   fsPath: string,
 ): boolean {
   const pathKey = watchPathKey(fsPath);
-  return set.fileUris.some((raw) => {
+  const uris = [...set.fileUris, ...(set.assemblyFileUris ?? [])];
+  return uris.some((raw) => {
     const filePath = parseFileUriFsPath(raw);
     return filePath ? watchPathKey(filePath) === pathKey : false;
   });
 }
 
-function addFileUriToCachedSet(
-  set: JovialSourceFileSet,
-  uri: vscode.Uri,
-): void {
+function addFileUriToList(list: string[], uri: vscode.Uri): void {
   const pathKey = watchPathKey(uri.fsPath);
   if (
-    set.fileUris.some((raw) => {
+    list.some((raw) => {
       const filePath = parseFileUriFsPath(raw);
       return filePath ? watchPathKey(filePath) === pathKey : false;
     })
   ) {
     return;
   }
-  set.fileUris.push(uri.toString());
-  set.fileUris.sort((a, b) => a.localeCompare(b));
+  list.push(uri.toString());
+  list.sort((a, b) => a.localeCompare(b));
+}
+
+function addFileUriToCachedSet(
+  set: JovialSourceFileSet,
+  uri: vscode.Uri,
+): void {
+  addFileUriToList(set.fileUris, uri);
+}
+
+function addAssemblyFileUriToCachedSet(
+  set: JovialSourceFileSet,
+  uri: vscode.Uri,
+): void {
+  if (!set.assemblyFileUris) set.assemblyFileUris = [];
+  addFileUriToList(set.assemblyFileUris, uri);
 }
 
 function removeFilePathFromCachedSet(
@@ -838,38 +815,230 @@ function removeFilePathFromCachedSet(
     const filePath = parseFileUriFsPath(raw);
     return filePath ? watchPathKey(filePath) !== pathKey : true;
   });
+  if (set.assemblyFileUris) {
+    set.assemblyFileUris = set.assemblyFileUris.filter((raw) => {
+      const filePath = parseFileUriFsPath(raw);
+      return filePath ? watchPathKey(filePath) !== pathKey : true;
+    });
+  }
+}
+
+function isDefaultJovialSourcePath(fsPath: string): boolean {
+  return hasJovialSourceExtension(fsPath, DEFAULT_JOVIAL_SOURCE_EXTENSIONS);
+}
+
+function isConfiguredExtraSourcePath(
+  fsPath: string,
+  cfg: JovialConfig,
+): boolean {
+  return (
+    !isDefaultJovialSourcePath(fsPath) &&
+    hasJovialSourceExtension(fsPath, cfg.sourceExtensions)
+  );
+}
+
+function isAssemblySourcePath(fsPath: string, cfg: JovialConfig): boolean {
+  return hasJovialSourceExtension(fsPath, cfg.assemblyExtensions);
+}
+
+function watchedWorkspaceExtensions(cfg: JovialConfig): string[] {
+  return Array.from(new Set([...cfg.sourceExtensions, ...cfg.assemblyExtensions]));
+}
+
+function configuredExtraSourceExtensions(cfg: JovialConfig): string[] {
+  const defaults = new Set(DEFAULT_JOVIAL_SOURCE_EXTENSIONS);
+  return cfg.extraSourceFileExtensions.filter((ext) => !defaults.has(ext));
+}
+
+function isKnownSourcePath(fsPath: string): boolean {
+  return currentSourceFileSets.some((set) =>
+    sourceFileSetContainsPath(set, fsPath),
+  );
+}
+
+const jovialSourceSignatureWords = new Set([
+  "START",
+  "PROGRAM",
+  "COMPOOL",
+  "ICOMPOOL",
+  "DEFINE",
+  "TYPE",
+  "BLOCK",
+  "DEF",
+  "REF",
+  "PROC",
+  "ITEM",
+  "TABLE",
+  "STATIC",
+  "CONSTANT",
+  "READONLY",
+  "INLINE",
+  "OVERLAY",
+]);
+
+function probeFirstWordUpper(text: string): string {
+  const match = /^[A-Za-z_$][A-Za-z0-9_$']*/.exec(text.trimStart());
+  return match ? match[0].toUpperCase() : "";
+}
+
+function looksLikeJovialSourceSnippet(rawText: string): boolean {
+  if (!rawText || rawText.includes("\u0000")) return false;
+  const text = rawText.replace(/^\uFEFF/, "");
+  const upper = text.toUpperCase();
+  if (
+    /\bSTART\b/.test(upper) &&
+    /\b(TERM|PROGRAM|COMPOOL|ICOMPOOL|PROC|ITEM|TABLE)\b/.test(upper)
+  ) {
+    return true;
+  }
+
+  const lines = text.split(/\r?\n/, 32);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("%") || trimmed.startsWith('"')) {
+      continue;
+    }
+    const directive = trimmed.startsWith("!") ? trimmed.slice(1) : trimmed;
+    if (jovialSourceSignatureWords.has(probeFirstWordUpper(directive))) {
+      return true;
+    }
+    const colon = directive.indexOf(":");
+    if (
+      colon >= 0 &&
+      jovialSourceSignatureWords.has(
+        probeFirstWordUpper(directive.slice(colon + 1)),
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function readFilePrefix(fsPath: string): Promise<string | undefined> {
+  let handle: fs.promises.FileHandle | undefined;
+  try {
+    handle = await fs.promises.open(fsPath, "r");
+    const buffer = Buffer.alloc(JOVIAL_SOURCE_PROBE_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function shouldAcceptSourceUri(
+  uri: vscode.Uri,
+  cfg: JovialConfig,
+): Promise<boolean> {
+  if (uri.scheme !== "file") return false;
+  if (!isConfiguredExtraSourcePath(uri.fsPath, cfg)) return true;
+  const prefix = await readFilePrefix(uri.fsPath);
+  return prefix !== undefined && looksLikeJovialSourceSnippet(prefix);
+}
+
+async function filterDiscoveredSourceUris(
+  folder: vscode.WorkspaceFolder,
+  uris: readonly vscode.Uri[],
+  cfg: JovialConfig,
+  output: vscode.OutputChannel,
+): Promise<vscode.Uri[]> {
+  const accepted: vscode.Uri[] = [];
+  let skippedExtra = 0;
+  for (const uri of uris) {
+    if (await shouldAcceptSourceUri(uri, cfg)) {
+      accepted.push(uri);
+    } else if (
+      uri.scheme === "file" &&
+      isConfiguredExtraSourcePath(uri.fsPath, cfg)
+    ) {
+      skippedExtra += 1;
+    }
+  }
+  if (skippedExtra > 0) {
+    output.appendLine(
+      `Jovial source discovery: skipped ${skippedExtra} configured-extension file(s) under ${folder.uri.fsPath} that did not look like Jovial source.`,
+    );
+  }
+  return accepted;
+}
+
+async function shouldForwardWatchedSourceChange(
+  change: PendingWatchedFileChange,
+  cfg: JovialConfig,
+): Promise<boolean> {
+  if (!isConfiguredExtraSourcePath(change.fsPath, cfg)) return true;
+  if (isKnownSourcePath(change.fsPath)) return true;
+  if (change.type === WATCH_CHANGE_DELETED) return false;
+  const prefix = await readFilePrefix(change.fsPath);
+  return prefix !== undefined && looksLikeJovialSourceSnippet(prefix);
+}
+
+async function filterWatchedSourceChanges(
+  batch: readonly PendingWatchedFileChange[],
+  cfg: JovialConfig,
+  output: vscode.OutputChannel,
+): Promise<PendingWatchedFileChange[]> {
+  const accepted: PendingWatchedFileChange[] = [];
+  let skippedExtra = 0;
+  for (const change of batch) {
+    if (await shouldForwardWatchedSourceChange(change, cfg)) {
+      accepted.push(change);
+    } else {
+      skippedExtra += 1;
+    }
+  }
+  if (skippedExtra > 0) {
+    output.appendLine(
+      `Jovial watcher: skipped ${skippedExtra} configured-extension change(s) that did not look like Jovial source.`,
+    );
+  }
+  return accepted;
 }
 
 function sourceFileSetForFolder(
   folder: vscode.WorkspaceFolder,
   uris: readonly vscode.Uri[],
+  assemblyUris: readonly vscode.Uri[],
   cfg: JovialConfig,
   searchTruncated: boolean,
 ): JovialSourceFileSet | undefined {
   const rootKey = watchPathKey(folder.uri.fsPath);
   const seen = new Set<string>();
   const fileUris: string[] = [];
+  const assemblyFileUris: string[] = [];
   const filePaths: string[] = [];
 
-  for (const uri of uris) {
-    if (uri.scheme !== "file") continue;
+  const addUri = (
+    uri: vscode.Uri,
+    targetUris: string[],
+    extensions: readonly string[],
+  ) => {
+    if (uri.scheme !== "file") return;
     const pathKey = watchPathKey(uri.fsPath);
-    if (!pathWithinRoot(pathKey, rootKey)) continue;
+    if (!pathWithinRoot(pathKey, rootKey)) return;
     if (
       shouldIgnoreWatchedPath(
         uri.fsPath,
         process.platform,
-        cfg.sourceExtensions,
+        extensions,
       )
     )
-      continue;
-    if (seen.has(pathKey)) continue;
+      return;
+    if (seen.has(pathKey)) return;
     seen.add(pathKey);
-    fileUris.push(uri.toString());
+    targetUris.push(uri.toString());
     filePaths.push(uri.fsPath);
-  }
+  };
+
+  for (const uri of uris) addUri(uri, fileUris, cfg.sourceExtensions);
+  for (const uri of assemblyUris)
+    addUri(uri, assemblyFileUris, cfg.assemblyExtensions);
 
   fileUris.sort((a, b) => a.localeCompare(b));
+  assemblyFileUris.sort((a, b) => a.localeCompare(b));
   filePaths.sort((a, b) => watchPathKey(a).localeCompare(watchPathKey(b)));
   if (filePaths.length === 0) return undefined;
 
@@ -880,6 +1049,7 @@ function sourceFileSetForFolder(
     workspaceUri: folder.uri.toString(),
     rootUri: vscode.Uri.file(rootPath).toString(),
     fileUris,
+    assemblyFileUris,
     searchTruncated,
     inferred: true,
     reason: "minimal-common-container",
@@ -896,18 +1066,59 @@ async function discoverSourceFileSets(
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 0) return [];
 
-  const glob = watcherGlobForSourceExtensions(cfg.sourceExtensions);
   const exclude = sourceDiscoveryExcludeGlob();
+  const defaultGlob = watcherGlobForSourceExtensions(
+    DEFAULT_JOVIAL_SOURCE_EXTENSIONS,
+  );
+  const extraExtensions = configuredExtraSourceExtensions(cfg);
+  const extraGlob =
+    extraExtensions.length > 0
+      ? watcherGlobForSourceExtensions(extraExtensions)
+      : undefined;
+  const assemblyGlob = watcherGlobForSourceExtensions(cfg.assemblyExtensions);
   const sets: JovialSourceFileSet[] = [];
   for (const folder of folders) {
-    const include = new vscode.RelativePattern(folder, glob);
-    const uris = await vscode.workspace.findFiles(
-      include,
+    const defaultInclude = new vscode.RelativePattern(folder, defaultGlob);
+    const defaultUris = await vscode.workspace.findFiles(
+      defaultInclude,
       exclude,
       cfg.maxStartupFiles,
     );
-    const searchTruncated = uris.length >= cfg.maxStartupFiles;
-    const set = sourceFileSetForFolder(folder, uris, cfg, searchTruncated);
+    const remainingExtraBudget = Math.max(
+      0,
+      cfg.maxStartupFiles - defaultUris.length,
+    );
+    const extraUris =
+      extraGlob && remainingExtraBudget > 0
+        ? await vscode.workspace.findFiles(
+            new vscode.RelativePattern(folder, extraGlob),
+            exclude,
+            remainingExtraBudget,
+          )
+        : [];
+    const assemblyStartupBudget = Math.max(128, cfg.maxStartupFiles);
+    const assemblyUris = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(folder, assemblyGlob),
+      exclude,
+      assemblyStartupBudget,
+    );
+    const searchTruncated =
+      defaultUris.length >= cfg.maxStartupFiles ||
+      (extraGlob !== undefined && extraUris.length >= remainingExtraBudget) ||
+      assemblyUris.length >= assemblyStartupBudget;
+    const sourceUris = await filterDiscoveredSourceUris(
+      folder,
+      [...defaultUris, ...extraUris],
+      cfg,
+      output,
+    );
+    const set = sourceFileSetForFolder(
+      folder,
+      sourceUris,
+      assemblyUris,
+      cfg,
+      searchTruncated,
+    );
     if (!set) {
       output.appendLine(
         `Jovial source discovery: 0 files under ${folder.uri.fsPath}`,
@@ -918,7 +1129,9 @@ async function discoverSourceFileSets(
     output.appendLine(
       `[JOVIAL] inferred source root: ${rootPath}\n` +
         `[JOVIAL] reason: minimal-common-container\n` +
-        `[JOVIAL] files: ${set.fileUris.length}${
+        `[JOVIAL] files: ${set.fileUris.length}, asm: ${
+          set.assemblyFileUris?.length ?? 0
+        }${
           searchTruncated ? " (truncated)" : ""
         }`,
     );
@@ -931,34 +1144,38 @@ function sourceFileSetRefreshReasonForChanges(
   changes: readonly PendingWatchedFileChange[],
   cfg: JovialConfig,
 ): string | undefined {
-  // A changed/deleted JOVIAL file can affect dependency shape; a new file only
+  // A changed/deleted source/support file can affect dependency shape; a new file only
   // forces rediscovery when it sits outside the currently inferred root.
+  const watchedExtensions = watchedWorkspaceExtensions(cfg);
   for (const change of changes) {
     if (
       shouldIgnoreWatchedPath(
         change.fsPath,
         process.platform,
-        cfg.sourceExtensions,
+        watchedExtensions,
       )
     ) {
       continue;
     }
 
-    if (change.type === WATCH_CHANGE_DELETED) return "JOVIAL file deletion";
-    if (change.type === WATCH_CHANGE_CHANGED) return "JOVIAL file change";
+    if (change.type === WATCH_CHANGE_DELETED) return "source file deletion";
+    if (change.type === WATCH_CHANGE_CHANGED) return "source file change";
     if (change.type !== WATCH_CHANGE_CREATED) continue;
+    if (isAssemblySourcePath(change.fsPath, cfg)) {
+      return "new assembly file in workspace";
+    }
 
     const folder = pickBestWorkspaceFolderForUri(
       vscode.Uri.file(change.fsPath),
     );
     if (!folder) continue;
     const set = sourceFileSetForWorkspaceFolder(folder);
-    if (!set) return "new JOVIAL file in workspace";
+    if (!set) return "new source file in workspace";
 
     const rootPath = sourceFileSetRootPath(set);
-    if (!rootPath) return "new JOVIAL file in workspace";
+    if (!rootPath) return "new source file in workspace";
     if (!pathWithinRoot(watchPathKey(change.fsPath), watchPathKey(rootPath))) {
-      return "new JOVIAL file outside current root";
+      return "new source file outside current root";
     }
   }
   return undefined;
@@ -970,12 +1187,13 @@ function updateCachedSourceFileSetsForChanges(
 ): void {
   // When roots are stable, keep the cached file list fresh without running a
   // workspace-wide file search.
+  const watchedExtensions = watchedWorkspaceExtensions(cfg);
   for (const change of changes) {
     if (
       shouldIgnoreWatchedPath(
         change.fsPath,
         process.platform,
-        cfg.sourceExtensions,
+        watchedExtensions,
       )
     ) {
       continue;
@@ -999,7 +1217,12 @@ function updateCachedSourceFileSetsForChanges(
       rootPath &&
       pathWithinRoot(watchPathKey(change.fsPath), watchPathKey(rootPath))
     ) {
-      addFileUriToCachedSet(set, vscode.Uri.file(change.fsPath));
+      const uri = vscode.Uri.file(change.fsPath);
+      if (isAssemblySourcePath(change.fsPath, cfg)) {
+        addAssemblyFileUriToCachedSet(set, uri);
+      } else {
+        addFileUriToCachedSet(set, uri);
+      }
     }
   }
 }
@@ -1034,7 +1257,9 @@ function logSourceFileSetRootChanges(
       `[JOVIAL] source root changed after ${reason}\n` +
         `old root: ${oldRoot ?? "<none>"}\n` +
         `new root: ${newRoot ?? "<none>"}\n` +
-        `files: ${newSet?.fileUris.length ?? 0}`,
+        `files: ${newSet?.fileUris.length ?? 0}, asm: ${
+          newSet?.assemblyFileUris?.length ?? 0
+        }`,
     );
   }
 }
@@ -1519,13 +1744,51 @@ function collectLsifLocations(
   return dedupeLsifLocations(merged).slice(0, LSIF_MAX_FAST_RESULTS);
 }
 
+function isLsifExternalRefImport(sym: LsifSymbolEntry): boolean {
+  return (
+    sym.externalKind === "external REF import" ||
+    sym.declarationRole === "external REF import"
+  );
+}
+
+function lsifCompanionSymbolsForKey(
+  document: vscode.TextDocument,
+  key: string | undefined,
+): LsifSymbolEntry[] {
+  if (!key) return [];
+  const cache = lsifCacheForDocument(document);
+  if (!cache) return [];
+  const ids = cache.symbolIdsByKey.get(key);
+  if (!ids || ids.length === 0) return [];
+  const out: LsifSymbolEntry[] = [];
+  for (const id of ids) {
+    const sym = cache.symbolsById.get(id);
+    if (sym) out.push(sym);
+  }
+  return out;
+}
+
 function lsifDefinitionFastPath(
   document: vscode.TextDocument,
   position: vscode.Position,
 ): vscode.Location[] | undefined {
   const resolved = resolveLsifSymbolsAt(document, position);
   if (!resolved) return undefined;
-  const defs = collectLsifLocations(resolved.symbols, (sym) => sym.definitions);
+  if (!resolved.fromOccurrence && resolved.symbols.length !== 1) {
+    return undefined;
+  }
+  const companionSymbols = lsifCompanionSymbolsForKey(document, resolved.key);
+  const defs = collectLsifLocations(resolved.symbols, (sym) => {
+    if (!isLsifExternalRefImport(sym)) return sym.definitions;
+    if (sym.implementations.length > 0) return sym.implementations;
+    return collectLsifLocations(companionSymbols, (candidate) =>
+      isLsifExternalRefImport(candidate)
+        ? []
+        : candidate.implementations.length > 0
+          ? candidate.implementations
+          : candidate.definitions,
+    );
+  });
   if (defs.length === 0) return undefined;
   const locations = toVscodeLocations(defs);
   return locations.length > 0 ? locations : undefined;
@@ -1544,8 +1807,15 @@ function lsifImplementationFastPath(
 ): vscode.Location[] | undefined {
   const resolved = resolveLsifSymbolsAt(document, position);
   if (!resolved) return undefined;
+  if (!resolved.fromOccurrence && resolved.symbols.length !== 1) {
+    return undefined;
+  }
   const impls = collectLsifLocations(resolved.symbols, (sym) =>
-    sym.implementations.length > 0 ? sym.implementations : sym.definitions,
+    sym.implementations.length > 0
+      ? sym.implementations
+      : isLsifExternalRefImport(sym)
+        ? []
+        : sym.definitions,
   );
   if (impls.length === 0) return undefined;
   const locations = toVscodeLocations(impls);
@@ -1684,12 +1954,12 @@ function lsifHoverFastPath(
   );
   md.appendMarkdown("\n**Symbol key:**\n");
   md.appendCodeblock(sym.key, "jovial");
-  md.appendMarkdown(
-    "\n**Change impact:** Use Find References before renaming or changing type/signature. Cross-file references may exist through COMPOOL imports or external DEF/REF declarations.\n\n",
-  );
-  md.appendMarkdown(
-    "**Note:** This is LSIF fast-path hover. Server hover may add source declaration, scope, implementation preview, and deeper JOVIAL semantics once indexing catches up.",
-  );
+  // md.appendMarkdown(
+  //   "\n**Change impact:** Use Find References before renaming or changing type/signature. Cross-file references may exist through COMPOOL imports or external DEF/REF declarations.\n\n",
+  // );
+  // md.appendMarkdown(
+  //   "**Note:** This is LSIF fast-path hover. Server hover may add source declaration, scope, implementation preview, and deeper JOVIAL semantics once indexing catches up.",
+  // );
 
   const range =
     document.getWordRangeAtPosition(position, /[A-Za-z_$'][A-Za-z0-9_$']*/) ??
@@ -1812,6 +2082,16 @@ async function raceLsifProviderFallback<T>(
   budgetMs = LSIF_FALLBACK_RACE_BUDGET_MS,
   lateBudgetMs = PROVIDER_LATE_BUDGET_MS,
 ): Promise<T | undefined> {
+  if (!getConfig().lsifFastPath) {
+    try {
+      const value = await Promise.resolve(server());
+      return normalizeResult ? normalizeResult(value) : value;
+    } catch (e) {
+      output.appendLine(`Server ${providerName} failed: ${String(e)}`);
+      return undefined;
+    }
+  }
+
   // Give the authoritative server a short head start, then use the LSIF cache as
   // a responsive fallback while still accepting late server results.
   return raceServerWithFallback({
@@ -1823,6 +2103,8 @@ async function raceLsifProviderFallback<T>(
     hasResult: hasProviderResult,
     normalizeServerResult: normalizeResult,
     normalizeFallbackResult: normalizeResult,
+    preferLateServerResult: true,
+    fallbackServerBudgetMs: LSIF_FALLBACK_SERVER_GRACE_MS,
     onServerError: (e) => {
       output.appendLine(
         `Server ${providerName} failed; trying LSIF fallback: ${String(e)}`,
@@ -2007,7 +2289,87 @@ function applyTraceSetting(output: vscode.OutputChannel): void {
   output.appendLine(`LSP trace level: ${trace}`);
 }
 
-async function stopClient(status: vscode.StatusBarItem) {
+function isProcessRunning(child: cp.ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+function waitForProcessExit(
+  child: cp.ChildProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (!isProcessRunning(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (exited: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      child.off("close", onExit);
+      resolve(exited);
+    };
+    const onExit = (): void => done(true);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    child.once("exit", onExit);
+    child.once("close", onExit);
+  });
+}
+
+async function stopLanguageClient(
+  languageClient: LanguageClient,
+  output?: vscode.OutputChannel,
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const stopPromise = languageClient.stop().then(
+    () => true,
+    (e) => {
+      output?.appendLine(`Language client stop failed: ${String(e)}`);
+      return false;
+    },
+  );
+  const timeoutPromise = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), SERVER_STOP_TIMEOUT_MS);
+  });
+  const stopped = await Promise.race([stopPromise, timeoutPromise]);
+  if (timer) clearTimeout(timer);
+  if (!stopped) {
+    output?.appendLine(
+      `Language client stop did not finish within ${SERVER_STOP_TIMEOUT_MS}ms; terminating server process.`,
+    );
+  }
+  return stopped;
+}
+
+async function terminateServerProcess(
+  output: vscode.OutputChannel | undefined,
+  reason: string,
+  child: cp.ChildProcess | undefined = serverProcess,
+): Promise<void> {
+  if (!child) return;
+  if (serverProcess === child) serverProcess = undefined;
+  if (!isProcessRunning(child)) return;
+
+  output?.appendLine(`Terminating Jovial LSP process (${reason}).`);
+  try {
+    child.kill("SIGTERM");
+  } catch (e) {
+    output?.appendLine(`Failed to signal Jovial LSP process: ${String(e)}`);
+  }
+  if (await waitForProcessExit(child, SERVER_KILL_TIMEOUT_MS)) return;
+
+  output?.appendLine("Jovial LSP process did not exit after SIGTERM; killing.");
+  try {
+    child.kill("SIGKILL");
+  } catch (e) {
+    output?.appendLine(`Failed to kill Jovial LSP process: ${String(e)}`);
+  }
+  await waitForProcessExit(child, SERVER_KILL_TIMEOUT_MS);
+}
+
+async function stopClient(
+  status: vscode.StatusBarItem,
+  output?: vscode.OutputChannel,
+) {
   // Stop owns every background timer and queue so an explicit restart starts
   // from a clean extension-host state.
   serverStopRequested = true;
@@ -2027,14 +2389,17 @@ async function stopClient(status: vscode.StatusBarItem) {
   currentSourceFileSets = [];
 
   if (!client) {
+    await terminateServerProcess(output, "stop without active client");
     setStatus(status, "stopped");
     return;
   }
   const c = client;
+  const child = serverProcess;
   client = undefined;
   try {
-    await c.stop();
+    await stopLanguageClient(c, output);
   } finally {
+    await terminateServerProcess(output, "client stop cleanup", child);
     clearStartupStatus();
     setStatus(status, "stopped");
   }
@@ -2054,7 +2419,7 @@ function scheduleAutoRestart(
       AUTO_RESTART_WINDOW_MS / 1000,
     )}s).`;
     output.appendLine(msg);
-    setStatus(status, "error", msg);
+    setStatus(status, "error", `${msg} Server connection could not be restored.`);
     return;
   }
 
@@ -2108,7 +2473,7 @@ async function startClient(
     if (!serverPath || !fs.existsSync(serverPath)) {
       const msg =
         "Server executable not found. Bundle runtime binaries under runtime/server/<platform-arch>/ or set jovial.server.path.";
-      setStatus(status, "error", msg);
+      setStatus(status, "stopped", msg);
       if (source !== "auto-restart") {
         vscode.window.showErrorMessage(
           "Jovial LSP: server executable not found. Bundle runtime binaries or set jovial.server.path in Settings (can be relative to workspace).",
@@ -2117,11 +2482,14 @@ async function startClient(
       return;
     }
 
+    ensureServerExecutable(serverPath, output);
     setStatus(status, "starting", `Starting: ${serverPath}`);
 
     if (client) {
-      await stopClient(status);
+      await stopClient(status, output);
       serverStopRequested = false;
+    } else if (serverProcess) {
+      await terminateServerProcess(output, "pre-start cleanup");
     }
 
     output.appendLine(`Starting Jovial LSP (${source}): ${serverPath}`);
@@ -2132,8 +2500,9 @@ async function startClient(
     }
     resetWatchedFileStreamingState();
     currentSourceFileSets = [];
+    const watchedExtensions = watchedWorkspaceExtensions(cfg);
     fileWatcher = vscode.workspace.createFileSystemWatcher(
-      watcherGlobForSourceExtensions(cfg.sourceExtensions),
+      watcherGlobForSourceExtensions(watchedExtensions),
     );
     context.subscriptions.push(fileWatcher);
     fileWatcher.onDidCreate((uri) => {
@@ -2142,7 +2511,7 @@ async function startClient(
         { fsPath: uri.fsPath, type: WATCH_CHANGE_CREATED },
         {
           isOpenFilePath: isOpenFileDocumentPath,
-          sourceExtensions: cfg.sourceExtensions,
+          sourceExtensions: watchedExtensions,
         },
       );
       scheduleWatchedFileFlush(output);
@@ -2153,7 +2522,7 @@ async function startClient(
         { fsPath: uri.fsPath, type: WATCH_CHANGE_CHANGED },
         {
           isOpenFilePath: isOpenFileDocumentPath,
-          sourceExtensions: cfg.sourceExtensions,
+          sourceExtensions: watchedExtensions,
         },
       );
       scheduleWatchedFileFlush(output);
@@ -2164,7 +2533,7 @@ async function startClient(
         { fsPath: uri.fsPath, type: WATCH_CHANGE_DELETED },
         {
           isOpenFilePath: isOpenFileDocumentPath,
-          sourceExtensions: cfg.sourceExtensions,
+          sourceExtensions: watchedExtensions,
         },
       );
       scheduleWatchedFileFlush(output);
@@ -2182,7 +2551,8 @@ async function startClient(
     diagnosticSourceRefreshCursor = 0;
 
     const initialFileCount = initialSourceFileSets.reduce(
-      (acc, set) => acc + set.fileUris.length,
+      (acc, set) =>
+        acc + set.fileUris.length + (set.assemblyFileUris?.length ?? 0),
       0,
     );
 
@@ -2222,6 +2592,8 @@ async function startClient(
         windowsHide: true,
         stdio: stdioMode,
       });
+      const generation = ++serverProcessGeneration;
+      serverProcess = child;
 
       if (child.stderr) {
         child.stderr.setEncoding("utf8");
@@ -2232,12 +2604,20 @@ async function startClient(
 
       child.on("exit", (code, signal) => {
         output.appendLine(`Jovial LSP exited: code=${code} signal=${signal}`);
-        setStatus(status, "stopped", `Exited: code=${code} signal=${signal}`);
+        if (serverProcess === child) serverProcess = undefined;
+        if (serverProcessGeneration === generation && !serverStopRequested) {
+          setStatus(
+            status,
+            "error",
+            `Server connection closed unexpectedly: code=${code} signal=${signal}`,
+          );
+        }
       });
 
       child.on("error", (err) => {
         output.appendLine(`Failed to start Jovial LSP: ${String(err)}`);
-        setStatus(status, "error", `Failed to start: ${String(err)}`);
+        if (serverProcess === child) serverProcess = undefined;
+        setStatus(status, "stopped", `Failed to start: ${String(err)}`);
       });
 
       const reader = child.stdout;
@@ -2260,17 +2640,11 @@ async function startClient(
       outputChannel: output,
       middleware: {
         provideDocumentSymbols: (document, token, next) => {
-          if (isHugeDocument(document)) return [];
           return next(document, token);
         },
         // Navigation requests race the canonical server answer against the
         // local LSIF cache so large workspaces still feel immediate.
         provideDefinition: async (document, position, token, next) => {
-          if (isHugeDocument(document)) {
-            return normalizeNavResult(
-              lsifDefinitionFastPath(document, position) ?? [],
-            );
-          }
           return raceLsifProviderFallback(
             output,
             "definition",
@@ -2284,11 +2658,6 @@ async function startClient(
           );
         },
         provideDeclaration: async (document, position, token, next) => {
-          if (isHugeDocument(document)) {
-            return normalizeNavResult(
-              lsifDeclarationFastPath(document, position) ?? [],
-            );
-          }
           return raceLsifProviderFallback(
             output,
             "declaration",
@@ -2302,11 +2671,6 @@ async function startClient(
           );
         },
         provideTypeDefinition: async (document, position, token, next) => {
-          if (isHugeDocument(document)) {
-            return normalizeNavResult(
-              lsifTypeDefinitionFastPath(document, position) ?? [],
-            );
-          }
           return raceLsifProviderFallback(
             output,
             "typeDefinition",
@@ -2320,11 +2684,6 @@ async function startClient(
           );
         },
         provideImplementation: async (document, position, token, next) => {
-          if (isHugeDocument(document)) {
-            return normalizeNavResult(
-              lsifImplementationFastPath(document, position) ?? [],
-            );
-          }
           return raceLsifProviderFallback(
             output,
             "implementation",
@@ -2338,7 +2697,6 @@ async function startClient(
           );
         },
         provideReferences: async (document, position, context, token, next) => {
-          if (isHugeDocument(document)) return [];
           return raceLsifProviderFallback(
             output,
             "references",
@@ -2354,9 +2712,6 @@ async function startClient(
           );
         },
         provideHover: async (document, position, token, next) => {
-          if (isHugeDocument(document)) {
-            return lsifHoverFastPath(document, position);
-          }
           return raceLsifProviderFallback(
             output,
             "hover",
@@ -2371,16 +2726,11 @@ async function startClient(
           );
         },
         provideCompletionItem: (document, position, context, token, next) => {
-          if (isHugeDocument(document)) return [];
           return next(document, position, context, token);
         },
         provideInlayHints: async (document, range, token, next) => {
           const cfg = getConfig();
           if (!cfg.features.inlayHints) return [];
-          // VS Code can queue inlay requests behind large-document provider work.
-          // Keep huge files responsive; the server still offers richer hints once
-          // clients request them directly or the file is below the huge cutoff.
-          if (document.getText().length > cfg.hugeFileThresholdBytes) return [];
           try {
             return await next(document, range, token);
           } catch (e) {
@@ -2391,9 +2741,6 @@ async function startClient(
         provideDocumentRangeSemanticTokens: (document, range, token, next) => {
           const cfg = getConfig();
           if (!cfg.features.semanticTokens) {
-            return new vscode.SemanticTokens(new Uint32Array());
-          }
-          if (document.getText().length > cfg.hugeFileThresholdBytes) {
             return new vscode.SemanticTokens(new Uint32Array());
           }
           return next(document, range, token);
@@ -2410,9 +2757,16 @@ async function startClient(
         },
         closed: () => {
           output.appendLine("Client closed.");
-          setStatus(status, "stopped", "Client closed.");
+          setStatus(
+            status,
+            serverStopRequested ? "stopped" : "error",
+            serverStopRequested
+              ? "Client closed."
+              : "Server connection closed unexpectedly.",
+          );
           clearExecuteCommandRegistrations(client, output);
           client = undefined;
+          void terminateServerProcess(output, "transport closure");
           clearDiagnosticRefreshTimer();
           diagnosticRefreshPending = false;
           diagnosticSourceRefreshCursor = 0;
@@ -2461,6 +2815,7 @@ async function startClient(
     setStatus(status, "error", `Client failed to start: ${String(e)}`);
     clearExecuteCommandRegistrations(client, output);
     client = undefined;
+    await terminateServerProcess(output, "startup failure cleanup");
     if (!serverStopRequested) {
       scheduleAutoRestart(context, output, status, "startup failure");
     }
@@ -2640,5 +2995,9 @@ export async function deactivate() {
   currentSourceFileSets = [];
   liveEditDiagnosticCollection?.dispose();
   liveEditDiagnosticCollection = undefined;
-  if (client) await client.stop();
+  const c = client;
+  const child = serverProcess;
+  client = undefined;
+  if (c) await stopLanguageClient(c);
+  await terminateServerProcess(undefined, "extension deactivation", child);
 }

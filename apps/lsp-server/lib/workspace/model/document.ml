@@ -29,7 +29,13 @@ type parsed_payload = {
 }
 
 let recompute_diags (d : t) : t =
-  { d with diags = d.pre_diags @ d.import_diags @ d.parse_diags }
+  let parse_output = Option.map (fun syntax -> syntax.Syntax_cache.parse) d.syntax in
+  {
+    d with
+    diags =
+      Diagnostic_gate.merge ?parse_output ~lexer:d.pre_diags
+        ~syntax:d.parse_diags ~semantic:d.import_diags ();
+  }
 
 let reparse_with_profile ?previous_syntax ?edit_summary
     ~(profile : Parser.profile) (doc : t) : t =
@@ -55,6 +61,10 @@ let reparse_with_profile ?previous_syntax ?edit_summary
     ~bytes:(String.length doc.text) ~rev:doc.rev ~ms:elapsed_ms;
   let pre = syntax.preprocess in
   let out = syntax.parse in
+  let ast =
+    if Diagnostic_gate.semantic_analysis_allowed ~parse_output:out () then out.ast
+    else None
+  in
   let doc =
     {
       doc with
@@ -63,8 +73,8 @@ let reparse_with_profile ?previous_syntax ?edit_summary
       compool_def = pre.compool_def;
       defines = pre.defines;
       pre_diags = pre.diags;
-      parse_diags = out.diags;
-      ast = out.ast;
+      parse_diags = out.diags @ out.recovery_diags;
+      ast;
       syntax = Some syntax;
       (* keep import_diags; workspace fills it *)
     }

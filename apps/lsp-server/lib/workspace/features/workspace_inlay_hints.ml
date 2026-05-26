@@ -11,6 +11,7 @@ type proc_sig = { params : string list }
 
 type context = {
   ws : t;
+  doc : Document.t;
   range : T.Range.t;
   budget : Workspace_budget.t;
   type_env : JT.type_env;
@@ -57,6 +58,8 @@ let decl_loc (decl : Ast.decl Ast.node) = decl.loc
 let top_loc = function
   | Ast.TopDecl decl -> decl.loc
   | Ast.TopStmt stmt -> stmt.loc
+  | Ast.TopModule modul -> modul.loc
+  | Ast.TopError err -> err.loc
 
 let range_contains_loc_opt range loc =
   match range with None -> true | Some range -> should_visit_loc range loc
@@ -232,13 +235,17 @@ let rec collect_type_env_from_program ?range budget env (prog : Ast.program) :
     (function
       | Ast.TopDecl d ->
           collect_type_env_from_decl ?range budget env ~top:true d
-      | Ast.TopStmt s -> collect_type_env_from_stmt ?range budget env s)
+      | Ast.TopStmt s -> collect_type_env_from_stmt ?range budget env s
+      | Ast.TopModule m ->
+          collect_type_env_from_program ?range budget env m.v.module_items
+      | Ast.TopError _ -> ())
     prog
 
 and collect_type_env_from_decl ?range budget env ~top (decl : Ast.decl Ast.node)
     : unit =
   if budget_allows budget ~phase:"inlay.type_env.decl" then
     match decl.v with
+    | Ast.DError _ -> ()
     | Ast.DType { name; defn; _ } ->
         if top || range_contains_loc_opt range decl.loc then
           JT.add_type env name.v defn
@@ -273,10 +280,15 @@ and collect_type_env_from_stmt ?range budget env (stmt : Ast.stmt Ast.node) :
         Option.iter (collect_type_env_from_stmt ?range budget env) init;
         Option.iter (collect_type_env_from_stmt ?range budget env) step;
         collect_type_env_from_stmt ?range budget env body
+    | Ast.SCase { options; _ } ->
+        List.iter
+          (fun (opt : Ast.case_option Ast.node) ->
+            collect_type_env_from_stmt ?range budget env opt.v.case_body)
+          options
     | Ast.SLabel { body; _ } ->
         collect_type_env_from_stmt ?range budget env body
-    | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _
-      ->
+    | Ast.SEmpty | Ast.SError _ | Ast.SAssign _ | Ast.SCallStmt _
+    | Ast.SReturn _ | Ast.SGoto _ ->
         ()
 
 let rec collect_proc_sigs_from_program ?range budget table (prog : Ast.program)
@@ -285,13 +297,17 @@ let rec collect_proc_sigs_from_program ?range budget table (prog : Ast.program)
     (function
       | Ast.TopDecl d ->
           collect_proc_sigs_from_decl ?range budget table ~top:true d
-      | Ast.TopStmt s -> collect_proc_sigs_from_stmt ?range budget table s)
+      | Ast.TopStmt s -> collect_proc_sigs_from_stmt ?range budget table s
+      | Ast.TopModule m ->
+          collect_proc_sigs_from_program ?range budget table m.v.module_items
+      | Ast.TopError _ -> ())
     prog
 
 and collect_proc_sigs_from_decl ?range budget table ~top
     (decl : Ast.decl Ast.node) : unit =
   if budget_allows budget ~phase:"inlay.proc_sigs.decl" then
     match decl.v with
+    | Ast.DError _ -> ()
     | Ast.DProc proc ->
         if top || range_contains_loc_opt range decl.loc then
           add_proc_sig table proc;
@@ -327,10 +343,15 @@ and collect_proc_sigs_from_stmt ?range budget table (stmt : Ast.stmt Ast.node) :
         Option.iter (collect_proc_sigs_from_stmt ?range budget table) init;
         Option.iter (collect_proc_sigs_from_stmt ?range budget table) step;
         collect_proc_sigs_from_stmt ?range budget table body
+    | Ast.SCase { options; _ } ->
+        List.iter
+          (fun (opt : Ast.case_option Ast.node) ->
+            collect_proc_sigs_from_stmt ?range budget table opt.v.case_body)
+          options
     | Ast.SLabel { body; _ } ->
         collect_proc_sigs_from_stmt ?range budget table body
-    | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _
-      ->
+    | Ast.SEmpty | Ast.SError _ | Ast.SAssign _ | Ast.SCallStmt _
+    | Ast.SReturn _ | Ast.SGoto _ ->
         ()
 
 let lookup_docs_for_hints ws doc budget =
@@ -414,7 +435,7 @@ let scan_proc_sig_line table line =
   match find_substring_from upper 0 "PROC" with
   | None -> ()
   | Some proc_idx -> (
-      match read_ident line (proc_idx + 4) with
+      match read_ident line (skip_spaces line (proc_idx + 4)) with
       | None -> ()
       | Some (name, after_name) ->
           let after_name = skip_spaces line after_name in
@@ -471,16 +492,23 @@ let build_text_proc_sigs ws doc (range : T.Range.t) budget =
   let table = Hashtbl.create 32 in
   text_lookup_docs_for_hints ws doc budget
   |> List.iter (fun candidate ->
-         if budget_allows budget ~phase:"inlay.text.proc_sigs" then
-           let start_line, end_line =
-             if Workspace_tuning.is_large_doc candidate ws then
-               (range.start.line, range.end_.line)
-             else (0, Text_index.line_count candidate.Document.index - 1)
-           in
-           iter_doc_lines candidate ~start_line ~end_line (fun _ line ->
-               if budget_allows budget ~phase:"inlay.text.proc_sig.line" then
-                 scan_proc_sig_line table line));
+         let start_line, end_line =
+           if Workspace_tuning.is_large_doc candidate ws then
+             (range.start.line, range.end_.line)
+           else (0, Text_index.line_count candidate.Document.index - 1)
+         in
+         iter_doc_lines candidate ~start_line ~end_line (fun _ line ->
+             scan_proc_sig_line table line));
   table
+
+let merge_proc_sig_tables target source =
+  Hashtbl.iter
+    (fun key sigs ->
+      let current =
+        match Hashtbl.find_opt target key with None -> [] | Some xs -> xs
+      in
+      Hashtbl.replace target key (current @ sigs))
+    source
 
 let type_detail_of_decl_text text =
   let upper = String.uppercase_ascii (String.trim text) in
@@ -551,10 +579,10 @@ let callee_before_open line open_idx =
   if start < open_idx then Some (String.sub line start (open_idx - start), start)
   else None
 
-let add_text_call_hints ctx ~line_no ~callee ~arg_positions =
+let rec add_text_call_hints ctx ~line_no ~callee ~arg_positions =
   let key = normalize_name callee in
-  match Hashtbl.find_opt ctx.proc_sigs key with
-  | Some (sig_ :: _) ->
+  match first_proc_sig_by_key ctx key with
+  | Some sig_ ->
       List.iteri
         (fun i character ->
           match List.nth_opt sig_.params i with
@@ -570,18 +598,72 @@ let add_text_call_hints ctx ~line_no ~callee ~arg_positions =
         arg_positions
   | _ -> ()
 
+and first_proc_sig_by_key ctx key =
+  match Hashtbl.find_opt ctx.proc_sigs key with
+  | Some (sig_ :: _) -> Some sig_
+  | _ ->
+      let scratch = Hashtbl.create 8 in
+      iter_doc_lines ctx.doc ~start_line:0
+        ~end_line:(Text_index.line_count ctx.doc.Document.index - 1)
+        (fun _ line -> scan_proc_sig_line scratch line);
+      Hashtbl.iter
+        (fun key sigs ->
+          let current =
+            match Hashtbl.find_opt ctx.proc_sigs key with
+            | None -> []
+            | Some xs -> xs
+          in
+          Hashtbl.replace ctx.proc_sigs key (current @ sigs))
+        scratch;
+      (match Hashtbl.find_opt ctx.proc_sigs key with
+      | Some (sig_ :: _) -> Some sig_
+      | _ -> None)
+
+let line_code_position line idx =
+  let n = String.length line in
+  let rec loop i in_string in_comment =
+    if i >= idx then (not in_string) && not in_comment
+    else if i >= n then false
+    else if in_comment then
+      if line.[i] = '%' then loop (i + 1) in_string false
+      else loop (i + 1) in_string in_comment
+    else if in_string then
+      if line.[i] = '\'' then
+        if i + 1 < n && line.[i + 1] = '\'' then loop (i + 2) true false
+        else loop (i + 1) false false
+      else loop (i + 1) in_string false
+    else
+      match line.[i] with
+      | '%' -> loop (i + 1) false true
+      | '\'' -> loop (i + 1) true false
+      | _ -> loop (i + 1) false false
+  in
+  loop 0 false false
+
+let text_call_is_proc_declaration line callee_start =
+  let prefix =
+    String.sub line 0 (max 0 (min callee_start (String.length line)))
+    |> String.uppercase_ascii
+  in
+  match find_substring_from prefix 0 "PROC" with Some _ -> true | None -> false
+
 let scan_text_call_hints ctx ~line_no line =
   let rec loop start =
-    if budget_allows ctx.budget ~phase:"inlay.text.call" then
-      match find_char_from line start '(' with
-      | None -> ()
-      | Some open_idx -> (
-          match (callee_before_open line open_idx, find_char_from line open_idx ')') with
-          | Some (callee, _), Some close_idx ->
+    match find_char_from line start '(' with
+    | None -> ()
+    | Some open_idx -> (
+        match
+          ( line_code_position line open_idx,
+            callee_before_open line open_idx,
+            find_char_from line open_idx ')' )
+        with
+        | false, _, Some close_idx -> loop (close_idx + 1)
+        | true, Some (callee, callee_start), Some close_idx ->
+            if not (text_call_is_proc_declaration line callee_start) then
               add_text_call_hints ctx ~line_no ~callee
                 ~arg_positions:(call_arg_positions line open_idx close_idx);
-              loop (close_idx + 1)
-          | _ -> loop (open_idx + 1))
+            loop (close_idx + 1)
+        | _ -> loop (open_idx + 1))
   in
   loop 0
 
@@ -593,9 +675,7 @@ let add_text_range_hints ctx doc =
 
 let first_proc_sig (ctx : context) (callee : Ast.ident) : proc_sig option =
   let key = normalize_name callee.v in
-  match Hashtbl.find_opt ctx.proc_sigs key with
-  | Some (sig_ :: _) -> Some sig_
-  | _ -> None
+  first_proc_sig_by_key ctx key
 
 let add_call_parameter_hints (ctx : context) (callee : Ast.ident)
     (args : Ast.expr Ast.node list) : unit =
@@ -621,13 +701,17 @@ let add_call_parameter_hints (ctx : context) (callee : Ast.ident)
 let rec visit_program ctx (prog : Ast.program) : unit =
   iter_ordered_locs ~range:ctx.range ~phase:"inlay.program" ctx.budget top_loc
     (function
-      | Ast.TopDecl d -> visit_decl ctx d | Ast.TopStmt s -> visit_stmt ctx s)
+      | Ast.TopDecl d -> visit_decl ctx d
+      | Ast.TopStmt s -> visit_stmt ctx s
+      | Ast.TopModule m -> visit_program ctx m.v.module_items
+      | Ast.TopError _ -> ())
     prog
 
 and visit_decl ctx (decl : Ast.decl Ast.node) : unit =
   if not (loc_intersects ctx.range decl.loc) then ()
   else
     match decl.v with
+    | Ast.DError _ -> ()
     | Ast.DVar { name; dtype; init; data_decl_kind = Ast.DataTable; _ } ->
         add_table_count_hint ctx ~name_loc:name.loc dtype;
         Option.iter (visit_expr ctx) init
@@ -655,7 +739,7 @@ and visit_stmt ctx (stmt : Ast.stmt Ast.node) : unit =
   if not (loc_intersects ctx.range stmt.loc) then ()
   else
     match stmt.v with
-    | Ast.SEmpty -> ()
+    | Ast.SEmpty | Ast.SError _ -> ()
     | Ast.SBlock stmts ->
         iter_ordered_locs ~range:ctx.range ~phase:"inlay.stmt.block" ctx.budget
           stmt_loc (visit_stmt ctx) stmts
@@ -678,6 +762,21 @@ and visit_stmt ctx (stmt : Ast.stmt Ast.node) : unit =
         Option.iter (visit_expr ctx) cond;
         Option.iter (visit_stmt ctx) step;
         visit_stmt ctx body
+    | Ast.SCase { selector; options } ->
+        visit_expr ctx selector;
+        let visit_case_index (case_index : Ast.case_index Ast.node) : unit =
+          match case_index.v with
+          | Ast.CaseDefault -> ()
+          | Ast.CaseValue value -> visit_expr ctx value
+          | Ast.CaseRange (lo, hi) ->
+              visit_expr ctx lo;
+              visit_expr ctx hi
+        in
+        List.iter
+          (fun (opt : Ast.case_option Ast.node) ->
+            List.iter visit_case_index opt.v.case_indexes;
+            visit_stmt ctx opt.v.case_body)
+          options
     | Ast.SReturn expr -> Option.iter (visit_expr ctx) expr
     | Ast.SLabel { body; _ } -> visit_stmt ctx body
     | Ast.SGoto _ -> ()
@@ -686,7 +785,7 @@ and visit_expr ctx (expr : Ast.expr Ast.node) : unit =
   if not (loc_intersects ctx.range expr.loc) then ()
   else
     match expr.v with
-    | Ast.EName _ | Ast.ELit _ -> ()
+    | Ast.EName _ | Ast.ELit _ | Ast.EError _ | Ast.EMissing _ -> ()
     | Ast.EUnop { rhs; _ } -> visit_expr ctx rhs
     | Ast.EBinop { lhs; rhs; _ } ->
         visit_expr ctx lhs;
@@ -704,6 +803,13 @@ and visit_expr ctx (expr : Ast.expr Ast.node) : unit =
     | Ast.EPreset { base; items } ->
         visit_expr ctx base;
         List.iter (visit_expr ctx) items
+    | Ast.EOmitted -> ()
+    | Ast.ERepeat { count; items } ->
+        visit_expr ctx count;
+        List.iter (visit_expr ctx) items
+    | Ast.EPositioned { indexes; values } ->
+        List.iter (visit_expr ctx) indexes;
+        List.iter (visit_expr ctx) values
     | Ast.ERange { lo; hi } ->
         visit_expr ctx lo;
         visit_expr ctx hi
@@ -747,6 +853,7 @@ let inlay_hints_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t) :
         let ctx =
           {
             ws;
+            doc;
             range;
             budget;
             type_env = JT.empty_type_env ();
@@ -759,18 +866,37 @@ let inlay_hints_for (ws : t) ~(uri : T.DocumentUri.t) ~(range : T.Range.t) :
         sort_and_dedupe_hints ctx.hints)
       else
         match current_program doc with
-      | None -> []
-      | Some prog ->
+      | None ->
           let ctx =
             {
               ws;
+              doc;
+              range;
+              budget;
+              type_env = JT.empty_type_env ();
+              proc_sigs = build_text_proc_sigs ws doc range budget;
+              hints = [];
+            }
+          in
+          add_text_range_hints ctx doc;
+          ignore (Workspace_budget.check ~phase:"inlay.text.finish" budget);
+          sort_and_dedupe_hints ctx.hints
+      | Some prog ->
+          let proc_sigs = build_proc_sigs ws doc range budget in
+          merge_proc_sig_tables proc_sigs
+            (build_text_proc_sigs ws doc range budget);
+          let ctx =
+            {
+              ws;
+              doc;
               range;
               budget;
               type_env = build_type_env ws doc range budget;
-              proc_sigs = build_proc_sigs ws doc range budget;
+              proc_sigs;
               hints = [];
             }
           in
           visit_program ctx prog;
+          add_text_range_hints ctx doc;
           ignore (Workspace_budget.check ~phase:"inlay.finish" budget);
           sort_and_dedupe_hints ctx.hints)

@@ -43,7 +43,7 @@ type expansion_segment = {
 
 type result = {
   text : string; (* preprocessed text after DEFINE expansion *)
-  imports : import list; (* COMPOOL/ICOMPOOL/!COMPOOL extracted *)
+  imports : import list; (* !COMPOOL imports extracted; legacy ICOMPOOL aliases canonicalized *)
   compool_def : string option; (* START COMPOOL NAME; found in file *)
   defines : define list; (* DEFINE declarations in source order *)
   source_map : expansion_segment list;
@@ -51,6 +51,8 @@ type result = {
 }
 
 type lex_tok = Parser.token_span
+
+val canonical_directive_name : string -> string
 
 val lex_all_tokens : file:string option -> text:string -> lex_tok array
 val lex_all_tokens_with_lexemes : file:string option -> text:string -> lex_tok array

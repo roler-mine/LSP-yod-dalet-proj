@@ -13,12 +13,20 @@ val parser_version : string
 val indexer_version : string
 val cache_dir : root:string -> string
 val files_json_path : root:string -> string
+val files_bin_path : root:string -> string
 val symbols_json_path : root:string -> string
+val symbols_bin_path : root:string -> string
 val refs_json_path : root:string -> string
+val refs_bin_path : root:string -> string
 val scopes_json_path : root:string -> string
+val scopes_bin_path : root:string -> string
 val deps_json_path : root:string -> string
+val deps_bin_path : root:string -> string
 val macros_json_path : root:string -> string
+val macros_bin_path : root:string -> string
 val diagnostics_json_path : root:string -> string
+val diagnostics_bin_path : root:string -> string
+val snapshot_bin_path : root:string -> string
 val fingerprint_path : string -> file_fingerprint option
 
 val load_workspace_index :

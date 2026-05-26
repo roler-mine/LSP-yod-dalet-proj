@@ -12,6 +12,7 @@ type dim_bound =
   | BoundInt of int
   | BoundStatus of string
   | BoundExpr of Ast.expr Ast.node
+  | BoundDamaged of Ast.parse_error
   | BoundUnknown
 
 type dim = {
@@ -83,9 +84,11 @@ let int_of_string_opt s = try Some (int_of_string s) with _ -> None
 let literal_display = function
   | Ast.LInt s -> s
   | Ast.LFloat s -> s
+  | Ast.LBit { raw; _ } -> raw
   | Ast.LString s -> "'" ^ s ^ "'"
   | Ast.LChar c -> Printf.sprintf "'%c'" c
   | Ast.LBool b -> if b then "TRUE" else "FALSE"
+  | Ast.LNull -> "NULL"
 
 let binop_display = function
   | Ast.BAdd -> "+"
@@ -138,9 +141,20 @@ let rec expr_display (e : Ast.expr Ast.node) =
       expr_display base ^ "("
       ^ (items |> List.map expr_display |> String.concat ", ")
       ^ ")"
+  | Ast.EOmitted -> ""
+  | Ast.ERepeat { count; items } ->
+      expr_display count ^ "*("
+      ^ (items |> List.map expr_display |> String.concat ", ")
+      ^ ")"
+  | Ast.EPositioned { indexes; values } ->
+      "POS("
+      ^ (indexes |> List.map expr_display |> String.concat ", ")
+      ^ "):"
+      ^ (values |> List.map expr_display |> String.concat ", ")
   | Ast.ERange { lo; hi } -> expr_display lo ^ ":" ^ expr_display hi
   | Ast.EAt { field; ptr } -> expr_display field ^ " @ " ^ expr_display ptr
   | Ast.EDeref { ptr } -> "@ " ^ expr_display ptr
+  | Ast.EError _ | Ast.EMissing _ -> "?"
 
 and dim_bound_of_expr (e : Ast.expr Ast.node) =
   match e.v with
@@ -149,6 +163,7 @@ and dim_bound_of_expr (e : Ast.expr Ast.node) =
       | Some n -> BoundInt n
       | None -> BoundExpr e)
   | Ast.EName id -> BoundStatus id.v
+  | Ast.EError damage | Ast.EMissing damage -> BoundDamaged damage
   | _ -> BoundExpr e
 
 and dim_of_expr (e : Ast.expr Ast.node) =
@@ -191,6 +206,14 @@ and builtin_name_type key =
   | "P" -> Some (Pointer { target = None; typed = false })
   | _ -> None
 
+and scalar_base_key = function
+  | Ast.ScalarUnsigned -> "U"
+  | Ast.ScalarSigned -> "S"
+  | Ast.ScalarFloat -> "F"
+  | Ast.ScalarFixed -> "A"
+  | Ast.ScalarBit -> "B"
+  | Ast.ScalarChar -> "C"
+
 and of_ast_type_expr env t = of_ast_type_expr_seen env [] t
 
 and of_ast_type_expr_seen env seen (t : Ast.type_expr Ast.node) =
@@ -206,6 +229,13 @@ and of_ast_type_expr_seen env seen (t : Ast.type_expr Ast.node) =
             | Some defn when not (List.mem key seen) ->
                 of_ast_type_expr_seen env (key :: seen) defn
             | _ -> Named id.v))
+  | Ast.TScalar { base; sizes; _ } -> (
+      match builtin_array_type (scalar_base_key base) sizes with
+      | Some ty -> ty
+      | None -> Unknown)
+  | Ast.TPointer { v = Ast.TName id; _ }
+    when normalize_name id.v = "__UNTYPED_POINTER__" ->
+      Pointer { target = None; typed = false }
   | Ast.TPointer inner ->
       Pointer
         { target = Some (of_ast_type_expr_seen env seen inner); typed = true }
@@ -282,6 +312,7 @@ and dim_bound_display = function
   | BoundInt n -> string_of_int n
   | BoundStatus name -> name
   | BoundExpr expr -> expr_display expr
+  | BoundDamaged _ -> "?"
   | BoundUnknown -> "?"
 
 and dim_display { lower; upper } =

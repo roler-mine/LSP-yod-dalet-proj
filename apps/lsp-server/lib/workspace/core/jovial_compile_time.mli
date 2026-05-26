@@ -10,6 +10,7 @@ type ctf_value =
 type ctf_error_kind =
   | UnknownIdentifier of string
   | NonConstantReference of string
+  | ParseDamage of Ast.parse_error
   | UnsupportedConstruct of string
   | UnsupportedBuiltin of string
   | TypeMismatch of string

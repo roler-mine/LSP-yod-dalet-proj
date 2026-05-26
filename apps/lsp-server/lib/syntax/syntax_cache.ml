@@ -110,7 +110,9 @@ let is_boundary = function
   | _ -> false
 
 let is_decl_start = function
-  | Parser.BANG | Parser.COMPOOL | Parser.ICOMPOOL | Parser.DEFINE
+  | Parser.BANG | Parser.COMPOOL | Parser.ICOMPOOL | Parser.LINKAGE
+  | Parser.ILINKAGE
+  | Parser.DEFINE
   | Parser.TYPE | Parser.BLOCK | Parser.DEF | Parser.REF | Parser.PROC
   | Parser.ITEM | Parser.TABLE | Parser.READONLY | Parser.INLINE
   | Parser.OVERLAY | Parser.STATIC | Parser.CONSTANT ->
@@ -118,8 +120,9 @@ let is_decl_start = function
   | _ -> false
 
 let is_stmt_start = function
-  | Parser.ID _ | Parser.IF | Parser.WHILE | Parser.FOR | Parser.CASE
-  | Parser.EXIT | Parser.GOTO | Parser.RETURN | Parser.ABORT | Parser.STOP ->
+  | Parser.ID _ | Parser.FIXED_A _ | Parser.IF | Parser.WHILE | Parser.FOR
+  | Parser.CASE | Parser.EXIT | Parser.GOTO | Parser.RETURN | Parser.ABORT
+  | Parser.STOP ->
       true
   | _ -> false
 
@@ -273,7 +276,8 @@ let skeleton_of_preprocess ~(file : string option)
     if i < 0 || i >= len then None
     else
       match tokens.(i).Parser.tok with
-      | Parser.ID name | Parser.STRINGLIT name -> Some (name, tokens.(i))
+      | Parser.ID name | Parser.FIXED_A name | Parser.STRINGLIT name ->
+          Some (name, tokens.(i))
       | Parser.PROGRAM -> Some ("PROGRAM", tokens.(i))
       | Parser.TYPE -> Some ("TYPE", tokens.(i))
       | Parser.BLOCK -> Some ("BLOCK", tokens.(i))
@@ -334,7 +338,7 @@ let skeleton_of_preprocess ~(file : string option)
   in
   let proc_has_return i =
     let is_return_name = function
-      | Parser.ID s ->
+      | Parser.ID s | Parser.FIXED_A s ->
           let k = normalize_name s in
           k <> "REC" && k <> "RECURSIVE" && k <> "RENT" && k <> "REENTRANT"
       | Parser.TYPE | Parser.BLOCK -> true
@@ -388,7 +392,9 @@ let skeleton_of_preprocess ~(file : string option)
         if i = 0 || tokens.(i - 1).Parser.tok <> Parser.START then
           symbol_after i SkModule
     | Parser.COMPOOL ->
-        if i = 0 || tokens.(i - 1).Parser.tok <> Parser.START then
+        if i > 0 && tokens.(i - 1).Parser.tok = Parser.BANG then
+          symbol_after ~imported:true i SkCompool
+        else if i = 0 || tokens.(i - 1).Parser.tok <> Parser.START then
           symbol_after i SkCompool
     | Parser.ICOMPOOL -> symbol_after ~imported:true i SkCompool
     | Parser.PROC ->
@@ -413,7 +419,7 @@ let skeleton_of_preprocess ~(file : string option)
         | Some (name, tok) ->
             current_container := Some name;
             add_symbol ~exported ~imported name SkBlock (loc_of_token ~file tok))
-    | Parser.ID name
+    | (Parser.ID name | Parser.FIXED_A name)
       when i + 1 < len
            && tokens.(i + 1).Parser.tok = Parser.COLON
            && (i = 0 || tokens.(i - 1).Parser.tok <> Parser.FOR) ->

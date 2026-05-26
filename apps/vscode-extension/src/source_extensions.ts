@@ -1,6 +1,7 @@
 // Module overview: Builds normalized source-extension sets and workspace watcher globs for Jovial files.
 
 export const DEFAULT_JOVIAL_SOURCE_EXTENSIONS = [".jov", ".j73", ".jvl"];
+export const DEFAULT_ASSEMBLY_SOURCE_EXTENSIONS = [".asm"];
 
 export function normalizeSourceExtension(value: string): string | undefined {
   const trimmed = value.trim().toLowerCase();
@@ -30,6 +31,20 @@ export function sourceExtensionsWithDefaults(
   const seen = new Set<string>();
   const out: string[] = [];
   for (const item of [...DEFAULT_JOVIAL_SOURCE_EXTENSIONS, ...extra]) {
+    const ext = normalizeSourceExtension(item);
+    if (!ext || seen.has(ext)) continue;
+    seen.add(ext);
+    out.push(ext);
+  }
+  return out;
+}
+
+export function assemblyExtensionsWithDefaults(
+  extra: readonly string[],
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of [...DEFAULT_ASSEMBLY_SOURCE_EXTENSIONS, ...extra]) {
     const ext = normalizeSourceExtension(item);
     if (!ext || seen.has(ext)) continue;
     seen.add(ext);

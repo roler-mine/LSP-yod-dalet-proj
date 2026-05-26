@@ -1,7 +1,12 @@
 (** Module overview: Models lexical and module scopes for symbol lookup across Jovial files. *)
 
-type symbol_id = string
+type symbol_id = Symbol_id.t
 type import_id = int
+
+type symbol_binding = {
+  symbol_id : symbol_id;
+  normalized_name : string;
+}
 
 type scope_kind =
   | SystemScope
@@ -23,6 +28,7 @@ type scope = {
   name : string option;
   loc : Ast.Loc.t;
   symbols : symbol_id list;
+  symbol_bindings : symbol_binding list;
   imports : import_id list;
 }
 

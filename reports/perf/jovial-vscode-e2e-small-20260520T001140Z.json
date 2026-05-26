@@ -1,0 +1,377 @@
+{
+  "tool": "jovial-vscode-e2e-perf",
+  "generatedAt": "2026-05-20T00:12:14.805Z",
+  "note": "Measures VS Code extension-host UX path: extension activation, LanguageClient processing, stdio JSON-RPC, real OCaml LSP server processing, provider command results, and unsaved edit-to-diagnostics latency.",
+  "workspacePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e",
+  "workspaceFolders": [
+    {
+      "name": "jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e",
+      "uri": "file:///c%3A/Users/miran/AppData/Local/Temp/jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e",
+      "fsPath": "c:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e"
+    }
+  ],
+  "workspaceInventory": {
+    "sourceFileCount": 5,
+    "sourceBytes": 261662,
+    "files": [
+      {
+        "name": "MAINCOMP.j73",
+        "bytes": 940
+      },
+      {
+        "name": "MAINMODULE (1).j73",
+        "bytes": 459
+      },
+      {
+        "name": "MAINSYSCOMP.j73",
+        "bytes": 204
+      },
+      {
+        "name": "TINYCOMP2.j73",
+        "bytes": 258860
+      },
+      {
+        "name": "UTIL.j73",
+        "bytes": 1199
+      }
+    ],
+    "featureCounts": {
+      "compoolImports": 4,
+      "compoolDeclarations": 3,
+      "icopyIncludes": 0,
+      "defines": 3,
+      "defProcedures": 4,
+      "refProcedures": 2,
+      "types": 10,
+      "tables": 6
+    },
+    "featureScanBytesPerFile": 262144
+  },
+  "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e\\UTIL.j73",
+  "serverPath": "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\lsp-server\\_build-win32-x64\\install\\default\\bin\\jovial-lsp.exe",
+  "profile": "small",
+  "sampleBytes": 1199,
+  "hugeThresholdBytes": 15728640,
+  "fullParseMaxBytes": 15728640,
+  "commandSamples": 1,
+  "hoverSamples": 1,
+  "navigationSamples": 1,
+  "providerRange": {
+    "start": {
+      "line": 0,
+      "character": 0
+    },
+    "end": {
+      "line": 68,
+      "character": 4
+    }
+  },
+  "activation": {
+    "name": "openDocument.extensionActivate.serverInitialize",
+    "durationMs": 1945.544,
+    "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e\\UTIL.j73"
+  },
+  "sampleOpen": {
+    "name": "sample.openedDuringActivation",
+    "durationMs": 0,
+    "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e\\UTIL.j73"
+  },
+  "commands": [
+    {
+      "name": "documentSymbols",
+      "iterations": 1,
+      "durationsMs": [
+        2.398
+      ],
+      "stats": {
+        "minMs": 2.398,
+        "p50Ms": 2.398,
+        "p95Ms": 2.398,
+        "p99Ms": 2.398,
+        "maxMs": 2.398,
+        "avgMs": 2.398
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 13
+      },
+      "errors": []
+    },
+    {
+      "name": "hover",
+      "iterations": 1,
+      "durationsMs": [
+        19.966
+      ],
+      "stats": {
+        "minMs": 19.966,
+        "p50Ms": 19.966,
+        "p95Ms": 19.966,
+        "p99Ms": 19.966,
+        "maxMs": 19.966,
+        "avgMs": 19.966
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "definition",
+      "iterations": 1,
+      "durationsMs": [
+        9.269
+      ],
+      "stats": {
+        "minMs": 9.269,
+        "p50Ms": 9.269,
+        "p95Ms": 9.269,
+        "p99Ms": 9.269,
+        "maxMs": 9.269,
+        "avgMs": 9.269
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "references",
+      "iterations": 1,
+      "durationsMs": [
+        13.439
+      ],
+      "stats": {
+        "minMs": 13.439,
+        "p50Ms": 13.439,
+        "p95Ms": 13.439,
+        "p99Ms": 13.439,
+        "maxMs": 13.439,
+        "avgMs": 13.439
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "inlayHints",
+      "iterations": 1,
+      "durationsMs": [
+        17.36
+      ],
+      "stats": {
+        "minMs": 17.36,
+        "p50Ms": 17.36,
+        "p95Ms": 17.36,
+        "p99Ms": 17.36,
+        "maxMs": 17.36,
+        "avgMs": 17.36
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 5
+      },
+      "errors": []
+    },
+    {
+      "name": "semanticTokens.range",
+      "iterations": 1,
+      "durationsMs": [
+        13.859
+      ],
+      "stats": {
+        "minMs": 13.859,
+        "p50Ms": 13.859,
+        "p95Ms": 13.859,
+        "p99Ms": 13.859,
+        "maxMs": 13.859,
+        "avgMs": 13.859
+      },
+      "resultSummary": {
+        "kind": "semanticTokens",
+        "dataLength": 635
+      },
+      "errors": []
+    },
+    {
+      "name": "completion",
+      "iterations": 1,
+      "durationsMs": [
+        16.396
+      ],
+      "stats": {
+        "minMs": 16.396,
+        "p50Ms": 16.396,
+        "p95Ms": 16.396,
+        "p99Ms": 16.396,
+        "maxMs": 16.396,
+        "avgMs": 16.396
+      },
+      "resultSummary": {
+        "kind": "objectWithItems",
+        "length": 27
+      },
+      "errors": []
+    }
+  ],
+  "diagnostics": {
+    "baseline": {
+      "name": "diagnostics.baselineStable",
+      "durationMs": 534.815,
+      "count": 2,
+      "fingerprint": "0|parse||Expected ';' or ',' after the previous call before \"HELP3\". Expected: ,, ;|37|4|37|9\n1|parse||Recovered from damaged syntax in statement: skipped to the next statement boundary|37|4|53|33",
+      "messages": [
+        "Expected ';' or ',' after the previous call before \"HELP3\". Expected: ,, ;",
+        "Recovered from damaged syntax in statement: skipped to the next statement boundary"
+      ]
+    },
+    "brokenEdit": {
+      "name": "diagnostics.afterBrokenEdit",
+      "durationMs": 646.337,
+      "count": 4,
+      "fingerprint": "0|parse||Parse error near token ID (lexeme: \"LIVE\") Expected: ,, ;|0|7|0|11\n0|parse||Expected ';' or ',' after the previous call before \"HELP3\". Expected: ,, ;|38|4|38|9\n1|parse||Recovered from damaged syntax in module item: skipped to the next module or declaration boundary|0|7|3|23\n1|parse||Recovered from damaged syntax in statement: skipped to the next statement boundary|38|4|54|33",
+      "messages": [
+        "Parse error near token ID (lexeme: \"LIVE\") Expected: ,, ;",
+        "Expected ';' or ',' after the previous call before \"HELP3\". Expected: ,, ;",
+        "Recovered from damaged syntax in module item: skipped to the next module or declaration boundary",
+        "Recovered from damaged syntax in statement: skipped to the next statement boundary"
+      ]
+    },
+    "restoredEdit": {
+      "name": "diagnostics.afterRestoreEdit",
+      "durationMs": 10103.327,
+      "count": 4,
+      "fingerprint": "0|parse||Parse error near token ID (lexeme: \"LIVE\") Expected: ,, ;|0|7|0|11\n0|parse||Expected ';' or ',' after the previous call before \"HELP3\". Expected: ,, ;|38|4|38|9\n1|parse||Recovered from damaged syntax in module item: skipped to the next module or declaration boundary|0|7|3|23\n1|parse||Recovered from damaged syntax in statement: skipped to the next statement boundary|38|4|54|33",
+      "messages": [
+        "Parse error near token ID (lexeme: \"LIVE\") Expected: ,, ;",
+        "Expected ';' or ',' after the previous call before \"HELP3\". Expected: ,, ;",
+        "Recovered from damaged syntax in module item: skipped to the next module or declaration boundary",
+        "Recovered from damaged syntax in statement: skipped to the next statement boundary"
+      ],
+      "error": "Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/miran/AppData/Local/Temp/jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e/UTIL.j73\n\tat waitForDiagnosticsChange (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:429:11)\n\tat async captureDiagnosticStep (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:564:24)\n\tat async measureDiagnostics (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:587:22)\n\tat async runBenchmark (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:791:11)\n\tat async Object.run (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:871:5)"
+    },
+    "restoredPull": {
+      "kind": "error",
+      "count": 0,
+      "messages": [],
+      "error": "Error: jovial.pullDiagnostics timed out after 5000ms\n\tat Timeout.<anonymous> (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:117:49)\n\tat listOnTimeout (node:internal/timers:569:17)\n\tat process.processTimers (node:internal/timers:512:7)"
+    },
+    "editStates": {
+      "baseline": {
+        "version": 1,
+        "lineCount": 69,
+        "firstLine": "START",
+        "startsWithBrokenLine": false,
+        "textBytes": 1199
+      },
+      "broken": {
+        "version": 2,
+        "lineCount": 70,
+        "firstLine": "BROKEN LIVE EDIT",
+        "startsWithBrokenLine": false,
+        "textBytes": 1217
+      },
+      "restored": {
+        "version": 3,
+        "lineCount": 69,
+        "firstLine": "START",
+        "startsWithBrokenLine": false,
+        "textBytes": 1199
+      }
+    },
+    "restoredMatchesBaseline": false,
+    "errors": [
+      "diagnostics.afterRestoreEdit: Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/miran/AppData/Local/Temp/jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e/UTIL.j73\n\tat waitForDiagnosticsChange (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:429:11)\n\tat async captureDiagnosticStep (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:564:24)\n\tat async measureDiagnostics (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:587:22)\n\tat async runBenchmark (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:791:11)\n\tat async Object.run (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:871:5)"
+    ]
+  },
+  "workspaceReadiness": {
+    "name": "workspace.deepSemanticReady",
+    "durationMs": 10116.371,
+    "ready": false,
+    "elapsedMs": 9845,
+    "targetMs": 1500,
+    "startup": {
+      "startedMs": 1779235908283.3943,
+      "readyMs": null,
+      "elapsedMs": 9845,
+      "targetMs": 1500,
+      "readyWithinTarget": false,
+      "isReady": false,
+      "phase": "aggressiveCatchUp",
+      "aggressiveWindowMs": 500,
+      "aggressiveBudgetMs": 20,
+      "missNotified": true,
+      "stages": {
+        "diagHoverReady": {
+          "targetMs": 1500,
+          "elapsedMs": 9845,
+          "isReady": false,
+          "readyWithinTarget": false
+        },
+        "interactiveNavReady": {
+          "targetMs": 1500,
+          "elapsedMs": 9845,
+          "isReady": true,
+          "readyWithinTarget": false
+        },
+        "deepSemanticComplete": {
+          "targetMs": 1500,
+          "elapsedMs": 9845,
+          "isReady": false,
+          "readyWithinTarget": false
+        }
+      },
+      "components": {
+        "indexComplete": true,
+        "indexReconcilePending": false,
+        "seedComplete": true,
+        "seedReady": true,
+        "highQueuesEmpty": false,
+        "interactiveQueuesEmpty": false,
+        "queuesEmpty": false,
+        "backgroundDrainRequired": true,
+        "hintsReady": false,
+        "rootClosureReady": true,
+        "navPrereqsReady": false,
+        "interactiveNavReady": true,
+        "quickNavComplete": true,
+        "deepSemanticComplete": false,
+        "fullyNavigable": false,
+        "quickNavIndexReady": true,
+        "quickNavIndexComplete": true,
+        "quickNavIndexed": 6,
+        "quickNavTotal": 6,
+        "quickNavPending": 0,
+        "quickNavPendingSet": 0,
+        "parseWorkerJobs": 0,
+        "parseWorkerResults": 0,
+        "parseWorkerInflight": 0,
+        "openDocsConverged": true,
+        "openDocsAuthoritative": true,
+        "openDocsPendingParse": 0,
+        "xmoduleDiagReady": false,
+        "openDiagRevalidateQueueEmpty": true,
+        "openDiagRevalidatePending": 0
+      }
+    },
+    "errors": [
+      "Timed out waiting for full workspace navigation readiness after 10000ms."
+    ]
+  },
+  "summary": {
+    "commandErrors": [],
+    "emptyProviderResults": [],
+    "diagnosticsRestoredToBaseline": false,
+    "diagnosticErrors": [
+      "diagnostics.afterRestoreEdit: Error: Timed out waiting for diagnostics to change for file:///c%3A/Users/miran/AppData/Local/Temp/jovial-j73-examples-e2e-6e5050e45dd44ae1b49867479d796b5e/UTIL.j73\n\tat waitForDiagnosticsChange (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:429:11)\n\tat async captureDiagnosticStep (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:564:24)\n\tat async measureDiagnostics (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:587:22)\n\tat async runBenchmark (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:791:11)\n\tat async Object.run (c:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\vscode-extension\\out-test\\test\\e2e_perf\\index.js:871:5)"
+    ],
+    "seededDiagnosticErrors": [],
+    "workspaceReadinessErrors": [
+      "Timed out waiting for full workspace navigation readiness after 10000ms."
+    ]
+  }
+}

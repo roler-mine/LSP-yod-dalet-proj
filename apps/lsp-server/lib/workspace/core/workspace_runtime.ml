@@ -153,7 +153,7 @@ let startup_mark_open_doc (ws : t) ~(bytes : int) : unit =
 
 let startup_open_doc_blocks_interactive_ready (ws : t) (doc : Document.t) :
     bool =
-  doc.Document.parse_rev <> doc.Document.rev && not (is_huge_doc doc ws)
+  doc.Document.parse_rev <> doc.Document.rev && not (is_large_doc doc ws)
 
 let startup_open_docs_converged (ws : t) : bool =
   Hashtbl.fold
@@ -316,7 +316,7 @@ let startup_nav_prereqs_ready (ws : t) : bool =
   startup_root_closure_ready ws && startup_navigation_hints_ready ws
 
 let startup_open_docs_authoritative (ws : t) : bool =
-  (* Huge open files keep provisional diagnostics while their full parse waits
+  (* Large open files keep provisional diagnostics while their full parse waits
      for an idle window; they should not hold the editor in startup catch-up. *)
   startup_open_docs_converged ws && not (has_pending_open_parse_work ws)
 
@@ -398,11 +398,13 @@ let startup_update_phase (ws : t) : unit =
     | Some _ -> StartupReady
     | None ->
         let elapsed_ms = startup_elapsed_ms_float ws in
-        let warm_window =
-          float_of_int
-            (max 0 (ws.startup_nav_target_ms - ws.startup_aggressive_window_ms))
+        (* Startup targets are reporting/SLO metadata. Operational catch-up
+           uses its own window so changing a target cannot change parsing or
+           background scheduler behavior. *)
+        let aggressive_after_ms =
+          float_of_int (max 0 ws.startup_aggressive_window_ms)
         in
-        if elapsed_ms >= warm_window then StartupAggressiveCatchUp
+        if elapsed_ms >= aggressive_after_ms then StartupAggressiveCatchUp
         else StartupWarming
   in
   if ws.startup_phase <> next_phase then (
@@ -771,7 +773,9 @@ let effective_bg_tick_budget_ms (ws : t) ~(base_budget_ms : int) : int =
   match workspace_profile_for_budget ws with
   | ProfileSmall -> base
   | ProfileMedium -> max base 16
-  | ProfileLarge -> max base 24
+  | ProfileLarge ->
+      if ws.startup_fully_nav_ready_ms = None then max base 50
+      else max base 24
 
 let feature_flags (ws : t) : Workspace_settings.feature_flags = ws.feature_flags
 

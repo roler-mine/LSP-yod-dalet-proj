@@ -9,6 +9,11 @@ module Private_for_tests : sig
   val incoming_preempts_active_method :
     active:string -> incoming:string -> bool
 
+  val request_should_abort_for_test :
+    client_cancelled:bool -> preempted:bool -> bool
+
+  val response_should_cancel_for_test : client_cancelled:bool -> bool
+
   val open_document_workspace_survives_source_set_replacement :
     workspace_root:string -> source_root:string -> source_file:string -> bool
 end

@@ -3,8 +3,10 @@
 `workspace/` is split by purpose:
 
 - `model/`: `Document`, URI/path handling
-- `index/`: text line index + background filesystem compool index
-- `core/`: workspace state and shared semantic/navigation foundation
+- `index/`: text line index + filesystem source locator used by startup
+  scheduling and coarse path hints only
+- `core/`: workspace state, `Cross_file_index`, `Workspace_query`, and shared
+  semantic/navigation foundation
 - `features/`: feature endpoints used by the LSP layer (navigation, diagnostics, symbols, semantic tokens, inlay hints, LSIF-lite export)
 
 Entry module:
@@ -20,6 +22,11 @@ Staged architecture overview:
 
 Compatibility boundary:
 
+- `core/cross_file_index.ml` is the centralized semantic authority for
+  cross-file symbols, references, visibility, diagnostics, and direct LSP query
+  lookups. Request handlers should reach it through `Workspace_query`.
+- `index/workspace_index.ml` is deliberately file/path-first legacy
+  infrastructure. It should not become a request-time semantic lookup path.
 - `features/workspace_navigation.ml` is a legacy facade kept for compatibility
   with older callers. New internal feature logic should depend on the focused
   `Workspace_*` feature module that owns the capability, or on `Workspace_query`
@@ -28,19 +35,32 @@ Compatibility boundary:
 - `workspace_core_suite_test` includes a lightweight architecture guardrail that
   fails if new `lib/` code starts depending on `Workspace_navigation`.
 
+IPC boundary:
+
+- LSP client communication remains JSON-RPC with `Content-Length` framing in
+  `lsp/lsp_io.ml`.
+- Internal parse-worker queue traffic uses `core/worker_ipc.ml`, a compact
+  schema-framed binary protocol (`J73B` magic, versioned payloads). The current
+  workers are in-process threads, so parsed `Document` payloads are passed by
+  local slots while job/result metadata moves through the binary frame. This
+  keeps the worker boundary ready for process transport without mixing it with
+  the client JSON-RPC protocol.
+
 Public module summaries:
 
 - `core/module_summary.ml` derives the dependency-facing surface for each
-  document: COMPOOL name, exported symbols/types, COMPOOL/ICOPY imports, DEFINE
+  document: COMPOOL name, exported symbols/types, COMPOOL/!COPY imports, DEFINE
   macro signatures, and a `public_signature_hash`.
 - Workspace invalidation keeps the older declaration signature as a safety
   comparison, but COMPOOL importer revalidation is pruned when the public
   summary hash is unchanged. Incomplete summaries are conservative and include
   the content hash, so partial or skipped parses invalidate rather than risk
   stale cross-module results.
-- The persistent cache stores these lightweight summaries in
-  `.jovial-lsp-cache/module-summaries.json` with cache-version, source
-  extension, parser/indexer, metadata, content-hash, and reverse-importer data.
+- The persistent cache stores these lightweight summaries in binary-first
+  payloads such as `.jovial_ls/cache/module-summaries.bin` with strict
+  cache-version, source extension, parser/indexer, metadata, and content-hash
+  validation. Legacy JSON readers remain only as migration fallbacks when no
+  binary payload exists.
   Hydrated summaries can answer warm-start cross-module lookups, but summary-only
   query results remain provisional until normal workspace readiness catches up.
 - Perf counters exposed through the existing debug snapshot include

@@ -5,6 +5,7 @@ open Workspace_state
 open Workspace_nav_model
 open Workspace_nav_lookup
 open Workspace_navigation_support
+module Metadata = Workspace_symbol_metadata
 
 let is_fast_scoped_definition_target (d : def) : bool =
   d.kind <> sym_kind_field && d.kind <> sym_kind_module
@@ -20,7 +21,8 @@ let fast_local_defs_before_position (ws : t) (doc : Document.t) (pos : T.Positio
       defs
       |> List.filter (fun d ->
              same_uri d.uri doc.Document.uri && d.key = key
-             && is_fast_scoped_definition_target d)
+             && is_fast_scoped_definition_target d
+             && not (is_ref_import_def d))
     in
     let parsed_authoritative =
       match Document.current_parse doc with
@@ -71,13 +73,17 @@ let fast_local_defs_before_position (ws : t) (doc : Document.t) (pos : T.Positio
       if defs <> [] || parsed_authoritative then defs
       else matching (fallback_line_defs doc)
     in
-    defs |> prefer_local_defs_before_position doc pos
+    defs |> prefer_non_ref_targets |> prefer_local_defs_before_position doc pos
 
 let fast_imported_defs_for_key (ws : t) (doc : Document.t) ~(key : string) :
     def list =
   if key = "" then []
   else
-    let filter = List.filter is_fast_scoped_definition_target in
+    let filter defs =
+      defs |> List.filter is_fast_scoped_definition_target
+      |> List.filter (is_real_definition_target ws)
+      |> prefer_non_ref_targets
+    in
     let summary_hits =
       summary_defs_for_imported_compools ~max_defs:8 ws doc ~key |> filter
     in
@@ -128,7 +134,9 @@ let fast_global_proc_defs_for_key (ws : t) ~(key : string) : def list =
     let hits =
       Workspace_foundation.Perf_stats.time "query.fast_global_proc_rank_ms"
         (fun () ->
-      if line_hits <> [] then line_hits |> prefer_non_ref_targets |> uniq_defs
+      if line_hits <> [] then
+        line_hits |> prefer_real_definition_targets ws |> prefer_non_ref_targets
+        |> uniq_defs
       else
         semantic_hits
         |> prefer_real_definition_targets ws
@@ -139,17 +147,101 @@ let fast_global_proc_defs_for_key (ws : t) ~(key : string) : def list =
       Workspace_foundation.Perf_stats.tick "query.fast_global_proc_hit";
     hits)
 
+let doc_has_external_ref_for_key (ws : t) (doc : Document.t) ~(key : string) :
+    bool =
+  key <> ""
+  && ((ws.sem_store_enabled
+      &&
+      Semantic_store.defs_for_key_in_uri ws.semantic_store ~uri:doc.Document.uri
+        ~key
+      |> List.exists (fun d ->
+             Metadata.is_external_ref (def_of_snapshot_def d).metadata))
+     || collect_doc_defs doc
+        |> List.exists (fun d -> d.key = key && is_ref_import_def d))
+
+let imported_compools_have_external_ref_for_key (ws : t) (doc : Document.t)
+    ~(key : string) : bool =
+  key <> ""
+  && (semantic_defs_for_imported_compools ~max_defs:8 ws doc ~key
+     @ summary_defs_for_imported_compools ~max_defs:8 ws doc ~key)
+     |> List.exists is_ref_import_def
+
 let fast_nonlocal_defs_for_key (ws : t) (doc : Document.t) ~(key : string) :
     def list =
-  let imported_defs = fast_imported_defs_for_key ws doc ~key in
-  if
-    List.exists
-      (fun d -> d.kind <> sym_kind_func || not (is_ref_import_def d))
-      imported_defs
-  then imported_defs
+  let imported_defs =
+    fast_imported_defs_for_key ws doc ~key |> prefer_non_ref_targets
+  in
+  if imported_defs <> [] then imported_defs
+  else if
+    imported_compool_scopes doc <> []
+    && not
+         (has_unscoped_fallback_context doc
+         || doc_has_external_ref_for_key ws doc ~key)
+    && not (imported_compools_have_external_ref_for_key ws doc ~key)
+  then []
   else
     let global_proc_defs = fast_global_proc_defs_for_key ws ~key in
     if global_proc_defs <> [] then global_proc_defs else imported_defs
+
+let startup_fast_definition_active (ws : t) (doc : Document.t) : bool =
+  ws.startup_fully_nav_ready_ms = None
+  &&
+  (String.length doc.Document.text >= ws.full_semantic_tokens_max_bytes
+  ||
+  match Workspace_runtime.workspace_profile_for_budget ws with
+  | Workspace_foundation.ProfileLarge -> true
+  | Workspace_foundation.ProfileSmall | Workspace_foundation.ProfileMedium ->
+      false)
+
+let startup_local_defs_before_position (ws : t) (doc : Document.t)
+    (pos : T.Position.t) ~(key : string) : def list =
+  if
+    key = ""
+    || String.length doc.Document.text
+       > max 2_097_152 ws.full_semantic_tokens_max_bytes
+  then
+    []
+  else
+    fallback_line_defs doc
+    |> List.filter (fun d ->
+           same_uri d.uri doc.Document.uri && d.key = key
+           && is_fast_scoped_definition_target d
+           && not (is_ref_import_def d))
+    |> prefer_local_defs_before_position doc pos
+
+let startup_fast_definition_locations (budget : nav_budget) (ws : t)
+    (doc : Document.t) ~(pos : T.Position.t) : T.Location.t list =
+  let pos = adjust_nav_position doc pos in
+  if nav_budget_check budget then []
+  else
+    match import_under_cursor doc pos with
+    | Some imp -> defs_for_import_cursor ws imp |> List.map location_of_def
+    | None -> (
+        match nav_word_at_position doc pos with
+        | None -> []
+        | Some (nm, word_loc) ->
+            let key = normalize_name nm in
+            if key = "" then []
+            else
+              let local_defs =
+                startup_local_defs_before_position ws doc pos ~key
+              in
+              let imported_defs =
+                if local_defs <> [] then []
+                else
+                  let semantic_hits =
+                    semantic_defs_for_imported_compools ~max_defs:8 ws doc ~key
+                  in
+                  if semantic_hits <> [] then semantic_hits
+                  else summary_defs_for_imported_compools ~max_defs:8 ws doc ~key
+              in
+              let quick_defs =
+                if local_defs <> [] || imported_defs <> [] then []
+                else proc_index_real_defs_by_key ws doc ~key
+              in
+              let defs = local_defs @ imported_defs @ quick_defs in
+              if defs <> [] then List.map location_of_def defs
+              else [ Lsp_conv.location_of_loc ~uri:doc.Document.uri word_loc ])
 
 let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) : T.Location.t list =
@@ -162,6 +254,8 @@ let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
         let budget = nav_budget_start ws in
         let compute () =
           if nav_budget_check budget then []
+          else if startup_fast_definition_active ws doc then
+            startup_fast_definition_locations budget ws doc ~pos
           else
             match import_under_cursor doc pos with
             | Some imp ->
@@ -295,7 +389,9 @@ let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                                         ~key:d.key
                                     else proc_real_defs_by_key ws doc ~key:d.key
                                   in
-                                  if impls = [] then [ d ] else impls
+                                  if impls = [] then
+                                    if is_ref_import_def d then [] else [ d ]
+                                  else impls
                                 else [ d ]
                               in
                               List.map location_of_def defs
@@ -353,6 +449,7 @@ let definition_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                                     | Some (nm, _) ->
                                         fallback_defs_by_name ws doc
                                           (normalize_name nm)
+                                        |> prefer_non_ref_targets
                                         |> prefer_local_defs_before_position doc
                                              pos
                                   in
@@ -403,12 +500,7 @@ let declaration_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                   in
                   if real_fallback <> [] then
                     List.map location_of_def real_fallback
-                  else
-                    let ref_fallback =
-                      proc_defs |> List.filter is_ref_import_def
-                    in
-                    if ref_fallback = [] then definition_locations_for ws ~uri ~pos
-                    else List.map location_of_def ref_fallback
+                  else definition_locations_for ws ~uri ~pos
                 else List.map location_of_def decls
           | None -> definition_locations_for ws ~uri ~pos
       in

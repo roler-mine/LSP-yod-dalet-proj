@@ -167,8 +167,8 @@ let empty_client_overrides : client_overrides =
     implementation_config = Implementation_config.empty_client_overrides;
   }
 
-let pressure_soft_mb_default = 512
-let pressure_critical_mb_default = 768
+let pressure_soft_mb_default = 1536
+let pressure_critical_mb_default = 2048
 let startup_target_ms_default = 1500
 let startup_diag_hover_target_ms_default = 1500
 let startup_nav_target_ms_default = 1500
@@ -385,7 +385,7 @@ let from_env () : t =
          ~default:startup_aggressive_bg_budget_ms_default)
   in
   let parse_worker_count =
-    max 1 (Env_utils.nonneg_int "JOVIAL_BG_PARSE_WORKER_COUNT" ~default:2)
+    max 1 (Env_utils.nonneg_int "JOVIAL_BG_PARSE_WORKER_COUNT" ~default:4)
   in
   let parse_worker_max_inflight =
     max 1

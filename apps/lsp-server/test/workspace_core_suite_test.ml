@@ -539,6 +539,35 @@ let assert_shifted_suffix_reuse name text ~(start_off : int) ~(old_len : int)
     (name ^ " no token fallback")
     cache.Lib.Syntax_cache.token_reuse.fallback_reason
 
+let token_repr (tok : Lib.Parser.token) : string =
+  match tok with
+  | Lib.Parser.ID s -> "ID(" ^ s ^ ")"
+  | Lib.Parser.FIXED_A s -> "FIXED_A(" ^ s ^ ")"
+  | Lib.Parser.INTLIT s -> "INTLIT(" ^ s ^ ")"
+  | Lib.Parser.FLOATLIT s -> "FLOATLIT(" ^ s ^ ")"
+  | Lib.Parser.STRINGLIT s -> "STRINGLIT(" ^ String.escaped s ^ ")"
+  | t -> Lib.Parser.Debug.string_of_token t
+
+let token_stream_repr (tokens : Lib.Preprocess.lex_tok array) : string =
+  tokens |> Array.to_list
+  |> List.map (fun (span : Lib.Preprocess.lex_tok) ->
+         token_repr span.Lib.Parser.tok)
+  |> String.concat " "
+
+let expect_same_token_stream name (got : Lib.Preprocess.lex_tok array)
+    (want : Lib.Preprocess.lex_tok array) : unit =
+  let got_toks =
+    got |> Array.to_list
+    |> List.map (fun (span : Lib.Preprocess.lex_tok) -> span.Lib.Parser.tok)
+  in
+  let want_toks =
+    want |> Array.to_list
+    |> List.map (fun (span : Lib.Preprocess.lex_tok) -> span.Lib.Parser.tok)
+  in
+  if got_toks <> want_toks then
+    failf "%s: token stream mismatch\ngot:  [%s]\nwant: [%s]" name
+      (token_stream_repr got) (token_stream_repr want)
+
 let test_shifted_suffix_token_reuse () =
   let proc_text item_line =
     String.concat "\n"
@@ -589,6 +618,65 @@ let test_shifted_suffix_token_reuse () =
   in
   assert_shifted_suffix_reuse "comment-insert" comment_text
     ~start_off:comment_off ~old_len:0 ~replacement:"x"
+
+let test_incremental_stateful_lexer_restart_matches_full_lex () =
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "!COMPOOL (\"DATA\");";
+        "DEFINE LIMIT \"10\";";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ITEM NUM U 6;";
+        "  NUM = LIMIT;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let assert_edit name ~(offset : int) ~(replacement : string) : unit =
+    let uri =
+      expect_some (name ^ " URI")
+        (Lib.Uri_path.docuri_of_string
+           ("file:///workspace-stateful-lexer-" ^ name ^ ".j73"))
+    in
+    let doc = Lib.Document.make ~uri ~file:None ~text in
+    let range =
+      {
+        T.Range.start = position_of_offset text offset;
+        end_ = position_of_offset text offset;
+      }
+    in
+    let change =
+      T.TextDocumentContentChangeEvent.create ~range ~text:replacement ()
+    in
+    let updated =
+      Lib.Document.apply_changes_and_reparse ~changes:[ change ] doc
+    in
+    let cache =
+      expect_some (name ^ " syntax cache") updated.Lib.Document.syntax
+    in
+    let got =
+      expect_some (name ^ " raw tokens") cache.Lib.Syntax_cache.raw_tokens
+    in
+    let want =
+      Lib.Preprocess.lex_all_tokens ~file:None ~text:updated.Lib.Document.text
+    in
+    expect_true
+      (name ^ " attempted token reuse")
+      cache.Lib.Syntax_cache.token_reuse.attempted;
+    expect_true
+      (name ^ " rejoined suffix")
+      (cache.Lib.Syntax_cache.token_reuse.reused_suffix_tokens > 0);
+    expect_same_token_stream name got want
+  in
+  assert_edit "define-string-edit"
+    ~offset:(find_nth text ~needle:"10" ~nth:0 + 1)
+    ~replacement:"0";
+  assert_edit "compool-string-edit"
+    ~offset:(find_nth text ~needle:"DATA" ~nth:0 + 2)
+    ~replacement:"_"
 
 let test_checkpoint_reuse_after_failed_parse () =
   let text =
@@ -752,6 +840,26 @@ let test_quick_nav_uses_token_skeleton () =
         (List.mem (normalize_name name) names))
     [ "TARGET"; "MAC"; "MAIN"; "NUM"; "TAB"; "REC"; "LBL" ]
 
+let test_startup_foreground_nav_index_respects_budget () =
+  let root = mk_temp_dir "jovial-foreground-nav-budget" in
+  let path_a = Filename.concat root "A.j73" in
+  let path_b = Filename.concat root "B.j73" in
+  write_text path_a (main_text "A");
+  write_text path_b (main_text "B");
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  ignore (Lib.Workspace_state.set_source_files ws [ path_a; path_b ]);
+  Lib.Workspace_index_graph.rescan ws;
+  Lib.Workspace_background.complete_startup_nav_index_foreground ~max_ms:0 ws;
+  expect_int "foreground budget seeds quick-nav total"
+    ws.Lib.Workspace_foundation.quick_nav_index_total 2;
+  expect_int "foreground budget does not drain synchronously"
+    ws.Lib.Workspace_foundation.quick_nav_index_done 0;
+  expect_true "foreground budget leaves pending quick-nav work"
+    (Queue.length ws.Lib.Workspace_foundation.quick_nav_pending_paths > 0);
+  expect_false "foreground budget keeps startup index incomplete"
+    (Lib.Workspace_runtime.quick_nav_index_complete ws)
+
 let token_names text =
   Lib.Preprocess.lex_all_tokens ~file:None ~text
   |> Array.to_list
@@ -785,18 +893,230 @@ let test_lexer_regressions () =
   expect_true "conversion right token retained" (List.mem "*)" names);
   expect_true "based integer retained" (List.mem "INTLIT" names);
   expect_true "quoted identifier retained" (List.mem "ID" names);
+  let recovered_names = token_names "START\nITEM A U 1;\n[bad]\nITEM B U 1;\nTERM\n" in
+  let item_count =
+    List.fold_left
+      (fun acc name -> if name = "ITEM" then acc + 1 else acc)
+      0 recovered_names
+  in
+  expect_int "unexpected punctuation does not stop tokenization" item_count 2;
   let lexbuf = Lexing.from_string "DEFINE BAD \"unterminated" in
   Lib.Lexer.with_session_state (fun lexer ->
       match Lib.Lexer.token lexer lexbuf with
       | Lib.Parser.DEFINE -> (
           match Lib.Lexer.token lexer lexbuf with
           | Lib.Parser.ID _ -> (
-              try
-                ignore (Lib.Lexer.token lexer lexbuf);
-                failf "unterminated DEFINE string did not raise"
-              with Lib.Lexer.Lex_error _ -> ())
+              match Lib.Lexer.token lexer lexbuf with
+              | Lib.Parser.BAD_STRING s ->
+                  expect_true
+                    "unterminated DEFINE string is explicit bad token"
+                    (string_contains ~needle:"unterminated" s);
+                  (match Lib.Lexer.token lexer lexbuf with
+                  | Lib.Parser.EOF -> ()
+                  | _ -> failf "expected EOF after BAD_STRING")
+              | _ -> failf "expected BAD_STRING for unterminated DEFINE string")
           | _ -> failf "expected ID after DEFINE")
-      | _ -> failf "expected DEFINE token")
+        | _ -> failf "expected DEFINE token")
+
+let test_cross_file_index_name_table_and_tokens () =
+  let module C = Lib.Cross_file_index in
+  let names = C.NameTable.create () in
+  let mixed = C.NameTable.intern_identifier names "alpha'bravo$charlie" in
+  let upper = C.NameTable.intern_identifier names "ALPHA'BRAVO$CHARLIE" in
+  expect_int "JOVIAL names are case-insensitive" upper mixed;
+  expect_string "apostrophe and dollar are preserved"
+    (expect_some "normalized text" (C.NameTable.text names mixed))
+    "ALPHA'BRAVO$CHARLIE";
+  let first_31 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ12345" in
+  expect_int "first 31 helper length" (String.length first_31) 31;
+  let long_a = C.NameTable.intern_identifier names (first_31 ^ "A") in
+  let long_b = C.NameTable.intern_identifier names (first_31 ^ "B") in
+  expect_int "normal names compare by first 31 significant chars" long_b long_a;
+  let raw = C.NameTable.intern_raw names "alpha'bravo$charlie" in
+  if raw = mixed then failf "raw name interning should not normalize identifiers";
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "DEFINE MAC \"alpha'bravo$charlie\";";
+        "ITEM VALUE U 6;";
+        "TERM";
+        "";
+      ]
+  in
+  let token_index =
+    Lib.Preprocess.lex_all_tokens_with_lexemes ~file:None ~text
+    |> C.TokenIndex.of_lex_tokens names
+  in
+  let value_tok =
+    expect_some "identifier token"
+      (C.TokenIndex.find_at_offset token_index
+         (find_nth text ~needle:"VALUE" ~nth:0 + 1))
+  in
+  expect_true "identifier token has name id" (value_tok.C.TokenIndex.name_id <> None);
+  let literal_tok =
+    C.TokenIndex.all token_index
+    |> List.find_opt (fun (tok : C.TokenIndex.token) ->
+           tok.kind = C.TokenIndex.LiteralToken
+           &&
+           match tok.raw_text with
+           | Some raw -> string_contains ~needle:"alpha'bravo$charlie" raw
+           | None -> false)
+    |> expect_some "string literal token"
+  in
+  expect_true "string literal is a literal token"
+    (literal_tok.C.TokenIndex.kind = C.TokenIndex.LiteralToken);
+  expect_none "string literal text is not normalized as identifier"
+    literal_tok.C.TokenIndex.name_id
+
+let test_worker_ipc_binary_roundtrip () =
+  let module W = Lib.Worker_ipc in
+  let job =
+    W.JobOpen
+      {
+        kind = W.JobHighLarge;
+        epoch = 42;
+        path_key = "c:/repo/main.j73";
+        uri = "file:///c:/repo/main.j73";
+        generation = 7;
+        text_hash = "hash-open";
+        parse_profile = "background";
+        started_ms = 1234.5;
+        doc_slot = 99;
+        file = Some "c:/repo/main.j73";
+        rev = 3;
+        lsp_version = Some 12;
+      }
+  in
+  let frame = W.encode_parse_job job in
+  expect_true "worker IPC frame uses binary magic"
+    (Bytes.length frame >= 4 && Bytes.sub_string frame 0 4 = "J73B");
+  expect_false "worker IPC frame is not JSON text"
+    (Bytes.length frame > 0 && Bytes.get frame 0 = '{');
+  let decoded =
+    match W.decode_parse_job frame with
+    | Ok job -> job
+    | Error msg -> failf "worker IPC job decode failed: %s" msg
+  in
+  (match decoded with
+  | W.JobOpen x ->
+      expect_int "worker IPC job epoch" x.epoch 42;
+      expect_string "worker IPC job uri" x.uri "file:///c:/repo/main.j73";
+      expect_string "worker IPC job text hash" x.text_hash "hash-open";
+      expect_string "worker IPC job profile" x.parse_profile "background";
+      expect_int "worker IPC job doc slot" x.doc_slot 99;
+      expect_int "worker IPC job lsp version"
+        (expect_some "worker IPC job lsp version" x.lsp_version)
+        12
+  | W.JobPath _ -> failf "expected decoded open worker job");
+  let result =
+    W.ResultPath
+      {
+        kind = W.JobNormalLarge;
+        epoch = 43;
+        path = "c:/repo/compool.j73";
+        path_key = "c:/repo/compool.j73";
+        doc_slot = Some 123;
+      }
+  in
+  let result_frame = W.encode_parse_result result in
+  (match W.parse_result_message_kind result_frame with
+  | Ok W.ResultMessagePath -> ()
+  | Ok _ -> failf "worker IPC result kind should be path"
+  | Error msg -> failf "worker IPC result kind failed: %s" msg);
+  match W.decode_parse_result result_frame with
+  | Ok (W.ResultPath x) ->
+      expect_int "worker IPC result epoch" x.epoch 43;
+      expect_int "worker IPC result slot"
+        (expect_some "worker IPC result slot" x.doc_slot)
+        123
+  | Ok _ -> failf "expected decoded path worker result"
+  | Error msg -> failf "worker IPC result decode failed: %s" msg
+
+let test_source_file_sets_preserve_workspace_uri () =
+  let workspace_uri = "file:///workspace-root" in
+  let source_root_uri = "file:///workspace-root/apps" in
+  let source_file_uri = "file:///workspace-root/apps/MAIN.j73" in
+  let params =
+    `Assoc
+      [
+        ( "initializationOptions",
+          `Assoc
+            [
+              ( "jovial",
+                `Assoc
+                  [
+                    ( "workspace",
+                      `Assoc
+                        [
+                          ( "sourceFileSets",
+                            `List
+                              [
+                                `Assoc
+                                  [
+                                    ("workspaceUri", `String workspace_uri);
+                                    ("rootUri", `String source_root_uri);
+                                    ( "fileUris",
+                                      `List [ `String source_file_uri ] );
+                                    ("assemblyFileUris", `List []);
+                                    ("searchTruncated", `Bool false);
+                                  ];
+                              ] );
+                        ] );
+                  ] );
+            ] );
+      ]
+  in
+  match Lib.Lsp_request.parse_source_file_sets params with
+  | [ set ] ->
+      expect_string "source set keeps workspace cache root"
+        (Lib.Uri_path.docuri_to_string
+           (expect_some "source set workspace uri" set.workspace_uri))
+        workspace_uri;
+      expect_string "source set keeps inferred source root"
+        (Lib.Uri_path.docuri_to_string set.source_root_uri)
+        source_root_uri
+  | sets ->
+      failf "expected one parsed source file set, got %d" (List.length sets)
+
+let test_compool_quoted_name_does_not_consume_following_item () =
+  let check suffix =
+    let text =
+      String.concat "\n"
+        [ "COMPOOL 'DATA'" ^ suffix; "ITEM SOMETHING U 6;"; "" ]
+    in
+    let uri =
+      expect_some "compool quoted regression uri"
+        (Lib.Uri_path.docuri_of_string "file:///compool-quoted-regression.j73")
+    in
+    let doc = Lib.Document.make ~uri ~file:None ~text in
+    let diag_messages =
+      Lib.Document.diagnostics doc
+      |> List.map (fun (d : T.Diagnostic.t) ->
+             match d.message with
+             | `String s -> s
+             | `MarkupContent mc -> mc.value)
+    in
+    if
+      List.exists
+        (string_contains ~needle:"Parse error near token ITEM")
+        diag_messages
+    then
+      failf "quoted COMPOOL before ITEM: unexpected diagnostics [%s]"
+        (String.concat "; " diag_messages);
+    let symbols =
+      match Lib.Document.current_parse doc with
+      | Some { Lib.Document.parsed_syntax = Some syntax; _ } ->
+          syntax.Lib.Syntax_cache.skeleton.symbols
+      | _ -> []
+    in
+    List.exists
+      (fun (s : Lib.Syntax_cache.skeleton_symbol) ->
+        s.sk_name = "SOMETHING" && s.sk_kind = Lib.Syntax_cache.SkItem)
+      symbols
+  in
+  expect_true "item after semicolon quoted COMPOOL is still indexed" (check ";");
+  expect_true "item after newline quoted COMPOOL is still indexed" (check "")
 
 let diagnostic_texts (diags : T.Diagnostic.t list) : string list =
   List.map
@@ -819,6 +1139,165 @@ let expect_no_diagnostic_containing label ~(needle : string)
   if diagnostics_contain diags ~needle then
     failf "%s: unexpected diagnostic containing %S in [%s]" label needle
       (String.concat "; " (diagnostic_texts diags))
+
+let test_non_compool_bang_directives_are_skipped () =
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "!COMPOOL ('DATA');";
+        "!COPY 'IDENT.NEW';";
+        "!LIST;";
+        "!IF DEBUG;";
+        "!ITEM TOOLING;";
+        "TYPE ORDERED TABLE;";
+        "BEGIN";
+        "  !ORDER;";
+        "  ITEM FIELD U 6;";
+        "END";
+        "DEF PROC MAIN RENT;";
+        "!LINKAGE BIF;";
+        "BEGIN";
+        "  ITEM N U 6;";
+        "  N = 1;";
+        "  !INTERFERENCE N : N, N;";
+        "  !TRACE (N > 0) N;";
+        "  !INLINE LOCALTRACE;";
+        "  N = N + 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let uri =
+    expect_some "bang directives URI"
+      (Lib.Uri_path.docuri_of_string "file:///bang-directives.j73")
+  in
+  let doc = Lib.Document.make ~uri ~file:None ~text in
+  let diags = Lib.Document.diagnostics doc in
+  expect_no_diagnostic_containing "bang directives parse"
+    ~needle:"Parse error" diags;
+  expect_no_diagnostic_containing "bang directives avoid token errors"
+    ~needle:"Lex error" diags;
+  let prog =
+    match Lib.Document.current_parse doc with
+    | Some { Lib.Document.parsed_ast = Some prog; _ } -> prog
+    | _ -> failf "bang directives should parse"
+  in
+  let top_directives =
+    let rec collect acc = function
+      | Lib.Ast.TopDecl { v = Lib.Ast.DDirective { name; _ }; _ } ->
+          name.v :: acc
+      | Lib.Ast.TopModule m -> List.fold_left collect acc m.v.module_items
+      | _ -> acc
+    in
+    List.fold_left collect [] prog |> List.rev
+  in
+  expect_true "!COMPOOL remains a real directive"
+    (List.mem "COMPOOL" top_directives);
+  expect_false "!COPY is skipped by the parser"
+    (List.mem "COPY" top_directives);
+  expect_false "!LIST is skipped by the parser"
+    (List.mem "LIST" top_directives);
+  expect_false "non-COMPOOL bang directives are not kept as AST directives"
+    (List.exists
+       (fun name -> name = "IF" || name = "ITEM" || name = "LINKAGE")
+       top_directives)
+
+let test_manual_fixed_type_comma_sizes_parse () =
+  let module A = Lib.Ast in
+  let text =
+    String.concat "\n"
+      [ "START"; "ITEM ANGLE A 2,13;"; "PROC SCALE A 2,13;"; "TERM"; "" ]
+  in
+  let uri =
+    expect_some "manual fixed type URI"
+      (Lib.Uri_path.docuri_of_string "file:///manual-fixed-type.j73")
+  in
+  let doc = Lib.Document.make ~uri ~file:None ~text in
+  expect_no_diagnostic_containing "manual fixed type comma sizes"
+    ~needle:"Parse error" (Lib.Document.diagnostics doc);
+  let prog =
+    match Lib.Document.current_parse doc with
+    | Some { Lib.Document.parsed_ast = Some prog; _ } -> prog
+    | _ -> failf "manual fixed type forms should parse"
+  in
+  let rec find_top f = function
+    | [] -> None
+    | Lib.Ast.TopModule m :: rest -> (
+        match find_top f m.v.module_items with
+        | Some _ as hit -> hit
+        | None -> find_top f rest)
+    | top :: rest -> (
+        match f top with Some _ as hit -> hit | None -> find_top f rest)
+  in
+  let angle_ty =
+    find_top
+      (function
+      | A.TopDecl { v = A.DVar { name; dtype; _ }; _ } when name.v = "ANGLE" ->
+          Some dtype
+      | _ -> None)
+      prog
+    |> expect_some "ANGLE fixed item"
+  in
+  let scale_ret =
+    find_top
+      (function
+      | A.TopDecl { v = A.DProc proc; _ } when proc.v.name.v = "SCALE" ->
+          proc.v.returns
+      | _ -> None)
+      prog
+    |> expect_some "SCALE fixed return type"
+  in
+  expect_string "manual fixed item display"
+    (Lib.Workspace_symbol_metadata.type_display angle_ty)
+    "A 2,13";
+  expect_string "manual fixed PROC return display"
+    (Lib.Workspace_symbol_metadata.type_display scale_ret)
+    "A 2,13"
+
+let test_e2e_seeded_diagnostic_source_parses () =
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "PROC E2E'MIXED(COUNT'ARG, FLAGS'ARG);";
+        "BEGIN";
+        "  ITEM COUNT'ARG U 10;";
+        "  ITEM FLAGS'ARG B 4;";
+        "END";
+        "TYPE E2E'RECORD TABLE;";
+        "BEGIN";
+        "  ITEM GOODFIELD U 10;";
+        "END";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ITEM COUNT U 10;";
+        "  ITEM FLAGS B 4;";
+        "  ITEM TEXT C 1;";
+        "  ITEM REC'PTR P E2E'RECORD;";
+        "  ITEM NEEDS'IMPORT E2E_REMOTE_COUNT;";
+        "  COUNT = TEXT;";
+        "  E2E'MIXED(COUNT: FLAGS);";
+        "  E2E'MIXED(TEXT: FLAGS);";
+        "  E2E'MIXED(COUNT: FLAGS, TEXT);";
+        "  E2E'UNREFD'PROC(COUNT);";
+        "  E2E_IMPORTED_PROC();";
+        "  COUNT = GOODFIELD @ REC'PTR;";
+        "  COUNT = MISSINGFIELD @ REC'PTR;";
+        "  COUNT = @ COUNT;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let uri =
+    expect_some "e2e seeded diagnostic parser URI"
+      (Lib.Uri_path.docuri_of_string "file:///e2e-seeded-diagnostics.j73")
+  in
+  let doc = Lib.Document.make ~uri ~file:None ~text in
+  expect_no_diagnostic_containing "e2e seeded diagnostic source parses"
+    ~needle:"Parse error" (Lib.Document.diagnostics doc)
 
 let diagnostic_authority_text
     (diag : Lib.Workspace_diagnostic_authority.diagnostic) : string =
@@ -1506,7 +1985,17 @@ let test_parse_worker_stale_open_job_detected () =
     {
       pj_kind = ParseJobHighLarge;
       pj_epoch = ws.parse_epoch;
-      pj_payload = ParseJobOpen { path_key; uri; generation; doc };
+      pj_payload =
+        ParseJobOpen
+          {
+            path_key;
+            uri;
+            generation;
+            text_hash = Digest.to_hex (Digest.string (Lib.Document.text doc));
+            parse_profile = "background";
+            started_ms = 0.0;
+            doc;
+          };
     }
   in
   let change =
@@ -1715,6 +2204,149 @@ let revalidated_diagnostics ws uri =
   ignore (Lib.Workspace_doc_lifecycle.revalidate_all ws);
   Lib.Workspace_state.diagnostics_for ws ~uri
 
+let test_bad_lexer_tokens_are_structured_diagnostics () =
+  let text = String.concat "\n" [ "START"; "ITEM OK U 6;"; "#"; "TERM"; "" ] in
+  let uri =
+    expect_some "bad lexer token URI"
+      (Lib.Uri_path.docuri_of_string "file:///bad-lexer-token.j73")
+  in
+  let doc = Lib.Document.make ~uri ~file:None ~text in
+  let syntax =
+    match Lib.Document.current_parse doc with
+    | Some { Lib.Document.parsed_syntax = Some syntax; _ } -> syntax
+    | _ -> failf "bad lexer token document should keep a syntax cache"
+  in
+  let raw_tokens =
+    expect_some "bad lexer token raw tokens" syntax.Lib.Syntax_cache.raw_tokens
+  in
+  expect_true "bad character is retained as a BAD_CHAR token"
+    (Array.exists
+       (fun (span : Lib.Preprocess.lex_tok) ->
+         match span.Lib.Parser.tok with Lib.Parser.BAD_CHAR _ -> true | _ -> false)
+       raw_tokens);
+  expect_diagnostic_containing "bad character diagnostic"
+    ~needle:"Invalid character" (Lib.Document.diagnostics doc)
+
+let test_nested_define_numeric_paste_parses_cleanly () =
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "COMPOOL TINYCOMP2;";
+        "DEFINE GGG(A) \"50$A\";";
+        "DEFINE BOBA(A) \"50GGG($A)\";";
+        "DEF BEGIN";
+        "  ITEM THAT'ONE'ITEM B BOBA(009);";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let syntax =
+    Lib.Syntax_cache.build_with_profile ~profile:Lib.Parser.Batch ~file:None
+      ~text ()
+  in
+  expect_string "nested numeric-paste DEFINE health"
+    (match syntax.Lib.Syntax_cache.parse.parse_health with
+    | Lib.Parser.ParseClean -> "clean"
+    | Lib.Parser.ParseRecovered -> "recovered"
+    | Lib.Parser.ParsePartial -> "partial"
+    | Lib.Parser.ParseSkeletonOnly -> "skeleton"
+    | Lib.Parser.ParseLexicalOnly -> "lexical"
+    | Lib.Parser.ParseFailedInternal -> "internal")
+    "clean";
+  expect_int "nested numeric-paste DEFINE syntax diagnostics"
+    (List.length syntax.Lib.Syntax_cache.parse.diags)
+    0;
+  expect_int "nested numeric-paste DEFINE recovery diagnostics"
+    (List.length syntax.Lib.Syntax_cache.parse.recovery_diags)
+    0;
+  expect_true "nested numeric-paste DEFINE expands nested function macro"
+    (string_contains ~needle:"5050009" syntax.Lib.Syntax_cache.preprocess.text)
+
+let test_call_statement_without_terminator_parses_cleanly () =
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  HELP2()";
+        "  HELP3();";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let syntax =
+    Lib.Syntax_cache.build_with_profile ~profile:Lib.Parser.Batch ~file:None
+      ~text ()
+  in
+  expect_string "call statement without terminator health"
+    (match syntax.Lib.Syntax_cache.parse.parse_health with
+    | Lib.Parser.ParseClean -> "clean"
+    | Lib.Parser.ParseRecovered -> "recovered"
+    | Lib.Parser.ParsePartial -> "partial"
+    | Lib.Parser.ParseSkeletonOnly -> "skeleton"
+    | Lib.Parser.ParseLexicalOnly -> "lexical"
+    | Lib.Parser.ParseFailedInternal -> "internal")
+    "clean";
+  if syntax.Lib.Syntax_cache.parse.parse_confidence < 1.0 then
+    failf "call statement without terminator confidence expected 1.0, got %.2f"
+      syntax.Lib.Syntax_cache.parse.parse_confidence;
+  expect_int "call statement without terminator syntax diagnostics"
+    (List.length syntax.Lib.Syntax_cache.parse.diags)
+    0;
+  expect_int "call statement without terminator recovery diagnostics"
+    (List.length syntax.Lib.Syntax_cache.parse.recovery_diags)
+    0
+
+let test_parse_damage_suppresses_semantic_cascade () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "parse damage cascade URI"
+      (Lib.Uri_path.docuri_of_string "file:///parse-damage-cascade.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ITEM OK U 6;";
+        "  #";
+        "  MISSING = OK;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_diagnostic_containing "damaged source keeps primary lexer diagnostic"
+    ~needle:"Invalid character" diags;
+  expect_no_diagnostic_containing
+    "low-confidence parse suppresses undefined-symbol cascade"
+    ~needle:"Undefined" diags;
+  let doc =
+    expect_some "parse damage doc" (Hashtbl.find_opt ws.docs uri)
+  in
+  let syntax =
+    expect_some "parse damage syntax" doc.Lib.Document.syntax
+  in
+  if syntax.Lib.Syntax_cache.parse.Lib.Parser.parse_confidence >= 0.80 then
+    failf "damaged parse should not be high-confidence";
+  let report = Lib.Workspace_query.debug_report_json ws doc in
+  let parse_status = expect_json_field "parse damage debug report" "parseStatus" report in
+  (match
+     expect_json_field "parse damage debug report" "semanticDiagnosticsSuppressed"
+       parse_status
+   with
+  | `Bool true -> ()
+  | got ->
+      failf "parse damage debug report: expected semantic suppression, got %s"
+        (Yojson.Safe.to_string got))
+
 let test_literals_keywords_and_strings_are_not_hover_targets () =
   let ws = Lib.Workspace_state.create () in
   let uri =
@@ -1828,6 +2460,56 @@ let test_closed_document_diagnostics_refresh_after_file_change () =
   expect_diagnostic_containing "updated closed-file diagnostic"
     ~needle:"MISSING_NEW" after;
   expect_no_diagnostic_containing "stale closed-file diagnostic removed"
+    ~needle:"MISSING_OLD" after
+
+let test_force_closed_document_diagnostics_refresh_during_large_startup () =
+  let root = mk_temp_dir "jovial-closed-diag-force-refresh" in
+  let settings =
+    {
+      (Lib.Workspace_settings.from_env ()) with
+      workspace_profile_mode = Lib.Workspace_settings.ProfileModeLarge;
+    }
+  in
+  let ws = Lib.Workspace_state.create ~settings () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  let initial_text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  MISSING_OLD = 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let uri, path = open_workspace_text ws root "CLOSED.j73" initial_text in
+  Lib.Workspace_doc_lifecycle.close_doc ws ~uri;
+  let updated_text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  MISSING_NEW = 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  write_text path updated_text;
+  Lib.Workspace_doc_lifecycle.apply_watched_file_changes ws
+    ~changes:[ (path, `Changed) ];
+  expect_false "normal closed refresh obeys large-startup quiet"
+    (Lib.Workspace_background.refresh_closed_doc_diagnostics_now ws ~uri);
+  expect_true "forced closed refresh bypasses large-startup quiet"
+    (Lib.Workspace_background.refresh_closed_doc_diagnostics_now ~force:true ws
+       ~uri);
+  let after = Lib.Workspace_state.diagnostics_for ws ~uri in
+  expect_diagnostic_containing "forced closed-file diagnostic"
+    ~needle:"MISSING_NEW" after;
+  expect_no_diagnostic_containing "forced refresh removes stale diagnostic"
     ~needle:"MISSING_OLD" after
 
 let test_selected_imported_item_helper_type_no_false_positive () =
@@ -2205,7 +2887,7 @@ let test_hover_nav_fixture_import_diagnostics_are_not_undefined () =
     write_text dst text;
     (dst, text)
   in
-  let compool_path, compool_text = copy_fixture "compool_data.j73" in
+  let compool_path, compool_text = copy_fixture "data.j73" in
   let find_path, find_text = copy_fixture "find_impl.j73" in
   let main_path, main_text = copy_fixture "main.j73" in
   let types_path, types_text = copy_fixture "types.j73" in
@@ -2214,7 +2896,7 @@ let test_hover_nav_fixture_import_diagnostics_are_not_undefined () =
   ignore
     (Lib.Workspace_state.set_source_files ws
        [ compool_path; find_path; main_path; types_path ]);
-  ignore (open_workspace_text ws root "compool_data.j73" compool_text);
+  ignore (open_workspace_text ws root "data.j73" compool_text);
   ignore (open_workspace_text ws root "find_impl.j73" find_text);
   ignore (open_workspace_text ws root "types.j73" types_text);
   let main_uri, _ = open_workspace_text ws root "main.j73" main_text in
@@ -2234,6 +2916,29 @@ let test_hover_nav_fixture_import_diagnostics_are_not_undefined () =
         ~needle:("Undefined procedure \"" ^ name ^ "\"")
         diags)
     [ "CLOCK"; "LIMIT"; "FIND"; "PRIVILEGE"; "COUNTER" ]
+
+let test_jovial_hover_nav_fixtures_parse_cleanly () =
+  [ "data.j73"; "find_impl.j73"; "main.j73"; "types.j73" ]
+  |> List.iter (fun name ->
+         let path = jovial_hover_nav_fixture name in
+         let text = read_text path in
+         let uri =
+           expect_some ("fixture URI: " ^ name) (Lib.Uri_path.docuri_of_path path)
+         in
+         let doc = Lib.Document.make ~uri ~file:(Some path) ~text in
+         let syntax_diags =
+           Lib.Document.diagnostics doc
+           |> diagnostic_texts
+           |> List.filter (fun msg ->
+                  string_contains ~needle:"Parse error" msg
+                  || string_contains ~needle:"Lex" msg
+                  || string_contains ~needle:"lexeme" msg)
+         in
+         match syntax_diags with
+         | [] -> ()
+         | _ ->
+             failf "fixture %s should parse cleanly, got [%s]" name
+               (String.concat "; " syntax_diags))
 
 let test_symbol_hints_include_skeleton_imported_helpers () =
   let root = mk_temp_dir "jovial-skeleton-import-hints" in
@@ -2420,6 +3125,62 @@ let test_truly_undefined_still_errors () =
   expect_diagnostic_containing "undefined proc still errors"
     ~needle:"REALLY_MISSING_PROC" diags
 
+let test_recursive_proc_call_requires_rec () =
+  let check use_attr =
+    let ws = Lib.Workspace_state.create () in
+    let uri =
+      expect_some ("recursive proc " ^ use_attr ^ " URI")
+        (Lib.Uri_path.docuri_of_string
+           ("file:///recursive-proc-" ^ String.lowercase_ascii use_attr ^ ".j73"))
+    in
+    let text =
+      String.concat "\n"
+        [
+          "START";
+          "DEF PROC MAIN " ^ use_attr ^ ";";
+          "BEGIN";
+          "  MAIN();";
+          "END";
+          "TERM";
+          "";
+        ]
+    in
+    Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+    revalidated_diagnostics ws uri
+  in
+  let rent_diags = check "RENT" in
+  expect_diagnostic_containing "RENT self-call requires REC"
+    ~needle:"requires REC" rent_diags;
+  let rec_diags = check "REC" in
+  expect_no_diagnostic_containing "REC self-call is allowed"
+    ~needle:"requires REC" rec_diags
+
+let test_proc_use_attr_before_return_type () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "procedure use attribute return URI"
+      (Lib.Uri_path.docuri_of_string "file:///proc-use-attr-return.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC VALUE RENT U 4;";
+        "BEGIN";
+        "  VALUE = 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_no_diagnostic_containing "RENT is parsed as a procedure use attribute"
+    ~needle:"Undefined type \"RENT\"" diags;
+  expect_no_diagnostic_containing
+    "return type after RENT stays available for result assignment"
+    ~needle:"procedure and cannot be used as a value" diags
+
 let test_status_size_and_colon_call_syntax_parse () =
   let ws = Lib.Workspace_state.create () in
   let uri =
@@ -2519,6 +3280,154 @@ let test_proc_call_argument_count_and_type_diagnostics () =
       "Argument count mismatch in call to \"ACCEPT\": expected 2, provided 3"
     diags
 
+let test_ref_proc_call_keeps_type_check_but_not_hard_arity () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "REF procedure call diagnostic URI"
+      (Lib.Uri_path.docuri_of_string "file:///ref-proc-call-diagnostics.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC HELPER RENT (NUM);";
+        "BEGIN";
+        "  ITEM NUM U 6;";
+        "END";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ITEM NUMBER U 6;";
+        "  ITEM NUMBER1 U 6;";
+        "  ITEM FLAG B 1;";
+        "  HELPER(FLAG);";
+        "  HELPER(NUMBER, NUMBER1);";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_diagnostic_containing "REF PROC still checks known formal types"
+    ~needle:
+      "Argument type mismatch in call to \"HELPER\": expected integer, provided \
+       bit"
+    diags;
+  expect_no_diagnostic_containing
+    "REF PROC arity waits for the external DEF binding"
+    ~needle:
+      "Argument count mismatch in call to \"HELPER\": expected 1, provided 2"
+    diags
+
+let test_imported_block_field_type_drives_call_diagnostic () =
+  let root = mk_temp_dir "jovial-imported-block-field-type" in
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  let compool_text =
+    String.concat "\n"
+      [
+        "START";
+        "COMPOOL DATA;";
+        "DEF BLOCK ALL'DEM'VARS;";
+        "BEGIN";
+        "  ITEM THAT'ONE'WITH'THE'ODD'NAME B 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let importer_text =
+    String.concat "\n"
+      [
+        "START";
+        "!COMPOOL ('DATA');";
+        "PROC ACCEPT(A);";
+        "BEGIN";
+        "  ITEM A U 6;";
+        "END";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ACCEPT(THAT'ONE'WITH'THE'ODD'NAME);";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  ignore (open_workspace_text ws root "DATA.j73" compool_text);
+  let importer_uri, _ = open_workspace_text ws root "MAIN.j73" importer_text in
+  let diags = revalidated_diagnostics ws importer_uri in
+  expect_diagnostic_containing
+    "imported DEF BLOCK field keeps its type in call checking"
+    ~needle:
+      "Argument type mismatch in call to \"ACCEPT\": expected integer, provided \
+       bit"
+    diags
+
+let test_table_field_at_qualification_is_not_pointer_deref () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "table field @ qualification URI"
+      (Lib.Uri_path.docuri_of_string "file:///table-field-at-qualification.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "TYPE ROW TABLE W 8;";
+        "BEGIN";
+        "  ITEM FIELD U 2 POS(0,0);";
+        "END";
+        "TABLE TYPED'ONE (2) ROW;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  FIELD @ TYPED'ONE = 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_no_diagnostic_containing
+    "FIELD @ table qualification is not a pointer dereference"
+    ~needle:"Invalid pointer dereference" diags;
+  expect_no_diagnostic_containing "FIELD @ table resolves the table field"
+    ~needle:"Unknown field" diags
+
+let test_workspace_query_diagnostics_refresh_cached_cross_index () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "workspace query diagnostic URI"
+      (Lib.Uri_path.docuri_of_string "file:///workspace-query-diag.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  NOT'DEFINED'VAR = 1;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  ignore (Lib.Workspace_doc_lifecycle.revalidate_all ws);
+  expect_diagnostic_containing "workspace query exposes live diagnostics"
+    ~needle:"Undefined item \"NOT'DEFINED'VAR\""
+    (Lib.Workspace_query.diagnostics_for_file ws ~uri);
+  let cross_diags =
+    match
+      Lib.Cross_file_index.diagnostics_for_file
+        ws.Lib.Workspace_foundation.cross_file_index ~uri
+    with
+    | Some diags -> diags
+    | None -> failf "cross-file index has no diagnostic file record"
+  in
+  expect_diagnostic_containing "cross-file index diagnostic payload refreshed"
+    ~needle:"Undefined item \"NOT'DEFINED'VAR\"" cross_diags
+
 let test_open_doc_owner_survives_source_set_replacement () =
   let root = mk_temp_dir "jovial-mixed-workspace" in
   let system = Filename.concat root "system" in
@@ -2609,6 +3518,17 @@ let test_request_priority_dispatch_order () =
       expect_false "workspace symbol does not preempt hover"
         (Lib.Lsp_server.Private_for_tests.incoming_preempts_active_method
            ~active:"textDocument/hover" ~incoming:"workspace/symbol"))
+
+let test_request_preemption_does_not_cancel_computed_response () =
+  let module P = Lib.Lsp_server.Private_for_tests in
+  expect_true "client cancellation aborts compute"
+    (P.request_should_abort_for_test ~client_cancelled:true ~preempted:false);
+  expect_true "preemption aborts expensive compute"
+    (P.request_should_abort_for_test ~client_cancelled:false ~preempted:true);
+  expect_false "client cancellation does not discard computed response"
+    (P.response_should_cancel_for_test ~client_cancelled:true);
+  expect_false "preemption does not cancel a computed response"
+    (P.response_should_cancel_for_test ~client_cancelled:false)
 
 let expect_same_json_set name to_json got want =
   let keys xs =
@@ -2784,6 +3704,165 @@ let test_workspace_query_local_symbol_lookup () =
     (query_defs.authority = Lib.Workspace_readiness.Authoritative);
   expect_same_json_set "query local definition matches feature module"
     T.Location.yojson_of_t query_defs.value direct_defs
+
+let test_cross_file_index_direct_lookup_flow () =
+  let module C = Lib.Cross_file_index in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ITEM VALUE U 6;";
+        "  VALUE = VALUE;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "cross-file index URI"
+      (Lib.Uri_path.docuri_of_string "file:///cross-file-index-direct.j73")
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let doc =
+    expect_some "cross-file indexed doc"
+      (Hashtbl.find_opt ws.Lib.Workspace_foundation.docs uri)
+  in
+  expect_true "cross-file file index current"
+    (C.file_current_for_doc ws.Lib.Workspace_foundation.cross_file_index doc);
+  let index = ws.Lib.Workspace_foundation.cross_file_index in
+  let value_use =
+    position_of_offset text (find_nth text ~needle:"VALUE" ~nth:1 + 1)
+  in
+  let hit =
+    expect_some "cross-file symbol at use"
+      (C.symbol_at_position index ~uri ~pos:value_use)
+  in
+  let sym = hit.C.symbol in
+  expect_string "cross-file symbol spelling" sym.C.spelling "VALUE";
+  expect_true "cross-file use has reference id" (hit.C.reference <> None);
+  let defs =
+    expect_some "cross-file direct definition"
+      (C.definition_at_position index ~uri ~pos:value_use)
+  in
+  let def =
+    match defs with
+    | loc :: _ -> loc
+    | [] -> failf "cross-file direct definition loc: expected at least one location"
+  in
+  expect_int "cross-file definition line" def.T.Location.range.start.line 3;
+  let refs =
+    expect_some "cross-file direct references"
+      (C.references_at_position index ~uri ~pos:value_use ~include_declaration:true)
+  in
+  expect_true "cross-file references include declaration and uses"
+    (List.length refs >= 3);
+  let hover =
+    expect_some "cross-file direct hover"
+      (C.hover_at_position index ~uri ~pos:value_use)
+  in
+  (match hover.T.Hover.contents with
+  | `MarkupContent mc ->
+      expect_true "cross-file hover names symbol"
+        (string_contains ~needle:"VALUE" mc.T.MarkupContent.value)
+  | _ -> failf "cross-file hover should use markup content")
+
+let test_cross_file_index_ref_decl_is_import_ref () =
+  let module C = Lib.Cross_file_index in
+  let def_text =
+    String.concat "\n"
+      [ "START"; "DEF PROC CALLEE RENT;"; "BEGIN"; "END"; "TERM"; "" ]
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC CALLEE RENT;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  CALLEE();";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let ws = Lib.Workspace_state.create () in
+  let def_uri =
+    expect_some "cross-file DEF index URI"
+      (Lib.Uri_path.docuri_of_string "file:///cross-file-ref-def.j73")
+  in
+  let uri =
+    expect_some "cross-file REF index URI"
+      (Lib.Uri_path.docuri_of_string "file:///cross-file-ref-import.j73")
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:def_uri ~file:None ~text:def_text;
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let index = ws.Lib.Workspace_foundation.cross_file_index in
+  let callee_name =
+    C.NameTable.intern_identifier (C.name_table index) "CALLEE"
+  in
+  let callee_symbols = C.symbols_by_name index callee_name in
+  expect_true "cross-file name id sees DEF PROC"
+    (List.exists
+       (fun (sym : C.symbol_record) -> sym.C.kind = C.ExternalDef)
+       callee_symbols);
+  expect_true "cross-file name id sees REF PROC"
+    (List.exists
+       (fun (sym : C.symbol_record) -> sym.C.kind = C.ExternalRef)
+       callee_symbols);
+  expect_true "cross-file DEF PROC has external info"
+    (List.exists
+       (fun (sym : C.symbol_record) ->
+         match sym.C.external_info with
+         | Some info ->
+             sym.C.kind = C.ExternalDef && info.C.is_def
+             && info.C.external_name_id = callee_name
+         | None -> false)
+       callee_symbols);
+  expect_true "cross-file REF PROC has external info"
+    (List.exists
+       (fun (sym : C.symbol_record) ->
+         match sym.C.external_info with
+         | Some info ->
+             sym.C.kind = C.ExternalRef && (not info.C.is_def)
+             && info.C.external_name_id = callee_name
+         | None -> false)
+       callee_symbols);
+  let ref_name =
+    position_of_offset text (find_nth text ~needle:"CALLEE" ~nth:0 + 1)
+  in
+  let hit =
+    expect_some "cross-file REF declaration hit"
+      (C.symbol_at_position index ~uri ~pos:ref_name)
+  in
+  let refn =
+    expect_some "cross-file REF declaration has reference record" hit.C.reference
+  in
+  expect_int "REF declaration reference uses normalized CALLEE name id"
+    refn.C.name_id callee_name;
+  expect_true "REF declaration is an import reference"
+    (refn.C.reference_kind = C.ImportRef);
+  (match C.definition_at_position index ~uri ~pos:ref_name with
+  | Some (loc :: _) ->
+      expect_string "REF declaration definition URI"
+        (Lib.Uri_path.docuri_to_string loc.T.Location.uri)
+        (Lib.Uri_path.docuri_to_string def_uri);
+      expect_int "REF declaration definition jumps to DEF PROC"
+        loc.T.Location.range.start.line 1
+  | _ -> failf "REF declaration definition returned no DEF location");
+  let call_name =
+    position_of_offset text (find_nth text ~needle:"CALLEE" ~nth:1 + 1)
+  in
+  match C.definition_at_position index ~uri ~pos:call_name with
+  | Some (loc :: _) ->
+      expect_string "REF-backed call definition URI"
+        (Lib.Uri_path.docuri_to_string loc.T.Location.uri)
+        (Lib.Uri_path.docuri_to_string def_uri);
+      expect_int "REF-backed call definition jumps to DEF PROC"
+        loc.T.Location.range.start.line 1
+  | _ -> failf "REF-backed call definition returned no DEF location"
 
 let test_workspace_query_facade_preserves_feature_results () =
   let ws = Lib.Workspace_state.create () in
@@ -2983,7 +4062,7 @@ let test_large_stale_change_keeps_navigation () =
         1
   | [] -> failf "large ready definition after stale edit returned no locations"
 
-let test_large_deferred_change_publishes_provisional_start_diag () =
+let test_large_deferred_change_suppresses_provisional_start_diag () =
   let text = large_deferred_text () in
   let root = mk_temp_dir "jovial-large-live-edit-diag" in
   let path = Filename.concat root "LARGE.j73" in
@@ -3019,7 +4098,7 @@ let test_large_deferred_change_publishes_provisional_start_diag () =
   in
   expect_true "large live edit remains deferred"
     (broken_doc.Lib.Document.parse_rev <> broken_doc.Lib.Document.rev);
-  expect_diagnostic_containing "large provisional live edit diagnostic"
+  expect_no_diagnostic_containing "large provisional live edit diagnostic"
     ~needle:"Expected START before source text"
     (Lib.Document.diagnostics broken_doc);
   expect_false "large diagnostic catch-up does not force sync parse"
@@ -3975,6 +5054,140 @@ let test_compile_time_unknown_does_not_overdiagnose () =
     "recognized but unimplemented compile-time formulas stay quiet"
     ~needle:"Compile-time constant expression required" diags
 
+let test_chapter12_builtins_typecheck_and_pseudovariables () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "chapter 12 builtins URI"
+      (Lib.Uri_path.docuri_of_string "file:///chapter12-builtins.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "TYPE SWITCH STATUS (V(OFF), V(ON));";
+        "ITEM MASK B 10;";
+        "ITEM TEXT C 8;";
+        "ITEM N S 6;";
+        "ITEM SIGN S 1;";
+        "ITEM SVAL SWITCH;";
+        "ITEM PVAL P;";
+        "TABLE TAB (1:10) U 6;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  MASK = BIT(MASK, 0, 3);";
+        "  MASK = SHIFTL(MASK, 1);";
+        "  TEXT = BYTE(TEXT, 0, 2);";
+        "  N = ABS(N);";
+        "  SIGN = SGN(N);";
+        "  PVAL = LOC(N);";
+        "  PVAL = NEXT(PVAL, 1);";
+        "  SVAL = NEXT(SVAL, 1);";
+        "  N = BITSIZE(MASK);";
+        "  N = BYTESIZE(TEXT);";
+        "  N = WORDSIZE(TAB);";
+        "  N = LBOUND(TAB, 0);";
+        "  N = UBOUND(TAB, 0);";
+        "  N = NWDSEN(TAB);";
+        "  SVAL = FIRST(SWITCH);";
+        "  SVAL = LAST(SVAL);";
+        "  BIT(MASK, 0, 1) = 1B'1';";
+        "  BYTE(TEXT, 0, 1) = 'A';";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  match diagnostic_texts diags with
+  | [] -> ()
+  | messages ->
+      let rendered =
+        List.map2
+          (fun (d : T.Diagnostic.t) message ->
+            Printf.sprintf "%d:%d %s" d.range.start.line
+              d.range.start.character message)
+          diags messages
+      in
+      failf "chapter 12 built-ins should typecheck cleanly, got [%s]"
+        (String.concat "; " rendered)
+
+let test_chapter12_builtin_argument_diagnostics () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "chapter 12 builtin diagnostics URI"
+      (Lib.Uri_path.docuri_of_string "file:///chapter12-builtin-diags.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "ITEM MASK B 10;";
+        "ITEM TEXT C 8;";
+        "ITEM N U 6;";
+        "ITEM SVAL STATUS (V(OFF), V(ON));";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  MASK = BYTE(TEXT, 0, 1);";
+        "  TEXT = BIT(MASK, 0, 1);";
+        "  N = SHIFTL(TEXT, 1);";
+        "  SVAL = NEXT(N, 1);";
+        "  N = FIRST(N);";
+        "  N = BIT(MASK, 0);";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_diagnostic_containing "BYTE result keeps character type"
+    ~needle:"cannot assign C 8 to B 10" diags;
+  expect_diagnostic_containing "BIT result keeps bit type"
+    ~needle:"cannot assign B 10 to C 8" diags;
+  expect_diagnostic_containing "SHIFTL validates bit argument"
+    ~needle:"Built-in function \"SHIFTL\" argument 1 expects bit" diags;
+  expect_diagnostic_containing "NEXT validates pointer/status argument"
+    ~needle:"Built-in function \"NEXT\" argument 1 expects pointer or status"
+    diags;
+  expect_diagnostic_containing "FIRST validates status argument"
+    ~needle:"Built-in function \"FIRST\" argument 1 expects status" diags;
+  expect_diagnostic_containing "BIT validates arity"
+    ~needle:"Built-in function \"BIT\" expects 3 arguments, got 2" diags
+
+let test_rep_conversion_semantics () =
+  let ws = Lib.Workspace_state.create () in
+  let uri =
+    expect_some "REP conversion URI"
+      (Lib.Uri_path.docuri_of_string "file:///rep-conversion.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "ITEM COUNT U 3;";
+        "ITEM BITS B;";
+        "ITEM TEXT C 4;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  BITS = REP(COUNT);";
+        "  REP(COUNT) = BITS;";
+        "  TEXT = REP(COUNT);";
+        "  BITS = REP(COUNT + 1);";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_no_diagnostic_containing "REP is a supported built-in conversion"
+    ~needle:"Undefined procedure \"REP\"" diags;
+  expect_diagnostic_containing "REP returns a bit representation"
+    ~needle:"left is character, right is bit" diags;
+  expect_diagnostic_containing "REP requires a data reference"
+    ~needle:"REP expects a named variable or data reference" diags
+
 let test_implementation_config_compile_time_type_and_layout () =
   let module A = Lib.Ast in
   let node v = A.node v in
@@ -4424,13 +5637,14 @@ let test_constant_table_parsing_and_metadata () =
     | _ -> failf "constant table forms should parse"
   in
   let count =
-    prog
-    |> List.filter (function
+    let rec count_top acc = function
       | Lib.Ast.TopDecl
           { v = Lib.Ast.DConst { data_decl_kind = Lib.Ast.DataTable; _ }; _ } ->
-          true
-      | _ -> false)
-    |> List.length
+          acc + 1
+      | Lib.Ast.TopModule m -> List.fold_left count_top acc m.v.module_items
+      | _ -> acc
+    in
+    List.fold_left count_top 0 prog
   in
   expect_int "all common constant table forms parse" count 3;
   let defs = Lib.Workspace_nav_model.collect_doc_defs doc in
@@ -4572,11 +5786,13 @@ let test_inline_and_readonly_parsing () =
     | _ -> failf "INLINE and READONLY declarations should parse"
   in
   let readonly_names =
-    prog
-    |> List.filter_map (function
+    let rec collect acc = function
       | A.TopDecl { v = A.DVar { name; is_readonly = true; _ }; _ } ->
-          Some name.v
-      | _ -> None)
+          name.v :: acc
+      | A.TopModule m -> List.fold_left collect acc m.v.module_items
+      | _ -> acc
+    in
+    List.fold_left collect [] prog |> List.rev
   in
   expect_true "prefix READONLY item is preserved"
     (List.mem "LIMIT" readonly_names);
@@ -4584,10 +5800,12 @@ let test_inline_and_readonly_parsing () =
     (List.mem "TRAILING" readonly_names);
   expect_true "READONLY table is preserved" (List.mem "LOCKED" readonly_names);
   let fast =
-    prog
-    |> List.find_map (function
+    let rec find_fast = function
       | A.TopDecl { v = A.DProc p; _ } when p.v.name.v = "FAST" -> Some p
-      | _ -> None)
+      | A.TopModule m -> List.find_map find_fast m.v.module_items
+      | _ -> None
+    in
+    List.find_map find_fast prog
     |> expect_some "FAST inline proc"
   in
   expect_true "INLINE proc flag is preserved" fast.v.is_inline;
@@ -4966,7 +6184,7 @@ let test_hover_shadowing_prefers_innermost () =
     (string_contains ~needle:"ITEM VALUE U 6" body);
   expect_no_hover_metadata "shadowed VALUE hover" body
 
-let test_hover_unresolved_is_semantic_message () =
+let test_hover_unresolved_is_absent () =
   let text =
     String.concat "\n"
       [
@@ -4987,14 +6205,8 @@ let test_hover_unresolved_is_semantic_message () =
   Lib.Workspace.open_doc ws ~uri ~file:None ~text;
   let use_off = find_nth text ~needle:"MISSING = 1" ~nth:0 in
   let pos = position_of_offset text (use_off + 1) in
-  let hover =
-    expect_some "unresolved MISSING hover"
-      (Lib.Workspace.hover_for ws ~uri ~pos)
-  in
-  let body = hover_markdown_text hover in
-  expect_true "hover reports unresolved symbol"
-    (string_contains ~needle:"Unresolved JOVIAL symbol" body);
-  expect_no_hover_metadata "unresolved MISSING hover" body
+  expect_none "unresolved MISSING has no hover"
+    (Lib.Workspace.hover_for ws ~uri ~pos)
 
 let test_compool_import_definition () =
   let ws = Lib.Workspace.create () in
@@ -5073,12 +6285,352 @@ let test_ref_proc_links_to_def_proc () =
   let pos = position_of_offset ref_text (call_off + 1) in
   (match Lib.Workspace.definition_locations_for ws ~uri:ref_uri ~pos with
   | loc :: _ ->
+      expect_string "REF PROC definition URI jumps to DEF PROC file"
+        (Lib.Uri_path.docuri_to_string loc.uri)
+        (Lib.Uri_path.docuri_to_string def_uri);
       expect_int "REF PROC definition jumps to DEF PROC" loc.range.start.line 1
   | [] -> failf "REF PROC definition returned no implementation");
   match Lib.Workspace.declaration_locations_for ws ~uri:ref_uri ~pos with
   | loc :: _ ->
-      expect_int "REF PROC declaration stays on REF line" loc.range.start.line 1
-  | [] -> failf "REF PROC declaration returned no declaration"
+      expect_string "REF PROC declaration URI skips REF import"
+        (Lib.Uri_path.docuri_to_string loc.uri)
+        (Lib.Uri_path.docuri_to_string def_uri);
+      expect_int "REF PROC declaration jumps to DEF PROC" loc.range.start.line 1
+  | [] -> failf "REF PROC declaration returned no real declaration"
+
+let test_unresolved_ref_proc_is_not_definition_target () =
+  let ws = Lib.Workspace.create () in
+  let uri =
+    expect_some "unresolved REF PROC URI"
+      (Lib.Uri_path.docuri_of_string "file:///workspace-ref-only-proc.j73")
+  in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC ONLY'REF RENT;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ONLY'REF;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  Lib.Workspace.open_doc ws ~uri ~file:None ~text;
+  let call_off = find_nth text ~needle:"ONLY'REF;" ~nth:0 in
+  let pos = position_of_offset text (call_off + 1) in
+  (match Lib.Workspace.definition_locations_for ws ~uri ~pos with
+  | [] -> ()
+  | loc :: _ ->
+      failf "unresolved REF PROC definition leaked REF import at line %d"
+        loc.range.start.line);
+  match Lib.Workspace.declaration_locations_for ws ~uri ~pos with
+  | [] -> ()
+  | loc :: _ ->
+      failf "unresolved REF PROC declaration leaked REF import at line %d"
+        loc.range.start.line
+
+let test_proc_linkage_bif_is_preserved () =
+  let module A = Lib.Ast in
+  let text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC BITSIZE(VALUE) U 10;";
+        "LINKAGE BIF;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ITEM VALUE U 6;";
+        "  ITEM OUT U 10;";
+        "  OUT = BITSIZE(VALUE);";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let uri =
+    expect_some "LINKAGE BIF URI"
+      (Lib.Uri_path.docuri_of_string "file:///linkage-bif.j73")
+  in
+  let doc = Lib.Document.make ~uri ~file:None ~text in
+  expect_no_diagnostic_containing "LINKAGE BIF parses" ~needle:"Parse error"
+    (Lib.Document.diagnostics doc);
+  let prog =
+    match Lib.Document.current_parse doc with
+    | Some { Lib.Document.parsed_ast = Some prog; _ } -> prog
+    | _ -> failf "LINKAGE BIF program should parse"
+  in
+  let linkage =
+    let rec find_linkage = function
+      | A.TopDecl { v = A.DProc p; _ } when p.v.name.v = "BITSIZE" ->
+          p.v.linkage
+      | A.TopModule m -> List.find_map find_linkage m.v.module_items
+      | _ -> None
+    in
+    List.find_map find_linkage prog
+    |> expect_some "BITSIZE linkage"
+  in
+  expect_string "BIF linkage preserved" linkage.v "BIF";
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:None ~text;
+  let diags = revalidated_diagnostics ws uri in
+  expect_no_diagnostic_containing "BIF builtin call typechecks"
+    ~needle:"Undefined procedure" diags;
+  expect_no_diagnostic_containing "BIF linkage has no parse error"
+    ~needle:"Parse error" diags
+
+let test_asm_label_satisfies_ref_proc_implementation () =
+  let root = mk_temp_dir "jovial-asm-linkage" in
+  let main_text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC HELPER RENT;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  HELPER;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let asm_text = String.concat "\n" [ "HELPER:"; "  RTS"; "" ] in
+  let main_path = Filename.concat root "main.j73" in
+  let asm_path = Filename.concat root "helper.asm" in
+  write_text main_path main_text;
+  write_text asm_path asm_text;
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  ignore (Lib.Workspace_state.set_source_files ws [ main_path ]);
+  ignore (Lib.Workspace_state.set_assembly_files ws [ asm_path ]);
+  Lib.Workspace_index_graph.pump_index_background ws;
+  let main_uri =
+    expect_some "ASM main URI" (Lib.Uri_path.docuri_of_path main_path)
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:main_uri ~file:(Some main_path)
+    ~text:main_text;
+  let diags = revalidated_diagnostics ws main_uri in
+  expect_no_diagnostic_containing "ASM label makes REF PROC callable"
+    ~needle:"Undefined procedure \"HELPER\"" diags;
+  let call_off = find_nth main_text ~needle:"HELPER;" ~nth:0 in
+  let pos = position_of_offset main_text (call_off + 1) in
+  match
+    Lib.Workspace_implementation.implementation_locations_for ws ~uri:main_uri
+      ~pos
+  with
+  | loc :: _ ->
+      expect_int "ASM implementation line" loc.range.start.line 0;
+      let got_path =
+        expect_some "ASM implementation path"
+          (Lib.Uri_path.file_path_of_uri loc.uri)
+      in
+      expect_true "ASM implementation URI points at helper.asm"
+        (Lib.Uri_path.same_path got_path asm_path)
+  | [] -> failf "ASM label implementation returned no locations"
+
+let test_asm_label_uses_compool_import_scope () =
+  let root = mk_temp_dir "jovial-asm-compool-linkage" in
+  let data_text = String.concat "\n" [ "START COMPOOL 'DATA';"; "TERM"; "" ] in
+  let main_text =
+    String.concat "\n"
+      [
+        "START";
+        "!COMPOOL 'DATA';";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  HELPER;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let other_text =
+    String.concat "\n"
+      [
+        "START";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  HELPER;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let asm_text = String.concat "\n" [ "!COMPOOL 'DATA';"; "HELPER:"; "  RTS"; "" ] in
+  let data_path = Filename.concat root "data.j73" in
+  let main_path = Filename.concat root "main.j73" in
+  let other_path = Filename.concat root "other.j73" in
+  let asm_path = Filename.concat root "helper.asm" in
+  write_text data_path data_text;
+  write_text main_path main_text;
+  write_text other_path other_text;
+  write_text asm_path asm_text;
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  ignore
+    (Lib.Workspace_state.set_source_files ws
+       [ data_path; main_path; other_path ]);
+  ignore (Lib.Workspace_state.set_assembly_files ws [ asm_path ]);
+  Lib.Workspace_index_graph.pump_index_background ws;
+  let data_uri =
+    expect_some "ASM compool DATA URI" (Lib.Uri_path.docuri_of_path data_path)
+  in
+  let main_uri =
+    expect_some "ASM compool main URI" (Lib.Uri_path.docuri_of_path main_path)
+  in
+  let other_uri =
+    expect_some "ASM compool other URI" (Lib.Uri_path.docuri_of_path other_path)
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:data_uri ~file:(Some data_path)
+    ~text:data_text;
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:main_uri ~file:(Some main_path)
+    ~text:main_text;
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:other_uri ~file:(Some other_path)
+    ~text:other_text;
+  expect_no_diagnostic_containing
+    "ASM label is visible through matching !COMPOOL import"
+    ~needle:"Undefined procedure \"HELPER\""
+    (revalidated_diagnostics ws main_uri);
+  expect_diagnostic_containing
+    "ASM label is hidden without the matching !COMPOOL import"
+    ~needle:"Undefined procedure \"HELPER\""
+    (revalidated_diagnostics ws other_uri);
+  let call_off = find_nth main_text ~needle:"HELPER;" ~nth:0 in
+  let pos = position_of_offset main_text (call_off + 1) in
+  match
+    Lib.Workspace_implementation.implementation_locations_for ws ~uri:main_uri
+      ~pos
+  with
+  | loc :: _ ->
+      expect_int "ASM compool implementation line" loc.range.start.line 1;
+      let got_path =
+        expect_some "ASM compool implementation path"
+          (Lib.Uri_path.file_path_of_uri loc.uri)
+      in
+      expect_true "ASM compool implementation URI points at helper.asm"
+        (Lib.Uri_path.same_path got_path asm_path)
+  | [] -> failf "ASM compool label implementation returned no locations"
+
+let test_workspace_query_asm_ref_proc_implementation_falls_through () =
+  let root = mk_temp_dir "jovial-asm-query-linkage" in
+  let main_text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC FUU'ASM'FUNC RENT;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  FUU'ASM'FUNC();";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let asm_text =
+    String.concat "\n"
+      [
+        "         EXTDEF     FUU'ASM'FUNC";
+        "";
+        "FUU'ASM'FUNC EQU       *";
+        "         RET";
+        "         END";
+        "";
+      ]
+  in
+  let main_path = Filename.concat root "main.j73" in
+  let asm_path = Filename.concat root "sutest.asm" in
+  write_text main_path main_text;
+  write_text asm_path asm_text;
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  ignore (Lib.Workspace_state.set_source_files ws [ main_path ]);
+  ignore (Lib.Workspace_state.set_assembly_files ws [ asm_path ]);
+  Lib.Workspace_index_graph.pump_index_background ws;
+  let main_uri =
+    expect_some "ASM query main URI" (Lib.Uri_path.docuri_of_path main_path)
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:main_uri ~file:(Some main_path)
+    ~text:main_text;
+  ignore (revalidated_diagnostics ws main_uri);
+  let call_off = find_nth main_text ~needle:"FUU'ASM'FUNC();" ~nth:0 in
+  let pos = position_of_offset main_text (call_off + 1) in
+  let ctx =
+    expect_some "ASM query context"
+      (Lib.Workspace_query.context ws ~uri:main_uri ~pos)
+  in
+  (match (Lib.Workspace_query.definition_at_position ctx).value with
+  | loc :: _ ->
+      expect_int "ASM query definition uses real ASM label line"
+        loc.range.start.line 2;
+      let got_path =
+        expect_some "ASM query definition path"
+          (Lib.Uri_path.file_path_of_uri loc.uri)
+      in
+      expect_true "ASM query definition URI points at sutest.asm"
+        (Lib.Uri_path.same_path got_path asm_path)
+  | [] -> failf "WorkspaceQuery ASM definition returned no locations");
+  match (Lib.Workspace_query.implementation_at_position ctx).value with
+  | loc :: _ ->
+      expect_int "ASM query implementation prefers real label line"
+        loc.range.start.line 2;
+      let got_path =
+        expect_some "ASM query implementation path"
+          (Lib.Uri_path.file_path_of_uri loc.uri)
+      in
+      expect_true "ASM query implementation URI points at sutest.asm"
+        (Lib.Uri_path.same_path got_path asm_path)
+  | [] -> failf "WorkspaceQuery ASM implementation returned no locations"
+
+let test_asm_extdef_directive_is_fallback_implementation () =
+  let root = mk_temp_dir "jovial-asm-extdef-linkage" in
+  let main_text =
+    String.concat "\n"
+      [
+        "START";
+        "REF PROC ONLY'EXTDEF RENT;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  ONLY'EXTDEF;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let asm_text =
+    String.concat "\n" [ "         EXTDEF     ONLY'EXTDEF"; "         END"; "" ]
+  in
+  let main_path = Filename.concat root "main.j73" in
+  let asm_path = Filename.concat root "only_extdef.asm" in
+  write_text main_path main_text;
+  write_text asm_path asm_text;
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  ignore (Lib.Workspace_state.set_source_files ws [ main_path ]);
+  ignore (Lib.Workspace_state.set_assembly_files ws [ asm_path ]);
+  Lib.Workspace_index_graph.pump_index_background ws;
+  let main_uri =
+    expect_some "ASM EXTDEF main URI" (Lib.Uri_path.docuri_of_path main_path)
+  in
+  Lib.Workspace_doc_lifecycle.open_doc ws ~uri:main_uri ~file:(Some main_path)
+    ~text:main_text;
+  ignore (revalidated_diagnostics ws main_uri);
+  let call_off = find_nth main_text ~needle:"ONLY'EXTDEF;" ~nth:0 in
+  let pos = position_of_offset main_text (call_off + 1) in
+  match
+    Lib.Workspace_query.context ws ~uri:main_uri ~pos
+    |> Option.map Lib.Workspace_query.implementation_at_position
+  with
+  | Some { value = loc :: _; _ } ->
+      expect_int "ASM EXTDEF fallback implementation line" loc.range.start.line 0;
+      let got_path =
+        expect_some "ASM EXTDEF implementation path"
+          (Lib.Uri_path.file_path_of_uri loc.uri)
+      in
+      expect_true "ASM EXTDEF implementation URI points at only_extdef.asm"
+        (Lib.Uri_path.same_path got_path asm_path)
+  | Some { value = []; _ } -> failf "ASM EXTDEF implementation returned no locations"
+  | None -> failf "ASM EXTDEF query context missing"
 
 let test_jovial_hover_nav_fixture () =
   let root = mk_temp_dir "jovial-hover-nav-fixture" in
@@ -5089,7 +6641,7 @@ let test_jovial_hover_nav_fixture () =
     write_text dst text;
     (dst, text)
   in
-  let compool_path, compool_text = copy_fixture "compool_data.j73" in
+  let compool_path, compool_text = copy_fixture "data.j73" in
   let find_path, find_text = copy_fixture "find_impl.j73" in
   let main_path, main_text = copy_fixture "main.j73" in
   let types_path, types_text = copy_fixture "types.j73" in
@@ -5148,7 +6700,9 @@ let test_jovial_hover_nav_fixture () =
   expect_contains "REF PROC hover classification"
     "JOVIAL external REF function import" ref_hover;
   expect_contains "REF PROC hover meaning"
-    "not the real definition or implementation" ref_hover;
+    "imported external reference" ref_hover;
+  expect_contains "REF PROC hover implementation link" "Definition resolves to"
+    ref_hover;
   let def_hover =
     hover_text "DEF PROC FIND hover" find_uri find_text "FIND(CODE" 0
   in
@@ -5170,7 +6724,7 @@ let test_jovial_hover_nav_fixture () =
   expect_false "PRIVILEGE is not generic item"
     (string_contains ~needle:"Classification: item" privilege_hover);
   let data_hover =
-    hover_text "ICOMPOOL DATA hover" main_uri main_text "DATA" 0
+    hover_text "!COMPOOL DATA hover" main_uri main_text "DATA" 0
   in
   expect_contains "DATA is COMPOOL import" "JOVIAL COMPOOL import" data_hover;
   let u_hover =
@@ -5368,13 +6922,15 @@ let test_specified_table_w_parsing_and_pos () =
     | _ -> failf "specified table should parse"
   in
   let dtype =
-    prog
-    |> List.find_map (function
+    let rec find_packed = function
       | A.TopDecl
           { v = A.DVar { name; dtype; data_decl_kind = A.DataTable; _ }; _ }
         when name.v = "PACKED" ->
           Some dtype
-      | _ -> None)
+      | A.TopModule m -> List.find_map find_packed m.v.module_items
+      | _ -> None
+    in
+    List.find_map find_packed prog
     |> expect_some "PACKED specified table declaration"
   in
   match dtype.v with
@@ -5591,12 +7147,14 @@ let test_overlay_parsing () =
     | _ -> failf "simple OVERLAY declaration should parse"
   in
   let overlay =
-    prog
-    |> List.find_map (function
+    let rec find_pack = function
       | A.TopDecl { v = A.DOverlay overlay; _ }
         when overlay.overlay_name.v = "PACK" ->
           Some overlay
-      | _ -> None)
+      | A.TopModule m -> List.find_map find_pack m.v.module_items
+      | _ -> None
+    in
+    List.find_map find_pack prog
     |> expect_some "PACK overlay declaration"
   in
   (match overlay.overlay_pos with
@@ -6150,6 +7708,109 @@ let test_imported_compool_symbol_prefers_semantic_path () =
     (perf_metric_calls "query.cross_module.fallback_scan")
     0
 
+let test_compool_lookup_does_not_escape_import_scope () =
+  let root = mk_temp_dir "jovial-compool-scope-nav" in
+  let bob = Filename.concat root "bob" in
+  Unix.mkdir bob 0o755;
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  let comp2_text =
+    String.concat "\n"
+      [
+        "START";
+        "COMPOOL TINYCOMP2;";
+        "DEF BEGIN";
+        "  ITEM THAT'ONE'ITEM B 12;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let comp3_text =
+    String.concat "\n"
+      [
+        "START";
+        "COMPOOL TINYCOMP3;";
+        "DEF BEGIN";
+        "  ITEM THAT'ONE'ITEM B 12;";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let importer_text =
+    String.concat "\n"
+      [
+        "START";
+        "!COMPOOL ('TINYCOMP2');";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  THAT'ONE'ITEM = 4B'0000';";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let importer_selected_text =
+    String.concat "\n"
+      [
+        "START";
+        "!COMPOOL ('TINYCOMP2') OTHER'ITEM;";
+        "DEF PROC MAIN RENT;";
+        "BEGIN";
+        "  THAT'ONE'ITEM = 4B'0000';";
+        "END";
+        "TERM";
+        "";
+      ]
+  in
+  let comp2_uri, comp2_path =
+    open_workspace_text ws root "TINYCOMP2.j73" comp2_text
+  in
+  let comp3_uri, comp3_path =
+    open_workspace_text ws root (Filename.concat "bob" "TINYCOMP3.j73")
+      comp3_text
+  in
+  let importer_uri, importer_path =
+    open_workspace_text ws root "UTIL.j73" importer_text
+  in
+  let selected_uri, selected_path =
+    open_workspace_text ws root "UTIL_SELECTED.j73" importer_selected_text
+  in
+  ignore
+    (Lib.Workspace_state.set_source_files ws
+       [ comp2_path; comp3_path; importer_path; selected_path ]);
+  let use_pos =
+    position_of_offset importer_text
+      (find_nth importer_text ~needle:"THAT'ONE'ITEM" ~nth:0 + 1)
+  in
+  let defs =
+    Lib.Workspace_definition.definition_locations_for ws ~uri:importer_uri
+      ~pos:use_pos
+  in
+  let def = expect_first_location "scoped TINYCOMP2 item definition" defs in
+  expect_location_uri "scoped TINYCOMP2 item definition URI" def comp2_uri;
+  expect_true "scoped definition does not include TINYCOMP3"
+    (List.for_all
+       (fun (loc : T.Location.t) ->
+         Lib.Uri_path.docuri_to_string loc.uri
+         <> Lib.Uri_path.docuri_to_string comp3_uri)
+       defs);
+  let selected_pos =
+    position_of_offset importer_selected_text
+      (find_nth importer_selected_text ~needle:"THAT'ONE'ITEM" ~nth:0 + 1)
+  in
+  let selected_defs =
+    Lib.Workspace_definition.definition_locations_for ws ~uri:selected_uri
+      ~pos:selected_pos
+  in
+  expect_true "selected import does not leak same-name TINYCOMP3"
+    (List.for_all
+       (fun (loc : T.Location.t) ->
+         Lib.Uri_path.docuri_to_string loc.uri
+         <> Lib.Uri_path.docuri_to_string comp3_uri)
+       selected_defs)
+
 let test_imported_compool_proc_prefers_summary_path () =
   let compool_text =
     String.concat "\n"
@@ -6316,7 +7977,7 @@ let test_icopy_include_reverse_dependency () =
     (String.concat "\n"
        [
          "START";
-         "ICOPY ('INC.j73');";
+         "!COPY ('INC.j73');";
          "DEF PROC MAIN RENT;";
          "BEGIN";
          "END";
@@ -6335,12 +7996,12 @@ let test_icopy_include_reverse_dependency () =
     expect_some "include graph node"
       (Hashtbl.find_opt ws.graph_nodes include_key)
   in
-  expect_true "ICOPY reverse importer recorded"
+  expect_true "!COPY reverse importer recorded"
     (List.mem user_key include_node.gn_rev_importers);
   let user_node =
     expect_some "user graph node" (Hashtbl.find_opt ws.graph_nodes user_key)
   in
-  expect_true "ICOPY dependency edge recorded"
+  expect_true "!COPY dependency edge recorded"
     (List.exists
        (fun edge ->
          edge.de_kind = ICopyInclude && edge.de_path_key = Some include_key)
@@ -6348,21 +8009,21 @@ let test_icopy_include_reverse_dependency () =
   let include_target =
     match user_node.gn_include_targets with
     | target :: _ -> target
-    | [] -> failf "ICOPY include target model was not recorded"
+    | [] -> failf "!COPY include target model was not recorded"
   in
-  expect_string "ICOPY target raw path"
+  expect_string "!COPY target raw path"
     include_target.Lib.Workspace_include_model.target "INC.j73";
-  expect_string "ICOPY target normalized path"
+  expect_string "!COPY target normalized path"
     include_target.Lib.Workspace_include_model.normalized_target "INC.J73";
-  expect_int "ICOPY directive location line"
+  expect_int "!COPY directive location line"
     include_target.Lib.Workspace_include_model.directive_loc.start_pos.line 2;
   (match include_target.Lib.Workspace_include_model.resolved_path with
   | Some path ->
-      expect_string "ICOPY resolved path" (normalize_path path) include_key
-  | None -> failf "ICOPY include target did not resolve");
+      expect_string "!COPY resolved path" (normalize_path path) include_key
+  | None -> failf "!COPY include target did not resolve");
   Lib.Workspace_doc_lifecycle.apply_watched_file_changes ws
     ~changes:[ (include_path, `Changed) ];
-  expect_true "ICOPY target change enqueues dependent"
+  expect_true "!COPY target change enqueues dependent"
     (Hashtbl.mem ws.bg_enqueued user_key)
 
 let test_icopy_debug_report_exposes_includes () =
@@ -6377,7 +8038,7 @@ let test_icopy_debug_report_exposes_includes () =
     String.concat "\n"
       [
         "START";
-        "ICOPY ('INC.j73');";
+        "!COPY ('INC.j73');";
         "DEF PROC MAIN RENT;";
         "BEGIN";
         "END";
@@ -6392,10 +8053,10 @@ let test_icopy_debug_report_exposes_includes () =
   ignore (Lib.Workspace_state.set_source_files ws [ include_path; user_path ]);
   Lib.Workspace_index_graph.pump_index_background ws;
   let user_uri =
-    expect_some "ICOPY debug user URI" (Lib.Uri_path.docuri_of_path user_path)
+    expect_some "!COPY debug user URI" (Lib.Uri_path.docuri_of_path user_path)
   in
   let include_uri =
-    expect_some "ICOPY debug include URI"
+    expect_some "!COPY debug include URI"
       (Lib.Uri_path.docuri_of_path include_path)
   in
   Lib.Workspace_doc_lifecycle.open_doc ~inline_catch_up:false ws ~uri:user_uri
@@ -6407,33 +8068,33 @@ let test_icopy_debug_report_exposes_includes () =
   in
   let include_targets =
     match
-      expect_json_field "ICOPY debug report" "includeTargets" user_report
+      expect_json_field "!COPY debug report" "includeTargets" user_report
     with
     | `List xs -> xs
     | got ->
-        failf "ICOPY debug includeTargets: expected list, got %s"
+        failf "!COPY debug includeTargets: expected list, got %s"
           (Yojson.Safe.to_string got)
   in
-  expect_int "ICOPY debug include target count" (List.length include_targets) 1;
+  expect_int "!COPY debug include target count" (List.length include_targets) 1;
   let target_json =
     match include_targets with
     | [ item ] -> item
-    | _ -> failf "ICOPY debug include target count changed unexpectedly"
+    | _ -> failf "!COPY debug include target count changed unexpectedly"
   in
-  expect_string "ICOPY debug target"
-    (match expect_json_field "ICOPY debug target" "target" target_json with
+  expect_string "!COPY debug target"
+    (match expect_json_field "!COPY debug target" "target" target_json with
     | `String s -> s
     | got ->
-        failf "ICOPY debug target: expected string, got %s"
+        failf "!COPY debug target: expected string, got %s"
           (Yojson.Safe.to_string got))
     "INC.j73";
-  expect_string "ICOPY debug resolved path"
+  expect_string "!COPY debug resolved path"
     (match
-       expect_json_field "ICOPY debug target" "resolvedPath" target_json
+       expect_json_field "!COPY debug target" "resolvedPath" target_json
      with
     | `String s -> normalize_path s
     | got ->
-        failf "ICOPY debug resolvedPath: expected string, got %s"
+        failf "!COPY debug resolvedPath: expected string, got %s"
           (Yojson.Safe.to_string got))
     (normalize_path include_path);
   let include_report =
@@ -6441,7 +8102,7 @@ let test_icopy_debug_report_exposes_includes () =
   in
   let reverse_users =
     match
-      expect_json_field "ICOPY debug include report" "reverseIncludeUsers"
+      expect_json_field "!COPY debug include report" "reverseIncludeUsers"
         include_report
     with
     | `List xs ->
@@ -6450,10 +8111,10 @@ let test_icopy_debug_report_exposes_includes () =
           | `String s -> Some (normalize_path s)
           | _ -> None)
     | got ->
-        failf "ICOPY debug reverseIncludeUsers: expected list, got %s"
+        failf "!COPY debug reverseIncludeUsers: expected list, got %s"
           (Yojson.Safe.to_string got)
   in
-  expect_true "ICOPY debug reverse include user recorded"
+  expect_true "!COPY debug reverse include user recorded"
     (List.mem (normalize_path user_path) reverse_users)
 
 let test_icopy_unresolved_include_diagnostic () =
@@ -6463,7 +8124,7 @@ let test_icopy_unresolved_include_diagnostic () =
     String.concat "\n"
       [
         "START";
-        "ICOPY ('MISSING.j73');";
+        "!COPY ('MISSING.j73');";
         "DEF PROC MAIN RENT;";
         "BEGIN";
         "END";
@@ -6476,13 +8137,13 @@ let test_icopy_unresolved_include_diagnostic () =
   Lib.Workspace_state.set_root_path ws (Some root);
   ignore (Lib.Workspace_state.set_source_files ws [ user_path ]);
   let uri =
-    expect_some "ICOPY missing URI" (Lib.Uri_path.docuri_of_path user_path)
+    expect_some "!COPY missing URI" (Lib.Uri_path.docuri_of_path user_path)
   in
   Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:(Some user_path)
     ~text:user_text;
   let diags = revalidated_diagnostics ws uri in
-  expect_diagnostic_containing "unresolved ICOPY target is diagnosed"
-    ~needle:"Unresolved ICOPY target: MISSING.j73" diags
+  expect_diagnostic_containing "unresolved !COPY target is diagnosed"
+    ~needle:"Unresolved !COPY target: MISSING.j73" diags
 
 let test_icopy_cyclic_include_diagnostic () =
   let root = mk_temp_dir "jovial-icopy-cycle" in
@@ -6491,7 +8152,7 @@ let test_icopy_cyclic_include_diagnostic () =
     String.concat "\n"
       [
         "START";
-        "ICOPY ('LOOP.j73');";
+        "!COPY ('LOOP.j73');";
         "DEF PROC MAIN RENT;";
         "BEGIN";
         "END";
@@ -6503,11 +8164,11 @@ let test_icopy_cyclic_include_diagnostic () =
   let ws = Lib.Workspace_state.create () in
   Lib.Workspace_state.set_root_path ws (Some root);
   ignore (Lib.Workspace_state.set_source_files ws [ path ]);
-  let uri = expect_some "ICOPY cycle URI" (Lib.Uri_path.docuri_of_path path) in
+  let uri = expect_some "!COPY cycle URI" (Lib.Uri_path.docuri_of_path path) in
   Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:(Some path) ~text;
   let diags = revalidated_diagnostics ws uri in
-  expect_diagnostic_containing "cyclic ICOPY target is diagnosed"
-    ~needle:"Cyclic ICOPY include detected for LOOP.j73" diags
+  expect_diagnostic_containing "cyclic !COPY target is diagnosed"
+    ~needle:"Cyclic !COPY include detected for LOOP.j73" diags
 
 let test_icopy_source_map_json_roundtrip () =
   let pos line col offset : Lib.Ast.Loc.pos = { line; col; offset } in
@@ -6799,6 +8460,52 @@ let expect_json_int_field name key json : int =
       failf "%s: expected integer field %S, got %s" name key
         (Yojson.Safe.to_string got)
 
+let json_string_field name key json : string =
+  match expect_json_field name key json with
+  | `String value -> value
+  | got ->
+      failf "%s: expected string field %S, got %s" name key
+        (Yojson.Safe.to_string got)
+
+let test_startup_target_is_reporting_only () =
+  let make_ws ~nav_target_ms ~aggressive_window_ms ~elapsed_ms =
+    let settings =
+      {
+        (Lib.Workspace_settings.from_env ()) with
+        startup_diag_hover_target_ms = nav_target_ms;
+        startup_nav_target_ms = nav_target_ms;
+        startup_aggressive_window_ms = aggressive_window_ms;
+        startup_aggressive_bg_budget_ms = 123;
+      }
+    in
+    let ws = Lib.Workspace_state.create ~settings () in
+    ws.Lib.Workspace_foundation.startup_started_ms <-
+      Lib.Workspace_foundation.Perf_stats.now_ms () -. float_of_int elapsed_ms;
+    ws
+  in
+  let phase_of ws =
+    let readiness = Lib.Workspace_runtime.startup_readiness_json_for_report ws in
+    json_string_field "startup target reporting" "phase" readiness
+  in
+  let target_of ws =
+    let readiness = Lib.Workspace_runtime.startup_readiness_json_for_report ws in
+    expect_json_int_field "startup target reporting" "targetMs" readiness
+  in
+  let short_target_ws =
+    make_ws ~nav_target_ms:100 ~aggressive_window_ms:1000 ~elapsed_ms:750
+  in
+  expect_string "short target does not accelerate operational catch-up"
+    (phase_of short_target_ws) "warming";
+  expect_int "short target remains report metadata" (target_of short_target_ws)
+    100;
+  let long_target_ws =
+    make_ws ~nav_target_ms:60000 ~aggressive_window_ms:500 ~elapsed_ms:750
+  in
+  expect_string "long target does not delay operational catch-up"
+    (phase_of long_target_ws) "aggressiveCatchUp";
+  expect_int "long target remains report metadata" (target_of long_target_ws)
+    60000
+
 let test_debug_scheduler_memory_json_shape () =
   let root = mk_temp_dir "jovial-debug-state" in
   let path = Filename.concat root "MAIN.j73" in
@@ -6930,6 +8637,13 @@ let test_persistent_workspace_index_roundtrip () =
       ~paths:[ main_path; compool_path ]
   in
   Lib.Workspace_persistent_index.save_workspace_index ~root idx;
+  expect_string "persistent workspace index dir"
+    (Lib.Workspace_persistent_index.cache_dir ~root)
+    (Filename.concat (Filename.concat root ".jovial_ls") "index");
+  expect_true "persistent workspace index binary written"
+    (Sys.file_exists (Lib.Workspace_persistent_index.files_bin_path ~root));
+  expect_false "persistent workspace index avoids legacy root"
+    (Sys.file_exists (Filename.concat root ".jovial-lsp"));
   let loaded =
     expect_some "persistent workspace index"
       (Lib.Workspace_persistent_index.load_workspace_index
@@ -6960,18 +8674,20 @@ let test_persistent_workspace_index_roundtrip () =
   Lib.Workspace.snapshot ws
   |> Lib.Workspace_persistent_index.save_snapshot_index ~root;
   let expect_cache_file name path = expect_true name (Sys.file_exists path) in
-  expect_cache_file "persistent symbols.json"
-    (Lib.Workspace_persistent_index.symbols_json_path ~root);
-  expect_cache_file "persistent refs.json"
-    (Lib.Workspace_persistent_index.refs_json_path ~root);
-  expect_cache_file "persistent scopes.json"
-    (Lib.Workspace_persistent_index.scopes_json_path ~root);
-  expect_cache_file "persistent deps.json"
-    (Lib.Workspace_persistent_index.deps_json_path ~root);
-  expect_cache_file "persistent macros.json"
-    (Lib.Workspace_persistent_index.macros_json_path ~root);
-  expect_cache_file "persistent diagnostics.json"
-    (Lib.Workspace_persistent_index.diagnostics_json_path ~root)
+  expect_cache_file "persistent snapshot.bin"
+    (Lib.Workspace_persistent_index.snapshot_bin_path ~root);
+  expect_cache_file "persistent symbols.bin"
+    (Lib.Workspace_persistent_index.symbols_bin_path ~root);
+  expect_cache_file "persistent refs.bin"
+    (Lib.Workspace_persistent_index.refs_bin_path ~root);
+  expect_cache_file "persistent scopes.bin"
+    (Lib.Workspace_persistent_index.scopes_bin_path ~root);
+  expect_cache_file "persistent deps.bin"
+    (Lib.Workspace_persistent_index.deps_bin_path ~root);
+  expect_cache_file "persistent macros.bin"
+    (Lib.Workspace_persistent_index.macros_bin_path ~root);
+  expect_cache_file "persistent diagnostics.bin"
+    (Lib.Workspace_persistent_index.diagnostics_bin_path ~root)
 
 let test_persistent_cache_source_index_invalidation_and_corrupt () =
   let root = mk_temp_dir "jovial-persistent-cache-source" in
@@ -6986,12 +8702,16 @@ let test_persistent_cache_source_index_invalidation_and_corrupt () =
   in
   expect_false "source cache first startup is cold"
     load1.Lib.Persistent_cache.loaded_from_cache;
+  expect_string "persistent source cache dir" (Lib.Persistent_cache.cache_dir ~root)
+    (Filename.concat (Filename.concat root ".jovial_ls") "cache");
   expect_int "source cache cold source count"
     (Lib.Workspace_index.source_count load1.index)
     2;
   Lib.Persistent_cache.save_source_index ~root ~source_extensions load1.index;
   expect_true "source cache file written"
-    (Sys.file_exists (Lib.Persistent_cache.source_index_json_path ~root));
+    (Sys.file_exists (Lib.Persistent_cache.source_index_bin_path ~root));
+  expect_false "persistent source cache avoids legacy root"
+    (Sys.file_exists (Filename.concat root ".jovial-lsp-cache"));
   let load2 =
     Lib.Persistent_cache.load_or_build_source_index ~root ~source_extensions
       ~paths:[ main_path; compool_path ]
@@ -7017,7 +8737,7 @@ let test_persistent_cache_source_index_invalidation_and_corrupt () =
     (path_in load3.Lib.Persistent_cache.changed_paths main_path);
   expect_none "source cache reconciles removed compool"
     (Lib.Workspace_index.find_compool load3.index ~name:"TARGET");
-  write_text (Lib.Persistent_cache.source_index_json_path ~root) "{not json";
+  write_text (Lib.Persistent_cache.source_index_bin_path ~root) "{not binary";
   let load4 =
     Lib.Persistent_cache.load_or_build_source_index ~root ~source_extensions
       ~paths:[ main_path; compool_path ]
@@ -7090,7 +8810,7 @@ let test_persistent_cache_skeleton_roundtrip_and_startup_hydrate () =
   in
   expect_none "skeleton cache invalidates modified file"
     (Lib.Persistent_cache.skeleton_entries stale_cache ~path);
-  write_text (Lib.Persistent_cache.skeleton_index_json_path ~root) "{not json";
+  write_text (Lib.Persistent_cache.skeleton_index_bin_path ~root) "{not binary";
   let corrupt_cache =
     Lib.Persistent_cache.load_skeleton_cache ~root ~source_extensions ~max_bytes
       ~paths:[ path ]
@@ -7181,7 +8901,7 @@ let test_persistent_cache_module_summary_roundtrip_and_corrupt () =
   expect_true "module summary roundtrip is metadata validated"
     (entry.Lib.Workspace_foundation.msc_authority
    = Lib.Workspace_foundation.ModuleSummaryMetadataValidated);
-  write_text (Lib.Persistent_cache.module_summary_json_path ~root) "{not json";
+  write_text (Lib.Persistent_cache.module_summary_bin_path ~root) "{not binary";
   let corrupt =
     Lib.Persistent_cache.load_module_summary_cache ~root ~source_extensions
       ~paths:[ path ]
@@ -7406,12 +9126,35 @@ let () =
       ("document_stale_parse_state", test_document_stale_parse_state);
       ("incremental_syntax_metadata", test_incremental_syntax_metadata);
       ("shifted_suffix_token_reuse", test_shifted_suffix_token_reuse);
+      ( "incremental_stateful_lexer_restart_matches_full_lex",
+        test_incremental_stateful_lexer_restart_matches_full_lex );
       ( "checkpoint_reuse_after_failed_parse",
         test_checkpoint_reuse_after_failed_parse );
       ( "token_skeleton_symbols_for_broken_file",
         test_token_skeleton_symbols_for_broken_file );
       ("quick_nav_uses_token_skeleton", test_quick_nav_uses_token_skeleton);
+      ( "startup_foreground_nav_index_respects_budget",
+        test_startup_foreground_nav_index_respects_budget );
       ("lexer_regressions", test_lexer_regressions);
+      ( "bad_lexer_tokens_are_structured_diagnostics",
+        test_bad_lexer_tokens_are_structured_diagnostics );
+      ( "nested_define_numeric_paste_parses_cleanly",
+        test_nested_define_numeric_paste_parses_cleanly );
+      ( "call_statement_without_terminator_parses_cleanly",
+        test_call_statement_without_terminator_parses_cleanly );
+      ( "cross_file_index_name_table_and_tokens",
+        test_cross_file_index_name_table_and_tokens );
+      ("worker_ipc_binary_roundtrip", test_worker_ipc_binary_roundtrip);
+      ( "source_file_sets_preserve_workspace_uri",
+        test_source_file_sets_preserve_workspace_uri );
+      ( "compool_quoted_name_does_not_consume_following_item",
+        test_compool_quoted_name_does_not_consume_following_item );
+      ( "non_compool_bang_directives_are_skipped",
+        test_non_compool_bang_directives_are_skipped );
+      ( "manual_fixed_type_comma_sizes_parse",
+        test_manual_fixed_type_comma_sizes_parse );
+      ( "e2e_seeded_diagnostic_source_parses",
+        test_e2e_seeded_diagnostic_source_parses );
       ("macro_expansion_source_mapping", test_macro_expansion_source_mapping);
       ( "macro_graph_navigation_hover_references",
         test_macro_graph_navigation_hover_references );
@@ -7440,6 +9183,8 @@ let () =
         test_closed_document_diagnostics_survive_close );
       ( "closed_document_diagnostics_refresh_after_file_change",
         test_closed_document_diagnostics_refresh_after_file_change );
+      ( "force_closed_document_diagnostics_refresh_during_large_startup",
+        test_force_closed_document_diagnostics_refresh_during_large_startup );
       ( "selected_imported_item_helper_type_no_false_positive",
         test_selected_imported_item_helper_type_no_false_positive );
       ( "multiline_selected_import_excludes_unselected_symbol",
@@ -7483,18 +9228,34 @@ let () =
         test_imported_ref_item_and_proc_visibility_suppresses_undefined );
       ( "hover_nav_fixture_import_diagnostics_are_not_undefined",
         test_hover_nav_fixture_import_diagnostics_are_not_undefined );
+      ( "jovial_hover_nav_fixtures_parse_cleanly",
+        test_jovial_hover_nav_fixtures_parse_cleanly );
       ( "symbol_hints_include_skeleton_imported_helpers",
         test_symbol_hints_include_skeleton_imported_helpers );
       ("truly_undefined_still_errors", test_truly_undefined_still_errors);
+      ( "recursive_proc_call_requires_rec",
+        test_recursive_proc_call_requires_rec );
+      ( "proc_use_attr_before_return_type",
+        test_proc_use_attr_before_return_type );
       ( "status_size_and_colon_call_syntax_parse",
         test_status_size_and_colon_call_syntax_parse );
       ( "unresolved_all_import_does_not_hide_random_local",
         test_unresolved_all_import_does_not_hide_random_local );
       ( "proc_call_argument_count_and_type_diagnostics",
         test_proc_call_argument_count_and_type_diagnostics );
+      ( "ref_proc_call_keeps_type_check_but_not_hard_arity",
+        test_ref_proc_call_keeps_type_check_but_not_hard_arity );
+      ( "imported_block_field_type_drives_call_diagnostic",
+        test_imported_block_field_type_drives_call_diagnostic );
+      ( "table_field_at_qualification_is_not_pointer_deref",
+        test_table_field_at_qualification_is_not_pointer_deref );
+      ( "workspace_query_diagnostics_refresh_cached_cross_index",
+        test_workspace_query_diagnostics_refresh_cached_cross_index );
       ( "open_doc_owner_survives_source_set_replacement",
         test_open_doc_owner_survives_source_set_replacement );
       ("request_priority_dispatch_order", test_request_priority_dispatch_order);
+      ( "request_preemption_does_not_cancel_computed_response",
+        test_request_preemption_does_not_cancel_computed_response );
       ("partial_references_stream", test_partial_references_stream);
       ("partial_workspace_symbols_stream", test_partial_workspace_symbols_stream);
       ("basic_navigation", test_basic_navigation);
@@ -7503,18 +9264,24 @@ let () =
         test_workspace_navigation_compat_boundary );
       ( "workspace_query_local_symbol_lookup",
         test_workspace_query_local_symbol_lookup );
+      ( "cross_file_index_direct_lookup_flow",
+        test_cross_file_index_direct_lookup_flow );
+      ( "cross_file_index_ref_decl_is_import_ref",
+        test_cross_file_index_ref_decl_is_import_ref );
       ( "workspace_query_facade_preserves_feature_results",
         test_workspace_query_facade_preserves_feature_results );
       ( "workspace_feature_split_completion_smoke",
         test_workspace_feature_split_completion_smoke );
       ( "large_stale_change_keeps_navigation",
         test_large_stale_change_keeps_navigation );
-      ( "large_deferred_change_publishes_provisional_start_diag",
-        test_large_deferred_change_publishes_provisional_start_diag );
+      ( "large_deferred_change_suppresses_provisional_start_diag",
+        test_large_deferred_change_suppresses_provisional_start_diag );
       ( "workspace_budget_tiny_stops_scans",
         test_workspace_budget_tiny_stops_scans );
       ( "hover_body_cache_reuses_symbol_markdown",
         test_hover_body_cache_reuses_symbol_markdown );
+      ( "parse_damage_suppresses_semantic_cascade",
+        test_parse_damage_suppresses_semantic_cascade );
       ( "literals_keywords_and_strings_are_not_hover_targets",
         test_literals_keywords_and_strings_are_not_hover_targets );
       ( "semantic_graph_stable_ids_from_defs",
@@ -7529,6 +9296,11 @@ let () =
         test_compile_time_bad_nonconstant_required_context );
       ( "compile_time_unknown_does_not_overdiagnose",
         test_compile_time_unknown_does_not_overdiagnose );
+      ( "chapter12_builtins_typecheck_and_pseudovariables",
+        test_chapter12_builtins_typecheck_and_pseudovariables );
+      ( "chapter12_builtin_argument_diagnostics",
+        test_chapter12_builtin_argument_diagnostics );
+      ("rep_conversion_semantics", test_rep_conversion_semantics);
       ( "implementation_config_compile_time_type_and_layout",
         test_implementation_config_compile_time_type_and_layout );
       ( "system_subroutine_config_suppresses_unresolved_and_hovers",
@@ -7575,10 +9347,20 @@ let () =
         test_scope_shadowing_prefers_innermost );
       ( "hover_shadowing_prefers_innermost",
         test_hover_shadowing_prefers_innermost );
-      ( "hover_unresolved_is_semantic_message",
-        test_hover_unresolved_is_semantic_message );
+      ("hover_unresolved_is_absent", test_hover_unresolved_is_absent);
       ("compool_import_definition", test_compool_import_definition);
       ("ref_proc_links_to_def_proc", test_ref_proc_links_to_def_proc);
+      ( "unresolved_ref_proc_is_not_definition_target",
+        test_unresolved_ref_proc_is_not_definition_target );
+      ("proc_linkage_bif_is_preserved", test_proc_linkage_bif_is_preserved);
+      ( "asm_label_satisfies_ref_proc_implementation",
+        test_asm_label_satisfies_ref_proc_implementation );
+      ( "asm_label_uses_compool_import_scope",
+        test_asm_label_uses_compool_import_scope );
+      ( "workspace_query_asm_ref_proc_implementation_falls_through",
+        test_workspace_query_asm_ref_proc_implementation_falls_through );
+      ( "asm_extdef_directive_is_fallback_implementation",
+        test_asm_extdef_directive_is_fallback_implementation );
       ("jovial_hover_nav_fixture", test_jovial_hover_nav_fixture);
       ( "function_return_expression_type_mismatch",
         test_function_return_expression_type_mismatch );
@@ -7629,6 +9411,8 @@ let () =
         test_compool_import_change_invalidates_graph );
       ( "imported_compool_symbol_prefers_semantic_path",
         test_imported_compool_symbol_prefers_semantic_path );
+      ( "compool_lookup_does_not_escape_import_scope",
+        test_compool_lookup_does_not_escape_import_scope );
       ( "imported_compool_proc_prefers_summary_path",
         test_imported_compool_proc_prefers_summary_path );
       ( "broken_compool_summary_result_is_provisional",
@@ -7653,6 +9437,8 @@ let () =
       ("file_modes_and_huge_policy", test_file_modes_and_huge_policy);
       ( "open_doc_readiness_targets_reset_per_open",
         test_open_doc_readiness_targets_reset_per_open );
+      ( "startup_target_is_reporting_only",
+        test_startup_target_is_reporting_only );
       ( "debug_scheduler_memory_json_shape",
         test_debug_scheduler_memory_json_shape );
       ( "large_startup_readiness_allows_incremental_drain",

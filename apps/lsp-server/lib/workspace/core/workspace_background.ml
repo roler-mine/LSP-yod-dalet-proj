@@ -32,6 +32,28 @@ type doc_store_diff = {
   new_summary : Module_summary.t;
 }
 
+let large_workspace_scale (ws : t) : bool =
+  match workspace_profile_for_budget ws with
+  | ProfileLarge -> true
+  | ProfileSmall | ProfileMedium ->
+      ws.quick_nav_index_total >= 320
+      || ws.source_bytes_estimate_count >= 320
+      || List.length ws.source_file_paths >= 320
+
+let large_workspace_nav_complete (ws : t) : bool =
+  large_workspace_scale ws
+  && (quick_nav_index_complete ws || Queue.is_empty ws.quick_nav_pending_paths)
+
+let large_workspace_startup_quiet_active (ws : t) : bool =
+  large_workspace_scale ws
+  &&
+  match ws.startup_fully_nav_ready_ms with
+  | None -> true
+  | Some ready_ms ->
+      post_startup_large_parse_idle_quiet_ms > 0
+      && Perf_stats.now_ms () -. ready_ms
+         < float_of_int post_startup_large_parse_idle_quiet_ms
+
 let has_compool_doc (doc : Document.t) : bool =
   match doc.Document.compool_def with
   | None -> false
@@ -128,7 +150,9 @@ let validated_doc_with_diags ?(import_lookup_pump : bool = true)
   in
   let semantic_diags =
     match Document.current_parse doc with
-    | Some { Document.parsed_ast = Some _; parsed_diags = []; _ } -> (
+    | Some { Document.parsed_ast = Some _; parsed_syntax = Some syntax; _ }
+      when Diagnostic_gate.semantic_analysis_allowed
+             ~parse_output:syntax.Syntax_cache.parse () -> (
         match semantic_mode with
         | SemanticFull -> (
             try validate_semantics ws doc
@@ -414,13 +438,25 @@ let semantic_snapshot_current_for_doc (ws : t) (doc : Document.t) : bool =
          = Digest.to_hex (Digest.string doc.Document.text)
   | None -> false
 
-let refresh_semantic_nav_snapshot_for_doc (ws : t) (doc : Document.t) : unit =
+let refresh_semantic_nav_snapshot_for_doc ?(prefer_skeleton : bool = false)
+    (ws : t) (doc : Document.t) : unit =
   if ws.sem_store_enabled && doc.Document.parse_rev = doc.Document.rev then
     match
       Semantic_store.snapshot_for_uri ws.semantic_store ~uri:doc.Document.uri
     with
-    | Some _ when semantic_snapshot_current_for_doc ws doc ->
-        Perf_stats.tick "nav.index_doc.cache_hit"
+    | Some snap when semantic_snapshot_current_for_doc ws doc ->
+        Perf_stats.tick "nav.index_doc.cache_hit";
+        Cross_file_index.upsert_document_snapshot ws.cross_file_index doc snap
+    | _ when prefer_skeleton && Document.has_current_syntax doc ->
+        Perf_stats.tick "nav.index_doc.skeleton_live_edit";
+        Workspace_nav_model.upsert_semantic_snapshot_for_doc_with_skeleton ws
+          doc
+    | _
+      when String.length doc.Document.text >= ws.bg_large_file_bytes
+           && Document.has_current_syntax doc ->
+        Perf_stats.tick "nav.index_doc.skeleton_large";
+        Workspace_nav_model.upsert_semantic_snapshot_for_doc_with_skeleton ws
+          doc
     | _
       when String.length doc.Document.text > ws.full_semantic_tokens_max_bytes
            && Document.has_current_syntax doc ->
@@ -443,9 +479,14 @@ let refresh_semantic_nav_snapshot_for_doc (ws : t) (doc : Document.t) : unit =
             ~uri:(Uri_path.docuri_to_string doc.Document.uri)
             ~bytes:(String.length doc.Document.text)
             ~rev:doc.Document.rev)
+    | _ when Document.has_current_syntax doc ->
+        Perf_stats.tick "nav.index_doc.skeleton_low_confidence";
+        Workspace_nav_model.upsert_semantic_snapshot_for_doc_with_skeleton ws
+          doc
     | _ ->
         Perf_stats.tick "nav.index_doc.skipped_imports_pending";
-        Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri
+        Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+        Cross_file_index.remove_uri ws.cross_file_index ~uri:doc.Document.uri
 
 let record_doc_diff_side_effects (ws : t) (diff : doc_store_diff) : unit =
   (match diff.old_summary with
@@ -481,9 +522,9 @@ let record_doc_diff_side_effects (ws : t) (diff : doc_store_diff) : unit =
 let install_doc_surface ?(touch_bg_parsed : bool = true)
     ?(clear_closed_doc_touch : bool = true)
     ?(enqueue_importer_revalidate : bool = true) ?(allow_ast_shed : bool = true)
-    ?(preserve_current_semantic_snapshot : bool = false) (ws : t)
-    ~(uri : T.DocumentUri.t) ~(old_doc : Document.t option) (doc : Document.t) :
-    doc_store_diff =
+    ?(preserve_current_semantic_snapshot : bool = false)
+    ?(prefer_skeleton_nav : bool = false) (ws : t) ~(uri : T.DocumentUri.t)
+    ~(old_doc : Document.t option) (doc : Document.t) : doc_store_diff =
   let diff = doc_store_diff ~old_doc ~new_doc:doc in
   record_doc_diff_side_effects ws diff;
   replace_doc_storage ~touch_bg_parsed ~clear_closed_doc_touch ws ~uri ~old_doc
@@ -495,9 +536,12 @@ let install_doc_surface ?(touch_bg_parsed : bool = true)
       && not
            (preserve_current_semantic_snapshot
            && semantic_snapshot_current_for_doc ws doc)
-    then Semantic_store.remove_uri ws.semantic_store ~uri
+    then (
+      Semantic_store.remove_uri ws.semantic_store ~uri;
+      Cross_file_index.remove_uri ws.cross_file_index ~uri)
     else if diff.rev_changed then Perf_stats.tick "query.cache.keep_stale_uri";
-  refresh_semantic_nav_snapshot_for_doc ws doc;
+  refresh_semantic_nav_snapshot_for_doc ~prefer_skeleton:prefer_skeleton_nav ws
+    doc;
   if allow_ast_shed then
     maybe_shed_open_doc_parse_state ws ~prefer_uri:(Some uri);
   revalidate_importers_for_doc_diff ws ~old_doc ~new_doc:doc ~diff
@@ -511,7 +555,10 @@ let store_doc ?(import_lookup_pump : bool = true)
   let doc =
     validated_doc_with_diags ~import_lookup_pump ~semantic_mode ws doc
   in
-  ignore (install_doc_surface ws ~uri ~old_doc doc)
+  let prefer_skeleton_nav =
+    match semantic_mode with SemanticRangeSemi _ -> true | SemanticFull -> false
+  in
+  ignore (install_doc_surface ~prefer_skeleton_nav ws ~uri ~old_doc doc)
 
 let store_doc_fast ?(preserve_current_semantic_snapshot : bool = false) (ws : t)
     (uri : T.DocumentUri.t) (doc : Document.t) : unit =
@@ -558,10 +605,15 @@ let refresh_open_doc_diags ?(import_lookup_pump : bool = false) (ws : t)
   | Some doc ->
       (* Stale large documents keep provisional diagnostics until the worker
          parse lands; the refresh path must not become a foreground full parse. *)
+      let background_large =
+        String.length doc.Document.text >= ws.bg_large_file_bytes
+      in
       let semantic_mode =
-        if is_large_doc doc ws && doc.Document.parse_rev <> doc.Document.rev
-        then (
-          Perf_stats.tick "diag.open.revalidate_stale_large_fast";
+        if background_large then (
+          Perf_stats.tick
+            (if doc.Document.parse_rev <> doc.Document.rev then
+               "diag.open.revalidate_stale_large_fast"
+             else "diag.open.revalidate_large_semantic_deferred");
           SemanticRangeSemi zero_lsp_range)
         else SemanticFull
       in
@@ -598,8 +650,8 @@ let queue_workspace_diag_update_for_doc (ws : t) (doc : Document.t) : unit =
               else Hashtbl.replace ws.bg_closed_diags uri_s filtered;
               enqueue_bg_diag_update ws ~uri:doc.Document.uri ~diags:filtered))
 
-let refresh_closed_doc_diagnostics_now (ws : t) ~(uri : T.DocumentUri.t) : bool
-    =
+let refresh_closed_doc_diagnostics_now ?(force : bool = false) (ws : t)
+    ~(uri : T.DocumentUri.t) : bool =
   if Hashtbl.mem ws.docs uri then false
   else
     match Uri_path.file_path_of_uri uri with
@@ -616,12 +668,15 @@ let refresh_closed_doc_diagnostics_now (ws : t) ~(uri : T.DocumentUri.t) : bool
           let uri_s = Uri_path.docuri_to_string uri in
           let had = Hashtbl.mem ws.bg_closed_diags uri_s in
           Hashtbl.remove ws.bg_closed_diags uri_s;
-          Hashtbl.remove ws.files path_key;
-          Hashtbl.remove ws.bg_parsed path_key;
-          Hashtbl.remove ws.closed_doc_last_touch path_key;
-          remove_module_summary_cache_entry ws ~path_key;
-          if had then enqueue_bg_diag_update ws ~uri ~diags:[];
-          had)
+                  Hashtbl.remove ws.files path_key;
+                  Hashtbl.remove ws.bg_parsed path_key;
+                  Hashtbl.remove ws.closed_doc_last_touch path_key;
+                  remove_module_summary_cache_entry ws ~path_key;
+                  if had then enqueue_bg_diag_update ws ~uri ~diags:[];
+                  had)
+        else if (not force) && large_workspace_startup_quiet_active ws then (
+          Perf_stats.tick "diag.refresh.closed_suppressed_nav_ready";
+          false)
         else
           match read_file_text path with
           | None -> false
@@ -726,37 +781,46 @@ let refresh_bg_seed_paths (ws : t) : unit =
       ws.quick_nav_index_done <- Hashtbl.length ws.quick_nav_done_set;
       ws.bg_seed_needs_refresh <- false
 
+let suppress_large_workspace_bulk_sweep_seed (ws : t) : unit =
+  ws.bg_seed_cursor <- Array.length ws.bg_seed_paths;
+  ws.graph_root_closure_cursor <- Array.length ws.graph_root_closure_paths;
+  Perf_stats.tick "bg.bulk_seed_suppressed_nav_ready"
+
 let seed_bg_paths_from_index (ws : t) : unit =
-  ensure_graph_fresh ws;
-  if ws.bg_seed_needs_refresh then refresh_bg_seed_paths ws;
-  let per_tick =
-    match workspace_pressure_mode ws with
-    | PressureNormal -> bg_seed_paths_per_tick
-    | PressureSoft -> max 1 (bg_seed_paths_per_tick / 4)
-    | PressureCritical -> 0
-  in
-  if per_tick <= 0 then ()
-  else
-    let added = ref 0 in
-    while
-      !added < per_tick
-      && ws.graph_root_closure_cursor < Array.length ws.graph_root_closure_paths
-    do
-      let p = ws.graph_root_closure_paths.(ws.graph_root_closure_cursor) in
-      ws.graph_root_closure_cursor <- ws.graph_root_closure_cursor + 1;
-      enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"root_closure" ~high:false
-        p;
-      incr added
-    done;
-    while
-      !added < per_tick && ws.bg_seed_cursor < Array.length ws.bg_seed_paths
-    do
-      let p = ws.bg_seed_paths.(ws.bg_seed_cursor) in
-      ws.bg_seed_cursor <- ws.bg_seed_cursor + 1;
-      enqueue_bg_path ws ~lane:LaneSweep ~reason_group:"seed_sweep" ~high:false
-        p;
-      incr added
-    done
+  if large_workspace_startup_quiet_active ws then
+    suppress_large_workspace_bulk_sweep_seed ws
+  else (
+    ensure_graph_fresh ws;
+    if ws.bg_seed_needs_refresh then refresh_bg_seed_paths ws;
+    let per_tick =
+      match workspace_pressure_mode ws with
+      | PressureNormal -> bg_seed_paths_per_tick
+      | PressureSoft -> max 1 (bg_seed_paths_per_tick / 4)
+      | PressureCritical -> 0
+    in
+    if per_tick <= 0 then ()
+    else
+      let added = ref 0 in
+      while
+        !added < per_tick
+        && ws.graph_root_closure_cursor
+           < Array.length ws.graph_root_closure_paths
+      do
+        let p = ws.graph_root_closure_paths.(ws.graph_root_closure_cursor) in
+        ws.graph_root_closure_cursor <- ws.graph_root_closure_cursor + 1;
+        enqueue_bg_path ws ~lane:LaneRoot ~reason_group:"root_closure"
+          ~high:false p;
+        incr added
+      done;
+      while
+        !added < per_tick && ws.bg_seed_cursor < Array.length ws.bg_seed_paths
+      do
+        let p = ws.bg_seed_paths.(ws.bg_seed_cursor) in
+        ws.bg_seed_cursor <- ws.bg_seed_cursor + 1;
+        enqueue_bg_path ws ~lane:LaneSweep ~reason_group:"seed_sweep"
+          ~high:false p;
+        incr added
+      done)
 
 let quick_nav_proc_kind = 12
 
@@ -802,11 +866,35 @@ let open_doc_generation_for_uri (ws : t) (uri : T.DocumentUri.t) : int =
   | Some g -> g
   | None -> 0
 
+let document_text_hash (doc : Document.t) : string =
+  Digest.to_hex (Digest.string doc.Document.text)
+
+let parser_profile_name = function
+  | Parser.Interactive -> "interactive"
+  | Parser.Background -> "background"
+  | Parser.Batch -> "batch"
+  | Parser.Debug -> "debug"
+
+let background_parse_profile_name = parser_profile_name Parser.Background
+
+let parse_job_open_payload ~(path_key : string) ~(uri : T.DocumentUri.t)
+    ~(generation : int) (doc : Document.t) =
+  ParseJobOpen
+    {
+      path_key;
+      uri;
+      generation;
+      text_hash = document_text_hash doc;
+      parse_profile = background_parse_profile_name;
+      started_ms = Perf_stats.now_ms ();
+      doc;
+    }
+
 let parse_job_stale_reason (ws : t) (job : parse_job) : string option =
   if job.pj_epoch <> ws.parse_epoch then Some "epoch"
   else
     match job.pj_payload with
-    | ParseJobOpen { uri; generation; doc; _ } -> (
+    | ParseJobOpen { uri; generation; text_hash; doc; _ } -> (
         match Hashtbl.find_opt ws.docs uri with
         | None -> Some "closed"
         | Some latest_doc ->
@@ -815,6 +903,7 @@ let parse_job_stale_reason (ws : t) (job : parse_job) : string option =
             else if latest_doc.Document.rev <> doc.Document.rev then Some "rev"
             else if latest_doc.Document.lsp_version <> doc.Document.lsp_version
             then Some "version"
+            else if document_text_hash latest_doc <> text_hash then Some "hash"
             else None)
     | ParseJobPath { path_key; _ } ->
         if Hashtbl.mem ws.bg_parsed path_key then Some "already_parsed"
@@ -834,6 +923,172 @@ let parse_job_kind_of_queue_kind = function
   | BgQueueNormalLarge -> Some ParseJobNormalLarge
   | BgQueueHighSmall | BgQueueRootSmall | BgQueueNormalSmall -> None
 
+let worker_job_kind_of_parse_job_kind = function
+  | ParseJobHighLarge -> Worker_ipc.JobHighLarge
+  | ParseJobRootLarge -> Worker_ipc.JobRootLarge
+  | ParseJobNormalLarge -> Worker_ipc.JobNormalLarge
+
+let parse_job_kind_of_worker_job_kind = function
+  | Worker_ipc.JobHighLarge -> ParseJobHighLarge
+  | Worker_ipc.JobRootLarge -> ParseJobRootLarge
+  | Worker_ipc.JobNormalLarge -> ParseJobNormalLarge
+
+let docuri_of_wire_string (s : string) : T.DocumentUri.t =
+  try T.DocumentUri.t_of_yojson (`String s)
+  with _ -> T.DocumentUri.t_of_yojson (`String "file:///")
+
+let alloc_parse_worker_doc_slot_locked (ws : t) (doc : Document.t) : int =
+  let id = ws.parse_worker_next_doc_slot in
+  ws.parse_worker_next_doc_slot <- ws.parse_worker_next_doc_slot + 1;
+  Hashtbl.replace ws.parse_worker_doc_slots id doc;
+  id
+
+let take_parse_worker_doc_slot_locked (ws : t) (id : int) : Document.t option =
+  let doc = Hashtbl.find_opt ws.parse_worker_doc_slots id in
+  Hashtbl.remove ws.parse_worker_doc_slots id;
+  doc
+
+let worker_frame_of_parse_job_locked (ws : t) (job : parse_job) : bytes =
+  let kind = worker_job_kind_of_parse_job_kind job.pj_kind in
+  let wire_job =
+    match job.pj_payload with
+    | ParseJobOpen
+        { path_key; uri; generation; text_hash; parse_profile; started_ms; doc }
+      ->
+        let doc_slot = alloc_parse_worker_doc_slot_locked ws doc in
+        Worker_ipc.JobOpen
+          {
+            kind;
+            epoch = job.pj_epoch;
+            path_key;
+            uri = Uri_path.docuri_to_string uri;
+            generation;
+            text_hash;
+            parse_profile;
+            started_ms;
+            doc_slot;
+            file = doc.Document.file;
+            rev = doc.Document.rev;
+            lsp_version = doc.Document.lsp_version;
+          }
+    | ParseJobPath { path; path_key } ->
+        Worker_ipc.JobPath { kind; epoch = job.pj_epoch; path; path_key }
+  in
+  Worker_ipc.encode_parse_job wire_job
+
+let parse_job_of_worker_job_locked (ws : t) (job : Worker_ipc.parse_job) :
+    parse_job option =
+  match job with
+  | Worker_ipc.JobOpen x -> (
+      match take_parse_worker_doc_slot_locked ws x.doc_slot with
+      | None -> None
+      | Some doc ->
+          Some
+            {
+              pj_kind = parse_job_kind_of_worker_job_kind x.kind;
+              pj_epoch = x.epoch;
+              pj_payload =
+                ParseJobOpen
+                  {
+                    path_key = x.path_key;
+                    uri = docuri_of_wire_string x.uri;
+                    generation = x.generation;
+                    text_hash = x.text_hash;
+                    parse_profile = x.parse_profile;
+                    started_ms = x.started_ms;
+                    doc;
+                  };
+            })
+  | Worker_ipc.JobPath x ->
+      Some
+        {
+          pj_kind = parse_job_kind_of_worker_job_kind x.kind;
+          pj_epoch = x.epoch;
+          pj_payload = ParseJobPath { path = x.path; path_key = x.path_key };
+        }
+
+let stale_result_of_worker_job (job : Worker_ipc.parse_job) : parse_result =
+  ParseResultStale
+    {
+      pr_epoch = Worker_ipc.parse_job_epoch job;
+      path_key = Worker_ipc.parse_job_path_key job;
+    }
+
+let worker_frame_of_parse_result_locked (ws : t) (res : parse_result) : bytes =
+  let wire_result =
+    match res with
+    | ParseResultOpen x ->
+        let doc_slot = alloc_parse_worker_doc_slot_locked ws x.doc in
+        Worker_ipc.ResultOpen
+          {
+            kind = worker_job_kind_of_parse_job_kind x.pr_kind;
+            epoch = x.pr_epoch;
+            path_key = x.path_key;
+            uri = Uri_path.docuri_to_string x.uri;
+            generation = x.generation;
+            text_hash = x.text_hash;
+            parse_profile = x.parse_profile;
+            started_ms = x.started_ms;
+            doc_slot;
+          }
+    | ParseResultPath x ->
+        let doc_slot =
+          match x.doc_opt with
+          | None -> None
+          | Some doc -> Some (alloc_parse_worker_doc_slot_locked ws doc)
+        in
+        Worker_ipc.ResultPath
+          {
+            kind = worker_job_kind_of_parse_job_kind x.pr_kind;
+            epoch = x.pr_epoch;
+            path = x.path;
+            path_key = x.path_key;
+            doc_slot;
+          }
+    | ParseResultStale x ->
+        Worker_ipc.ResultStale { epoch = x.pr_epoch; path_key = x.path_key }
+  in
+  Worker_ipc.encode_parse_result wire_result
+
+let parse_result_of_worker_result_locked (ws : t)
+    (res : Worker_ipc.parse_result) : parse_result option =
+  match res with
+  | Worker_ipc.ResultOpen x -> (
+      match take_parse_worker_doc_slot_locked ws x.doc_slot with
+      | None ->
+          Some (ParseResultStale { pr_epoch = x.epoch; path_key = x.path_key })
+      | Some doc ->
+          Some
+            (ParseResultOpen
+               {
+                 pr_kind = parse_job_kind_of_worker_job_kind x.kind;
+                 pr_epoch = x.epoch;
+                 path_key = x.path_key;
+                 uri = docuri_of_wire_string x.uri;
+                 generation = x.generation;
+                 text_hash = x.text_hash;
+                 parse_profile = x.parse_profile;
+                 started_ms = x.started_ms;
+                 doc;
+               }))
+  | Worker_ipc.ResultPath x ->
+      let doc_opt =
+        match x.doc_slot with
+        | None -> None
+        | Some slot -> take_parse_worker_doc_slot_locked ws slot
+      in
+      Some
+        (ParseResultPath
+           {
+             pr_kind = parse_job_kind_of_worker_job_kind x.kind;
+             pr_epoch = x.epoch;
+             path = x.path;
+             path_key = x.path_key;
+             doc_opt;
+           })
+  | Worker_ipc.ResultStale x ->
+      Some (ParseResultStale { pr_epoch = x.epoch; path_key = x.path_key })
+
 let parse_worker_loop (ws : t) () : unit =
   let wait_job () =
     Mutex.lock ws.parse_worker_mtx;
@@ -849,62 +1104,92 @@ let parse_worker_loop (ws : t) () : unit =
   in
   let push_result (res : parse_result) =
     Mutex.lock ws.parse_worker_mtx;
-    Queue.add res ws.parse_worker_results;
+    Queue.add (worker_frame_of_parse_result_locked ws res)
+      ws.parse_worker_results;
     Mutex.unlock ws.parse_worker_mtx
   in
   let rec loop () =
     match wait_job () with
     | None -> ()
-    | Some job ->
-        let result =
-          if parse_job_is_stale ws job then stale_result_of_parse_job job
-          else
-            match job.pj_payload with
-            | ParseJobOpen { path_key; uri; generation; doc } ->
-                let doc =
-                  parse_open_doc_worker ~max_bytes:ws.parse_file_max_bytes doc
-                in
-                ParseResultOpen
-                  {
-                    pr_kind = job.pj_kind;
-                    pr_epoch = job.pj_epoch;
-                    path_key;
-                    uri;
-                    generation;
-                    doc;
-                  }
-            | ParseJobPath { path; path_key } ->
-                let uri =
-                  match Uri_path.docuri_of_path path with
-                  | Some u -> u
-                  | None -> (
-                      match
-                        T.DocumentUri.t_of_yojson
-                          (`String (Uri_path.file_uri_of_path path))
-                      with
-                      | u -> u
-                      | exception _ ->
-                          T.DocumentUri.t_of_yojson (`String "file:///"))
-                in
-                let doc_opt =
-                  match read_file_text path with
-                  | None -> None
-                  | Some text ->
-                      Some
-                        (parse_doc_worker ~max_bytes:ws.parse_file_max_bytes
-                           ~uri ~file:(Some path) ~text)
-                in
-                ParseResultPath
-                  {
-                    pr_kind = job.pj_kind;
-                    pr_epoch = job.pj_epoch;
-                    path;
-                    path_key;
-                    doc_opt;
-                  }
-        in
-        push_result result;
-        loop ()
+    | Some job_frame -> (
+        match Worker_ipc.decode_parse_job job_frame with
+        | Error msg ->
+            Perf_log.log_event "worker_ipc_decode_error" ~uri:msg;
+            Perf_stats.tick "worker.ipc.decode_error";
+            loop ()
+        | Ok wire_job -> (
+            let job_opt =
+              Mutex.lock ws.parse_worker_mtx;
+              let job_opt = parse_job_of_worker_job_locked ws wire_job in
+              Mutex.unlock ws.parse_worker_mtx;
+              job_opt
+            in
+            let result =
+              match job_opt with
+              | None -> stale_result_of_worker_job wire_job
+              | Some job ->
+                  if parse_job_is_stale ws job then stale_result_of_parse_job job
+                  else
+                    match job.pj_payload with
+                    | ParseJobOpen
+                        {
+                          path_key;
+                          uri;
+                          generation;
+                          text_hash;
+                          parse_profile;
+                          started_ms;
+                          doc;
+                        } ->
+                        let doc =
+                          parse_open_doc_worker
+                            ~max_bytes:ws.parse_file_max_bytes doc
+                        in
+                        ParseResultOpen
+                          {
+                            pr_kind = job.pj_kind;
+                            pr_epoch = job.pj_epoch;
+                            path_key;
+                            uri;
+                            generation;
+                            text_hash;
+                            parse_profile;
+                            started_ms;
+                            doc;
+                          }
+                    | ParseJobPath { path; path_key } ->
+                        let uri =
+                          match Uri_path.docuri_of_path path with
+                          | Some u -> u
+                          | None -> (
+                              match
+                                T.DocumentUri.t_of_yojson
+                                  (`String (Uri_path.file_uri_of_path path))
+                              with
+                              | u -> u
+                              | exception _ ->
+                                  T.DocumentUri.t_of_yojson (`String "file:///"))
+                        in
+                        let doc_opt =
+                          match read_file_text path with
+                          | None -> None
+                          | Some text ->
+                              Some
+                                (parse_doc_worker
+                                   ~max_bytes:ws.parse_file_max_bytes ~uri
+                                   ~file:(Some path) ~text)
+                        in
+                        ParseResultPath
+                          {
+                            pr_kind = job.pj_kind;
+                            pr_epoch = job.pj_epoch;
+                            path;
+                            path_key;
+                            doc_opt;
+                          }
+            in
+            push_result result;
+            loop ()))
   in
   loop ()
 
@@ -923,6 +1208,10 @@ let try_submit_large_parse_job (ws : t) ~(path : string)
   | Some pj_kind ->
       let path_key = normalize_path_key path in
       if path_key = "" then true
+      else if Hashtbl.mem ws.bg_parsed path_key then true
+      else if large_workspace_startup_quiet_active ws then (
+        Perf_stats.tick "bg.parse.large_suppressed_nav_ready";
+        true)
       else if Hashtbl.mem ws.parse_worker_inflight path_key then true
       else if
         Hashtbl.length ws.parse_worker_inflight >= ws.parse_worker_max_inflight
@@ -939,14 +1228,16 @@ let try_submit_large_parse_job (ws : t) ~(path : string)
                 | Some g -> g
                 | None -> 0
               in
-              ParseJobOpen { path_key; uri = doc.Document.uri; generation; doc }
+              parse_job_open_payload ~path_key ~uri:doc.Document.uri
+                ~generation doc
           | None -> ParseJobPath { path; path_key }
         in
         let job =
           { pj_kind; pj_epoch = ws.parse_epoch; pj_payload = payload }
         in
         Mutex.lock ws.parse_worker_mtx;
-        Queue.add job ws.parse_worker_jobs;
+        Queue.add (worker_frame_of_parse_job_locked ws job)
+          ws.parse_worker_jobs;
         Condition.signal ws.parse_worker_cv;
         Mutex.unlock ws.parse_worker_mtx;
         Hashtbl.replace ws.parse_worker_inflight path_key pj_kind;
@@ -1018,19 +1309,20 @@ let quick_nav_entries_of_path_prefix (path : string) ~(max_bytes : int) :
       | Some cache ->
           cache.Syntax_cache.skeleton.symbols
           |> List.filter_map (fun (symbol : Syntax_cache.skeleton_symbol) ->
-              let key = normalize_name symbol.sk_name in
-              if key = "" then None
-              else
-                Some
-                  {
-                    qn_uri = uri;
-                    qn_name = symbol.sk_name;
-                    qn_key = key;
-                    qn_loc = symbol.sk_loc;
-                    qn_kind = quick_nav_kind_of_skeleton_kind symbol.sk_kind;
-                    qn_container = symbol.sk_container;
-                    qn_metadata = quick_nav_metadata_of_skeleton_symbol symbol;
-                  }))
+                 let key = normalize_name symbol.sk_name in
+                 if key = "" then None
+                 else
+                   Some
+                     {
+                       qn_uri = uri;
+                       qn_name = symbol.sk_name;
+                       qn_key = key;
+                       qn_loc = symbol.sk_loc;
+                       qn_kind = quick_nav_kind_of_skeleton_kind symbol.sk_kind;
+                       qn_container = symbol.sk_container;
+                       qn_metadata =
+                         quick_nav_metadata_of_skeleton_symbol symbol;
+                     }))
 
 let quick_nav_index_step ?(should_stop : unit -> bool = fun () -> false)
     (ws : t) ~(budget_ms : int) : unit =
@@ -1039,22 +1331,24 @@ let quick_nav_index_step ?(should_stop : unit -> bool = fun () -> false)
     let deadline = Perf_stats.now_ms () +. float_of_int budget_ms in
     let cache_updates = ref [] in
     let flush_cache_if_needed ~force =
-      match ws.root_path with
-      | None -> ()
-      | Some root ->
-          let updates = List.rev !cache_updates in
-          cache_updates := [];
-          if updates <> [] then
-            Perf_stats.time "persistent_cache.skeleton_buffer" (fun () ->
-                Persistent_cache.save_skeleton_entries_buffered
-                  ~source_extensions:ws.source_extensions ~root
-                  ~max_bytes:nav_quick_scan_per_file_bytes
-                  ~entries_by_path:updates);
-          if force then
-            Perf_stats.time "persistent_cache.skeleton_flush" (fun () ->
-                Persistent_cache.flush_skeleton_entries
-                  ~source_extensions:ws.source_extensions ~root
-                  ~max_bytes:nav_quick_scan_per_file_bytes)
+      if ws.startup_fully_nav_ready_ms = None then cache_updates := []
+      else
+        match ws.root_path with
+        | None -> ()
+        | Some root ->
+            let updates = List.rev !cache_updates in
+            cache_updates := [];
+            if updates <> [] then
+              Perf_stats.time "persistent_cache.skeleton_buffer" (fun () ->
+                  Persistent_cache.save_skeleton_entries_buffered
+                    ~source_extensions:ws.source_extensions ~root
+                    ~max_bytes:nav_quick_scan_per_file_bytes
+                    ~entries_by_path:updates);
+            if force then
+              Perf_stats.time "persistent_cache.skeleton_flush" (fun () ->
+                  Persistent_cache.flush_skeleton_entries
+                    ~source_extensions:ws.source_extensions ~root
+                    ~max_bytes:nav_quick_scan_per_file_bytes)
     in
     let rec loop () =
       Thread.yield ();
@@ -1081,9 +1375,57 @@ let quick_nav_index_step ?(should_stop : unit -> bool = fun () -> false)
     loop ();
     flush_cache_if_needed ~force:(Queue.is_empty ws.quick_nav_pending_paths)
 
+let complete_startup_nav_index_foreground ?max_ms (ws : t) : unit =
+  let t0 = Perf_log.now_ms () in
+  let max_ms =
+    max 0
+      (Option.value max_ms ~default:startup_foreground_nav_index_budget_ms)
+  in
+  Perf_log.log_event "startup_foreground_nav_index_start"
+    ~queue:(Queue.length ws.quick_nav_pending_paths);
+  if ws.assembly_file_paths <> [] then Workspace_asm.ensure_label_index ws;
+  if ws.bg_seed_needs_refresh then refresh_bg_seed_paths ws;
+  if (not (quick_nav_index_complete ws)) && max_ms > 0 then (
+    let before_done = ws.quick_nav_index_done in
+    let before_pending = Queue.length ws.quick_nav_pending_paths in
+    quick_nav_index_step ws ~budget_ms:max_ms;
+    let after_pending = Queue.length ws.quick_nav_pending_paths in
+    if ws.quick_nav_index_done = before_done && after_pending = before_pending
+    then Perf_stats.tick "startup.foreground_nav_no_progress");
+  if Queue.is_empty ws.quick_nav_pending_paths then (
+    Hashtbl.clear ws.quick_nav_pending_set;
+    if ws.quick_nav_index_total > 0
+       && ws.quick_nav_index_done < ws.quick_nav_index_total
+    then ws.quick_nav_index_done <- ws.quick_nav_index_total);
+  (if large_workspace_nav_complete ws then
+      let clear_queue q =
+        while not (Queue.is_empty q) do
+          ignore (Queue.pop q)
+        done
+      in
+      clear_queue ws.bg_high_small_queue;
+      clear_queue ws.bg_root_small_queue;
+      clear_queue ws.bg_norm_small_queue;
+      clear_queue ws.bg_high_large_queue;
+      clear_queue ws.bg_root_large_queue;
+      clear_queue ws.bg_norm_large_queue;
+      Hashtbl.clear ws.bg_enqueued;
+      ws.bg_seed_cursor <- Array.length ws.bg_seed_paths;
+      ws.graph_root_closure_cursor <- Array.length ws.graph_root_closure_paths;
+      Perf_stats.tick "startup.foreground_nav_suppressed_bulk_parse_sweep"
+   else ());
+  update_startup_ready_state ws;
+  Perf_log.log_event "startup_foreground_nav_index_end"
+    ~ms:(max 0.0 (Perf_log.now_ms () -. t0))
+    ~queue:(Queue.length ws.quick_nav_pending_paths);
+  if quick_nav_index_complete ws then
+    Perf_stats.tick "startup.foreground_nav_complete"
+  else Perf_stats.tick "startup.foreground_nav_deferred"
+
 let apply_parse_result_open (ws : t) ~(pr_kind : parse_job_kind)
     ~(pr_epoch : int) ~(path_key : string) ~(uri : T.DocumentUri.t)
-    ~(generation : int) ~(doc : Document.t) : unit =
+    ~(generation : int) ~(text_hash : string) ~(parse_profile : string)
+    ~(started_ms : float) ~(doc : Document.t) : unit =
   Hashtbl.remove ws.parse_worker_inflight path_key;
   if pr_epoch <> ws.parse_epoch then
     Perf_stats.tick "bg.parse.stale_result_drop"
@@ -1095,12 +1437,18 @@ let apply_parse_result_open (ws : t) ~(pr_kind : parse_job_kind)
       match Hashtbl.find_opt ws.docs uri with
       | None -> Perf_stats.tick "diag.open.stale_generation_drop"
       | Some latest_doc ->
+          let latest_text_hash = document_text_hash latest_doc in
           if
             latest_doc.Document.rev <> doc.Document.rev
             || doc.Document.lsp_version <> latest_doc.Document.lsp_version
+            || latest_text_hash <> text_hash
+            || document_text_hash doc <> text_hash
           then Perf_stats.tick "diag.open.stale_version_drop"
           else (
             ignore pr_kind;
+            ignore parse_profile;
+            Perf_stats.observe_ms "diag.open.worker_result_age_ms"
+              (max 0.0 (Perf_stats.now_ms () -. started_ms));
             let old_doc = Hashtbl.find_opt ws.docs uri in
             let finalize_diag_now =
               doc.Document.parse_rev = doc.Document.rev
@@ -1169,7 +1517,9 @@ let apply_parse_result_path (ws : t) ~(pr_kind : parse_job_kind)
         touch_closed_doc_path ws ~path_key;
         evict_closed_docs_if_needed ws;
         if ws.sem_store_enabled && (diff.rev_changed || diff.parse_rev_changed)
-        then Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+        then (
+          Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+          Cross_file_index.remove_uri ws.cross_file_index ~uri:doc.Document.uri);
         refresh_semantic_nav_snapshot_for_doc ws doc;
         queue_workspace_diag_update_for_doc ws doc
 
@@ -1210,9 +1560,12 @@ let finish_open_doc_now_if_needed (ws : t) ~(uri : T.DocumentUri.t) : bool =
               with exn ->
                 with_internal_phase_diag doc ~phase:"open-doc-forced" ~exn
             in
+            let text_hash = document_text_hash doc in
             apply_parse_result_open ws ~pr_kind:ParseJobHighLarge
               ~pr_epoch:ws.parse_epoch ~path_key:(normalize_path_key path) ~uri
-              ~generation ~doc:parsed_doc;
+              ~generation ~text_hash
+              ~parse_profile:background_parse_profile_name
+              ~started_ms:(Perf_stats.now_ms ()) ~doc:parsed_doc;
             (match Hashtbl.find_opt ws.docs uri with
             | Some latest when latest.Document.parse_rev = latest.Document.rev
               ->
@@ -1241,18 +1594,30 @@ let drain_parse_worker_results ?(open_only : bool = false) (ws : t)
   else
     let pop_next_result () =
       Mutex.lock ws.parse_worker_mtx;
+      let materialize frame =
+        match Worker_ipc.decode_parse_result frame with
+        | Error msg ->
+            Perf_log.log_event "worker_ipc_decode_error" ~uri:msg;
+            Perf_stats.tick "worker.ipc.decode_error";
+            None
+        | Ok wire_result -> parse_result_of_worker_result_locked ws wire_result
+      in
       let next =
         if Queue.is_empty ws.parse_worker_results then None
-        else if not open_only then Some (Queue.pop ws.parse_worker_results)
+        else if not open_only then materialize (Queue.pop ws.parse_worker_results)
         else
           let skipped = Queue.create () in
           let found = ref None in
           while !found = None && not (Queue.is_empty ws.parse_worker_results) do
-            let res = Queue.pop ws.parse_worker_results in
-            match res with
-            | ParseResultOpen _ -> found := Some res
-            | ParseResultStale _ -> found := Some res
-            | ParseResultPath _ -> Queue.add res skipped
+            let frame = Queue.pop ws.parse_worker_results in
+            match Worker_ipc.parse_result_message_kind frame with
+            | Ok Worker_ipc.ResultMessageOpen
+            | Ok Worker_ipc.ResultMessageStale ->
+                found := materialize frame
+            | Ok Worker_ipc.ResultMessagePath -> Queue.add frame skipped
+            | Error msg ->
+                Perf_log.log_event "worker_ipc_decode_error" ~uri:msg;
+                Perf_stats.tick "worker.ipc.decode_error"
           done;
           while not (Queue.is_empty skipped) do
             Queue.add (Queue.pop skipped) ws.parse_worker_results
@@ -1271,7 +1636,8 @@ let drain_parse_worker_results ?(open_only : bool = false) (ws : t)
         | Some (ParseResultOpen x) ->
             apply_parse_result_open ws ~pr_kind:x.pr_kind ~pr_epoch:x.pr_epoch
               ~path_key:x.path_key ~uri:x.uri ~generation:x.generation
-              ~doc:x.doc;
+              ~text_hash:x.text_hash ~parse_profile:x.parse_profile
+              ~started_ms:x.started_ms ~doc:x.doc;
             loop (n - 1)
         | Some (ParseResultPath x) ->
             apply_parse_result_path ws ~pr_kind:x.pr_kind ~pr_epoch:x.pr_epoch
@@ -1287,12 +1653,21 @@ let drain_parse_worker_results ?(open_only : bool = false) (ws : t)
 let background_parse_path (ws : t) (path : string) : unit =
   let path_key = normalize_path_key path in
   if path_key = "" || Hashtbl.mem ws.bg_parsed path_key then ()
+  else if
+    large_workspace_startup_quiet_active ws
+    && not (has_open_doc_for_path_key ws ~path_key)
+  then Perf_stats.tick "bg.parse.closed_suppressed_nav_ready"
   else
     match find_open_doc_for_path ws ~path with
     | Some open_doc ->
         let uri = open_doc.Document.uri in
         let uri_key = Uri_path.docuri_to_string uri in
         if
+          large_workspace_startup_quiet_active ws
+          && String.length open_doc.Document.text
+             >= min ws.bg_large_file_bytes ws.large_file_threshold_bytes
+        then Perf_stats.tick "bg.parse.open_large_suppressed_nav_ready"
+        else if
           open_doc.Document.parse_rev = open_doc.Document.rev
           && not (Hashtbl.mem ws.open_parse_generation uri_key)
         then (
@@ -1414,7 +1789,9 @@ let background_parse_path (ws : t) (path : string) : unit =
               ws.sem_store_enabled
               && (diff.rev_changed || diff.parse_rev_changed)
             then
-              Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+              (Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+               Cross_file_index.remove_uri ws.cross_file_index
+                 ~uri:doc.Document.uri);
             refresh_semantic_nav_snapshot_for_doc ws doc;
             queue_workspace_diag_update_for_doc ws doc)
 
@@ -1422,6 +1799,8 @@ let revalidate_closed_docs_for_hint_readiness (ws : t) : unit =
   Hashtbl.iter
     (fun path_key doc ->
       if has_open_doc_for_path_key ws ~path_key then ()
+      else if String.length doc.Document.text >= ws.bg_large_file_bytes then
+        Perf_stats.tick "diag.hint_ready_revalidate_skipped_large"
       else
         let updated = background_doc_with_diags ws doc in
         if Document.diagnostics updated <> Document.diagnostics doc then (
@@ -1463,8 +1842,10 @@ let maybe_build_symbol_hints_background (ws : t) : unit =
     | Some idx ->
         if
           Queue.is_empty ws.bg_high_small_queue
+          && Queue.is_empty ws.bg_root_small_queue
           && Queue.is_empty ws.bg_norm_small_queue
           && Queue.is_empty ws.bg_high_large_queue
+          && Queue.is_empty ws.bg_root_large_queue
           && Queue.is_empty ws.bg_norm_large_queue
           && Workspace_index.is_complete idx
           && workspace_pressure_mode ws <> PressureCritical
@@ -1537,7 +1918,10 @@ let background_tick ?(should_stop : unit -> bool = fun () -> false) (ws : t)
             else if ws.startup_fully_nav_ready_ms = None then
               max 2 (budget_ms / 2)
             else max 1 (budget_ms / 4)
-        | BgTickIdle -> max 1 (budget_ms / 3)
+        | BgTickIdle ->
+            if ws.startup_fully_nav_ready_ms = None then
+              max 2 (budget_ms * 2 / 3)
+            else max 1 (budget_ms / 3)
       in
       if foreground_pending then Perf_stats.tick "quick_nav.deferred_open_doc"
       else if not (stop_requested ()) then
@@ -1553,13 +1937,17 @@ let background_tick ?(should_stop : unit -> bool = fun () -> false) (ws : t)
         max 0 (max idle_quiet_ms ws.bg_large_parse_idle_quiet_ms)
       in
       let effective_large_parse_quiet_ms =
-        if ws.startup_fully_nav_ready_ms = None then
+        if
+          ws.startup_fully_nav_ready_ms = None
+          && not (quick_nav_index_complete ws)
+        then
           max large_parse_quiet_ms startup_large_parse_idle_quiet_ms
-        else large_parse_quiet_ms
+        else max large_parse_quiet_ms post_startup_large_parse_idle_quiet_ms
       in
       let strict_startup_drain =
         ws.startup_fully_nav_ready_ms = None
         && startup_requires_background_drain ws
+        && not (quick_nav_index_complete ws)
       in
       let since_last_msg = Perf_stats.now_ms () -. last_message_ms in
       let large_parse_quiet_elapsed =
@@ -1574,7 +1962,8 @@ let background_tick ?(should_stop : unit -> bool = fun () -> false) (ws : t)
            Closed large parses must not start in the same tick that reaches it,
            otherwise worker CPU/IO competes with the editor-facing probes that
            decide readiness. Foreground open-doc parses still bypass this gate. *)
-        ws.startup_fully_nav_ready_ms <> None || strict_startup_drain
+        ws.startup_fully_nav_ready_ms <> None
+        || (strict_startup_drain && quick_nav_index_complete ws)
       in
       let allow_high_large =
         large_parse_quiet_elapsed

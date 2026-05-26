@@ -37,6 +37,14 @@ let match4 s a toka b tokb c tokc d tokd =
   else if equal_upper_ascii s d then Some tokd
   else None
 
+let match5 s a toka b tokb c tokc d tokd e toke =
+  if equal_upper_ascii s a then Some toka
+  else if equal_upper_ascii s b then Some tokb
+  else if equal_upper_ascii s c then Some tokc
+  else if equal_upper_ascii s d then Some tokd
+  else if equal_upper_ascii s e then Some toke
+  else None
+
 let classify (s : string) : Parser.token option =
   match String.length s with
   | 2 -> match3 s "BY" BY "IF" IF "OR" OR
@@ -82,12 +90,13 @@ let classify (s : string) : Parser.token option =
       match upper_char s.[0] with
       | 'C' -> match1 s "COMPOOL" COMPOOL
       | 'D' -> match1 s "DEFAULT" DEFAULT
+      | 'L' -> match1 s "LINKAGE" LINKAGE
       | 'O' -> match1 s "OVERLAY" OVERLAY
       | 'P' -> match1 s "PROGRAM" PROGRAM
       | _ -> None)
   | 8 ->
-      match4 s "CONSTANT" CONSTANT "FALLTHRU" FALLTHRU "ICOMPOOL" ICOMPOOL
-        "READONLY" READONLY
+      match5 s "CONSTANT" CONSTANT "FALLTHRU" FALLTHRU "ICOMPOOL" ICOMPOOL
+        "ILINKAGE" ILINKAGE "READONLY" READONLY
   | _ -> None
 
 let class_of_token = function
@@ -95,7 +104,8 @@ let class_of_token = function
   | START | TERM | BEGIN | END | DEF | REF | PROC | ITEM | TABLE | STATIC
   | CONSTANT | READONLY | INLINE | OVERLAY | IF | ELSE | WHILE | FOR | BY | THEN | CASE
   | FALLTHRU | EXIT | GOTO | RETURN | ABORT | STOP | TRUE | FALSE | NOT
-  | AND | OR | XOR | EQV | MOD | POS | COMPOOL | ICOMPOOL | DEFINE ->
+  | AND | OR | XOR | EQV | MOD | POS | COMPOOL | ICOMPOOL | LINKAGE | ILINKAGE
+  | DEFINE ->
       Some Hard
   | _ -> None
 

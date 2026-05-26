@@ -64,9 +64,12 @@ let literal_type = function
       then JT.BitString { bits = None }
       else JT.Integer { kind = JT.Signed; bits = None }
   | Ast.LFloat _ -> JT.Float { precision = None }
+  | Ast.LBit { bead_size; beads; _ } ->
+      JT.BitString { bits = Some (bead_size * String.length beads) }
   | Ast.LString s -> JT.CharString { chars = Some (String.length s) }
   | Ast.LChar _ -> JT.CharString { chars = Some 1 }
   | Ast.LBool _ -> JT.BitString { bits = Some 1 }
+  | Ast.LNull -> JT.Pointer { target = None; typed = false }
 
 let same_shape lhs rhs = display lhs = display rhs
 

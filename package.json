@@ -20,6 +20,7 @@
     "check": "npm run format:check:server && npm run lint:extension && npm run format:check:extension && npm run check:extension && npm run test:extension",
     "package:vsix:dev": "npm --prefix ./apps/vscode-extension run package:vsix:dev",
     "package:vsix:release": "npm --prefix ./apps/vscode-extension run package:vsix:release",
+    "package:vsix:release:all": "npm --prefix ./apps/vscode-extension run package:vsix:release:all",
     "clean": "powershell -ExecutionPolicy Bypass -File ./tools/scripts/clean-generated.ps1"
   }
 }

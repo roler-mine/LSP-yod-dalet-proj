@@ -326,6 +326,11 @@ let proc_signature_for_def (ws : t) (d : def) : string option =
                   | Some p -> Some (proc_signature_of_proc p)
                   | None -> find_top tl)
               | Ast.TopStmt _ :: tl -> find_top tl
+              | Ast.TopError _ :: tl -> find_top tl
+              | Ast.TopModule m :: tl -> (
+                  match find_top m.v.module_items with
+                  | Some _ as hit -> hit
+                  | None -> find_top tl)
             in
             find_top prog
         | _ -> None)
@@ -889,14 +894,26 @@ let fallback_defs_by_name (ws : t) (doc : Document.t) (key : string) : def list
         |> uniq_defs
         |> suppress_ambiguous_fields
     in
-    let local_hits = collect (docs_for_lookup ws doc) in
+    let local_hits = collect [ doc ] in
     if local_hits <> [] then local_hits
     else
-      let sem_hits = from_semantic_store () in
-      if sem_hits <> [] then sem_hits
-      else (
-        Perf_stats.tick "query.cross_module.fallback_scan";
-        collect (docs_for_rename ws doc)))
+      let import_scopes = imported_compool_scopes doc in
+      let imported_hits =
+        if import_scopes = [] then []
+        else
+          (semantic_defs_for_imported_compools ws doc ~key
+          @ summary_defs_for_imported_compools ws doc ~key)
+          |> uniq_defs |> suppress_ambiguous_fields
+      in
+      if imported_hits <> [] then imported_hits
+      else if import_scopes <> [] || not (has_unscoped_fallback_context doc)
+      then []
+      else
+        let sem_hits = from_semantic_store () in
+        if sem_hits <> [] then sem_hits
+        else (
+          Perf_stats.tick "query.cross_module.fallback_scan";
+          collect (docs_for_rename ws doc)))
 
 let allow_unscoped_fallback (doc : Document.t) : bool =
   has_unscoped_fallback_context doc
@@ -912,22 +929,39 @@ let is_ref_proc_decl_line (line : string) : bool =
   in
   has_ref_proc toks
 
+let is_ref_decl_line (line : string) : bool =
+  let toks =
+    tokenize_ident_words (normalize_name line) |> List.map (fun (w, _, _) -> w)
+  in
+  match toks with
+  | "REF" :: _ -> true
+  | _ -> is_ref_proc_decl_line line
+
+let source_line_is_ref_decl (ws : t) (d : def) : bool =
+  match source_line_for_def_cached_only ws d with
+  | None -> false
+  | Some line -> is_ref_decl_line line
+
 let is_likely_proc_implementation (ws : t) (d : def) : bool =
   if d.kind <> sym_kind_func then true
-  else if Metadata.has_real_implementation d.metadata then true
-  else if Metadata.is_external_ref d.metadata then false
-  else if d.metadata.Metadata.has_body = Some false then
-    source_proc_body_after_def ws d
   else
-    match source_line_for_def_cached_only ws d with
-    | None -> true
-    | Some line -> not (is_ref_proc_decl_line line)
+    let source_line = lazy (source_line_for_def_cached_only ws d) in
+    match Lazy.force source_line with
+    | Some line when is_ref_proc_decl_line line -> false
+    | _ when Metadata.has_real_implementation d.metadata -> true
+    | _ when Metadata.is_external_ref d.metadata -> false
+    | _ when d.metadata.Metadata.has_body = Some false ->
+        source_proc_body_after_def ws d
+    | _ -> (
+        match Lazy.force source_line with
+        | None -> true
+        | Some line -> not (is_ref_proc_decl_line line))
 
 let is_ref_import_def (d : def) : bool =
   Metadata.is_external_ref d.metadata
 
 let is_real_definition_target (ws : t) (d : def) : bool =
-  (not (is_ref_import_def d))
+  (not (is_ref_import_def d || source_line_is_ref_decl ws d))
   &&
   if d.kind = sym_kind_func then
     Metadata.is_external_def d.metadata || is_likely_proc_implementation ws d
@@ -939,8 +973,7 @@ let prefer_real_definition_targets (ws : t) (defs : def list) : def list =
   if real = [] then defs else real
 
 let prefer_non_ref_targets (defs : def list) : def list =
-  let non_ref = List.filter (fun d -> not (is_ref_import_def d)) defs in
-  if non_ref = [] then defs else non_ref
+  List.filter (fun d -> not (is_ref_import_def d)) defs
 
 let docuri_of_path_unsafe (path : string) : T.DocumentUri.t =
   match Uri_path.docuri_of_path path with
@@ -1279,9 +1312,42 @@ let proc_index_defs_by_key (ws : t) (doc : Document.t) ~(key : string) :
   if key = "" then []
   else quick_proc_defs_from_nav_index ws doc ~key |> uniq_defs
 
+let asm_visible_compools_for_doc (doc : Document.t) : string list =
+  let imported =
+    Workspace_imports.extract_compool_import_dirs doc
+    |> List.map (fun (d : Workspace_imports.compool_import_dir) -> d.compool)
+  in
+  match doc.Document.compool_def with
+  | None -> imported
+  | Some c -> c :: imported
+
+let asm_proc_defs_by_key (ws : t) (doc : Document.t) ~(key : string) : def list =
+  if key = "" then []
+  else
+    Workspace_asm.label_hits_for_key
+      ~visible_compools:(asm_visible_compools_for_doc doc)
+      ws ~key
+    |> List.filter_map (fun (hit : Workspace_asm.label_hit) ->
+           match Uri_path.docuri_of_path hit.label_path with
+           | None -> None
+           | Some uri ->
+               Some
+                 {
+                   uri;
+                   name = hit.label_name;
+                   key = hit.label_key;
+                   loc = hit.label_loc;
+                   kind = sym_kind_func;
+                   container = None;
+                   metadata = metadata_for_asm_proc;
+                 })
+    |> uniq_defs
+
 let proc_index_real_defs_by_key (ws : t) (doc : Document.t) ~(key : string) :
     def list =
-  proc_index_defs_by_key ws doc ~key |> prefer_real_definition_targets ws
+  uniq_defs
+    (proc_index_defs_by_key ws doc ~key @ asm_proc_defs_by_key ws doc ~key)
+  |> prefer_real_definition_targets ws
   |> prefer_non_ref_targets
 
 let quick_proc_defs_from_index_sources (ws : t) (doc : Document.t)
@@ -1447,7 +1513,8 @@ let proc_defs_by_key (ws : t) (doc : Document.t) ~(key : string) : def list =
       if local_has_impl then local_hits
       else
         let quick_hits = quick_proc_defs_from_index_sources ws doc ~key in
-        let combined = uniq_defs (sem_hits @ local_hits @ quick_hits) in
+        let asm_hits = asm_proc_defs_by_key ws doc ~key in
+        let combined = uniq_defs (sem_hits @ local_hits @ quick_hits @ asm_hits) in
         combined)
 
 let proc_impl_defs_by_key (ws : t) (doc : Document.t) ~(key : string) : def list

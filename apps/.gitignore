@@ -10,8 +10,12 @@ lsp-server/_build/
 lsp-server/_build-*/
 
 # Workspace/runtime caches
+.jovial_ls/
+**/.jovial_ls/
 .jovial-lsp/
 **/.jovial-lsp/
+.jovial-lsp-cache/
+**/.jovial-lsp-cache/
 
 # Generic local noise
 .DS_Store

@@ -1,6 +1,7 @@
 // Module overview: Reads VS Code settings and converts them into typed Jovial client/server initialization options.
 
 import {
+  assemblyExtensionsWithDefaults,
   sanitizeSourceExtensions,
   sourceExtensionsWithDefaults,
 } from "./source_extensions";
@@ -88,7 +89,9 @@ export type JovialConfig = {
   customEnabledFeatures: JovialPassiveFeatureName[];
   featureOverrides: JovialPassiveFeatureOverrides;
   extraSourceFileExtensions: string[];
+  extraAssemblyFileExtensions: string[];
   sourceExtensions: string[];
+  assemblyExtensions: string[];
   features: JovialFeatureFlags;
   implementation: JovialImplementationConfig;
 };
@@ -97,6 +100,7 @@ export type JovialSourceFileSet = {
   workspaceUri?: string;
   rootUri: string;
   fileUris: string[];
+  assemblyFileUris?: string[];
   searchTruncated: boolean;
   inferred?: boolean;
   reason?: "configured" | "minimal-common-container" | "manual" | "rescan";
@@ -230,6 +234,7 @@ export type JovialInitializationOptions = {
       maxStartupFiles: number;
       sourceDiscoveryTruncated: boolean;
       extraSourceFileExtensions: string[];
+      assemblySourceFileExtensions: string[];
       sourceFileSets: JovialSourceFileSet[];
     };
     background: {
@@ -460,8 +465,14 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
   const extraSourceFileExtensions = sanitizeSourceExtensions(
     source.get<unknown>("workspace.extraSourceFileExtensions", []),
   );
+  const extraAssemblyFileExtensions = sanitizeSourceExtensions(
+    source.get<unknown>("workspace.extraAssemblyFileExtensions", []),
+  );
   const sourceExtensions = sourceExtensionsWithDefaults(
     extraSourceFileExtensions,
+  );
+  const assemblyExtensions = assemblyExtensionsWithDefaults(
+    extraAssemblyFileExtensions,
   );
   const passiveFeatures = applyPassiveOverrides(
     passiveFlagsForProfile(featureProfile, customEnabledFeatures),
@@ -522,7 +533,7 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
     serverArgs: sanitizeStringArray(source.get<unknown>("server.args", [])),
     autostart: source.get<boolean>("autostart", true),
     trace: sanitizeTrace(source.get<unknown>("trace", "off")),
-    lsifFastPath: source.get<boolean>("lsif.fastPath", false),
+    lsifFastPath: source.get<boolean>("lsif.fastPath", true),
     workspaceDiagnosticsMode: sanitizeWorkspaceDiagnosticsMode(
       source.get<unknown>("workspaceDiagnostics.mode", "errors"),
     ),
@@ -568,20 +579,20 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
       false,
     ),
     backgroundParseWorkerCount: sanitizePositiveInt(
-      source.get<unknown>("performance.backgroundParseWorkerCount", 2),
-      2,
+      source.get<unknown>("performance.backgroundParseWorkerCount", 4),
+      4,
     ),
     parseMaxFileBytes: sanitizePositiveInt(
       source.get<unknown>("server.parseMaxFileBytes", 15728640),
       15728640,
     ),
     pressureSoftMb: sanitizePositiveInt(
-      source.get<unknown>("server.pressureSoftMb", 512),
-      512,
+      source.get<unknown>("server.pressureSoftMb", 1536),
+      1536,
     ),
     pressureCriticalMb: sanitizePositiveInt(
-      source.get<unknown>("server.pressureCriticalMb", 768),
-      768,
+      source.get<unknown>("server.pressureCriticalMb", 2048),
+      2048,
     ),
     startupPriorityMode: sanitizeStartupPriorityMode(
       readConfiguredOptionalString(source, "performance.priorityMode") ??
@@ -592,7 +603,9 @@ export function readJovialConfig(source: ConfigSource): JovialConfig {
     customEnabledFeatures,
     featureOverrides,
     extraSourceFileExtensions,
+    extraAssemblyFileExtensions,
     sourceExtensions,
+    assemblyExtensions,
     features,
     implementation,
   };
@@ -614,6 +627,7 @@ export function buildInitializationOptions(
           (set) => set.searchTruncated,
         ),
         extraSourceFileExtensions: config.extraSourceFileExtensions,
+        assemblySourceFileExtensions: config.assemblyExtensions,
         sourceFileSets,
       },
       background: {

@@ -53,22 +53,41 @@ let sync_diagnostics_if_current
 let diagnostics_enabled (ws : Workspace.t) : bool =
   (Workspace.feature_flags ws).Workspace_settings.diagnostics
 
+let diagnostic_source_is (source : string) (diag : T.Diagnostic.t) : bool =
+  match diag.source with
+  | Some s -> String.equal (String.lowercase_ascii s) source
+  | None -> false
+
+let diagnostics_snapshot_for_publish (ws : Workspace.t)
+    ~(uri : T.DocumentUri.t) ~(provisional : bool) :
+    int option * T.Diagnostic.t list =
+  let version, diags = Workspace.diagnostics_snapshot_for ws ~uri in
+  let is_open = Workspace.document_text_length ws ~uri <> None in
+  if is_open && (provisional || not (Workspace.open_doc_converged ws ~uri)) then
+    ( version,
+      List.filter
+        (fun diag -> not (diagnostic_source_is "parse" diag))
+        diags )
+  else (version, diags)
+
 let revalidate_and_publish_all_open_docs (ws : Workspace.t) (oc : out_channel)
     (published_diags : (string, string) Hashtbl.t) ~(push : bool) : bool =
   if diagnostics_enabled ws then
     Workspace.revalidate_all ws
     |> List.fold_left
          (fun any_changed uri ->
-        let version, diags = Workspace.diagnostics_snapshot_for ws ~uri in
+        let provisional = not (Workspace.open_doc_converged ws ~uri) in
+        let version, diags =
+          diagnostics_snapshot_for_publish ws ~uri ~provisional
+        in
         let changed =
           sync_diagnostics_if_changed published_diags oc ~push ~uri ~version
             ~diags
         in
         if changed then (
           Perf_stats.tick "diag.open.publish";
-          if Workspace.open_doc_converged ws ~uri then
-            Perf_stats.tick "diag.open.authoritative_publish"
-          else Perf_stats.tick "diag.open.provisional_publish");
+          if provisional then Perf_stats.tick "diag.open.provisional_publish"
+          else Perf_stats.tick "diag.open.authoritative_publish");
         if changed && diags = [] then Perf_stats.tick "diag.open.publish_empty";
         any_changed || changed)
          false
@@ -78,7 +97,9 @@ let publish_doc_diagnostics (ws : Workspace.t) (oc : out_channel)
     (published_diags : (string, string) Hashtbl.t) ~(push : bool)
     ~(provisional : bool) ~(uri : T.DocumentUri.t) : bool =
   if diagnostics_enabled ws then (
-    let version, diags = Workspace.diagnostics_snapshot_for ws ~uri in
+    let version, diags =
+      diagnostics_snapshot_for_publish ws ~uri ~provisional
+    in
     let changed =
       sync_diagnostics_if_changed published_diags oc ~push ~uri ~version ~diags
     in
@@ -131,7 +152,10 @@ let publish_partial_diagnostics_on_failure (ws : Workspace.t) (oc : out_channel)
     ~(uri : T.DocumentUri.t) ~(phase : string) ~(exn : exn) : bool =
   if diagnostics_enabled ws then (
     let version, base =
-      try Workspace.diagnostics_snapshot_for ws ~uri with _ -> (None, [])
+      try
+        diagnostics_snapshot_for_publish ws ~uri
+          ~provisional:(not (Workspace.open_doc_converged ws ~uri))
+      with _ -> (None, [])
     in
     let diag = diag_internal_server_failure ~uri ~phase exn in
     let changed =
@@ -355,7 +379,11 @@ let diagnostic_pull_result_id ~(uri : T.DocumentUri.t)
 
 let diagnostic_pull_report_json (ws : Workspace.t) ~(uri : T.DocumentUri.t)
     ~(previous_result_id : string option) : Yojson.Safe.t =
-  let diags = Workspace.diagnostics_for ws ~uri in
+  let provisional =
+    Workspace.document_text_length ws ~uri <> None
+    && not (Workspace.open_doc_converged ws ~uri)
+  in
+  let _, diags = diagnostics_snapshot_for_publish ws ~uri ~provisional in
   let result_id = diagnostic_pull_result_id ~uri ~diags in
   match previous_result_id with
   | Some prev when prev = result_id ->
@@ -533,6 +561,16 @@ let reusable_open_doc_workspace_for_set (roots_state : roots_state)
   in
   pick set.Req.source_file_uris
 
+let workspace_root_uri_for_source_set (set : Req.source_file_set) :
+    T.DocumentUri.t =
+  match set.Req.workspace_uri with
+  | Some workspace_uri -> workspace_uri
+  | None -> set.Req.source_root_uri
+
+let workspace_root_path_for_source_set (set : Req.source_file_set) :
+    string option =
+  Uri_path.file_path_of_uri (workspace_root_uri_for_source_set set)
+
 let ws_reusable_for_source_root (roots_state : roots_state)
     ~(used_root_keys : (string, bool) Hashtbl.t)
     ~(used_workspaces : (Workspace.t, bool) Hashtbl.t) ~(root_key : string) :
@@ -598,15 +636,23 @@ let apply_source_file_sets (roots_state : roots_state)
                            is_new_ws := true;
                            Hashtbl.replace used_workspaces ws true;
                            ws)
-                 in
-                 Hashtbl.replace used_root_keys root_key true;
-                 Workspace.set_root_uri ws (Some set.Req.source_root_uri);
-                 let source_changed =
-                   Workspace.set_source_files ws
-                     (Req.source_paths_for_root source_sets
+                  in
+                  Hashtbl.replace used_root_keys root_key true;
+                  Workspace.set_root_uri ws
+                    (Some (workspace_root_uri_for_source_set set));
+                  let source_changed =
+                    Workspace.set_source_files ws
+                      (Req.source_paths_for_root source_sets
                         set.Req.source_root_uri)
                  in
-                 if !is_new_ws || source_changed then Workspace.rescan ws;
+                 let assembly_changed =
+                   Workspace.set_assembly_files ws
+                     (Req.assembly_paths_for_root source_sets
+                        set.Req.source_root_uri)
+                 in
+                 if !is_new_ws || source_changed || assembly_changed then (
+                   Workspace.rescan ws;
+                   Workspace.complete_startup_nav_index_foreground ws);
                  if set.Req.source_search_truncated then
                    prerr_endline
                      (Printf.sprintf
@@ -614,20 +660,29 @@ let apply_source_file_sets (roots_state : roots_state)
                          indexing %d supplied files."
                         (Uri_path.docuri_to_string set.Req.source_root_uri)
                         (List.length set.Req.source_file_uris));
-                 prerr_endline
-                   (Printf.sprintf
-                      "[JOVIAL] inferred source root: %s\n\
-                       [JOVIAL] reason: minimal-common-container\n\
-                       [JOVIAL] files: %d"
-                      root_path
-                      (List.length set.Req.source_file_uris));
+                  prerr_endline
+                    (Printf.sprintf
+                       "[JOVIAL] inferred source root: %s\n\
+                        [JOVIAL] workspace/cache root: %s\n\
+                        [JOVIAL] reason: minimal-common-container\n\
+                        [JOVIAL] files: %d, asm: %d"
+                       root_path
+                       (Option.value
+                          (workspace_root_path_for_source_set set)
+                          ~default:root_path)
+                       (List.length set.Req.source_file_uris)
+                       (List.length set.Req.assembly_file_uris));
                  Some { root_path_key = root_key; ws })
   in
   roots_state.roots <- new_roots;
   Workspace.set_root_path roots_state.default_ws None;
   let default_changed = Workspace.set_source_files roots_state.default_ws [] in
-  if new_roots = [] && (had_roots || default_changed) then
-    Workspace.rescan roots_state.default_ws
+  let default_assembly_changed =
+    Workspace.set_assembly_files roots_state.default_ws []
+  in
+  if new_roots = [] && (had_roots || default_changed || default_assembly_changed) then (
+    Workspace.rescan roots_state.default_ws;
+    Workspace.complete_startup_nav_index_foreground roots_state.default_ws)
 
 let ws_for_path (roots_state : roots_state) (path : string) : Workspace.t =
   let key = normalize_path_key path in
@@ -724,6 +779,11 @@ let handle_initialize (roots_state : roots_state)
     | [] -> requested_roots
     | roots -> roots
   in
+  let source_set_for_root root_uri =
+    source_sets
+    |> List.find_opt (fun set ->
+           Req.same_uri_path set.Req.source_root_uri root_uri)
+  in
   let discovery_t0 = Perf_log.now_ms () in
   Perf_log.log_event "workspace_discovery_start"
     ~queue:(List.length source_sets);
@@ -749,10 +809,14 @@ let handle_initialize (roots_state : roots_state)
         Workspace.set_root_uri roots_state.default_ws (Some ru);
         ignore
           (Workspace.set_source_files roots_state.default_ws
-             (Req.source_paths_for_root source_sets ru))
+             (Req.source_paths_for_root source_sets ru));
+        ignore
+          (Workspace.set_assembly_files roots_state.default_ws
+             (Req.assembly_paths_for_root source_sets ru))
     | None ->
         Workspace.set_root_path roots_state.default_ws (parse_root_path params));
-    Workspace.rescan roots_state.default_ws)
+    Workspace.rescan roots_state.default_ws;
+    Workspace.complete_startup_nav_index_foreground roots_state.default_ws)
     else (
     roots_state.roots <-
       roots
@@ -761,11 +825,20 @@ let handle_initialize (roots_state : roots_state)
           | None -> None
           | Some root_path ->
               let ws = Workspace.create ~settings:workspace_settings () in
-              Workspace.set_root_uri ws (Some root_uri);
+              let cache_root_uri =
+                match source_set_for_root root_uri with
+                | Some set -> workspace_root_uri_for_source_set set
+                | None -> root_uri
+              in
+              Workspace.set_root_uri ws (Some cache_root_uri);
               ignore
                 (Workspace.set_source_files ws
                    (Req.source_paths_for_root source_sets root_uri));
+              ignore
+                (Workspace.set_assembly_files ws
+                   (Req.assembly_paths_for_root source_sets root_uri));
               Workspace.rescan ws;
+              Workspace.complete_startup_nav_index_foreground ws;
               Some { root_path_key = normalize_path_key root_path; ws });
     Workspace.set_root_path roots_state.default_ws None;
     ());
@@ -1015,7 +1088,7 @@ let handle_notification (roots_state : roots_state)
              try
                let refreshed =
                  if finish_document_diagnostics_now_if_needed ws ~uri then true
-                 else Workspace.refresh_closed_doc_diagnostics_now ws ~uri
+                 else Workspace.refresh_closed_doc_diagnostics_now ~force:true ws ~uri
                in
                let open_doc = Workspace.document_text_length ws ~uri <> None in
                let changed =
@@ -1066,18 +1139,25 @@ let handle_notification (roots_state : roots_state)
                     else request_diagnostic_refresh_if_needed true));
               Workspace.open_doc ?lsp_version ~inline_catch_up:false
                 ~defer_cross_module_semantics:true ws ~uri ~file ~text;
-              (if Workspace.open_doc_converged ws ~uri then
-                 Perf_stats.tick "didopen.readiness_kick_skipped_ready"
-               else
-                 try
-                   Workspace.background_tick ws ~budget_ms:16
-                     ~mode:Workspace.BgTickInteractive ~idle_quiet_ms:0
-                     ~last_message_ms:(Perf_stats.now_ms ())
-                 with exn ->
-                   Perf_stats.tick "loop.bg_exception";
-                   prerr_endline
-                     (Printf.sprintf "didOpen readiness kick failed: %s"
-                        (Printexc.to_string exn)));
+              let open_doc_large =
+                Workspace.text_len_is_background_large ws
+                  ~bytes:(String.length text)
+              in
+              let nav_index_complete = Workspace.quick_nav_index_complete ws in
+              if Workspace.open_doc_converged ws ~uri then
+                Perf_stats.tick "didopen.readiness_kick_skipped_ready"
+              else if open_doc_large && nav_index_complete then
+                Perf_stats.tick "didopen.readiness_kick_skipped_large_nav_ready"
+              else (
+                try
+                  Workspace.background_tick ws ~budget_ms:16
+                    ~mode:Workspace.BgTickInteractive ~idle_quiet_ms:0
+                    ~last_message_ms:(Perf_stats.now_ms ())
+                with exn ->
+                  Perf_stats.tick "loop.bg_exception";
+                  prerr_endline
+                    (Printf.sprintf "didOpen readiness kick failed: %s"
+                       (Printexc.to_string exn)));
               bind_open_document roots_state uri ws;
               ignore
                 (maybe_finish_document_diagnostics_inline ws ~uri
@@ -1155,7 +1235,10 @@ let handle_notification (roots_state : roots_state)
         let p = T.DidCloseTextDocumentParams.t_of_yojson params in
         let uri = p.textDocument.uri in
         let ws = ws_for_document_uri roots_state uri in
-        let _, close_diags = Workspace.diagnostics_snapshot_for ws ~uri in
+        let provisional = not (Workspace.open_doc_converged ws ~uri) in
+        let _, close_diags =
+          diagnostics_snapshot_for_publish ws ~uri ~provisional
+        in
         Workspace.close_doc ws ~uri;
         unbind_open_document roots_state uri;
         let close_changed =
@@ -1308,15 +1391,15 @@ let request_priority_of_method = function
   | "textDocument/completion" | "textDocument/hover"
   | "textDocument/signatureHelp" | "textDocument/definition"
   | "textDocument/declaration" | "textDocument/typeDefinition"
-  | "textDocument/implementation" ->
+  | "textDocument/implementation" | "textDocument/references" ->
       Interactive
   | "textDocument/semanticTokens/range" | "textDocument/documentSymbol"
   | "textDocument/codeLens" | "textDocument/inlayHint"
   | "textDocument/formatting" | "textDocument/rangeFormatting"
-  | "textDocument/diagnostic" ->
+  | "textDocument/diagnostic" | "workspace/executeCommand" ->
       Visible
-  | "textDocument/references" | "textDocument/prepareRename"
-  | "textDocument/rename" | "textDocument/codeAction" | "codeLens/resolve" ->
+  | "textDocument/prepareRename" | "textDocument/rename"
+  | "textDocument/codeAction" | "codeLens/resolve" ->
       Medium
   | "workspace/symbol" | "textDocument/semanticTokens/full"
   | "textDocument/semanticTokens/full/delta" ->
@@ -1327,22 +1410,32 @@ let incoming_preempts_active ~(active : request_priority)
     ~(incoming : request_priority) : bool =
   request_priority_rank incoming < request_priority_rank active
 
+let request_should_abort ~(client_cancelled : bool) ~(preempted : bool) : bool =
+  client_cancelled || preempted
+
+let response_should_cancel ~(client_cancelled : bool) : bool =
+  ignore client_cancelled;
+  false
+
 let handle_request (roots_state : roots_state)
     ~(all_workspaces : unit -> Workspace.t list)
     ~(pending_change_refreshes : (Workspace.t, int) Hashtbl.t)
     ~(semantic_refresh_supported : bool ref)
     ~(diagnostic_push_enabled : bool ref)
     ~(diagnostic_refresh_supported : bool ref) ~(is_cancelled : unit -> bool)
+    ~(is_client_cancelled : unit -> bool)
     (oc : out_channel) (method_ : string) (id : Yojson.Safe.t)
     (params : Yojson.Safe.t) =
   let respond_result (result : Yojson.Safe.t) : unit =
-    if is_cancelled () then respond_cancelled oc ~id else respond oc ~id ~result
+    ignore (is_client_cancelled ());
+    Workspace_foundation.Perf_stats.tick "lsp.response.result";
+    respond oc ~id ~result
   in
-  let with_cancel_ws (ws : Workspace.t) f =
-    Workspace.drain_open_parse_results_now ws;
+  let with_cancel_ws ?(drain_open_results = false) (ws : Workspace.t) f =
+    if drain_open_results then Workspace.drain_open_parse_results_now ws;
     Workspace.with_request_cancel_checker ws is_cancelled f
   in
-  if is_cancelled () then respond_cancelled oc ~id
+  if is_client_cancelled () then respond_cancelled oc ~id
   else
     match method_ with
     | "initialize" ->
@@ -1755,12 +1848,19 @@ let handle_request (roots_state : roots_state)
                  ])
           else
             let j =
-              with_cancel_ws ws (fun () ->
+              with_cancel_ws ~drain_open_results:true ws (fun () ->
                   if finish_document_diagnostics_now_if_needed ws ~uri then ()
-                  else ignore (Workspace.refresh_closed_doc_diagnostics_now ws ~uri);
+                  else
+                    ignore
+                      (Workspace.refresh_closed_doc_diagnostics_now ~force:true
+                         ws ~uri);
                   if !diagnostic_push_enabled then (
+                    let provisional =
+                      Workspace.document_text_length ws ~uri <> None
+                      && not (Workspace.open_doc_converged ws ~uri)
+                    in
                     let version, diags =
-                      Workspace.diagnostics_snapshot_for ws ~uri
+                      diagnostics_snapshot_for_publish ws ~uri ~provisional
                     in
                     Resp.publish_diagnostics oc ~uri ~version ~diags;
                     Perf_stats.tick "diag.pull.side_publish");
@@ -2002,6 +2102,9 @@ module Private_for_tests = struct
       ~active:(request_priority_of_method active)
       ~incoming:(request_priority_of_method incoming)
 
+  let request_should_abort_for_test = request_should_abort
+  let response_should_cancel_for_test = response_should_cancel
+
   let open_document_workspace_survives_source_set_replacement
       ~(workspace_root : string) ~(source_root : string) ~(source_file : string)
       : bool =
@@ -2027,8 +2130,10 @@ module Private_for_tests = struct
     let source_root_uri = uri_of_path "source root" source_root in
     let set : Req.source_file_set =
       {
+        workspace_uri = Some (uri_of_path "workspace root" workspace_root);
         source_root_uri;
         source_file_uris = [ file_uri ];
+        assembly_file_uris = [];
         source_search_truncated = false;
       }
     in
@@ -2090,7 +2195,7 @@ let run (ic : in_channel) (oc : out_channel) : unit =
   let next_index_health_check_ms =
     ref (Perf_stats.now_ms () +. index_health_check_interval_ms)
   in
-  let max_inbound_msg_bytes = 128 * 1024 * 1024 in
+  let max_inbound_msg_bytes = 256 * 1024 * 1024 in
   let wake_r, wake_w = Unix.pipe () in
   let wake_nonblock =
     let ok = ref true in
@@ -2247,8 +2352,13 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                     ar_preempted = false;
                   };
                 let is_cancelled () =
-                  request_is_cancelled req_key
-                  || active_request_preempted req_key
+                  request_should_abort
+                    ~client_cancelled:(request_is_cancelled req_key)
+                    ~preempted:(active_request_preempted req_key)
+                in
+                let is_client_cancelled () =
+                  response_should_cancel
+                    ~client_cancelled:(request_is_cancelled req_key)
                 in
                 (try
                    Perf_log.with_request_kind_opt
@@ -2260,10 +2370,11 @@ let run (ic : in_channel) (oc : out_channel) : unit =
                              ~pending_change_refreshes
                              ~semantic_refresh_supported
                              ~diagnostic_push_enabled
-                             ~diagnostic_refresh_supported ~is_cancelled oc m
-                             id (params_of_msg json)))
+                             ~diagnostic_refresh_supported ~is_cancelled
+                             ~is_client_cancelled oc m id
+                             (params_of_msg json)))
                  with exn ->
-                   if is_cancelled () then respond_cancelled oc ~id
+                   if is_client_cancelled () then respond_cancelled oc ~id
                    else
                      respond_error oc ~id ~code:(-32603)
                        ~message:
@@ -2502,6 +2613,19 @@ let run (ic : in_channel) (oc : out_channel) : unit =
         true
   in
 
+  let handle_inbox_items (items : inbox_item list) : unit =
+    List.iter
+      (function
+        | InboxMsg msg -> enqueue_or_handle_message msg
+        | InboxInvalidFrame msg ->
+            prerr_endline
+              (Printf.sprintf
+                 "invalid LSP frame received; terminating session: %s" msg);
+            reader_done := true
+        | InboxEof -> reader_done := true)
+      items
+  in
+
   let rec loop () =
     if
       !reader_done && inbox_is_empty box
@@ -2545,18 +2669,9 @@ let run (ic : in_channel) (oc : out_channel) : unit =
            in
            if late_items <> [] then (
              items := late_items;
-             last_message_ms := Perf_stats.now_ms ())))
-       else
-         List.iter
-           (function
-             | InboxMsg msg -> enqueue_or_handle_message msg
-             | InboxInvalidFrame msg ->
-                 prerr_endline
-                   (Printf.sprintf
-                      "invalid LSP frame received; terminating session: %s" msg);
-                 reader_done := true
-             | InboxEof -> reader_done := true)
-           !items);
+             last_message_ms := Perf_stats.now_ms ();
+             handle_inbox_items late_items)))
+       else handle_inbox_items !items);
       let dispatched =
         if inbox_is_empty box then dispatch_one_scheduled_request () else false
       in

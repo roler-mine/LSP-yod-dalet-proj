@@ -128,6 +128,10 @@ let metadata_for_proc ?implementation_config
     ~source_keyword:(Some "PROC") ~has_body ~is_inline ~jovial_kind
     ~external_modifier ()
 
+let metadata_for_asm_proc =
+  metadata ~source_keyword:(Some "ASM") ~has_body:true
+    ~jovial_kind:Metadata.JovialProcedure ~external_modifier:Ast.DefDecl ()
+
 let metadata_for_field ?implementation_config ~(ftype : Ast.type_expr Ast.node)
     () =
   {
@@ -391,28 +395,52 @@ let fallback_line_defs (doc : Document.t) : def list =
   let idx = doc.Document.index in
   let file = doc.Document.file in
   let lines = String.split_on_char '\n' doc.Document.text in
+  let label_on_line line tokens =
+    match tokens with
+    | (name, c0, c1) :: _ ->
+        let len = String.length line in
+        let rec skip_ws i =
+          if i < len && (line.[i] = ' ' || line.[i] = '\t') then skip_ws (i + 1)
+          else i
+        in
+        let colon = skip_ws c1 in
+        if colon < len && line.[colon] = ':' then Some (name, c0, c1)
+        else None
+    | [] -> None
+  in
   let defs_rev =
     lines
     |> List.mapi (fun line0 line -> (line0, line))
     |> List.fold_left
          (fun acc (line0, line) ->
            let tokens = tokenize_ident_words line in
-           match classify_fallback_decl ~line tokens with
-           | None -> acc
-           | Some (kw_idx, kw, kind) -> (
-               match
-                 ( nth_opt tokens (kw_idx + 1),
-                   Text_index.line_start_offset idx ~line:line0 )
-               with
-               | Some (name, c0, c1), Some base ->
+           match label_on_line line tokens with
+           | Some (name, c0, c1) -> (
+               match Text_index.line_start_offset idx ~line:line0 with
+               | Some base ->
                    let s = base + c0 in
                    let e = base + c1 in
                    let loc = loc_of_offsets ~file ~idx ~s ~e in
-                   add_def_raw acc ~uri ~name ~loc ~kind ~container:None
-                     ~metadata:
-                       (fallback_metadata_for_line ~kw ~kind ~tokens ~kw_idx
-                          ~name_idx:(kw_idx + 1))
-               | _ -> acc))
+                   add_def_raw acc ~uri ~name ~loc ~kind:sym_kind_var
+                     ~container:None ~metadata:metadata_for_label
+               | None -> acc)
+           | None -> (
+               match classify_fallback_decl ~line tokens with
+               | None -> acc
+               | Some (kw_idx, kw, kind) -> (
+                   match
+                     ( nth_opt tokens (kw_idx + 1),
+                       Text_index.line_start_offset idx ~line:line0 )
+                   with
+                   | Some (name, c0, c1), Some base ->
+                       let s = base + c0 in
+                       let e = base + c1 in
+                       let loc = loc_of_offsets ~file ~idx ~s ~e in
+                       add_def_raw acc ~uri ~name ~loc ~kind ~container:None
+                         ~metadata:
+                           (fallback_metadata_for_line ~kw ~kind ~tokens
+                              ~kw_idx ~name_idx:(kw_idx + 1))
+                   | _ -> acc)))
          []
   in
   List.rev defs_rev
@@ -482,6 +510,7 @@ let rec collect_type_defs ~(uri : T.DocumentUri.t) ~(container : string option)
     (acc : def list) (t : Ast.type_expr Ast.node) : def list =
   match t.v with
   | Ast.TName _ -> acc
+  | Ast.TScalar _ -> acc
   | Ast.TPointer inner -> collect_type_defs ~uri ~container acc inner
   | Ast.TArray { elem; _ } -> collect_type_defs ~uri ~container acc elem
   | Ast.TSpecifiedTable { elem; _ } ->
@@ -527,7 +556,7 @@ let rec collect_type_defs ~(uri : T.DocumentUri.t) ~(container : string option)
 let rec collect_stmt_defs ~(uri : T.DocumentUri.t) ~(container : string option)
     (acc : def list) (s : Ast.stmt Ast.node) : def list =
   match s.v with
-  | Ast.SEmpty -> acc
+  | Ast.SEmpty | Ast.SError _ -> acc
   | Ast.SDecl d -> collect_decl_defs ~uri ~container acc d
   | Ast.SBlock xs -> List.fold_left (collect_stmt_defs ~uri ~container) acc xs
   | Ast.SAssign _ -> acc
@@ -550,6 +579,11 @@ let rec collect_stmt_defs ~(uri : T.DocumentUri.t) ~(container : string option)
         | Some st -> collect_stmt_defs ~uri ~container acc st
       in
       collect_stmt_defs ~uri ~container acc body
+  | Ast.SCase { options; _ } ->
+      List.fold_left
+        (fun a (opt : Ast.case_option Ast.node) ->
+          collect_stmt_defs ~uri ~container a opt.v.case_body)
+        acc options
   | Ast.SReturn _ -> acc
   | Ast.SLabel { label; body } ->
       let acc =
@@ -562,6 +596,7 @@ let rec collect_stmt_defs ~(uri : T.DocumentUri.t) ~(container : string option)
 and collect_decl_defs ~(uri : T.DocumentUri.t) ~(container : string option)
     (acc : def list) (d : Ast.decl Ast.node) : def list =
   match d.v with
+  | Ast.DError _ -> acc
   | Ast.DVar
       {
         name;
@@ -637,9 +672,8 @@ let find_compool_loc_in_doc (doc : Document.t) (key : string) : Ast.Loc.t option
   let match_directive (d : Ast.decl Ast.node) =
     match d.v with
     | Ast.DDirective { name; args = first :: _ } ->
-        let dir = normalize_name name.v in
-        if (dir = "COMPOOL" || dir = "ICOMPOOL") && normalize_name first.v = key
-        then Some first.loc
+        let dir = Preprocess.canonical_directive_name name.v in
+        if dir = "COMPOOL" && normalize_name first.v = key then Some first.loc
         else None
     | _ -> None
   in
@@ -649,7 +683,20 @@ let find_compool_loc_in_doc (doc : Document.t) (key : string) : Ast.Loc.t option
         | [] -> None
         | Ast.TopDecl d :: tl -> (
             match match_directive d with Some _ as hit -> hit | None -> go tl)
-        | _ :: tl -> go tl
+        | Ast.TopModule m :: tl -> (
+            let module_hit =
+              match m.v.module_kind with
+              | Ast.CompoolModule (Some id) when normalize_name id.v = key ->
+                  Some id.loc
+              | _ -> None
+            in
+            match module_hit with
+            | Some _ as hit -> hit
+            | None -> (
+                match go m.v.module_items with
+                | Some _ as hit -> hit
+                | None -> go tl))
+        | Ast.TopStmt _ :: tl | Ast.TopError _ :: tl -> go tl
       in
       go prog
   | _ -> None
@@ -659,12 +706,14 @@ let collect_doc_defs (doc : Document.t) : def list =
   let defs0 =
     match Document.current_parse doc with
     | Some { Document.parsed_ast = Some prog; _ } ->
-        List.fold_left
-          (fun acc top ->
-            match top with
-            | Ast.TopDecl d -> collect_decl_defs ~uri ~container:None acc d
-            | Ast.TopStmt s -> collect_stmt_defs ~uri ~container:None acc s)
-          [] prog
+        let rec collect_top acc = function
+          | Ast.TopDecl d -> collect_decl_defs ~uri ~container:None acc d
+          | Ast.TopStmt s -> collect_stmt_defs ~uri ~container:None acc s
+          | Ast.TopModule m ->
+              List.fold_left collect_top acc m.v.module_items
+          | Ast.TopError _ -> acc
+        in
+        List.fold_left collect_top [] prog
     | _ -> []
   in
   let defs =
@@ -1322,7 +1371,8 @@ let upsert_semantic_snapshot_for_doc_with_nav (ws : t) (doc : Document.t)
     Perf_stats.time "snapshot.build" (fun () ->
         let snap = snapshot_for_doc ws doc nav in
         Perf_stats.tick "query.cache.upsert";
-        Semantic_store.upsert_snapshot ws.semantic_store snap)
+        Semantic_store.upsert_snapshot ws.semantic_store snap;
+        Cross_file_index.upsert_document_snapshot ws.cross_file_index doc snap)
 
 let nav_add_occurrence (nav : doc_nav) ~(sym_id : string)
     ~(uri : T.DocumentUri.t) ~(loc : Ast.Loc.t) : unit =
@@ -1353,7 +1403,8 @@ let upsert_semantic_snapshot_for_doc_with_skeleton (ws : t) (doc : Document.t) :
         |> List.iter (fun d -> ignore (nav_add_decl nav d));
         let snap = snapshot_for_doc ws doc nav in
         Perf_stats.tick "query.cache.upsert_skeleton";
-        Semantic_store.upsert_snapshot ws.semantic_store snap)
+        Semantic_store.upsert_snapshot ws.semantic_store snap;
+        Cross_file_index.upsert_document_snapshot ws.cross_file_index doc snap)
 
 let nav_bind_value (scope : nav_scope) (b : nav_binding) : unit =
   match Hashtbl.find_opt scope.values b.decl.key with
@@ -1637,7 +1688,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         status_owner_for_type_expr scope ?owner_name ?owner_loc elem
     | Ast.TPointer inner ->
         status_owner_for_type_expr scope ?owner_name ?owner_loc inner
-    | Ast.TRecord _ | Ast.TFunc _ -> None
+    | Ast.TScalar _ | Ast.TRecord _ | Ast.TFunc _ -> None
   in
 
   let status_owner_for_lvalue (scope : nav_scope) (e : Ast.expr Ast.node) :
@@ -1663,7 +1714,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         match Hashtbl.find_opt scope.type_exprs (normalize_name id.v) with
         | Some defn -> type_expr_has_fields scope defn
         | None -> false)
-    | Ast.TStatus _ | Ast.TFunc _ -> false
+    | Ast.TScalar _ | Ast.TStatus _ | Ast.TFunc _ -> false
   in
 
   let rec field_owner_for_type_expr (scope : nav_scope) ?value_name
@@ -1689,7 +1740,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
     | Ast.TArray { elem; _ } -> field_owner_for_type_expr scope elem
     | Ast.TSpecifiedTable { elem; _ } -> field_owner_for_type_expr scope elem
     | Ast.TPointer inner -> field_owner_for_type_expr scope inner
-    | Ast.TStatus _ | Ast.TFunc _ -> None
+    | Ast.TScalar _ | Ast.TStatus _ | Ast.TFunc _ -> None
   in
 
   let rec field_owner_for_expr (scope : nav_scope) (e : Ast.expr Ast.node) :
@@ -1707,8 +1758,10 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
         field_owner_for_expr scope base
     | Ast.EParen inner -> field_owner_for_expr scope inner
     | Ast.EDeref { ptr } -> field_owner_for_expr scope ptr
-    | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _ | Ast.EPreset _
-    | Ast.ERange _ | Ast.EAt _ ->
+    | Ast.ELit _ | Ast.EError _ | Ast.EMissing _ | Ast.EUnop _ | Ast.EBinop _
+    | Ast.EConvert _ | Ast.EPreset _
+    | Ast.EOmitted | Ast.ERepeat _ | Ast.EPositioned _ | Ast.ERange _
+    | Ast.EAt _ ->
         None
   in
 
@@ -1766,6 +1819,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   let rec prebind_decl (scope : nav_scope) ~(container : string option)
       (d : Ast.decl Ast.node) : unit =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DVar
         {
           name;
@@ -1817,6 +1871,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   and prebind_stmt (scope : nav_scope) ~(container : string option)
       (s : Ast.stmt Ast.node) : unit =
     match s.v with
+    | Ast.SError _ -> ()
     | Ast.SDecl d -> prebind_decl scope ~container d
     | Ast.SLabel { label; _ } ->
         add_decl_label ~metadata:metadata_for_label scope ~id:label
@@ -1826,6 +1881,8 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
       (t : Ast.type_expr Ast.node) : unit =
     match t.v with
     | Ast.TName id -> use_type scope id
+    | Ast.TScalar { sizes; _ } ->
+        List.iter (walk_expr scope ~container) sizes
     | Ast.TPointer inner -> walk_type scope ~container inner
     | Ast.TArray { elem; dims } ->
         walk_type scope ~container elem;
@@ -1880,6 +1937,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
       ~(container : string option) (e : Ast.expr Ast.node) : unit =
     match e.v with
     | Ast.EName id -> use_value scope id
+    | Ast.EError _ | Ast.EMissing _ -> ()
     | Ast.ELit _ -> ()
     | Ast.EUnop { rhs; _ } -> walk_expr scope ~container rhs
     | Ast.EBinop { lhs; rhs; _ } ->
@@ -1907,6 +1965,13 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
     | Ast.EPreset { base; items } ->
         walk_expr scope ~container base;
         List.iter (walk_expr scope ~container) items
+    | Ast.EOmitted -> ()
+    | Ast.ERepeat { count; items } ->
+        walk_expr scope ~container count;
+        List.iter (walk_expr scope ~container) items
+    | Ast.EPositioned { indexes; values } ->
+        List.iter (walk_expr scope ~container) indexes;
+        List.iter (walk_expr scope ~container) values
     | Ast.ERange { lo; hi } ->
         walk_expr scope ~container lo;
         walk_expr scope ~container hi
@@ -1933,6 +1998,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   and walk_decl (scope : nav_scope) ~(container : string option)
       (d : Ast.decl Ast.node) : unit =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DVar { name; dtype; init; _ } -> (
         walk_type scope ~container:(Some name.v) dtype;
         let expected_status_owner =
@@ -1992,7 +2058,7 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   and walk_stmt (scope : nav_scope) ~(container : string option)
       (s : Ast.stmt Ast.node) : unit =
     match s.v with
-    | Ast.SEmpty -> ()
+    | Ast.SEmpty | Ast.SError _ -> ()
     | Ast.SDecl d ->
         prebind_decl scope ~container d;
         walk_decl scope ~container d
@@ -2036,6 +2102,23 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
             walk_stmt loop_scope ~container st);
         let body_scope = nav_scope_copy loop_scope in
         walk_stmt body_scope ~container body
+    | Ast.SCase { selector; options } ->
+        walk_expr scope ~container selector;
+        let walk_case_index (case_index : Ast.case_index Ast.node) : unit =
+          match case_index.v with
+          | Ast.CaseDefault -> ()
+          | Ast.CaseValue value -> walk_expr scope ~container value
+          | Ast.CaseRange (lo, hi) ->
+              walk_expr scope ~container lo;
+              walk_expr scope ~container hi
+        in
+        List.iter
+          (fun (opt : Ast.case_option Ast.node) ->
+            List.iter walk_case_index opt.v.case_indexes;
+            let option_scope = nav_scope_copy scope in
+            prebind_stmt option_scope ~container opt.v.case_body;
+            walk_stmt option_scope ~container opt.v.case_body)
+          options
     | Ast.SReturn eo -> (
         match eo with None -> () | Some e -> walk_expr scope ~container e)
     | Ast.SLabel { body; _ } -> walk_stmt scope ~container body
@@ -2091,21 +2174,26 @@ let build_doc_nav (ws : t) (doc : Document.t) : doc_nav =
   bind_defines ();
   (match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } ->
-      List.iter
-        (function
-          | Ast.TopDecl ({ v = Ast.DType _; _ } as d) ->
-              prebind_decl root_scope ~container:None d
-          | _ -> ())
-        prog;
-      List.iter
-        (function
-          | Ast.TopDecl d -> prebind_decl root_scope ~container:None d
-          | Ast.TopStmt s -> prebind_stmt root_scope ~container:None s)
-        prog;
-      List.iter
-        (function
-          | Ast.TopDecl d -> walk_decl root_scope ~container:None d
-          | Ast.TopStmt s -> walk_stmt root_scope ~container:None s)
-        prog
+      let rec prebind_top_types = function
+        | Ast.TopDecl ({ v = Ast.DType _; _ } as d) ->
+            prebind_decl root_scope ~container:None d
+        | Ast.TopDecl _ | Ast.TopStmt _ | Ast.TopError _ -> ()
+        | Ast.TopModule m -> List.iter prebind_top_types m.v.module_items
+      in
+      let rec prebind_top = function
+        | Ast.TopDecl d -> prebind_decl root_scope ~container:None d
+        | Ast.TopStmt s -> prebind_stmt root_scope ~container:None s
+        | Ast.TopModule m -> List.iter prebind_top m.v.module_items
+        | Ast.TopError _ -> ()
+      in
+      let rec walk_top = function
+        | Ast.TopDecl d -> walk_decl root_scope ~container:None d
+        | Ast.TopStmt s -> walk_stmt root_scope ~container:None s
+        | Ast.TopModule m -> List.iter walk_top m.v.module_items
+        | Ast.TopError _ -> ()
+      in
+      List.iter prebind_top_types prog;
+      List.iter prebind_top prog;
+      List.iter walk_top prog
   | _ -> ());
   nav

@@ -74,11 +74,8 @@ let implementation_locations_for (ws : t) ~(uri : T.DocumentUri.t)
                       match key_opt with
                       | None -> []
                       | Some key ->
-                          if
-                            allow_fallback_for_ws ws doc
-                            && not (nav_budget_check budget)
-                          then proc_impl_defs_by_key ws doc ~key
-                          else []
+                          if nav_budget_check budget then []
+                          else proc_impl_defs_by_key ws doc ~key
                   in
                   if defs = [] then [] else List.map location_of_def defs)
       in

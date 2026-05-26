@@ -9,6 +9,7 @@ val create : ?settings:Workspace_settings.t -> unit -> t
 val set_root_uri : t -> T.DocumentUri.t option -> unit
 val set_root_path : t -> string option -> unit
 val set_source_files : t -> string list -> bool
+val set_assembly_files : t -> string list -> bool
 val rescan : t -> unit
 val ensure_index_health : t -> bool
 val revalidate_all : t -> T.DocumentUri.t list
@@ -54,6 +55,8 @@ val background_tick :
   last_message_ms:float ->
   unit
 
+val complete_startup_nav_index_foreground : ?max_ms:int -> t -> unit
+
 val effective_bg_tick_budget_ms : t -> base_budget_ms:int -> int
 
 val drain_pending_diag_updates :
@@ -62,7 +65,7 @@ val drain_pending_diag_updates :
 val drain_open_diag_revalidate_uris : t -> max_items:int -> T.DocumentUri.t list
 val drain_open_parse_results_now : t -> unit
 val finish_open_doc_now_if_needed : t -> uri:T.DocumentUri.t -> bool
-val refresh_closed_doc_diagnostics_now : t -> uri:T.DocumentUri.t -> bool
+val refresh_closed_doc_diagnostics_now : ?force:bool -> t -> uri:T.DocumentUri.t -> bool
 val finish_last_open_doc_now_if_needed : t -> bool
 val startup_background_budget_ms : t -> base_budget_ms:int -> int
 val feature_flags : t -> Workspace_settings.feature_flags
@@ -73,6 +76,7 @@ val startup_diag_hover_ready_now : t -> bool
 val startup_is_ready_now : t -> bool
 val open_doc_count : t -> int
 val background_work_pending : t -> bool
+val text_len_is_background_large : t -> bytes:int -> bool
 val startup_readiness_json_for_report : t -> Yojson.Safe.t
 val workspace_ready_event_json : t -> Yojson.Safe.t option
 val startup_phase_event_json : t -> Yojson.Safe.t option

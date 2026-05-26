@@ -107,10 +107,12 @@ let shift_token ~(delta : int) ~(edit_line : int)
 
 let is_safe_restart_token (tok : Parser.token) : bool =
   match tok with
+  (* DEFINE and COMPOOL are intentionally excluded: they put the lexer into a
+     state that changes how the next quoted string is tokenized. *)
   | Parser.SEMI | Parser.TERM | Parser.END | Parser.START | Parser.BEGIN
   | Parser.PROC | Parser.DEF | Parser.REF | Parser.ITEM | Parser.TABLE
   | Parser.READONLY | Parser.INLINE | Parser.OVERLAY | Parser.TYPE
-  | Parser.BLOCK | Parser.COMPOOL | Parser.ICOMPOOL | Parser.DEFINE ->
+  | Parser.BLOCK | Parser.LINKAGE | Parser.ILINKAGE ->
       true
   | _ -> false
 

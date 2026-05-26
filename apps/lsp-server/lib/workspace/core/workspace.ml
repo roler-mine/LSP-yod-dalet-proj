@@ -12,6 +12,7 @@ let create = Workspace_state.create
 let set_root_uri = Workspace_state.set_root_uri
 let set_root_path = Workspace_state.set_root_path
 let set_source_files = Workspace_state.set_source_files
+let set_assembly_files = Workspace_state.set_assembly_files
 let rescan = Workspace_index_graph.rescan
 let ensure_index_health = Workspace_index_graph.ensure_index_health
 let revalidate_all = Workspace_doc_lifecycle.revalidate_all
@@ -22,6 +23,9 @@ let change_doc = Workspace_doc_lifecycle.change_doc
 let close_doc = Workspace_doc_lifecycle.close_doc
 let apply_watched_file_changes = Workspace_doc_lifecycle.apply_watched_file_changes
 let background_tick = Workspace_background.background_tick
+let complete_startup_nav_index_foreground =
+  Workspace_background.complete_startup_nav_index_foreground
+
 let effective_bg_tick_budget_ms = Workspace_runtime.effective_bg_tick_budget_ms
 let drain_pending_diag_updates = Workspace_background.drain_pending_diag_updates
 let drain_open_diag_revalidate_uris =
@@ -50,6 +54,8 @@ let startup_diag_hover_ready_now = Workspace_runtime.startup_diag_hover_ready_no
 let startup_is_ready_now = Workspace_runtime.startup_is_ready_now
 let open_doc_count = Workspace_runtime.open_doc_count
 let background_work_pending = Workspace_runtime.background_work_pending
+let text_len_is_background_large ws ~bytes =
+  bytes >= ws.Workspace_foundation.bg_large_file_bytes
 let startup_readiness_json_for_report =
   Workspace_runtime.startup_readiness_json_for_report
 
@@ -59,7 +65,7 @@ let startup_miss_event_json = Workspace_runtime.startup_miss_event_json
 let open_doc_converged = Workspace_doc_lifecycle.open_doc_converged
 let request_cancelled = Workspace_runtime.request_cancelled
 let with_request_cancel_checker = Workspace_runtime.with_request_cancel_checker
-let diagnostics_for = Workspace_state.diagnostics_for
+let diagnostics_for = Workspace_query.diagnostics_for_file
 let document_version = Workspace_state.document_version
 let document_text_length = Workspace_state.document_text_length
 let diagnostics_snapshot_for = Workspace_state.diagnostics_snapshot_for
@@ -68,28 +74,35 @@ let cst_dump_for = Workspace_state.cst_dump_for
 let definition_locations_for = Workspace_query.definition_locations_for
 let declaration_locations_for = Workspace_definition.declaration_locations_for
 let type_definition_locations_for =
-  Workspace_type_definition.type_definition_locations_for
+  Workspace_query.type_definition_locations_for
 
 let implementation_locations_for =
-  Workspace_implementation.implementation_locations_for
+  Workspace_query.implementation_locations_for
 
 let references_locations_for = Workspace_query.references_locations_for
 
 let references_locations_stream ws ~uri ~pos ~include_decl ~emit =
-  Workspace_references.references_locations_stream ws ~uri ~pos ~include_decl
-    ~emit
+  let locs =
+    Workspace_query.references_locations_for ws ~uri ~pos ~include_decl
+  in
+  if locs <> [] then emit locs;
+  locs
 
-let document_symbols_for = Workspace_reporting.document_symbols_for
-let workspace_symbols_for = Workspace_symbols.workspace_symbols_for
-let workspace_symbols_stream = Workspace_symbols.workspace_symbols_stream
+let document_symbols_for ws ~uri =
+  match Workspace_query.document_symbols_for_file ws ~uri with
+  | Some symbols -> symbols
+  | None -> Workspace_reporting.document_symbols_for ws ~uri
+
+let workspace_symbols_for = Workspace_query.workspace_symbols_for
+let workspace_symbols_stream = Workspace_query.workspace_symbols_stream
 let hover_for = Workspace_query.hover_for
 let explain_symbol_resolution_json =
   Workspace_query.explain_symbol_resolution_json
 
 let signature_help_for = Workspace_signature_help.signature_help_for
-let prepare_rename_for = Workspace_rename.prepare_rename_for
-let rename_for = Workspace_rename.rename_for
-let completion_items_for = Workspace_completion.completion_items_for
+let prepare_rename_for = Workspace_query.prepare_rename_for
+let rename_for = Workspace_query.rename_for
+let completion_items_for = Workspace_query.completion_items_for
 let code_actions_for = Workspace_code_actions.code_actions_for
 let code_lenses_for = Workspace_codelens.code_lenses_for
 let resolve_code_lens = Workspace_codelens.resolve_code_lens

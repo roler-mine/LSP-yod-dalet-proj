@@ -1,0 +1,353 @@
+{
+  "tool": "jovial-vscode-e2e-perf",
+  "generatedAt": "2026-05-20T09:12:28.138Z",
+  "note": "Measures VS Code extension-host UX path: extension activation, LanguageClient processing, stdio JSON-RPC, real OCaml LSP server processing, provider command results, and unsaved edit-to-diagnostics latency.",
+  "workspacePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411",
+  "workspaceFolders": [
+    {
+      "name": "jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411",
+      "uri": "file:///c%3A/Users/miran/AppData/Local/Temp/jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411",
+      "fsPath": "c:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411"
+    }
+  ],
+  "workspaceInventory": {
+    "sourceFileCount": 5,
+    "sourceBytes": 261662,
+    "files": [
+      {
+        "name": "MAINCOMP.j73",
+        "bytes": 940
+      },
+      {
+        "name": "MAINMODULE (1).j73",
+        "bytes": 459
+      },
+      {
+        "name": "MAINSYSCOMP.j73",
+        "bytes": 204
+      },
+      {
+        "name": "TINYCOMP2.j73",
+        "bytes": 258860
+      },
+      {
+        "name": "UTIL.j73",
+        "bytes": 1199
+      }
+    ],
+    "featureCounts": {
+      "compoolImports": 4,
+      "compoolDeclarations": 3,
+      "icopyIncludes": 0,
+      "defines": 3,
+      "defProcedures": 4,
+      "refProcedures": 2,
+      "types": 10,
+      "tables": 6
+    },
+    "featureScanBytesPerFile": 262144
+  },
+  "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411\\UTIL.j73",
+  "serverPath": "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\lsp-server\\_build-win32-x64\\install\\default\\bin\\jovial-lsp.exe",
+  "profile": "small",
+  "sampleBytes": 1199,
+  "hugeThresholdBytes": 15728640,
+  "fullParseMaxBytes": 15728640,
+  "commandSamples": 1,
+  "hoverSamples": 1,
+  "navigationSamples": 1,
+  "providerRange": {
+    "start": {
+      "line": 0,
+      "character": 0
+    },
+    "end": {
+      "line": 68,
+      "character": 4
+    }
+  },
+  "activation": {
+    "name": "openDocument.extensionActivate.serverInitialize",
+    "durationMs": 2215.632,
+    "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411\\UTIL.j73"
+  },
+  "sampleOpen": {
+    "name": "sample.openedDuringActivation",
+    "durationMs": 0,
+    "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-38e6184a802640f0bf3e2bdbc30f0411\\UTIL.j73"
+  },
+  "commands": [
+    {
+      "name": "documentSymbols",
+      "iterations": 1,
+      "durationsMs": [
+        2.599
+      ],
+      "stats": {
+        "minMs": 2.599,
+        "p50Ms": 2.599,
+        "p95Ms": 2.599,
+        "p99Ms": 2.599,
+        "maxMs": 2.599,
+        "avgMs": 2.599
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 13
+      },
+      "errors": []
+    },
+    {
+      "name": "hover",
+      "iterations": 1,
+      "durationsMs": [
+        20.022
+      ],
+      "stats": {
+        "minMs": 20.022,
+        "p50Ms": 20.022,
+        "p95Ms": 20.022,
+        "p99Ms": 20.022,
+        "maxMs": 20.022,
+        "avgMs": 20.022
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "definition",
+      "iterations": 1,
+      "durationsMs": [
+        8.545
+      ],
+      "stats": {
+        "minMs": 8.545,
+        "p50Ms": 8.545,
+        "p95Ms": 8.545,
+        "p99Ms": 8.545,
+        "maxMs": 8.545,
+        "avgMs": 8.545
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "references",
+      "iterations": 1,
+      "durationsMs": [
+        19.574
+      ],
+      "stats": {
+        "minMs": 19.574,
+        "p50Ms": 19.574,
+        "p95Ms": 19.574,
+        "p99Ms": 19.574,
+        "maxMs": 19.574,
+        "avgMs": 19.574
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "inlayHints",
+      "iterations": 1,
+      "durationsMs": [
+        17.04
+      ],
+      "stats": {
+        "minMs": 17.04,
+        "p50Ms": 17.04,
+        "p95Ms": 17.04,
+        "p99Ms": 17.04,
+        "maxMs": 17.04,
+        "avgMs": 17.04
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 5
+      },
+      "errors": []
+    },
+    {
+      "name": "semanticTokens.range",
+      "iterations": 1,
+      "durationsMs": [
+        16.711
+      ],
+      "stats": {
+        "minMs": 16.711,
+        "p50Ms": 16.711,
+        "p95Ms": 16.711,
+        "p99Ms": 16.711,
+        "maxMs": 16.711,
+        "avgMs": 16.711
+      },
+      "resultSummary": {
+        "kind": "semanticTokens",
+        "dataLength": 635
+      },
+      "errors": []
+    },
+    {
+      "name": "completion",
+      "iterations": 1,
+      "durationsMs": [
+        17.07
+      ],
+      "stats": {
+        "minMs": 17.07,
+        "p50Ms": 17.07,
+        "p95Ms": 17.07,
+        "p99Ms": 17.07,
+        "maxMs": 17.07,
+        "avgMs": 17.07
+      },
+      "resultSummary": {
+        "kind": "objectWithItems",
+        "length": 29
+      },
+      "errors": []
+    }
+  ],
+  "diagnostics": {
+    "baseline": {
+      "name": "diagnostics.baselineStable",
+      "durationMs": 552.446,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "brokenEdit": {
+      "name": "diagnostics.afterBrokenEdit",
+      "durationMs": 640.266,
+      "count": 2,
+      "fingerprint": "0|parse||Parse error near token ID (lexeme: \"LIVE\") Expected: ,, ;|0|7|0|11\n1|parse||Recovered from damaged syntax in module item: skipped to the next module or declaration boundary|0|7|3|23",
+      "messages": [
+        "Parse error near token ID (lexeme: \"LIVE\") Expected: ,, ;",
+        "Recovered from damaged syntax in module item: skipped to the next module or declaration boundary"
+      ]
+    },
+    "restoredEdit": {
+      "name": "diagnostics.afterRestoreEdit",
+      "durationMs": 776.69,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "editStates": {
+      "baseline": {
+        "version": 1,
+        "lineCount": 69,
+        "firstLine": "START",
+        "startsWithBrokenLine": false,
+        "textBytes": 1199
+      },
+      "broken": {
+        "version": 2,
+        "lineCount": 70,
+        "firstLine": "BROKEN LIVE EDIT",
+        "startsWithBrokenLine": true,
+        "textBytes": 1217
+      },
+      "restored": {
+        "version": 3,
+        "lineCount": 69,
+        "firstLine": "START",
+        "startsWithBrokenLine": false,
+        "textBytes": 1199
+      }
+    },
+    "restoredMatchesBaseline": true,
+    "errors": []
+  },
+  "workspaceReadiness": {
+    "name": "workspace.deepSemanticReady",
+    "durationMs": 10125.468,
+    "ready": false,
+    "elapsedMs": 9852,
+    "targetMs": 1500,
+    "startup": {
+      "startedMs": 1779268335911.319,
+      "readyMs": null,
+      "elapsedMs": 9852,
+      "targetMs": 1500,
+      "readyWithinTarget": false,
+      "isReady": false,
+      "phase": "aggressiveCatchUp",
+      "aggressiveWindowMs": 500,
+      "aggressiveBudgetMs": 20,
+      "missNotified": true,
+      "stages": {
+        "diagHoverReady": {
+          "targetMs": 1500,
+          "elapsedMs": 9852,
+          "isReady": false,
+          "readyWithinTarget": false
+        },
+        "interactiveNavReady": {
+          "targetMs": 1500,
+          "elapsedMs": 9852,
+          "isReady": true,
+          "readyWithinTarget": false
+        },
+        "deepSemanticComplete": {
+          "targetMs": 1500,
+          "elapsedMs": 9852,
+          "isReady": false,
+          "readyWithinTarget": false
+        }
+      },
+      "components": {
+        "indexComplete": true,
+        "indexReconcilePending": false,
+        "seedComplete": true,
+        "seedReady": true,
+        "highQueuesEmpty": false,
+        "interactiveQueuesEmpty": false,
+        "queuesEmpty": false,
+        "backgroundDrainRequired": true,
+        "hintsReady": false,
+        "rootClosureReady": true,
+        "navPrereqsReady": false,
+        "interactiveNavReady": true,
+        "quickNavComplete": true,
+        "deepSemanticComplete": false,
+        "fullyNavigable": false,
+        "quickNavIndexReady": true,
+        "quickNavIndexComplete": true,
+        "quickNavIndexed": 6,
+        "quickNavTotal": 6,
+        "quickNavPending": 0,
+        "quickNavPendingSet": 0,
+        "parseWorkerJobs": 0,
+        "parseWorkerResults": 0,
+        "parseWorkerInflight": 0,
+        "openDocsConverged": true,
+        "openDocsAuthoritative": true,
+        "openDocsPendingParse": 0,
+        "xmoduleDiagReady": false,
+        "openDiagRevalidateQueueEmpty": true,
+        "openDiagRevalidatePending": 0
+      }
+    },
+    "errors": []
+  },
+  "strictWorkspaceReadiness": false,
+  "summary": {
+    "commandErrors": [],
+    "emptyProviderResults": [],
+    "diagnosticsRestoredToBaseline": true,
+    "diagnosticErrors": [],
+    "seededDiagnosticErrors": [],
+    "workspaceReadinessErrors": []
+  }
+}

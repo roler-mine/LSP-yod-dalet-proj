@@ -22,7 +22,10 @@ That command rebuilds the host server into the dune target build directory,
 runs that fresh executable directly, and writes a report to
 `reports/perf/jovial-vscode-e2e-<timestamp>.json`. Set
 `JOVIAL_E2E_SERVER_PATH=<path-to-jovial-lsp>` to benchmark a specific server
-build, or `JOVIAL_E2E_PERF_REPORT=<path>` to choose the output file.
+build, or `JOVIAL_E2E_PERF_REPORT=<path>` to choose the output file. When
+invoking through `npm --prefix`, use an absolute `JOVIAL_E2E_PERF_REPORT` if
+you override the destination; relative paths are resolved from the extension
+package directory.
 
 For a huge-file UX smoke run, use:
 
@@ -130,6 +133,36 @@ opam exec -- dune exec --display=quiet --root . apps/lsp-server/bench/workspace_
 When `--stress-workspace-gb` is set, non-source ballast files are sparse marker
 files. `sourceBytes` reports actual `.j73` source size; `workspaceBytes` reports
 the logical workspace size on disk.
+
+To exercise the same generated workspace through the VS Code extension path
+with complex seeded diagnostics, run the e2e mixed profile against the generated
+workspace:
+
+```powershell
+$env:JOVIAL_E2E_WAIT_TIMEOUT_MS = "60000"
+$env:JOVIAL_E2E_PERF_REPORT = "$(Resolve-Path reports/perf)\jovial-vscode-e2e-mixed-local.json"
+npm --prefix apps/vscode-extension run test:e2e-perf -- --profile mixed --workspace-root C:\temp\jovial-lsp-bench\mixed-realistic-stress
+```
+
+The mixed e2e profile injects a small diagnostic fixture into the large
+workspace, opens the 50 MiB stress sample, then measures document symbols,
+hover, definition, references, inlay hints, semantic-token range, completion,
+visible seeded diagnostics, and unsaved edit-to-diagnostics restore behavior.
+The seeded fixture covers imported types/procs, assignment mismatch,
+procedure-argument type and count mismatch, unresolved procedure/import,
+unknown field access, and invalid pointer dereference.
+
+Lower-spec environments should use these full mixed runs as machine-local
+baselines. On an i5-8250U laptop with about 8 GiB RAM, the 1536-file, 3 GiB
+source / 20 GiB logical workspace reached cold interactive readiness in about
+20.1 s and warm readiness in about 16.0 s, missing the default 1500 ms
+readiness target. The matching VS Code e2e run still had no provider command
+errors, visible seeded diagnostics in about 544 ms, a full
+`jovial.pullDiagnostics` result in about 134 ms, live edit diagnostics in about
+555 ms, hover/definition/references/inlay/semantic range p95s under 11 ms,
+document symbols p95 around 489 ms, and completion p95 around 378 ms. In that
+environment, treat `readyWithinTarget=false` as a capacity signal and compare
+against the local artifact rather than treating it as a correctness failure.
 
 For a quick smoke test that exercises the same generator without creating a
 large workspace:

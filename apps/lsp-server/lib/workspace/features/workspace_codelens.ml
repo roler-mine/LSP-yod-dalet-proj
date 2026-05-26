@@ -17,7 +17,7 @@ type count_context = {
   mutable lookup_docs : Document.t list option;
 }
 
-let code_lens_budget_ms = 20
+let code_lens_budget_ms = 40
 
 type count_confidence =
   | ExactAuthoritative

@@ -1,6 +1,5 @@
 %{
   (* Module overview: Menhir grammar and interface for building the recoverable Jovial syntax tree. *)
-  [@@@warning "-32"]
 
   open Ast
 
@@ -27,8 +26,32 @@
       labels
       s
 
+  let recovered_message kind =
+    "Recovered from damaged syntax in " ^ kind
+
+  let parse_error_info ?(expected = []) ?actual ~(kind : string)
+      ~(message : string) () : Ast.parse_error =
+    { Ast.message; expected; actual; recovery_kind = kind }
+
+  let note_recovery sp ep kind detail =
+    Parse_diags.add (loc sp ep) (recovered_message kind ^ ": " ^ detail)
+
   let bad_stmt sp ep : Ast.stmt Ast.node =
-    n sp ep Ast.SEmpty
+    note_recovery sp ep "statement" "skipped to the next statement boundary";
+    n sp ep
+      (Ast.SError
+         (parse_error_info ~kind:"statementSyncSkip"
+            ~message:"Could not parse this statement." ()))
+
+  let bad_top sp ep : Ast.toplevel list =
+    note_recovery sp ep "module item"
+      "skipped to the next module or declaration boundary";
+    [
+      Ast.TopError
+        (n sp ep
+           (parse_error_info ~kind:"moduleItemSyncSkip"
+              ~message:"Could not parse this module item." ()));
+    ]
 
   let mk_assign_stmt sp ep (lhses : Ast.expr Ast.node list)
       (rhs : Ast.expr Ast.node) : Ast.stmt Ast.node =
@@ -97,6 +120,20 @@
     | "REF" -> Ast.RefDecl
     | _ -> Ast.LocalDecl
 
+  let warn_ref_preset (m : string option) (init : Ast.expr Ast.node option) (where : Ast.Loc.t) =
+    match m, init with
+    | Some "REF", Some _ ->
+        Parse_diags.add where
+          "J73 REF item/table specifications cannot contain presets; remove the preset or use a DEF specification."
+    | _ -> ()
+
+  let warn_external_constant (m : string option) (where : Ast.Loc.t) =
+    match m with
+    | Some x when x = "DEF" || x = "REF" ->
+        Parse_diags.add where
+          "J73 CONSTANT declarations cannot be directly DEF/REF; wrap the constant inside an external BLOCK."
+    | _ -> ()
+
   let apply_external_modifier_to_proc (m : Ast.external_modifier)
       (p : Ast.proc Ast.node) : Ast.proc Ast.node =
     { p with v = { p.v with external_modifier = m } }
@@ -111,6 +148,7 @@
       | Ast.DProc p -> Ast.DProc (apply_external_modifier_to_proc m p)
       | Ast.DOverlay _ as x -> x
       | Ast.DDirective _ as x -> x
+      | Ast.DError _ as x -> x
     in
     { d with v }
 
@@ -139,6 +177,46 @@
     in
     (a_rec || b_rec, a_rent || b_rent, a_inline || b_inline, ret)
 
+  let scalar_base_of_ident (id : Ast.ident) : Ast.scalar_base option =
+    match String.uppercase_ascii id.v with
+    | "U" -> Some Ast.ScalarUnsigned
+    | "S" -> Some Ast.ScalarSigned
+    | "F" -> Some Ast.ScalarFloat
+    | "A" -> Some Ast.ScalarFixed
+    | "B" -> Some Ast.ScalarBit
+    | "C" -> Some Ast.ScalarChar
+    | _ -> None
+
+  let round_mode_of_ident (id : Ast.ident) : Ast.round_mode option =
+    match String.uppercase_ascii id.v with
+    | "R" -> Some Ast.Round
+    | "T" -> Some Ast.Truncate
+    | _ -> None
+
+  let mk_type_expr_with_round sp ep (base : Ast.ident)
+      (round : Ast.round_mode option) (sizes : Ast.expr Ast.node list) :
+      Ast.type_expr Ast.node =
+    match String.uppercase_ascii base.v, sizes with
+    | "P", [{ v = Ast.EName pointed; loc = pointed_loc; _ }] ->
+        let inner = Ast.node ~loc:pointed_loc (Ast.TName pointed) in
+        n sp ep (Ast.TPointer inner)
+    | "P", [] ->
+        let inner = n sp ep (Ast.TName (nid sp ep "__untyped_pointer__")) in
+        n sp ep (Ast.TPointer inner)
+    | _, _ ->
+        (match scalar_base_of_ident base with
+         | Some scalar -> n sp ep (Ast.TScalar { base = scalar; round; sizes })
+         | None ->
+             match sizes with
+             | [] -> n sp ep (Ast.TName base)
+             | dims ->
+                 let elem = Ast.node ~loc:base.loc (Ast.TName base) in
+                 n sp ep (Ast.TArray { elem; dims }))
+
+  let mk_type_expr sp ep (base : Ast.ident) (sizes : Ast.expr Ast.node list) :
+      Ast.type_expr Ast.node =
+    mk_type_expr_with_round sp ep base None sizes
+
   let for_step_stmt sp ep lhs (by_expr, then_expr) =
     match by_expr, then_expr with
     | Some inc, _ ->
@@ -148,14 +226,41 @@
         Some (n sp ep (Ast.SAssign { lhs; rhs = nextv }))
     | None, None ->
         None
+
+  let module_kind_of_header (items : Ast.toplevel list) : Ast.module_kind =
+    let rec first_program = function
+      | Ast.TopDecl { v = Ast.DDirective { name; args }; _ } :: _
+        when String.uppercase_ascii name.v = "PROGRAM" ->
+          Some (Ast.MainProgram (match args with x :: _ -> Some x | [] -> None))
+      | _ :: xs -> first_program xs
+      | [] -> None
+    in
+    let rec first_compool_module = function
+      | Ast.TopDecl { v = Ast.DDirective { name; args }; _ } :: _
+        when String.uppercase_ascii name.v = "COMPOOL_MODULE" ->
+          Some (Ast.CompoolModule (match args with x :: _ -> Some x | [] -> None))
+      | _ :: xs -> first_compool_module xs
+      | [] -> None
+    in
+    match first_program items, first_compool_module items with
+    | Some k, _ -> k
+    | None, Some k -> k
+    | None, None -> Ast.ProcedureModule
 %}
 
 /* identifiers + literals */
 %token <string> ID
+%token <string> FIXED_A
 %token <string> INTLIT
 %token <string> FLOATLIT
 %token <string> STRINGLIT
-%token TRUE FALSE
+%token <int * string * string> BITLIT
+%token <string> BAD_CHAR
+%token <string> BAD_STRING
+%token <string> BAD_COMMENT
+%token <string> BAD_DIRECTIVE
+%token <string> BAD_LITERAL
+%token TRUE FALSE NULL
 
 /* keywords */
 %token START TERM BEGIN END
@@ -168,7 +273,7 @@
 %token NOT AND OR XOR EQV MOD
 
 /* “header / meta” keywords (safe even if used as IDs) */
-%token PROGRAM COMPOOL ICOMPOOL DEFINE TYPE BLOCK
+%token PROGRAM COMPOOL ICOMPOOL DEFINE TYPE BLOCK LINKAGE ILINKAGE CODE ICODE
 %token POS
 
 /* conversion brackets */
@@ -237,9 +342,22 @@ rev_jmodules:
   ;
 
 jmodule:
-  | START hs=header_items body=module_items_opt TERM { hs @ body }
-  | body=module_items TERM                       { body }
-  | body=module_items                            { body }
+  | START _t=terminator_opt hs=header_items body=module_items_opt TERM
+      {
+        let items = hs @ body in
+        [Ast.TopModule (n $startpos $endpos
+          { module_kind = module_kind_of_header items; module_items = items })]
+      }
+  | body=module_items TERM
+      {
+        [Ast.TopModule (n $startpos $endpos
+          { module_kind = Ast.UnknownModule; module_items = body })]
+      }
+  | body=module_items
+      {
+        [Ast.TopModule (n $startpos $endpos
+          { module_kind = Ast.UnknownModule; module_items = body })]
+      }
   ;
 
 /* Accept PROGRAM/COMPOOL lines in the header area. */
@@ -253,12 +371,18 @@ rev_header_items:
   ;
 
 header_item:
-  | d=directive_decl { [Ast.TopDecl d] }
+  | _skip=ignored_bang_directive { [] }
   | PROGRAM nm=ident _t=terminator_opt
       {
         let d = n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "PROGRAM"; args = [nm] }) in
         [Ast.TopDecl d]
       }
+  | COMPOOL nm=ident _t=terminator_opt
+      {
+        let d = n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL_MODULE"; args = [nm] }) in
+        [Ast.TopDecl d]
+      }
+  | d=directive_decl { [Ast.TopDecl d] }
   ;
 
 /* =========================================================
@@ -281,9 +405,21 @@ rev_module_items:
 
 module_item:
   | ds=decl_item     { List.map (fun d -> Ast.TopDecl d) ds }
+  | BEGIN ds=module_body_decl_section ss=block_list_opt END
+      {
+        let tops = List.map (fun d -> Ast.TopDecl d) ds in
+        match ss with
+        | [] -> tops
+        | _ -> tops @ [Ast.TopStmt (mk_block $startpos $endpos ss)]
+      }
   | s=statement      { [Ast.TopStmt s] }
   | error _t=terminator
-      { [] }
+      { bad_top $startpos $endpos }
+  ;
+
+module_body_decl_section:
+  | ds=decl_item { ds }
+  | ds=decl_item rest=module_body_decl_section { ds @ rest }
   ;
 
 /* =========================================================
@@ -291,6 +427,7 @@ module_item:
    ========================================================= */
 
 decl_item:
+  | _skip=ignored_bang_directive { [] }
   | d=directive_decl { [d] }
   | ds=group_decl    { ds }
   | ds=inline_proc_decl { ds }
@@ -343,7 +480,7 @@ inline_invalid_data_decl:
   ;
 
 inline_proc_decl:
-  | INLINE PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator body=proc_body_opt
+  | INLINE PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator linkage=proc_linkage_opt _skip=ignored_bang_directives_opt body=proc_body_opt
       {
         let seen_rec, seen_rent, _seen_inline, ret =
           merge_proc_header_info pre post
@@ -362,6 +499,7 @@ inline_proc_decl:
               params;
               returns = ret;
               use_attr;
+              linkage;
               locals;
               body = body_stmt;
               external_modifier = Ast.LocalDecl;
@@ -373,22 +511,22 @@ inline_proc_decl:
       }
   ;
 
-/* Directives: !NAME [args] ;  (and allow COMPOOL/ICOMPOOL without ! too) */
+/* Directives: COMPOOL imports participate in the workspace model.  Other bang
+   compiler controls are skipped through their semicolon so they cannot create
+   stray parse errors or synthetic declarations. */
 directive_decl:
   | BANG COMPOOL LPAREN arg=compool_arg RPAREN rest=directive_args_opt _t=terminator_opt
       { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL"; args = arg :: rest }) }
   | BANG ICOMPOOL LPAREN arg=compool_arg RPAREN rest=directive_args_opt _t=terminator_opt
-      { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "ICOMPOOL"; args = arg :: rest }) }
+      { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL"; args = arg :: rest }) }
   | BANG COMPOOL arg=compool_arg rest=directive_args_opt _t=terminator_opt
       { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL"; args = arg :: rest }) }
   | BANG ICOMPOOL arg=compool_arg rest=directive_args_opt _t=terminator_opt
-      { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "ICOMPOOL"; args = arg :: rest }) }
-  | BANG name=directive_name args=directive_args_opt _t=terminator
-      { n $startpos $endpos (Ast.DDirective { name; args }) }
-  | COMPOOL arg=compool_arg rest=directive_args_opt _t=terminator_opt
       { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL"; args = arg :: rest }) }
-  | ICOMPOOL arg=compool_arg rest=directive_args_opt _t=terminator_opt
-      { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "ICOMPOOL"; args = arg :: rest }) }
+  | COMPOOL arg=compool_arg _t=terminator_opt
+      { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL"; args = [arg] }) }
+  | ICOMPOOL arg=compool_arg _t=terminator_opt
+      { n $startpos $endpos (Ast.DDirective { name = nid $startpos $endpos "COMPOOL"; args = [arg] }) }
   ;
 
 compool_arg:
@@ -396,12 +534,108 @@ compool_arg:
   | s=STRINGLIT { nid $startpos $endpos s }
   ;
 
-directive_name:
-  | nm=ident { nm }
-  | PROGRAM  { nid $startpos $endpos "PROGRAM" }
-  | DEFINE   { nid $startpos $endpos "DEFINE" }
-  | TYPE     { nid $startpos $endpos "TYPE" }
-  | BLOCK    { nid $startpos $endpos "BLOCK" }
+ignored_bang_directives_opt:
+  | /* empty */ { () }
+  | ignored_bang_directives_opt _skip=ignored_bang_directive { () }
+  ;
+
+ignored_bang_directive:
+  | BANG SEMI { () }
+  | BANG _first=ignored_bang_initial _rest=ignored_bang_payload SEMI { () }
+  ;
+
+ignored_bang_payload:
+  | /* empty */ { () }
+  | ignored_bang_payload _tok=ignored_bang_token { () }
+  ;
+
+ignored_bang_initial:
+  | _tok=ignored_bang_token_non_compool { () }
+  ;
+
+ignored_bang_token_non_compool:
+  | _tok=ignored_bang_token_non_compool_keyword { () }
+  | _id=ID { () }
+  | _id=FIXED_A { () }
+  | _lit=INTLIT { () }
+  | _lit=FLOATLIT { () }
+  | _lit=STRINGLIT { () }
+  | _lit=BITLIT { () }
+  | TRUE { () }
+  | FALSE { () }
+  | NULL { () }
+  | CONV_L { () }
+  | CONV_R { () }
+  | PLUS { () }
+  | MINUS { () }
+  | STAR { () }
+  | SLASH { () }
+  | POW { () }
+  | EQ { () }
+  | NE { () }
+  | LT { () }
+  | LE { () }
+  | GT { () }
+  | GE { () }
+  | LPAREN { () }
+  | RPAREN { () }
+  | COMMA { () }
+  | COLON { () }
+  | DOT { () }
+  | BANG { () }
+  | AT { () }
+  ;
+
+ignored_bang_token_non_compool_keyword:
+  | START { () }
+  | TERM { () }
+  | BEGIN { () }
+  | END { () }
+  | DEF { () }
+  | REF { () }
+  | PROC { () }
+  | ITEM { () }
+  | TABLE { () }
+  | STATIC { () }
+  | CONSTANT { () }
+  | READONLY { () }
+  | INLINE { () }
+  | OVERLAY { () }
+  | IF { () }
+  | ELSE { () }
+  | WHILE { () }
+  | FOR { () }
+  | BY { () }
+  | THEN { () }
+  | CASE { () }
+  | DEFAULT { () }
+  | FALLTHRU { () }
+  | EXIT { () }
+  | GOTO { () }
+  | RETURN { () }
+  | ABORT { () }
+  | STOP { () }
+  | NOT { () }
+  | AND { () }
+  | OR { () }
+  | XOR { () }
+  | EQV { () }
+  | MOD { () }
+  | PROGRAM { () }
+  | DEFINE { () }
+  | TYPE { () }
+  | BLOCK { () }
+  | LINKAGE { () }
+  | ILINKAGE { () }
+  | CODE { () }
+  | ICODE { () }
+  | POS { () }
+  ;
+
+ignored_bang_token:
+  | _tok=ignored_bang_token_non_compool { () }
+  | COMPOOL { () }
+  | ICOMPOOL { () }
   ;
 
 directive_args_opt:
@@ -424,7 +658,48 @@ directive_arg:
   | s=STRINGLIT { nid $startpos $endpos s }
   | i=INTLIT    { nid $startpos $endpos i }
   | f=FLOATLIT  { nid $startpos $endpos f }
+  | b=BITLIT    { let _, _, raw = b in nid $startpos $endpos raw }
   | id=ident_or_soft_keyword { id }
+  ;
+
+ident_or_directive_keyword:
+  | id=ident { id }
+  | START { nid $startpos $endpos "START" }
+  | TERM { nid $startpos $endpos "TERM" }
+  | BEGIN { nid $startpos $endpos "BEGIN" }
+  | END { nid $startpos $endpos "END" }
+  | DEF { nid $startpos $endpos "DEF" }
+  | REF { nid $startpos $endpos "REF" }
+  | PROC { nid $startpos $endpos "PROC" }
+  | ITEM { nid $startpos $endpos "ITEM" }
+  | TABLE { nid $startpos $endpos "TABLE" }
+  | STATIC { nid $startpos $endpos "STATIC" }
+  | CONSTANT { nid $startpos $endpos "CONSTANT" }
+  | READONLY { nid $startpos $endpos "READONLY" }
+  | INLINE { nid $startpos $endpos "INLINE" }
+  | OVERLAY { nid $startpos $endpos "OVERLAY" }
+  | IF { nid $startpos $endpos "IF" }
+  | ELSE { nid $startpos $endpos "ELSE" }
+  | WHILE { nid $startpos $endpos "WHILE" }
+  | FOR { nid $startpos $endpos "FOR" }
+  | BY { nid $startpos $endpos "BY" }
+  | THEN { nid $startpos $endpos "THEN" }
+  | CASE { nid $startpos $endpos "CASE" }
+  | DEFAULT { nid $startpos $endpos "DEFAULT" }
+  | FALLTHRU { nid $startpos $endpos "FALLTHRU" }
+  | EXIT { nid $startpos $endpos "EXIT" }
+  | GOTO { nid $startpos $endpos "GOTO" }
+  | RETURN { nid $startpos $endpos "RETURN" }
+  | ABORT { nid $startpos $endpos "ABORT" }
+  | STOP { nid $startpos $endpos "STOP" }
+  | TRUE { nid $startpos $endpos "TRUE" }
+  | FALSE { nid $startpos $endpos "FALSE" }
+  | NULL { nid $startpos $endpos "NULL" }
+  | PROGRAM { nid $startpos $endpos "PROGRAM" }
+  | TYPE { nid $startpos $endpos "TYPE" }
+  | BLOCK { nid $startpos $endpos "BLOCK" }
+  | LINKAGE { nid $startpos $endpos "LINKAGE" }
+  | ILINKAGE { nid $startpos $endpos "ILINKAGE" }
   ;
 
 ident_or_soft_keyword:
@@ -433,6 +708,7 @@ ident_or_soft_keyword:
   | TYPE { nid $startpos $endpos "TYPE" }
   | BLOCK { nid $startpos $endpos "BLOCK" }
   | DEFAULT { nid $startpos $endpos "DEFAULT" }
+  | NULL { nid $startpos $endpos "NULL" }
   ;
 
 /* DEFINE declarations (Chapter 18):
@@ -527,6 +803,14 @@ type_decl:
         in
         [n $startpos $endpos (Ast.DType { name = nm; defn; external_modifier = Ast.LocalDecl })]
       }
+  /* TYPE T BLOCK [;] BEGIN ... END [;] */
+  | TYPE nm=ident BLOCK _t=terminator_opt body=proc_body_opt
+      {
+        let defn =
+          n $startpos $endpos (Ast.TRecord (block_fields_of_body body))
+        in
+        [n $startpos $endpos (Ast.DType { name = nm; defn; external_modifier = Ast.LocalDecl })]
+      }
   /* Legacy form used by existing examples: TYPE T TABLE W 1; BEGIN ... END */
   | TYPE nm=ident TABLE base=ident sizes=type_sizes_opt _t=terminator BEGIN fs=field_decl_list END
       {
@@ -560,13 +844,14 @@ type_decl:
       }
   ;
 
-/* BLOCK name ; BEGIN ... END */
+/* BLOCK name [STATIC] ; BEGIN ... END
+   Also accepts BLOCK name [STATIC] type-name [preset]; for block type usage. */
 block_decl:
-  | mod_=modifier_opt BLOCK nm=ident _t=terminator body=proc_body_opt
+  | mod_=modifier_opt BLOCK nm=ident st=static_opt _t=terminator body=proc_body_opt
       {
         let storage =
           match mod_ with
-          | None -> Ast.Automatic
+          | None -> if st then Ast.Static else Ast.Automatic
           | Some _ -> Ast.External
         in
         let dtype =
@@ -578,6 +863,38 @@ block_decl:
               name = nm;
               dtype;
               init = None;
+              storage;
+              external_modifier = external_modifier_of_string_opt mod_;
+              data_decl_kind = Ast.DataBlock;
+              is_readonly = false;
+            })
+        in
+        match mod_ with
+        | None -> [block]
+        | Some m ->
+            let md =
+              n $startpos(mod_) $endpos(mod_)
+                (Ast.DDirective {
+                  name = nid $startpos(mod_) $endpos(mod_) m;
+                  args = [nid $startpos(nm) $endpos(nm) nm.v];
+                })
+            in
+            [md; block]
+      }
+  | mod_=modifier_opt BLOCK nm=ident st=static_opt ty=ident init=table_preset_opt _t=terminator
+      {
+        let storage =
+          match mod_ with
+          | None -> if st then Ast.Static else Ast.Automatic
+          | Some _ -> Ast.External
+        in
+        let dtype = n $startpos(ty) $endpos(ty) (Ast.TName ty) in
+        let block =
+          n $startpos $endpos
+            (Ast.DVar {
+              name = nm;
+              dtype;
+              init;
               storage;
               external_modifier = external_modifier_of_string_opt mod_;
               data_decl_kind = Ast.DataBlock;
@@ -695,6 +1012,7 @@ data_decl:
           | x -> x
         in
         let external_modifier = external_modifier_of_string_opt mod_ in
+        warn_ref_preset mod_ init (loc $startpos $endpos);
         let var =
           n $startpos $endpos
             (Ast.DVar {
@@ -733,6 +1051,7 @@ data_decl:
           | x -> x
         in
         let external_modifier = external_modifier_of_string_opt mod_ in
+        warn_external_constant mod_ (loc $startpos $endpos);
         let c =
           n $startpos $endpos
             (Ast.DConst {
@@ -769,6 +1088,7 @@ data_decl:
           | Some _ -> Ast.External
         in
         let external_modifier = external_modifier_of_string_opt mod_ in
+        warn_external_constant mod_ (loc $startpos $endpos);
         let ty =
           mk_table_type $startpos $endpos dims elem_ty_opt recopt_before
             recopt_after
@@ -809,6 +1129,7 @@ data_decl:
           | Some _ -> Ast.External
         in
         let external_modifier = external_modifier_of_string_opt mod_ in
+        warn_external_constant mod_ (loc $startpos $endpos);
         let elem_ty = n $startpos $endpos (Ast.TRecord fs) in
         let ty = n $startpos $endpos (Ast.TArray { elem = elem_ty; dims }) in
         let c =
@@ -856,6 +1177,7 @@ data_decl:
         let init = preset in
 
         let external_modifier = external_modifier_of_string_opt mod_ in
+        warn_ref_preset mod_ init (loc $startpos $endpos);
         let var =
           n $startpos $endpos
             (Ast.DVar {
@@ -949,15 +1271,22 @@ table_elem_type_opt:
   | ty=type_spec { Some ty }
   ;
 
-/* Table preset like: - 1000(,"XXXXX",O)  */
+/* Table/block preset support.
+   J73 presets are comma lists and may contain omitted values, POS(...) positioners,
+   and repetition counts such as 20(4(26),22).  We keep them as expression-shaped
+   AST nodes so existing analyzer paths can still accept `expr node option`. */
 table_preset_opt:
   | /* empty */ { None }
   | MINUS p=preset_expr { Some p }
+  | EQ p=preset_expr    { Some p }
   ;
 
 preset_expr:
-  | base=INTLIT LPAREN items=preset_items_opt RPAREN
-      { mk_preset $startpos $endpos base items }
+  | items=preset_items
+      {
+        let base = n $startpos $endpos (Ast.ELit (Ast.LInt "0")) in
+        n $startpos $endpos (Ast.EPreset { base; items })
+      }
   ;
 
 preset_items_opt:
@@ -971,14 +1300,44 @@ preset_items:
   ;
 
 preset_item:
-  | /* empty (hole) */ { n $startpos $endpos (Ast.ELit (Ast.LString "")) }
-  | s=STRINGLIT        { n $startpos $endpos (Ast.ELit (Ast.LString s)) }
-  | i=INTLIT           { n $startpos $endpos (Ast.ELit (Ast.LInt i)) }
-  | id=ident           { n $startpos $endpos (Ast.EName id) }
+  | /* empty (omitted preset value) */ { n $startpos $endpos Ast.EOmitted }
+  | POS LPAREN idxs=expr_list RPAREN COLON v=preset_item
+      { n $startpos $endpos (Ast.EPositioned { indexes = idxs; values = [v] }) }
+  | i=INTLIT LPAREN items=preset_items_opt RPAREN
+      {
+        let count = n $startpos(i) $endpos(i) (Ast.ELit (Ast.LInt i)) in
+        n $startpos $endpos (Ast.ERepeat { count; items })
+      }
+  | id=ident LPAREN items=preset_items_opt RPAREN
+      {
+        let count = n $startpos(id) $endpos(id) (Ast.EName id) in
+        n $startpos $endpos (Ast.ERepeat { count; items })
+      }
+  | LPAREN count=expr RPAREN LPAREN items=preset_items_opt RPAREN
+      { n $startpos $endpos (Ast.ERepeat { count; items }) }
+  | LPAREN items=preset_items_opt RPAREN
+      {
+        let base = n $startpos $endpos (Ast.ELit (Ast.LInt "0")) in
+        n $startpos $endpos (Ast.EPreset { base; items })
+      }
+  | e=expr { e }
   ;
 
 table_dims:
   | LPAREN ds=dim_list_opt RPAREN { ds }
+  | _open=CONV_L rest=leading_star_dim_tail RPAREN
+      {
+        let star =
+          n $startpos(_open) $endpos(_open)
+            (Ast.EName (nid $startpos(_open) $endpos(_open) "*"))
+        in
+        star :: rest
+      }
+  ;
+
+leading_star_dim_tail:
+  | /* empty */ { [] }
+  | COMMA rest=dim_list { rest }
   ;
 
 table_dims_opt:
@@ -1021,12 +1380,18 @@ table_record_after_term_opt:
 
 field_decl_list:
   | /* empty */ { [] }
-  | xs=rev_field_decl_list { List.rev xs }
+  | xs=rev_field_decl_items { List.filter_map (fun x -> x) (List.rev xs) }
   ;
 
-rev_field_decl_list:
-  | f=field_decl { [f] }
-  | xs=rev_field_decl_list f=field_decl { f :: xs }
+rev_field_decl_items:
+  | f=field_decl_item { [f] }
+  | xs=rev_field_decl_items f=field_decl_item { f :: xs }
+  ;
+
+field_decl_item:
+  | f=field_decl { Some f }
+  | _skip=ignored_bang_directive { None }
+  | _d=directive_decl { None }
   ;
 
 field_decl:
@@ -1054,47 +1419,89 @@ field_attr:
   ;
 
 type_spec:
-  | base=ident size=type_size LPAREN values=status_value_list RPAREN
+  | base=fixed_base round=round_attr_opt sizes=fixed_type_sizes_opt
+      { mk_type_expr_with_round $startpos $endpos base round sizes }
+  | base=type_base_ident tail=type_spec_tail
+      { tail $startpos $endpos base }
+  ;
+
+type_spec_tail:
+  | /* empty */
+      { fun sp ep base -> mk_type_expr_with_round sp ep base None [] }
+  | round=round_attr sizes=type_sizes_opt
+      { fun sp ep base -> mk_type_expr_with_round sp ep base round sizes }
+  | sizes=nonempty_type_sizes values=type_values_after_sizes_opt
       {
-        if String.uppercase_ascii base.v = "STATUS" then
-          n $startpos $endpos (Ast.TStatus values)
-        else
-          let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
-          let dims =
-            size
-            :: List.map
-                 (fun (value : Ast.status_value Ast.node) ->
-                   Ast.node ~loc:value.loc (Ast.EName value.v.sv_name))
-                 values
-          in
-          n $startpos $endpos (Ast.TArray { elem; dims })
+        fun sp ep base ->
+          match values with
+          | None -> mk_type_expr_with_round sp ep base None sizes
+          | Some values ->
+              if String.uppercase_ascii base.v = "STATUS" then
+                n sp ep (Ast.TStatus values)
+              else
+                let elem = n sp ep (Ast.TName base) in
+                let dims =
+                  sizes
+                  @ List.map
+                      (fun (value : Ast.status_value Ast.node) ->
+                        Ast.node ~loc:value.loc (Ast.EName value.v.sv_name))
+                      values
+                in
+                n sp ep (Ast.TArray { elem; dims })
       }
-  | base=ident LPAREN values=status_value_list RPAREN
+  | LPAREN values=status_value_list RPAREN
       {
-        if String.uppercase_ascii base.v = "STATUS" then
-          n $startpos $endpos (Ast.TStatus values)
-        else
-          let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
-          let dims =
-            List.map
-              (fun (value : Ast.status_value Ast.node) ->
-                Ast.node ~loc:value.loc (Ast.EName value.v.sv_name))
-              values
-          in
-          n $startpos $endpos (Ast.TArray { elem; dims })
+        fun sp ep base ->
+          if String.uppercase_ascii base.v = "STATUS" then
+            n sp ep (Ast.TStatus values)
+          else
+            let elem = n sp ep (Ast.TName base) in
+            let dims =
+              List.map
+                (fun (value : Ast.status_value Ast.node) ->
+                  Ast.node ~loc:value.loc (Ast.EName value.v.sv_name))
+                values
+            in
+            n sp ep (Ast.TArray { elem; dims })
       }
-  | base=ident sizes=type_sizes_opt
+  ;
+
+type_values_after_sizes_opt:
+  | /* empty */ { None }
+  | LPAREN values=status_value_list RPAREN { Some values }
+  ;
+
+round_attr:
+  | COMMA id=ident
       {
-        match String.uppercase_ascii base.v, sizes with
-        | "P", [{ v = Ast.EName pointed; loc = pointed_loc; _ }] ->
-            let inner = Ast.node ~loc:pointed_loc (Ast.TName pointed) in
-            n $startpos $endpos (Ast.TPointer inner)
-        | _, [] ->
-            n $startpos $endpos (Ast.TName base)
-        | _, dims ->
-            let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
-            n $startpos $endpos (Ast.TArray { elem; dims })
+        match round_mode_of_ident id with
+        | Some mode -> Some mode
+        | None ->
+            Parse_diags.add id.loc
+              (Printf.sprintf
+                 "Unknown round/truncate attribute %S; expected R or T." id.v);
+            None
       }
+  ;
+
+round_attr_opt:
+  | /* empty */ { None }
+  | mode=round_attr { mode }
+  ;
+
+type_base_ident:
+  | s=ID { nid $startpos $endpos s }
+  ;
+
+fixed_base:
+  | s=FIXED_A { nid $startpos $endpos s }
+  ;
+
+fixed_type_sizes_opt:
+  | /* empty */ { [] }
+  | s=type_size { [s] }
+  | whole=type_size fraction=type_size { [whole; fraction] }
+  | whole=type_size COMMA fraction=type_size { [whole; fraction] }
   ;
 
 status_value_list:
@@ -1107,22 +1514,60 @@ rev_status_value_list:
   ;
 
 status_value:
-  | nm=ident
-      { n $startpos $endpos { Ast.sv_name = nm; sv_representation = None } }
-  | ctor=ident LPAREN nm=ident RPAREN
+  | nm=status_name rep=status_representation_opt
+      { n $startpos $endpos { Ast.sv_name = nm; sv_representation = rep } }
+  | ctor=ident LPAREN nm=status_name RPAREN rep=status_representation_opt
       {
         if String.uppercase_ascii ctor.v <> "V" then
           Parse_diags.add ctor.loc
             (Printf.sprintf
                "Unknown STATUS value constructor %S (expected V)."
                ctor.v);
-        n $startpos $endpos { Ast.sv_name = nm; sv_representation = None }
+        n $startpos $endpos { Ast.sv_name = nm; sv_representation = rep }
       }
+  ;
+
+status_representation_opt:
+  | /* empty */ { None }
+  | EQ e=expr { Some e }
+  | MINUS e=expr { Some (n $startpos $endpos (Ast.EUnop { op = Ast.UMinus; rhs = e })) }
+  ;
+
+status_name:
+  | id=ident_or_directive_keyword { id }
+  | NOT { nid $startpos $endpos "NOT" }
+  | AND { nid $startpos $endpos "AND" }
+  | OR { nid $startpos $endpos "OR" }
+  | XOR { nid $startpos $endpos "XOR" }
+  | EQV { nid $startpos $endpos "EQV" }
+  | MOD { nid $startpos $endpos "MOD" }
+  | COMPOOL { nid $startpos $endpos "COMPOOL" }
+  | ICOMPOOL { nid $startpos $endpos "ICOMPOOL" }
+  | POS { nid $startpos $endpos "POS" }
   ;
 
 type_sizes_opt:
   | /* empty */ { [] }
   | s=type_size rest=type_sizes_opt { s :: rest }
+  ;
+
+type_sizes_no_paren_opt:
+  | /* empty */ { [] }
+  | s=type_size_nonparen rest=type_sizes_no_paren_opt { s :: rest }
+  ;
+
+nonempty_type_sizes:
+  | s=type_size_nonparen { [s] }
+  | s=type_size_nonparen rest=nonempty_type_sizes { s :: rest }
+  ;
+
+type_size_nonparen:
+  | i=INTLIT
+      { n $startpos $endpos (Ast.ELit (Ast.LInt i)) }
+  | f=FLOATLIT
+      { n $startpos $endpos (Ast.ELit (Ast.LFloat f)) }
+  | id=ident
+      { n $startpos $endpos (Ast.EName id) }
   ;
 
 type_size:
@@ -1132,10 +1577,12 @@ type_size:
       { n $startpos $endpos (Ast.ELit (Ast.LFloat f)) }
   | id=ident
       { n $startpos $endpos (Ast.EName id) }
+  | LPAREN e=expr RPAREN
+      { e }
   ;
 
 proc_decl:
-  | mod_=modifier_opt inline_prefix=inline_opt PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator body=proc_body_opt
+  | mod_=modifier_opt inline_prefix=inline_opt PROC nm=ident pre=proc_header_tail_opt formals=formals_opt post=proc_header_tail_opt _t=terminator linkage=proc_linkage_opt _skip=ignored_bang_directives_opt body=proc_body_opt
       {
         let seen_rec, seen_rent, seen_inline, ret =
           merge_proc_header_info pre post
@@ -1154,6 +1601,7 @@ proc_decl:
               params;
               returns = ret;
               use_attr;
+              linkage;
               locals;
               body = body_stmt;
               external_modifier = external_modifier_of_string_opt mod_;
@@ -1176,6 +1624,37 @@ proc_decl:
       }
   ;
 
+proc_linkage_opt:
+  | /* empty */ { None }
+  | ds=proc_linkage_directives
+      {
+        match List.rev ds with
+        | last :: _ -> Some last
+        | [] -> None
+      }
+  ;
+
+proc_linkage_directives:
+  | d=proc_linkage_directive { [d] }
+  | ds=proc_linkage_directives d=proc_linkage_directive { d :: ds }
+  ;
+
+proc_linkage_directive:
+  | ILINKAGE sym=linkage_symbol _t=terminator
+      { sym }
+  | LINKAGE sym=linkage_symbol _t=terminator
+      { sym }
+  | ILINKAGE LPAREN sym=linkage_symbol RPAREN _t=terminator
+      { sym }
+  | LINKAGE LPAREN sym=linkage_symbol RPAREN _t=terminator
+      { sym }
+  ;
+
+linkage_symbol:
+  | id=ident_or_soft_keyword { id }
+  | s=STRINGLIT { nid $startpos $endpos s }
+  ;
+
 inline_opt:
   | /* empty */ { false }
   | INLINE { true }
@@ -1195,6 +1674,15 @@ proc_header_atom:
   | INLINE { (false, false, true, None) }
   | ty=proc_header_type_spec
       {
+        let attr_with_trailing_return seen_rec seen_rent dims =
+          match dims with
+          | { v = Ast.EName base; _ } :: rest ->
+              ( seen_rec,
+                seen_rent,
+                false,
+                Some (mk_type_expr $startpos $endpos base rest) )
+          | _ -> (seen_rec, seen_rent, false, None)
+        in
         match ty.v with
         | Ast.TName id ->
             let k = String.uppercase_ascii id.v in
@@ -1202,6 +1690,14 @@ proc_header_atom:
               (true, false, false, None)
             else if k = "RENT" || k = "REENTRANT" then
               (false, true, false, None)
+            else
+              (false, false, false, Some ty)
+        | Ast.TArray { elem = { v = Ast.TName id; _ }; dims } ->
+            let k = String.uppercase_ascii id.v in
+            if k = "REC" || k = "RECURSIVE" then
+              attr_with_trailing_return true false dims
+            else if k = "RENT" || k = "REENTRANT" then
+              attr_with_trailing_return false true dims
             else
               (false, false, false, Some ty)
         | _ ->
@@ -1213,18 +1709,10 @@ proc_header_atom:
   ;
 
 proc_header_type_spec:
-  | base=ident sizes=type_sizes_opt
-      {
-        match String.uppercase_ascii base.v, sizes with
-        | "P", [{ v = Ast.EName pointed; loc = pointed_loc; _ }] ->
-            let inner = Ast.node ~loc:pointed_loc (Ast.TName pointed) in
-            n $startpos $endpos (Ast.TPointer inner)
-        | _, [] ->
-            n $startpos $endpos (Ast.TName base)
-        | _, dims ->
-            let elem = n $startpos(base) $endpos(base) (Ast.TName base) in
-            n $startpos $endpos (Ast.TArray { elem; dims })
-      }
+  | base=fixed_base sizes=fixed_type_sizes_opt
+      { mk_type_expr $startpos $endpos base sizes }
+  | base=type_base_ident sizes=type_sizes_no_paren_opt
+      { mk_type_expr $startpos $endpos base sizes }
   ;
 
 formals_opt:
@@ -1283,6 +1771,7 @@ rev_decl_section:
   | /* empty */ { [] }
   | xs=rev_decl_section ds=data_decl { ds :: xs }
   | xs=rev_decl_section ds=proc_decl { ds :: xs }
+  | xs=rev_decl_section _skip=ignored_bang_directive { [] :: xs }
   | xs=rev_decl_section d=directive_decl { [d] :: xs }
   | xs=rev_decl_section ds=define_decl { ds :: xs }
   | xs=rev_decl_section ds=type_decl   { ds :: xs }
@@ -1295,24 +1784,63 @@ rev_decl_section:
    ========================================================= */
 
 statement:
+  | _skip=ignored_bang_directive
+      { n $startpos $endpos Ast.SEmpty }
+  | d=directive_decl
+      { n $startpos $endpos (Ast.SDecl d) }
+  | labs=labels s=simple_or_control_stmt { wrap_labels labs s }
+  | callee=ident LPAREN args=postfix_call_args_opt RPAREN _t=terminator_opt
+      { n $startpos $endpos (Ast.SCallStmt { callee; args; abort_label = None }) }
+  | callee=ident LPAREN args=postfix_call_args_opt RPAREN ABORT lab=ident _t=terminator_opt
+      { n $startpos $endpos (Ast.SCallStmt { callee; args; abort_label = Some lab }) }
+  | callee=ident LPAREN args=postfix_call_args_opt RPAREN EQ rhs=expr _t=terminator_opt
+      {
+        let lhs = n $startpos(callee) $endpos(callee) (Ast.ECall { callee; args }) in
+        n $startpos $endpos (Ast.SAssign { lhs; rhs })
+      }
+  | callee=ident LPAREN args=postfix_call_args_opt RPAREN MINUS rhs=expr _t=terminator_opt
+      {
+        let lhs = n $startpos(callee) $endpos(callee) (Ast.ECall { callee; args }) in
+        n $startpos $endpos (Ast.SAssign { lhs; rhs })
+      }
   | lhs=lvalue EQ rhs=expr _t=terminator_opt
       { n $startpos $endpos (Ast.SAssign { lhs; rhs }) }
   | lhs=lvalue MINUS rhs=expr _t=terminator_opt
       { n $startpos $endpos (Ast.SAssign { lhs; rhs }) }
-  | s=call_stmt _t=terminator_opt { s }
-  | s=bare_call_stmt { s }
   | s=compound_stmt { s }
-  | labs=labels_opt s=simple_or_control_stmt { wrap_labels labs s }
+  | e=postfix _t=terminator
+      {
+        match e.v with
+        | Ast.ECall { callee; args } ->
+            n $startpos $endpos
+              (Ast.SCallStmt { callee; args; abort_label = None })
+        | Ast.EName callee ->
+            n $startpos $endpos
+              (Ast.SCallStmt { callee; args = []; abort_label = None })
+        | _ -> n $startpos $endpos Ast.SEmpty
+      }
+  | e=postfix ABORT lab=ident _t=terminator
+      {
+        match e.v with
+        | Ast.ECall { callee; args } ->
+            n $startpos $endpos
+              (Ast.SCallStmt { callee; args; abort_label = Some lab })
+        | Ast.EName callee ->
+            n $startpos $endpos
+              (Ast.SCallStmt { callee; args = []; abort_label = Some lab })
+        | _ -> n $startpos $endpos Ast.SEmpty
+      }
+  | s=simple_or_control_stmt { s }
   | error _t=terminator { bad_stmt $startpos $endpos }
   ;
 
-labels_opt:
-  | labs=rev_labels_opt { List.rev labs }
+labels:
+  | labs=rev_labels { List.rev labs }
   ;
 
-rev_labels_opt:
-  | /* empty */ { [] }
-  | labs=rev_labels_opt l=label { l :: labs }
+rev_labels:
+  | l=label { [l] }
+  | labs=rev_labels l=label { l :: labs }
   ;
 
 label:
@@ -1402,29 +1930,6 @@ stop_stmt:
       }
   ;
 
-call_stmt:
-  | callee=ident LPAREN RPAREN ab=abort_phrase_opt
-      { n $startpos $endpos (Ast.SCallStmt { callee; args = []; abort_label = ab }) }
-  | callee=ident LPAREN args=actual_list RPAREN ab=abort_phrase_opt
-      { n $startpos $endpos (Ast.SCallStmt { callee; args; abort_label = ab }) }
-  ;
-
-bare_call_stmt:
-  | callee=ident SEMI
-      { n $startpos $endpos (Ast.SCallStmt { callee; args = []; abort_label = None }) }
-  | callee=ident COMMA
-      { n $startpos $endpos (Ast.SCallStmt { callee; args = []; abort_label = None }) }
-  | callee=ident ABORT lab=ident SEMI
-      { n $startpos $endpos (Ast.SCallStmt { callee; args = []; abort_label = Some lab }) }
-  | callee=ident ABORT lab=ident COMMA
-      { n $startpos $endpos (Ast.SCallStmt { callee; args = []; abort_label = Some lab }) }
-  ;
-
-abort_phrase_opt:
-  | /* empty */ { None }
-  | ABORT lab=ident { Some lab }
-  ;
-
 actual_list:
   | ins=expr_list outs=actual_outs_opt { ins @ outs }
   | COLON outs=expr_list { outs }
@@ -1490,10 +1995,10 @@ while_opt:
   ;
 
 case_stmt:
-  | CASE _scrut=expr SEMI BEGIN opts=case_options END
+  | CASE scrut=expr _sel_term=terminator_opt BEGIN opts=case_options END _tail=terminator_opt
       {
-        (* placeholder: keep bodies so you at least get an AST *)
-        mk_block $startpos $endpos (List.map snd opts)
+        n $startpos $endpos
+          (Ast.SCase { selector = scrut; options = opts })
       }
   ;
 
@@ -1503,20 +2008,40 @@ case_options:
   ;
 
 case_option:
-  | LPAREN _idxs=case_index_list RPAREN _sep=case_sep body=simple_or_control_stmt _fall=fallthru_opt
-      { ([], body) }
+  | DEFAULT _sep=case_sep body=statement fall=fallthru_opt
+      {
+        let idx = n $startpos $endpos Ast.CaseDefault in
+        n $startpos $endpos
+          { Ast.case_indexes = [idx]; case_body = body; case_fallthru = fall }
+      }
+  | LPAREN DEFAULT RPAREN _sep=case_sep body=statement fall=fallthru_opt
+      {
+        let idx = n $startpos $endpos Ast.CaseDefault in
+        n $startpos $endpos
+          { Ast.case_indexes = [idx]; case_body = body; case_fallthru = fall }
+      }
+  | LPAREN idxs=case_index_list RPAREN _sep=case_sep body=statement fall=fallthru_opt
+      {
+        n $startpos $endpos
+          { Ast.case_indexes = idxs; case_body = body; case_fallthru = fall }
+      }
   | error _t=terminator
-      { ([], bad_stmt $startpos $endpos) }
+      {
+        let body = bad_stmt $startpos $endpos in
+        n $startpos $endpos
+          { Ast.case_indexes = []; case_body = body; case_fallthru = false }
+      }
   ;
 
 case_sep:
   | COLON { () }
   | BANG  { () }
+  | SEMI  { () }
   ;
 
 fallthru_opt:
-  | /* empty */ { () }
-  | FALLTHRU _t=terminator_opt { () }
+  | /* empty */ { false }
+  | FALLTHRU _t=terminator_opt { true }
   ;
 
 case_index_list:
@@ -1525,8 +2050,9 @@ case_index_list:
   ;
 
 case_index:
-  | DEFAULT { n $startpos $endpos (Ast.EName (nid $startpos $endpos "DEFAULT")) }
-  | e=expr  { e }
+  | lo=expr COLON hi=expr { n $startpos $endpos (Ast.CaseRange (lo, hi)) }
+  | DEFAULT { n $startpos $endpos Ast.CaseDefault }
+  | e=expr  { n $startpos $endpos (Ast.CaseValue e) }
   ;
 
 /* =========================================================
@@ -1540,14 +2066,19 @@ expr_opt:
 
 ident:
   | s=ID { nid $startpos $endpos s }
+  | s=FIXED_A { nid $startpos $endpos s }
+  | LINKAGE { nid $startpos $endpos "LINKAGE" }
+  | CODE {nid $startpos $endpos "CODE"}
   ;
 
 literal:
   | i=INTLIT    { Ast.LInt i }
   | f=FLOATLIT  { Ast.LFloat f }
+  | b=BITLIT    { let bead_size, beads, raw = b in Ast.LBit { bead_size; beads; raw } }
   | s=STRINGLIT { Ast.LString s }
   | TRUE        { Ast.LBool true }
   | FALSE       { Ast.LBool false }
+  | NULL        { Ast.LNull }
   ;
 
 primary:
@@ -1624,7 +2155,37 @@ module I = MenhirInterpreter
 type output = {
   ast : Ast.program option;
   diags : T.Diagnostic.t list;
+  recovery_diags : T.Diagnostic.t list;
+  tainted_ranges : tainted_range list;
+  parse_health : parse_health;
+  parse_confidence : float;
   ast_dump : string option;
+}
+
+and parse_health =
+  | ParseClean
+  | ParseRecovered
+  | ParsePartial
+  | ParseSkeletonOnly
+  | ParseLexicalOnly
+  | ParseFailedInternal
+
+and recovery_kind =
+  | RecoverTokenInsertion
+  | RecoverTokenDeletion
+  | RecoverBlockCloseInsertion
+  | RecoverSyncSkip
+  | RecoverIslandFallback
+  | RecoverSkeletonFallback
+  | RecoverGrammarError
+  | RecoverInternalFailure
+
+and tainted_range = {
+  taint_loc : Ast.Loc.t;
+  taint_reason : string;
+  taint_recovery_kind : recovery_kind;
+  taint_confidence_penalty : float;
+  taint_allows_semantic : bool;
 }
 
 type profile = Interactive | Background | Batch | Debug
@@ -1635,7 +2196,7 @@ type checkpoint_entry = {
   token_start_line : int;
   token_start_col : int;
   checkpoint : Ast.program I.checkpoint;
-} [@@warning "-69"]
+}
 
 type checkpoint_cache = {
   token_count : int;
@@ -1645,7 +2206,7 @@ type checkpoint_cache = {
   landmark_count : int;
   entries : checkpoint_entry list;
   output : output option;
-} [@@warning "-69"]
+}
 
 type checkpoint_stats = {
   cache_hit : bool;
@@ -1730,16 +2291,62 @@ let diag_error (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
 let diag_warn (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
   diag ~sev:T.DiagnosticSeverity.Warning ~source:"parse" loc msg
 
+let recovery_message_prefix = "Recovered from damaged syntax"
+
+let diagnostic_message_text (diag : T.Diagnostic.t) : string =
+  match diag.T.Diagnostic.message with
+  | `String s -> s
+  | `MarkupContent mc -> mc.value
+
+let is_recovery_message (msg : string) : bool =
+  let n = String.length recovery_message_prefix in
+  String.length msg >= n && String.sub msg 0 n = recovery_message_prefix
+
+let taint ?(kind = RecoverSyncSkip) ?(penalty = 0.2)
+    ?(allows_semantic = false) ~(reason : string) (loc : Ast.Loc.t) :
+    tainted_range =
+  {
+    taint_loc = loc;
+    taint_reason = reason;
+    taint_recovery_kind = kind;
+    taint_confidence_penalty = penalty;
+    taint_allows_semantic = allows_semantic;
+  }
+
+let clamp_confidence x = max 0.0 (min 1.0 x)
+
+let output ?ast ?ast_dump ~(diags : T.Diagnostic.t list)
+    ~(recovery_diags : T.Diagnostic.t list)
+    ~(tainted_ranges : tainted_range list) ~(parse_health : parse_health)
+    ~(parse_confidence : float) () : output =
+  {
+    ast;
+    diags;
+    recovery_diags;
+    tainted_ranges;
+    parse_health;
+    parse_confidence = clamp_confidence parse_confidence;
+    ast_dump;
+  }
+
 module Debug = struct
   let string_of_token (t : token) : string =
     match t with
     | EOF -> "EOF"
     | ID _ -> "ID"
+    | FIXED_A _ -> "ID"
     | INTLIT _ -> "INTLIT"
     | FLOATLIT _ -> "FLOATLIT"
     | STRINGLIT _ -> "STRINGLIT"
+    | BITLIT _ -> "BITLIT"
+    | BAD_CHAR _ -> "BAD_CHAR"
+    | BAD_STRING _ -> "BAD_STRING"
+    | BAD_COMMENT _ -> "BAD_COMMENT"
+    | BAD_DIRECTIVE _ -> "BAD_DIRECTIVE"
+    | BAD_LITERAL _ -> "BAD_LITERAL"
     | TRUE -> "TRUE"
     | FALSE -> "FALSE"
+    | NULL -> "NULL"
     | START -> "START"
     | TERM -> "TERM"
     | BEGIN -> "BEGIN"
@@ -1771,6 +2378,10 @@ module Debug = struct
     | PROGRAM -> "PROGRAM"
     | COMPOOL -> "COMPOOL"
     | ICOMPOOL -> "ICOMPOOL"
+    | LINKAGE -> "LINKAGE"
+    | ILINKAGE -> "ILINKAGE"
+    | CODE -> "CODE"
+    | ICODE -> "ICODE"
     | DEFINE -> "DEFINE"
     | TYPE -> "TYPE"
     | BLOCK -> "BLOCK"
@@ -1826,6 +2437,8 @@ let expected_candidates : token list =
     INTLIT "0";
     FLOATLIT "0.0";
     STRINGLIT "";
+    BITLIT (1, "0", "1B'0'");
+    NULL;
     START;
     TERM;
     BEGIN;
@@ -1843,6 +2456,10 @@ let expected_candidates : token list =
     PROGRAM;
     COMPOOL;
     ICOMPOOL;
+    LINKAGE;
+    ILINKAGE;
+    CODE;
+    ICODE;
     DEFINE;
     TYPE;
     BLOCK;
@@ -1903,9 +2520,10 @@ let expected_tokens_hint (chk : 'a I.checkpoint) (pos : Lexing.position) :
 let constant_storage_warning =
   "CONSTANT items should have static or external allocation."
 
-let parse_diags_to_lsp ~(file : string option) : T.Diagnostic.t list =
+let parse_entries_to_lsp ~(file : string option)
+    (entries : (Ast.Loc.t * string) list) : T.Diagnostic.t list =
   let seen_const_storage = ref false in
-  Parse_diags.take ()
+  entries
   |> List.filter_map (fun (loc, msg) ->
       if msg = constant_storage_warning then
         if !seen_const_storage then None
@@ -1917,11 +2535,18 @@ let parse_diags_to_lsp ~(file : string option) : T.Diagnostic.t list =
                 STATIC/DEF/REF where required."))
       else Some (diag_warn (attach_file file loc) msg))
 
+let parse_diags_to_lsp ~(file : string option) : T.Diagnostic.t list =
+  parse_entries_to_lsp ~file (Parse_diags.take ())
+
 type token_item = token * Lexing.position * Lexing.position * string
 
 let token_lexeme (t : token) : string =
   match t with
   | ID s | INTLIT s | FLOATLIT s | STRINGLIT s -> s
+  | BAD_CHAR s | BAD_STRING s | BAD_COMMENT s | BAD_DIRECTIVE s
+  | BAD_LITERAL s ->
+      s
+  | BITLIT (_, _, raw) -> raw
   | EOF -> ""
   | _ -> Debug.string_of_token t
 
@@ -1929,7 +2554,8 @@ let file_position (file : string option) : Lexing.position =
   { Lexing.dummy_pos with pos_fname = Option.value file ~default:"" }
 
 let is_checkpoint_landmark = function
-  | START | TERM | PROC | DEFINE | COMPOOL | ICOMPOOL | BEGIN | END -> true
+  | START | TERM | PROC | DEFINE | COMPOOL | ICOMPOOL | LINKAGE | ILINKAGE
+  | BEGIN | END -> true
   | _ -> false
 
 let checkpoint_interval_for_profile = function
@@ -1972,22 +2598,26 @@ let parse_stream ~(initial_checkpoint : Ast.program I.checkpoint option)
     match profile with
     | Interactive -> (true, 12, 1024, 4096)
     | Debug -> (true, 32, 2048, 8192)
-    | Background -> (false, 3, 128, 512)
+    | Background -> (false, 1, 128, 512)
     | Batch -> (false, 1, 64, 256)
   in
   let last_tok : token option ref = ref None in
   let last_sp : Lexing.position ref = ref start_pos in
   let last_ep : Lexing.position ref = ref start_pos in
   let last_lex : string ref = ref "" in
+  let prev_tok : token option ref = ref None in
   let last_expected : string list ref = ref [] in
   let pending_tok : token_item option ref = ref None in
   let parse_errors : T.Diagnostic.t list ref = ref [] in
+  let parse_taints : tainted_range list ref = ref [] in
   let parse_error_count : int ref = ref 0 in
+  let bad_token_error_seen : bool ref = ref false in
   let recovery_attempt_count : int ref = ref 0 in
   let last_error_span : (int * int) option ref = ref None in
 
   let remember_token (t : token) (sp : Lexing.position)
       (ep : Lexing.position) (lexeme : string) : unit =
+    prev_tok := !last_tok;
     last_tok := Some t;
     last_sp := sp;
     last_ep := ep;
@@ -2018,14 +2648,20 @@ let parse_stream ~(initial_checkpoint : Ast.program I.checkpoint option)
     | Some EOF ->
         diag_error loc ("Parse error: unexpected end of file." ^ expected_hint)
     | Some t ->
-        let tok_s = Debug.string_of_token t in
-        let base =
-          if !last_lex = "" then Printf.sprintf "Parse error near token %s" tok_s
-          else
-            Printf.sprintf "Parse error near token %s (lexeme: %S)" tok_s
-              !last_lex
-        in
-        diag_error loc (base ^ expected_hint)
+      let tok_s = Debug.string_of_token t in
+      let base =
+        match (!prev_tok, t) with
+        | Some RPAREN, ID name ->
+            Printf.sprintf
+              "Expected ';' or ',' after the previous call before %S." name
+        | _ ->
+            if !last_lex = "" then
+              Printf.sprintf "Parse error near token %s" tok_s
+            else
+              Printf.sprintf "Parse error near token %s (lexeme: %S)" tok_s
+                !last_lex
+      in
+      diag_error loc (base ^ expected_hint)
   in
 
   let add_parse_error () : unit =
@@ -2033,7 +2669,16 @@ let parse_stream ~(initial_checkpoint : Ast.program I.checkpoint option)
     if !parse_error_count < max_errors && Some key <> !last_error_span then (
       last_error_span := Some key;
       incr parse_error_count;
-      parse_errors := mk_error_diag () :: !parse_errors)
+      (match !last_tok with
+      | Some (BAD_CHAR _ | BAD_STRING _ | BAD_COMMENT _ | BAD_DIRECTIVE _
+             | BAD_LITERAL _) ->
+          bad_token_error_seen := true
+      | _ -> ());
+      let diag = mk_error_diag () in
+      parse_errors := diag :: !parse_errors;
+      let loc = loc_of_lex file !last_sp !last_ep in
+      parse_taints :=
+        taint ~reason:(diagnostic_message_text diag) loc :: !parse_taints)
   in
 
   let is_sync_token = function
@@ -2104,32 +2749,91 @@ let parse_stream ~(initial_checkpoint : Ast.program I.checkpoint option)
 
   try
     let ast_opt = drive checkpoint in
-    let extra = parse_diags_to_lsp ~file in
+    let parse_entries = Parse_diags.take () in
+    let extra = parse_entries_to_lsp ~file parse_entries in
+    let recovery_diags =
+      List.filter
+        (fun diag -> is_recovery_message (diagnostic_message_text diag))
+        extra
+    in
+    let syntax_extra =
+      List.filter
+        (fun diag -> not (is_recovery_message (diagnostic_message_text diag)))
+        extra
+    in
+    let grammar_taints =
+      parse_entries
+      |> List.filter_map (fun (loc, msg) ->
+             if is_recovery_message msg then
+               Some
+                 (taint ~kind:RecoverGrammarError ~penalty:0.25
+                    ~reason:msg (attach_file file loc))
+             else None)
+    in
     let errs = List.rev !parse_errors in
+    let taints = List.rev_append !parse_taints grammar_taints in
+    let recovery_count = List.length recovery_diags + !parse_error_count in
+    let confidence_for_ast =
+      clamp_confidence
+        (1.0 -. (0.06 *. float_of_int !parse_error_count)
+        -. (0.03 *. float_of_int (List.length recovery_diags))
+        -. (0.10
+           *. List.fold_left
+                (fun acc t -> acc +. t.taint_confidence_penalty)
+                0.0 taints))
+    in
     match ast_opt with
     | Some ast ->
         let ast_dump = if dump_ast then Some (Ast.Debug.to_string ast) else None in
-        { ast = Some ast; diags = errs @ extra; ast_dump }
+        let health =
+          if recovery_count = 0 then ParseClean else ParseRecovered
+        in
+        let confidence =
+          if recovery_count = 0 then 1.0
+          else if !bad_token_error_seen then
+            max 0.30 (min 0.49 confidence_for_ast)
+          else if recovery_count <= 2 then max 0.80 (min 0.95 confidence_for_ast)
+          else max 0.55 (min 0.79 confidence_for_ast)
+        in
+        output ~ast ~diags:(errs @ syntax_extra) ~recovery_diags
+          ~tainted_ranges:taints ~parse_health:health
+          ~parse_confidence:confidence ?ast_dump ()
     | None ->
         let errs = match errs with [] -> [ mk_error_diag () ] | xs -> xs in
-        { ast = None; diags = errs @ extra; ast_dump = None }
+        let taints =
+          if taints <> [] then taints
+          else
+            let loc = loc_of_lex file !last_sp !last_ep in
+            [ taint ~kind:RecoverSkeletonFallback ~penalty:0.55
+                ~reason:"Full parse failed; using skeleton facts only." loc ]
+        in
+        output ~diags:(errs @ syntax_extra) ~recovery_diags
+          ~tainted_ranges:taints ~parse_health:ParseSkeletonOnly
+          ~parse_confidence:0.45 ()
   with
   | exn ->
-      let extra = parse_diags_to_lsp ~file in
+      let parse_entries = Parse_diags.take () in
+      let extra = parse_entries_to_lsp ~file parse_entries in
       let errs = List.rev !parse_errors in
       let loc = loc_of_lex file !last_ep !last_ep in
-      {
-        ast = None;
-        diags =
-          errs @ extra
-          @ [ diag_error loc ("Unhandled exception: " ^ Printexc.to_string exn) ];
-        ast_dump = None;
-      }
+      let internal =
+        diag ~sev:T.DiagnosticSeverity.Error ~source:"internal" loc
+          ("Internal parser failure: " ^ Printexc.to_string exn)
+      in
+      output ~diags:(errs @ extra @ [ internal ]) ~recovery_diags:[]
+        ~tainted_ranges:
+          [
+            taint ~kind:RecoverInternalFailure ~penalty:1.0
+              ~reason:"Internal parser failure." loc;
+          ]
+        ~parse_health:ParseFailedInternal ~parse_confidence:0.0 ()
 
 let parse_tokens ~(file : string option) ~(dump_ast : bool)
     ~(profile : profile) ~(tokens : token_span array) : output =
   let len = Array.length tokens in
-  if len = 0 then { ast = None; diags = []; ast_dump = None }
+  if len = 0 then
+    output ~diags:[] ~recovery_diags:[] ~tainted_ranges:[]
+      ~parse_health:ParseLexicalOnly ~parse_confidence:0.25 ()
   else
     let start_pos =
       try token_span_start_p ~file tokens.(0) with _ -> file_position file
@@ -2292,7 +2996,10 @@ let full_parse_checkpointed ~(metadata : token_metadata) ~(file : string option)
     ~(dump_ast : bool) ~(profile : profile) ~(tokens : token_span array) :
     checkpointed_output =
   if Array.length tokens = 0 then
-    let output = { ast = None; diags = []; ast_dump = None } in
+    let output =
+      output ~diags:[] ~recovery_diags:[] ~tainted_ranges:[]
+        ~parse_health:ParseLexicalOnly ~parse_confidence:0.25 ()
+    in
     let checkpoint_cache =
       {
         token_count = metadata.metadata_token_count;

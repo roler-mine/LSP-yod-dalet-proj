@@ -26,6 +26,7 @@ type sem_proc_sig = {
   param_tys : sem_ty list option;
   ret_ty : sem_ty option;
   use_attr : Ast.proc_use;
+  external_modifier : Ast.external_modifier;
 }
 
 type sem_value = SVVar of sem_ty | SVConst of sem_ty | SVProc of sem_proc_sig
@@ -196,6 +197,13 @@ let is_single_letter_loop_control (name : string) : bool =
   String.length name = 1
   && match name.[0] with 'A' .. 'Z' | 'a' .. 'z' -> true | _ -> false
 
+let sem_ty_of_scalar_base (base : Ast.scalar_base) : sem_ty =
+  match base with
+  | Ast.ScalarUnsigned | Ast.ScalarSigned -> TyInt
+  | Ast.ScalarFloat | Ast.ScalarFixed -> TyFloat
+  | Ast.ScalarBit -> TyBit
+  | Ast.ScalarChar -> TyChar
+
 let rec sem_ty_of_type_expr ?(seen : string list = [])
     (types : (string, Ast.type_expr Ast.node) Hashtbl.t)
     (t : Ast.type_expr Ast.node) : sem_ty =
@@ -216,8 +224,12 @@ let rec sem_ty_of_type_expr ?(seen : string list = [])
             match Hashtbl.find_opt types k with
             | None -> TyUnknown
             | Some defn -> sem_ty_of_type_expr ~seen:(k :: seen) types defn))
+  | Ast.TScalar { base; _ } -> sem_ty_of_scalar_base base
   | Ast.TArray { elem; _ } | Ast.TSpecifiedTable { elem; _ } ->
       TyArray (sem_ty_of_type_expr ~seen types elem)
+  | Ast.TPointer { v = Ast.TName id; _ }
+    when normalize_name id.v = "__UNTYPED_POINTER__" ->
+      TyPointer None
   | Ast.TPointer inner ->
       TyPointer (Some (sem_ty_of_type_expr ~seen types inner))
   | Ast.TStatus _ -> TyStatus
@@ -260,22 +272,28 @@ let sem_proc_sig_of_proc (types : (string, Ast.type_expr Ast.node) Hashtbl.t)
     | None -> None
     | Some r -> Some (sem_ty_of_type_expr types r)
   in
-  { param_tys; ret_ty; use_attr = p.v.use_attr }
+  {
+    param_tys;
+    ret_ty;
+    use_attr = p.v.use_attr;
+    external_modifier = p.v.external_modifier;
+  }
 
 let block_proc_names_of_program (prog : Ast.program) : (string, bool) Hashtbl.t
     =
   let out = Hashtbl.create 32 in
-  List.iter
-    (function
-      | Ast.TopDecl d -> (
-          match d.v with
-          | Ast.DDirective { name; args = nm :: _ }
-            when normalize_name name.v = "BLOCK" ->
-              let k = normalize_name nm.v in
-              if k <> "" then Hashtbl.replace out k true
-          | _ -> ())
-      | Ast.TopStmt _ -> ())
-    prog;
+  let rec collect_top = function
+    | Ast.TopDecl d -> (
+        match d.v with
+        | Ast.DDirective { name; args = nm :: _ }
+          when normalize_name name.v = "BLOCK" ->
+            let k = normalize_name nm.v in
+            if k <> "" then Hashtbl.replace out k true
+        | _ -> ())
+    | Ast.TopStmt _ | Ast.TopError _ -> ()
+    | Ast.TopModule m -> List.iter collect_top m.v.module_items
+  in
+  List.iter collect_top prog;
   out
 
 let sem_exports_of_program_with_base ?(base : sem_scope option)
@@ -289,6 +307,7 @@ let sem_exports_of_program_with_base ?(base : sem_scope option)
   in
   let rec collect_types_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DType { name; defn; _ } -> sem_add_type out name.v defn
     | Ast.DProc p ->
         if in_block || is_block_proc p then
@@ -298,8 +317,18 @@ let sem_exports_of_program_with_base ?(base : sem_scope option)
   let rec collect_values_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit
       =
     match d.v with
-    | Ast.DVar { name; dtype; _ } ->
-        sem_add_value out name.v (SVVar (sem_ty_of_type_expr out.types dtype))
+    | Ast.DError _ -> ()
+    | Ast.DVar { name; dtype; data_decl_kind; _ } ->
+        sem_add_value out name.v (SVVar (sem_ty_of_type_expr out.types dtype));
+        (match (data_decl_kind, dtype.v) with
+        | Ast.DataBlock, Ast.TRecord fields ->
+            List.iter
+              (fun field ->
+                let fv = field.v in
+                sem_add_value ~overwrite:false out fv.fname.v
+                  (SVVar (sem_ty_of_type_expr out.types fv.ftype)))
+              fields
+        | _ -> ())
     | Ast.DConst { name; dtype; value = _; _ } ->
         let ty =
           match dtype with
@@ -316,16 +345,18 @@ let sem_exports_of_program_with_base ?(base : sem_scope option)
           List.iter (collect_values_decl ~in_block:true) p.v.locals
     | Ast.DDirective _ -> ()
   in
-  List.iter
-    (function
-      | Ast.TopDecl d -> collect_types_decl ~in_block:false d
-      | Ast.TopStmt _ -> ())
-    prog;
-  List.iter
-    (function
-      | Ast.TopDecl d -> collect_values_decl ~in_block:false d
-      | Ast.TopStmt _ -> ())
-    prog;
+  let rec collect_types_top = function
+    | Ast.TopDecl d -> collect_types_decl ~in_block:false d
+    | Ast.TopStmt _ | Ast.TopError _ -> ()
+    | Ast.TopModule m -> List.iter collect_types_top m.v.module_items
+  in
+  let rec collect_values_top = function
+    | Ast.TopDecl d -> collect_values_decl ~in_block:false d
+    | Ast.TopStmt _ | Ast.TopError _ -> ()
+    | Ast.TopModule m -> List.iter collect_values_top m.v.module_items
+  in
+  List.iter collect_types_top prog;
+  List.iter collect_values_top prog;
   out
 
 let sem_exports_of_program (prog : Ast.program) : sem_exports =
@@ -384,6 +415,7 @@ let rich_exports_of_program_with_base ?(base : rich_scope option)
   in
   let rec collect_types_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DType { name; defn; _ } -> rich_add_type out name.v defn
     | Ast.DProc p ->
         if in_block || is_block_proc p then
@@ -393,8 +425,18 @@ let rich_exports_of_program_with_base ?(base : rich_scope option)
   let rec collect_values_decl ~(in_block : bool) (d : Ast.decl Ast.node) : unit
       =
     match d.v with
-    | Ast.DVar { name; dtype; _ } ->
-        rich_add_value out name.v (RichVar (rich_ty_of_type_expr out dtype))
+    | Ast.DError _ -> ()
+    | Ast.DVar { name; dtype; data_decl_kind; _ } ->
+        rich_add_value out name.v (RichVar (rich_ty_of_type_expr out dtype));
+        (match (data_decl_kind, dtype.v) with
+        | Ast.DataBlock, Ast.TRecord fields ->
+            List.iter
+              (fun field ->
+                let fv = field.v in
+                rich_add_value ~overwrite:false out fv.fname.v
+                  (RichVar (rich_ty_of_type_expr out fv.ftype)))
+              fields
+        | _ -> ())
     | Ast.DConst { name; dtype; _ } ->
         let ty =
           match dtype with
@@ -411,16 +453,18 @@ let rich_exports_of_program_with_base ?(base : rich_scope option)
           List.iter (collect_values_decl ~in_block:true) p.v.locals
     | Ast.DDirective _ -> ()
   in
-  List.iter
-    (function
-      | Ast.TopDecl d -> collect_types_decl ~in_block:false d
-      | Ast.TopStmt _ -> ())
-    prog;
-  List.iter
-    (function
-      | Ast.TopDecl d -> collect_values_decl ~in_block:false d
-      | Ast.TopStmt _ -> ())
-    prog;
+  let rec collect_types_top = function
+    | Ast.TopDecl d -> collect_types_decl ~in_block:false d
+    | Ast.TopStmt _ | Ast.TopError _ -> ()
+    | Ast.TopModule m -> List.iter collect_types_top m.v.module_items
+  in
+  let rec collect_values_top = function
+    | Ast.TopDecl d -> collect_values_decl ~in_block:false d
+    | Ast.TopStmt _ | Ast.TopError _ -> ()
+    | Ast.TopModule m -> List.iter collect_values_top m.v.module_items
+  in
+  List.iter collect_types_top prog;
+  List.iter collect_values_top prog;
   out
 
 let rich_exports_of_program (prog : Ast.program) : rich_scope =
@@ -653,9 +697,11 @@ let sem_ty_of_literal (lit : Ast.literal) : sem_ty =
       then TyBit
       else TyInt
   | Ast.LFloat _ -> TyFloat
+  | Ast.LBit _ -> TyBit
   | Ast.LString s -> if String.length s = 1 then TyChar else TyString
   | Ast.LChar _ -> TyChar
   | Ast.LBool _ -> TyBit
+  | Ast.LNull -> TyPointer None
 
 let sem_ty_to_string (t : sem_ty) : string =
   let rec is_bit_like = function
@@ -708,6 +754,13 @@ let rec sem_compatible (lhs : sem_ty) (rhs : sem_ty) : bool =
   | TyRecord _, TyRecord _ -> true
   | TyArray a, TyArray b -> sem_compatible a b
   | _ -> false
+
+let sem_is_numeric = function TyInt | TyFloat -> true | _ -> false
+let sem_is_integer = function TyInt -> true | _ -> false
+let sem_is_bit = function TyBit -> true | _ -> false
+let sem_is_character = function TyChar | TyString -> true | _ -> false
+let sem_is_status = function TyStatus -> true | _ -> false
+let sem_is_table = function TyArray _ -> true | _ -> false
 
 let validate_semantics_with_authority (ws : t) (doc : Document.t) :
     DiagAuth.diagnostic list =
@@ -1126,9 +1179,27 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         || Implementation_config.is_system_subroutine ws.implementation_config k
       in
 
+      let asm_visible_compools =
+        let imported =
+          extract_compool_import_dirs doc
+          |> List.map (fun (d : compool_import_dir) -> d.compool)
+        in
+        match doc.Document.compool_def with
+        | None -> imported
+        | Some c -> c :: imported
+      in
+
+      let sem_is_asm_proc (name : string) : bool =
+        let key = normalize_name name in
+        key <> ""
+        && Workspace_asm.label_exists_for_key
+             ~visible_compools:asm_visible_compools ws ~key
+      in
+
       let register_ctf_decl_symbol (ctf_env : Jovial_compile_time.env)
           (d : Ast.decl Ast.node) : unit =
         match d.v with
+        | Ast.DError _ -> ()
         | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ } ->
             Jovial_compile_time.add_non_constant ctf_env name.v
         | Ast.DConst { name; value; _ } ->
@@ -1146,11 +1217,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
       let top_ctf_env = Jovial_compile_time.empty_env () in
       Jovial_compile_time.add_implementation_config top_ctf_env
         ws.implementation_config;
-      List.iter
-        (function
-          | Ast.TopDecl d -> register_ctf_decl_symbol top_ctf_env d
-          | Ast.TopStmt _ -> ())
-        prog;
+      let rec register_ctf_top = function
+        | Ast.TopDecl d -> register_ctf_decl_symbol top_ctf_env d
+        | Ast.TopStmt _ | Ast.TopError _ -> ()
+        | Ast.TopModule m -> List.iter register_ctf_top m.v.module_items
+      in
+      List.iter register_ctf_top prog;
       let layout_config =
         Jovial_layout.config_of_implementation_config ws.implementation_config
       in
@@ -1333,6 +1405,9 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           unit =
         match t.v with
         | Ast.TName _ -> ()
+        | Ast.TScalar { sizes; _ } ->
+            List.iter (check_compile_time_dim ctf_env) sizes;
+            emit_layout_issues ctf_env t
         | Ast.TArray { elem; dims } ->
             List.iter (check_compile_time_dim ctf_env) dims;
             emit_layout_issues ctf_env t;
@@ -1382,6 +1457,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             if
               k <> ""
               && k <> "__IMPLICIT__"
+              && k <> "__UNTYPED_POINTER__"
               && (not (sem_is_builtin_type k))
               && not (Hashtbl.mem scp.types k)
             then
@@ -1391,6 +1467,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                   ~symbol:id.v
               else
                 emit id.loc (Printf.sprintf "Undefined type %S." id.v)
+        | Ast.TScalar _ -> ()
         | Ast.TPointer inner -> check_type_import_hints scp inner
         | Ast.TArray { elem; _ } | Ast.TSpecifiedTable { elem; _ } ->
             check_type_import_hints scp elem
@@ -1464,6 +1541,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           ?(status_atom = false) ?(value_context = true)
           (e : Ast.expr Ast.node) : sem_ty =
         match e.v with
+        | Ast.EError _ | Ast.EMissing _ -> TyUnknown
         | Ast.ELit lit -> sem_ty_of_literal lit
         | Ast.EName id -> (
             if status_atom then TyStatus
@@ -1520,20 +1598,200 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                 args;
               TyStatus)
             else if sem_is_builtin_call callee.v then (
+              let actual = List.length args in
+              let emit_arity expected =
+                emit callee.loc
+                  (Printf.sprintf
+                     "Built-in function %S expects %d argument%s, got %d."
+                     callee.v expected
+                     (if expected = 1 then "" else "s")
+                     actual)
+              in
+              let expect_arity expected =
+                if actual <> expected then (
+                  emit_arity expected;
+                  false)
+                else true
+              in
+              let emit_arg_type arg index expected got =
+                if got <> TyUnknown then
+                  emit arg.loc
+                    (Printf.sprintf
+                       "Built-in function %S argument %d expects %s, got %s."
+                       callee.v index expected (sem_ty_to_mismatch_string got))
+              in
+              let check_arg arg index expected pred ty =
+                if not (pred ty) then
+                  emit_arg_type arg index expected ty
+              in
+              let ty_of_type_name_arg arg =
+                match arg.v with
+                | Ast.EName id -> (
+                    match Hashtbl.find_opt scp.types (normalize_name id.v) with
+                    | Some ty -> sem_ty_of_type_expr scp.types ty
+                    | None -> ty_of_expr scp current_proc arg)
+                | _ -> ty_of_expr scp current_proc arg
+              in
+              let ty_of_loc_arg arg =
+                match arg.v with
+                | Ast.EName id -> (
+                    match sem_lookup_value scp id.v with
+                    | Some (SVVar ty) | Some (SVConst ty) -> ty
+                    | Some (SVProc _) -> TyUnknown
+                    | None -> ty_of_expr scp current_proc arg)
+                | _ -> ty_of_expr scp current_proc arg
+              in
+              let check_int_arg arg index =
+                let ty = ty_of_expr scp current_proc arg in
+                check_arg arg index "integer" sem_is_integer ty
+              in
+              let rec is_rep_reference_arg (arg : Ast.expr Ast.node) : bool =
+                match arg.v with
+                | Ast.EName _ | Ast.EIndex _ | Ast.EField _ | Ast.EAt _
+                | Ast.EDeref _ ->
+                    true
+                | Ast.EParen inner -> is_rep_reference_arg inner
+                | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.ECall _
+                | Ast.EConvert _ | Ast.EPreset _ | Ast.EOmitted
+                | Ast.ERepeat _ | Ast.EPositioned _ | Ast.ERange _
+                | Ast.EError _ | Ast.EMissing _ ->
+                    false
+              in
               match (ck, args) with
-              | "LOC", a0 :: rest ->
-                  let target_ty = ty_of_expr scp current_proc a0 in
+              | "LOC", [ a0 ] ->
+                  let target_ty = ty_of_loc_arg a0 in
+                  (match target_ty with
+                  | TyUnknown -> TyPointer None
+                  | _ -> TyPointer (Some target_ty))
+              | "LOC", _ ->
+                  ignore (expect_arity 1);
                   List.iter
                     (fun a -> ignore (ty_of_expr scp current_proc a))
-                    rest;
-                  TyPointer (Some target_ty)
-              | "LOC", [] -> TyPointer None
-              | "NEXT", p0 :: rest -> (
-                  let pty = ty_of_expr scp current_proc p0 in
+                    args;
+                  TyPointer None
+              | "NEXT", [ value; increment ] ->
+                  let value_ty = ty_of_expr scp current_proc value in
+                  check_int_arg increment 2;
+                  let scalar = sem_scalarize value_ty in
+                  if sem_is_status scalar then TyStatus
+                  else
+                    (match scalar with
+                    | TyPointer _ -> scalar
+                    | TyUnknown -> TyUnknown
+                    | _ ->
+                        emit_arg_type value 1 "pointer or status" value_ty;
+                        TyUnknown)
+              | "NEXT", _ ->
+                  ignore (expect_arity 2);
                   List.iter
                     (fun a -> ignore (ty_of_expr scp current_proc a))
-                    rest;
-                  match pty with TyPointer _ -> pty | _ -> TyUnknown)
+                    args;
+                  TyUnknown
+              | ("BIT" | "BYTE"), [ source; first; length ] ->
+                  let source_ty = ty_of_expr scp current_proc source in
+                  check_int_arg first 2;
+                  check_int_arg length 3;
+                  let scalar = sem_scalarize source_ty in
+                  if ck = "BIT" then (
+                    check_arg source 1 "bit" sem_is_bit scalar;
+                    if sem_is_bit scalar then source_ty else TyUnknown)
+                  else (
+                    check_arg source 1 "character" sem_is_character scalar;
+                    if sem_is_character scalar then source_ty else TyUnknown)
+              | ("BIT" | "BYTE"), _ ->
+                  ignore (expect_arity 3);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyUnknown
+              | ("SHIFTL" | "SHIFTR"), [ value; count ] ->
+                  let value_ty = ty_of_expr scp current_proc value in
+                  check_int_arg count 2;
+                  let scalar = sem_scalarize value_ty in
+                  check_arg value 1 "bit" sem_is_bit scalar;
+                  if sem_is_bit scalar then value_ty else TyUnknown
+              | ("SHIFTL" | "SHIFTR"), _ ->
+                  ignore (expect_arity 2);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyUnknown
+              | "REP", [ source ] ->
+                  ignore (ty_of_expr scp current_proc source);
+                  if not (is_rep_reference_arg source) then
+                    emit source.loc
+                      "Built-in conversion REP expects a named variable or data reference.";
+                  TyBit
+              | "REP", _ ->
+                  ignore (expect_arity 1);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyBit
+              | "ABS", [ value ] ->
+                  let value_ty = ty_of_expr scp current_proc value in
+                  check_arg value 1 "numeric" sem_is_numeric
+                    (sem_scalarize value_ty);
+                  if sem_is_numeric (sem_scalarize value_ty) then value_ty
+                  else TyUnknown
+              | "ABS", _ ->
+                  ignore (expect_arity 1);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyUnknown
+              | "SGN", [ value ] ->
+                  let value_ty = ty_of_expr scp current_proc value in
+                  check_arg value 1 "numeric" sem_is_numeric
+                    (sem_scalarize value_ty);
+                  TyInt
+              | "SGN", _ ->
+                  ignore (expect_arity 1);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyInt
+              | ("BITSIZE" | "BYTESIZE" | "WORDSIZE"), [ value ] ->
+                  ignore (ty_of_type_name_arg value);
+                  TyInt
+              | ("BITSIZE" | "BYTESIZE" | "WORDSIZE"), _ ->
+                  ignore (expect_arity 1);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyInt
+              | ("LBOUND" | "UBOUND"), [ table; dim ] ->
+                  let table_ty = ty_of_expr scp current_proc table in
+                  check_arg table 1 "table" sem_is_table table_ty;
+                  check_int_arg dim 2;
+                  TyInt
+              | ("LBOUND" | "UBOUND"), _ ->
+                  ignore (expect_arity 2);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyInt
+              | "NWDSEN", [ table ] ->
+                  let table_ty = ty_of_type_name_arg table in
+                  check_arg table 1 "table" sem_is_table table_ty;
+                  TyInt
+              | "NWDSEN", _ ->
+                  ignore (expect_arity 1);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyInt
+              | ("FIRST" | "LAST"), [ value ] ->
+                  let value_ty = ty_of_type_name_arg value in
+                  check_arg value 1 "status" sem_is_status value_ty;
+                  if sem_is_status (sem_scalarize value_ty) then TyStatus
+                  else TyUnknown
+              | ("FIRST" | "LAST"), _ ->
+                  ignore (expect_arity 1);
+                  List.iter
+                    (fun a -> ignore (ty_of_expr scp current_proc a))
+                    args;
+                  TyStatus
               | _ ->
                   List.iter
                     (fun a -> ignore (ty_of_expr scp current_proc a))
@@ -1562,7 +1820,10 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                   | Some pts ->
                       let expected_count = List.length pts in
                       let actual_count = List.length args in
-                      if actual_count <> expected_count then
+                      if
+                        sig_.external_modifier <> Ast.RefDecl
+                        && actual_count <> expected_count
+                      then
                         emit callee.loc
                           (Printf.sprintf
                              "Argument count mismatch in call to %S: expected \
@@ -1613,7 +1874,8 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                       TyUnknown)
                     else out_ty
               | None ->
-                  if maybe_visible_through_import ~is_type:false ~name:callee.v
+                  if sem_is_asm_proc callee.v then ()
+                  else if maybe_visible_through_import ~is_type:false ~name:callee.v
                   then ()
                   else if
                     emit_provisional_cross_module_unresolved ~is_type:false
@@ -1665,6 +1927,15 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.EPreset { base; items } ->
             ignore (ty_of_expr scp current_proc base);
             List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) items;
+            TyUnknown
+        | Ast.EOmitted -> TyUnknown
+        | Ast.ERepeat { count; items } ->
+            ignore (ty_of_expr scp current_proc count);
+            List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) items;
+            TyUnknown
+        | Ast.EPositioned { indexes; values } ->
+            List.iter (fun i -> ignore (ty_of_expr scp current_proc i)) indexes;
+            List.iter (fun v -> ignore (ty_of_expr scp current_proc v)) values;
             TyUnknown
         | Ast.ERange { lo; hi } ->
             ignore (ty_of_expr scp current_proc lo);
@@ -1822,6 +2093,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
       in
       let rec collect_constant_table_decl (d : Ast.decl Ast.node) : unit =
         match d.v with
+        | Ast.DError _ -> ()
         | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ } ->
             let key = normalize_name name.v in
             if key <> "" then Hashtbl.replace constant_table_keys key name
@@ -1846,16 +2118,24 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             Option.iter collect_constant_table_stmt init;
             Option.iter collect_constant_table_stmt step;
             collect_constant_table_stmt body
+        | Ast.SCase { options; _ } ->
+            List.iter
+              (fun (opt : Ast.case_option Ast.node) ->
+                collect_constant_table_stmt opt.v.case_body)
+              options
         | Ast.SLabel { body; _ } -> collect_constant_table_stmt body
-        | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
+        | Ast.SEmpty | Ast.SError _ | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
         | Ast.SGoto _ ->
             ()
       in
-      List.iter
-        (function
-          | Ast.TopDecl d -> collect_constant_table_decl d
-          | Ast.TopStmt s -> collect_constant_table_stmt s)
-        prog;
+      let rec collect_constant_table_top = function
+        | Ast.TopDecl d -> collect_constant_table_decl d
+        | Ast.TopStmt s -> collect_constant_table_stmt s
+        | Ast.TopModule m ->
+            List.iter collect_constant_table_top m.v.module_items
+        | Ast.TopError _ -> ()
+      in
+      List.iter collect_constant_table_top prog;
 
       let rec constant_table_lvalue (e : Ast.expr Ast.node) : Ast.ident option =
         match e.v with
@@ -1868,7 +2148,8 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.EAt { field; _ } -> constant_table_lvalue field
         | Ast.EParen inner -> constant_table_lvalue inner
         | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _
-        | Ast.EPreset _ | Ast.ERange _ | Ast.EDeref _ ->
+        | Ast.EPreset _ | Ast.EOmitted | Ast.ERepeat _ | Ast.EPositioned _
+        | Ast.ERange _ | Ast.EDeref _ | Ast.EError _ | Ast.EMissing _ ->
             None
       in
 
@@ -1884,7 +2165,8 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
         | Ast.EAt { field; _ } -> readonly_data_lvalue field
         | Ast.EParen inner -> readonly_data_lvalue inner
         | Ast.ELit _ | Ast.EUnop _ | Ast.EBinop _ | Ast.EConvert _
-        | Ast.EPreset _ | Ast.ERange _ | Ast.EDeref _ ->
+        | Ast.EPreset _ | Ast.EOmitted | Ast.ERepeat _ | Ast.EPositioned _
+        | Ast.ERange _ | Ast.EDeref _ | Ast.EError _ | Ast.EMissing _ ->
             None
       in
 
@@ -1904,6 +2186,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           (current_proc : sem_proc_ctx option) (e : Ast.expr Ast.node) :
           Jovial_type.t =
         match e.v with
+        | Ast.EError _ | Ast.EMissing _ -> Jovial_type.Unknown
         | Ast.ELit lit -> Jovial_typecheck.literal_type lit
         | Ast.EName id -> (
             match rich_lookup_value rscp id.v with
@@ -1932,6 +2215,66 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             result.ty
         | Ast.ECall { callee; args } -> (
             let ck = normalize_name callee.v in
+            let signed_int =
+              Jovial_type.Integer { kind = Jovial_type.Signed; bits = None }
+            in
+            let signed_one_bit =
+              Jovial_type.Integer { kind = Jovial_type.Signed; bits = Some 1 }
+            in
+            let rec rich_scalarize = function
+              | Jovial_type.Table { entry; _ } -> rich_scalarize entry
+              | ty -> ty
+            in
+            let rich_is_unknown = function
+              | Jovial_type.Unknown | Jovial_type.Named _ -> true
+              | _ -> false
+            in
+            let rich_is_numeric = function
+              | Jovial_type.Integer _ | Jovial_type.Float _ | Jovial_type.Fixed _ ->
+                  true
+              | _ -> false
+            in
+            let rich_is_bit = function
+              | Jovial_type.BitString _ -> true
+              | _ -> false
+            in
+            let rich_is_character = function
+              | Jovial_type.CharString _ -> true
+              | _ -> false
+            in
+            let rich_is_status = function
+              | Jovial_type.Status _ -> true
+              | _ -> false
+            in
+            let rich_ty_of_type_name_arg arg =
+              match arg.v with
+              | Ast.EName id -> (
+                  match Hashtbl.find_opt rscp.rich_types (normalize_name id.v) with
+                  | Some ty -> rich_ty_of_type_expr rscp ty
+                  | None -> rich_ty_of_expr rscp current_proc arg)
+              | _ -> rich_ty_of_expr rscp current_proc arg
+            in
+            let int_arg_value arg =
+              match arg.v with
+              | Ast.ELit (Ast.LInt raw) -> int_of_string_opt raw
+              | _ -> None
+            in
+            let dim_has_status_bound (dim : Jovial_type.dim) =
+              match (dim.lower, dim.upper) with
+              | Some (Jovial_type.BoundStatus _), _
+              | _, Some (Jovial_type.BoundStatus _) ->
+                  true
+              | _ -> false
+            in
+            let bounds_result table_ty dim_arg =
+              match (table_ty, int_arg_value dim_arg) with
+              | Jovial_type.Table { dims; _ }, Some index -> (
+                  match List.nth_opt dims index with
+                  | Some dim when dim_has_status_bound dim ->
+                      Jovial_type.Status { values = [] }
+                  | _ -> signed_int)
+              | _ -> signed_int
+            in
             if ck = "V" then (
               match args with
               | [ { v = Ast.EName id; _ } ] ->
@@ -1958,19 +2301,107 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                   List.iter
                     (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
                     rest;
-                  Jovial_type.Pointer { target = Some target; typed = true }
+                  let target =
+                    if rich_is_unknown target then None else Some target
+                  in
+                  Jovial_type.Pointer { target; typed = Option.is_some target }
               | [] -> Jovial_type.Pointer { target = None; typed = false }
             else if ck = "NEXT" then
               match args with
-              | ptr :: rest ->
-                  let ptr_ty = rich_ty_of_expr rscp current_proc ptr in
+              | value :: rest ->
+                  let value_ty = rich_ty_of_expr rscp current_proc value in
                   List.iter
                     (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
                     rest;
-                  (match ptr_ty with
-                  | Jovial_type.Pointer _ -> ptr_ty
+                  (match rich_scalarize value_ty with
+                  | Jovial_type.Pointer _ -> value_ty
+                  | Jovial_type.Status _ -> value_ty
                   | _ -> Jovial_type.Unknown)
               | [] -> Jovial_type.Unknown
+            else if ck = "BIT" then
+              match args with
+              | source :: rest ->
+                  let source_ty = rich_ty_of_expr rscp current_proc source in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  if rich_is_bit (rich_scalarize source_ty) then source_ty
+                  else Jovial_type.Unknown
+              | [] -> Jovial_type.Unknown
+            else if ck = "BYTE" then
+              match args with
+              | source :: rest ->
+                  let source_ty = rich_ty_of_expr rscp current_proc source in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  if rich_is_character (rich_scalarize source_ty) then source_ty
+                  else Jovial_type.Unknown
+              | [] -> Jovial_type.Unknown
+            else if ck = "SHIFTL" || ck = "SHIFTR" then
+              match args with
+              | source :: rest ->
+                  let source_ty = rich_ty_of_expr rscp current_proc source in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  if rich_is_bit (rich_scalarize source_ty) then source_ty
+                  else Jovial_type.Unknown
+              | [] -> Jovial_type.Unknown
+            else if ck = "REP" then (
+              List.iter
+                (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                args;
+              Jovial_type.BitString { bits = None })
+            else if ck = "ABS" then
+              match args with
+              | source :: rest ->
+                  let source_ty = rich_ty_of_expr rscp current_proc source in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  if rich_is_numeric (rich_scalarize source_ty) then source_ty
+                  else Jovial_type.Unknown
+              | [] -> Jovial_type.Unknown
+            else if ck = "SGN" then (
+              List.iter
+                (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                args;
+              signed_one_bit)
+            else if ck = "BITSIZE" || ck = "BYTESIZE" || ck = "WORDSIZE" then (
+              List.iter
+                (fun a -> ignore (rich_ty_of_type_name_arg a))
+                args;
+              signed_int)
+            else if ck = "LBOUND" || ck = "UBOUND" then
+              match args with
+              | table :: dim :: rest ->
+                  let table_ty = rich_ty_of_expr rscp current_proc table in
+                  ignore (rich_ty_of_expr rscp current_proc dim);
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  bounds_result table_ty dim
+              | _ ->
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    args;
+                  signed_int
+            else if ck = "NWDSEN" then (
+              List.iter
+                (fun a -> ignore (rich_ty_of_type_name_arg a))
+                args;
+              signed_int)
+            else if ck = "FIRST" || ck = "LAST" then
+              match args with
+              | value :: rest ->
+                  let value_ty = rich_ty_of_type_name_arg value in
+                  List.iter
+                    (fun a -> ignore (rich_ty_of_expr rscp current_proc a))
+                    rest;
+                  if rich_is_status (rich_scalarize value_ty) then value_ty
+                  else Jovial_type.Unknown
+              | [] -> Jovial_type.Status { values = [] }
             else
               match rich_lookup_value rscp callee.v with
               | Some (RichProc sig_) ->
@@ -2028,27 +2459,60 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
               (fun item -> ignore (rich_ty_of_expr rscp current_proc item))
               items;
             Jovial_type.Unknown
+        | Ast.EOmitted -> Jovial_type.Unknown
+        | Ast.ERepeat { count; items } ->
+            ignore (rich_ty_of_expr rscp current_proc count);
+            List.iter
+              (fun item -> ignore (rich_ty_of_expr rscp current_proc item))
+              items;
+            Jovial_type.Unknown
+        | Ast.EPositioned { indexes; values } ->
+            List.iter
+              (fun index -> ignore (rich_ty_of_expr rscp current_proc index))
+              indexes;
+            List.iter
+              (fun value -> ignore (rich_ty_of_expr rscp current_proc value))
+              values;
+            Jovial_type.Unknown
         | Ast.ERange { lo; hi } ->
             ignore (rich_ty_of_expr rscp current_proc lo);
             ignore (rich_ty_of_expr rscp current_proc hi);
             Jovial_type.Unknown
         | Ast.EAt { field; ptr } ->
             let ptr_ty = rich_ty_of_expr rscp current_proc ptr in
-            let result =
-              Jovial_typecheck.dereference_result ~ptr:ptr_ty ~loc:ptr.loc
-            in
-            emit_typecheck_issues result.issues;
             (match field.v with
             | Ast.EName id -> (
-                match Jovial_type.field_type result.ty id.v with
+                let container_ty =
+                  match Jovial_type.field_type ptr_ty id.v with
+                  | Some _ -> ptr_ty
+                  | None ->
+                      let result =
+                        Jovial_typecheck.dereference_result ~ptr:ptr_ty
+                          ~loc:ptr.loc
+                      in
+                      emit_typecheck_issues result.issues;
+                      result.ty
+                in
+                match Jovial_type.field_type container_ty id.v with
                 | Some ty -> ty
                 | None -> Jovial_type.Unknown)
             | Ast.EIndex { base = { v = Ast.EName id; _ }; index } ->
                 List.iter
                   (fun i -> ignore (rich_ty_of_expr rscp current_proc i))
                   index;
+                let container_ty =
+                  match Jovial_type.field_type ptr_ty id.v with
+                  | Some _ -> ptr_ty
+                  | None ->
+                      let result =
+                        Jovial_typecheck.dereference_result ~ptr:ptr_ty
+                          ~loc:ptr.loc
+                      in
+                      emit_typecheck_issues result.issues;
+                      result.ty
+                in
                 let field_ty =
-                  match Jovial_type.field_type result.ty id.v with
+                  match Jovial_type.field_type container_ty id.v with
                   | Some ty -> ty
                   | None -> Jovial_type.Unknown
                 in
@@ -2064,6 +2528,46 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             emit_typecheck_issues result.issues;
             result.ty
         | Ast.EParen inner -> rich_ty_of_expr rscp current_proc inner
+      in
+
+      let rich_ty_of_lvalue (rscp : rich_scope)
+          (current_proc : sem_proc_ctx option) (e : Ast.expr Ast.node) :
+          Jovial_type.t =
+        let rec scalarize = function
+          | Jovial_type.Table { entry; _ } -> scalarize entry
+          | ty -> ty
+        in
+        let length_arg_size = function
+          | { Ast.v = Ast.ELit (Ast.LInt raw); _ } -> int_of_string_opt raw
+          | _ -> None
+        in
+        match e.v with
+        | Ast.ECall { callee; args = [ source ] }
+          when normalize_name callee.v = "REP" ->
+            ignore (rich_ty_of_expr rscp current_proc source);
+            Jovial_type.BitString { bits = None }
+        | Ast.ECall { callee; args = [ source; _first; length ] } -> (
+            match normalize_name callee.v with
+            | "BIT" ->
+                let source_ty = rich_ty_of_expr rscp current_proc source in
+                if
+                  match scalarize source_ty with
+                  | Jovial_type.BitString _ -> true
+                  | Jovial_type.Unknown | Jovial_type.Named _ -> false
+                  | _ -> false
+                then Jovial_type.BitString { bits = length_arg_size length }
+                else Jovial_type.Unknown
+            | "BYTE" ->
+                let source_ty = rich_ty_of_expr rscp current_proc source in
+                if
+                  match scalarize source_ty with
+                  | Jovial_type.CharString _ -> true
+                  | Jovial_type.Unknown | Jovial_type.Named _ -> false
+                  | _ -> false
+                then Jovial_type.CharString { chars = length_arg_size length }
+                else Jovial_type.Unknown
+            | _ -> rich_ty_of_expr rscp current_proc e)
+        | _ -> rich_ty_of_expr rscp current_proc e
       in
 
       let ty_of_lvalue (scp : sem_scope) (current_proc : sem_proc_ctx option)
@@ -2103,6 +2607,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                 None)
         | Ast.EField _ | Ast.EAt _ | Ast.EDeref _ | Ast.EIndex _ ->
             Some (ty_of_expr scp current_proc e)
+        | Ast.ECall { callee; _ }
+          when (
+            match normalize_name callee.v with
+            | "BIT" | "BYTE" | "REP" -> true
+            | _ -> false) ->
+            Some (ty_of_expr scp current_proc e)
         | _ ->
             ignore (ty_of_expr scp current_proc e);
             None
@@ -2121,6 +2631,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
 
       let is_omitted_preset_value (item : Ast.expr Ast.node) : bool =
         match item.v with
+        | Ast.EOmitted -> true
         | Ast.ELit (Ast.LString "") -> true
         | _ -> false
       in
@@ -2132,6 +2643,17 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           unit =
         match preset.v with
         | Ast.EPreset { items; _ } ->
+            let items =
+              match items with
+              | [ { v = Ast.ERepeat { count; items = nested }; _ } ] -> (
+                  match
+                    Jovial_compile_time.eval_expr ~env:ctf_env count
+                    |> Jovial_compile_time.int_value
+                  with
+                  | Some 0L -> nested
+                  | _ -> items)
+              | _ -> items
+            in
             (match table_dims_of_type_expr rscp table_type with
             | Some dims -> (
                 match table_entry_capacity ctf_env dims with
@@ -2216,6 +2738,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
 
       let add_decl_symbol (scp : sem_scope) (d : Ast.decl Ast.node) : unit =
         match d.v with
+        | Ast.DError _ -> ()
         | Ast.DType { name; defn; _ } -> sem_add_type scp name.v defn
         | Ast.DVar { name; dtype; _ } ->
             sem_add_value scp name.v
@@ -2236,6 +2759,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
       let rich_add_decl_symbol (rscp : rich_scope) (d : Ast.decl Ast.node) :
           unit =
         match d.v with
+        | Ast.DError _ -> ()
         | Ast.DType { name; defn; _ } -> rich_add_type rscp name.v defn
         | Ast.DVar { name; dtype; _ } ->
             rich_add_value rscp name.v
@@ -2256,7 +2780,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
       let rec collect_label_depths_for_stmt (out : (string, int) Hashtbl.t)
           ~(loop_depth : int) (s : Ast.stmt Ast.node) : unit =
         match s.v with
-        | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
+        | Ast.SEmpty | Ast.SError _ | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _
         | Ast.SGoto _ ->
             ()
         | Ast.SDecl _ -> ()
@@ -2277,6 +2801,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
             | None -> ()
             | Some st -> collect_label_depths_for_stmt out ~loop_depth st);
             collect_label_depths_for_stmt out ~loop_depth:(loop_depth + 1) body
+        | Ast.SCase { options; _ } ->
+            List.iter
+              (fun (opt : Ast.case_option Ast.node) ->
+                collect_label_depths_for_stmt out ~loop_depth
+                  opt.v.case_body)
+              options
         | Ast.SLabel { label; body } ->
             let key = normalize_name label.v in
             if key <> "" && not (Hashtbl.mem out key) then
@@ -2293,11 +2823,12 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
 
       let top_level_label_depths : (string, int) Hashtbl.t =
         let out = Hashtbl.create 64 in
-        List.iter
-          (function
-            | Ast.TopStmt s -> collect_label_depths_for_stmt out ~loop_depth:0 s
-            | Ast.TopDecl _ -> ())
-          prog;
+        let rec collect_top = function
+          | Ast.TopStmt s -> collect_label_depths_for_stmt out ~loop_depth:0 s
+          | Ast.TopDecl _ | Ast.TopError _ -> ()
+          | Ast.TopModule m -> List.iter collect_top m.v.module_items
+        in
+        List.iter collect_top prog;
         out
       in
 
@@ -2307,7 +2838,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           ~(label_depths : (string, int) Hashtbl.t)
           (s : Ast.stmt Ast.node) : unit =
         match s.v with
-        | Ast.SEmpty -> ()
+        | Ast.SEmpty | Ast.SError _ -> ()
         | Ast.SDecl d ->
             add_decl_symbol scp d;
             rich_add_decl_symbol rscp d;
@@ -2338,7 +2869,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                      id.v));
             let lhs_ty = ty_of_lvalue scp current_proc lhs in
             let rhs_ty = ty_of_expr scp current_proc rhs in
-            let lhs_rich_ty = rich_ty_of_expr rscp current_proc lhs in
+            let lhs_rich_ty = rich_ty_of_lvalue rscp current_proc lhs in
             let rhs_rich_ty = rich_ty_of_expr rscp current_proc rhs in
             emit_typecheck_issues
               (Jovial_typecheck.assignment_issues ~lhs:lhs_rich_ty
@@ -2393,6 +2924,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                  | None ->
                      if
                        (not (sem_is_builtin_call callee.v))
+                       && not (sem_is_asm_proc callee.v)
                        && not
                             (maybe_visible_through_import ~is_type:false
                                ~name:callee.v)
@@ -2475,6 +3007,31 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
                   ~label_depths st);
             check_stmt for_scope current_proc rscp ctf_env
               ~loop_depth:(loop_depth + 1) ~label_depths body
+        | Ast.SCase { selector; options } ->
+            ignore (ty_of_expr scp current_proc selector);
+            ignore (rich_ty_of_expr rscp current_proc selector);
+            check_status_value_expr selector;
+            let check_case_index (idx : Ast.case_index Ast.node) : unit =
+              match idx.v with
+              | Ast.CaseDefault -> ()
+              | Ast.CaseValue value ->
+                  ignore (ty_of_expr scp current_proc value);
+                  ignore (rich_ty_of_expr rscp current_proc value);
+                  check_status_value_expr value
+              | Ast.CaseRange (lo, hi) ->
+                  ignore (ty_of_expr scp current_proc lo);
+                  ignore (ty_of_expr scp current_proc hi);
+                  ignore (rich_ty_of_expr rscp current_proc lo);
+                  ignore (rich_ty_of_expr rscp current_proc hi);
+                  check_status_value_expr lo;
+                  check_status_value_expr hi
+            in
+            List.iter
+              (fun (opt : Ast.case_option Ast.node) ->
+                List.iter check_case_index opt.v.case_indexes;
+                check_stmt scp current_proc rscp ctf_env ~loop_depth
+                  ~label_depths opt.v.case_body)
+              options
         | Ast.SReturn eo -> (
             if current_proc = None then
               emit s.loc "RETURN is only valid inside a procedure.";
@@ -2525,6 +3082,7 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
           (d : Ast.decl Ast.node) : unit =
         let _ = loop_depth in
         match d.v with
+        | Ast.DError _ -> ()
         | Ast.DVar { dtype; init; data_decl_kind; _ } -> (
             check_type_import_hints scp dtype;
             check_compile_time_type_expr ctf_env dtype;
@@ -2657,15 +3215,17 @@ let validate_semantics_with_authority (ws : t) (doc : Document.t) :
               ~label_depths:proc_label_depths p.v.body
       in
 
-      List.iter
-        (function
-          | Ast.TopDecl d ->
-              check_decl scope None rich_scope top_ctf_env ~loop_depth:0
-                ~label_depths:top_level_label_depths d
-          | Ast.TopStmt s ->
-              check_stmt scope None rich_scope top_ctf_env ~loop_depth:0
-                ~label_depths:top_level_label_depths s)
-        prog;
+      let rec check_top = function
+        | Ast.TopDecl d ->
+            check_decl scope None rich_scope top_ctf_env ~loop_depth:0
+              ~label_depths:top_level_label_depths d
+        | Ast.TopStmt s ->
+            check_stmt scope None rich_scope top_ctf_env ~loop_depth:0
+              ~label_depths:top_level_label_depths s
+        | Ast.TopModule m -> List.iter check_top m.v.module_items
+        | Ast.TopError _ -> ()
+      in
+      List.iter check_top prog;
       List.rev !out
   | _ -> []
 

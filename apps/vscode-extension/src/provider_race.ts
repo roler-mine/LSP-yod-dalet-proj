@@ -31,6 +31,8 @@ export type RaceServerWithFallbackOptions<T> = {
   hasResult: (value: T | undefined) => boolean;
   normalizeServerResult?: (value: T) => T;
   normalizeFallbackResult?: (value: T) => T;
+  preferLateServerResult?: boolean;
+  fallbackServerBudgetMs?: number;
   onServerError?: (error: unknown) => void;
 };
 
@@ -108,8 +110,12 @@ export async function raceServerWithFallback<T>(
   let fallbackRead = false;
   let fallbackResult: T | undefined;
 
-  const readFallback = (): T | undefined => {
-    if (options.token.isCancellationRequested) return undefined;
+  const readFallback = (
+    opts: { ignoreCancellation?: boolean } = {},
+  ): T | undefined => {
+    if (!opts.ignoreCancellation && options.token.isCancellationRequested) {
+      return undefined;
+    }
     if (!fallbackRead) {
       fallbackRead = true;
       fallbackResult = options.fallback();
@@ -146,6 +152,19 @@ export async function raceServerWithFallback<T>(
       : outcome.value;
   };
 
+  const settleServerOutcomeOrFallback = (
+    outcome: ProviderServerOutcome<T>,
+    fallback: T,
+  ): T | undefined => {
+    if (outcome.kind === "serverError") {
+      options.onServerError?.(outcome.error);
+      return normalizeFallback(fallback);
+    }
+    return options.hasResult(outcome.value)
+      ? normalizeServer(outcome.value)
+      : normalizeFallback(fallback);
+  };
+
   const initialGate = createRaceGate(options.token, options.budgetMs);
   const first = await Promise.race([serverOutcome, initialGate.promise]);
   initialGate.dispose();
@@ -154,11 +173,32 @@ export async function raceServerWithFallback<T>(
     return settleServerOutcome(first);
   }
   if (first.kind === "cancelled") {
-    return undefined;
+    const fallback = readFallback({ ignoreCancellation: true });
+    return options.hasResult(fallback)
+      ? normalizeFallback(fallback as T)
+      : undefined;
   }
 
   const fallback = readFallback();
   if (options.hasResult(fallback)) {
+    if (options.preferLateServerResult) {
+      const lateServerGate = createRaceGate(
+        options.token,
+        options.fallbackServerBudgetMs ?? options.budgetMs,
+      );
+      const lateServer = await Promise.race([
+        serverOutcome,
+        lateServerGate.promise,
+      ]);
+      lateServerGate.dispose();
+
+      if (lateServer.kind === "server" || lateServer.kind === "serverError") {
+        return settleServerOutcomeOrFallback(lateServer, fallback as T);
+      }
+      if (lateServer.kind === "cancelled") {
+        return normalizeFallback(fallback as T);
+      }
+    }
     return normalizeFallback(fallback as T);
   }
 

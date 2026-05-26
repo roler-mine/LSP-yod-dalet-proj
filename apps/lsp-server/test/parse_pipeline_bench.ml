@@ -172,11 +172,202 @@ let run_menhir_codegen_probe () =
   let status = time "menhir --infer --code" (fun () -> Sys.command command) in
   Printf.printf "exit status: %d\n%!" status
 
-let () =
-  if Array.exists (( = ) "--menhir-codegen") Sys.argv then
-    run_menhir_codegen_probe ();
-  let sizes =
-    if Array.exists (( = ) "--large") Sys.argv then [ 10_000; 100_000; 1_000_000 ]
-    else [ 10_000 ]
+let has_arg flag = Array.exists (( = ) flag) Sys.argv
+
+let arg_value flag =
+  let rec loop i =
+    if i >= Array.length Sys.argv - 1 then None
+    else if Sys.argv.(i) = flag then Some Sys.argv.(i + 1)
+    else loop (i + 1)
   in
-  List.iter run_one sizes
+  loop 1
+
+let parser_health_label = function
+  | Lib.Parser.ParseClean -> "clean"
+  | Lib.Parser.ParseRecovered -> "recovered"
+  | Lib.Parser.ParsePartial -> "partial"
+  | Lib.Parser.ParseSkeletonOnly -> "skeleton"
+  | Lib.Parser.ParseLexicalOnly -> "lexical"
+  | Lib.Parser.ParseFailedInternal -> "internal"
+
+let diagnostic_message (diag : T.Diagnostic.t) =
+  match diag.T.Diagnostic.message with
+  | `String s -> s
+  | `MarkupContent mc -> mc.value
+
+let diagnostic_line (diag : T.Diagnostic.t) =
+  diag.T.Diagnostic.range.T.Range.start.T.Position.line + 1
+
+let has_suffix ~suffix s =
+  let n = String.length s and m = String.length suffix in
+  n >= m && String.lowercase_ascii (String.sub s (n - m) m) = suffix
+
+let rec collect_jovial_files root =
+  let entries =
+    try Sys.readdir root |> Array.to_list with Sys_error _ -> []
+  in
+  entries
+  |> List.concat_map (fun name ->
+         let path = Filename.concat root name in
+         if name = ".jovial_ls" || name = ".git" || name = "_build" then []
+         else if Sys.is_directory path then collect_jovial_files path
+         else if
+           List.exists (fun suffix -> has_suffix ~suffix path)
+             [ ".j73"; ".jov"; ".jovial"; ".j" ]
+         then [ path ]
+         else [])
+
+let rec collect_assembly_files root =
+  let entries =
+    try Sys.readdir root |> Array.to_list with Sys_error _ -> []
+  in
+  entries
+  |> List.concat_map (fun name ->
+         let path = Filename.concat root name in
+         if name = ".jovial_ls" || name = ".git" || name = "_build" then []
+         else if Sys.is_directory path then collect_assembly_files path
+         else if has_suffix ~suffix:".asm" path then [ path ]
+         else [])
+
+let read_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      let len = in_channel_length ic in
+      really_input_string ic len)
+
+let bad_token_count (tokens : Lib.Preprocess.lex_tok array option) =
+  match tokens with
+  | None -> 0
+  | Some toks ->
+      Array.fold_left
+        (fun acc (span : Lib.Preprocess.lex_tok) ->
+          match span.tok with
+          | Lib.Parser.BAD_CHAR _ | Lib.Parser.BAD_STRING _
+          | Lib.Parser.BAD_COMMENT _ | Lib.Parser.BAD_DIRECTIVE _
+          | Lib.Parser.BAD_LITERAL _ ->
+              acc + 1
+          | _ -> acc)
+        0 toks
+
+let line_at ~(text : string) line =
+  let lines = String.split_on_char '\n' text in
+  if line <= 0 || line > List.length lines then ""
+  else List.nth lines (line - 1)
+
+let report_corpus_file ~verbose path =
+  let text = read_file path in
+  let cache =
+    Lib.Syntax_cache.build_with_profile ~profile:Lib.Parser.Batch
+      ~file:(Some path) ~text ()
+  in
+  let parse = cache.Lib.Syntax_cache.parse in
+  let syntax_count = List.length parse.diags in
+  let recovery_count = List.length parse.recovery_diags in
+  let taint_count = List.length parse.tainted_ranges in
+  let bad_tokens = bad_token_count cache.raw_tokens in
+  let skeleton_symbols = List.length cache.skeleton.symbols in
+  let first_diag =
+    match parse.diags @ parse.recovery_diags with
+    | [] -> "none"
+    | diag :: _ ->
+        Printf.sprintf "line %d: %s" (diagnostic_line diag)
+          (diagnostic_message diag)
+  in
+  Printf.printf
+    "%s\tbytes=%d\thealth=%s\tconfidence=%.2f\tsyntax=%d\trecovery=%d\ttaints=%d\tbad_tokens=%d\tskeleton_symbols=%d\tfirst=%s\n%!"
+    path (String.length text) (parser_health_label parse.parse_health)
+    parse.parse_confidence syntax_count recovery_count taint_count bad_tokens
+    skeleton_symbols first_diag;
+  if verbose && (syntax_count > 0 || recovery_count > 0) then (
+    List.iter
+      (fun diag ->
+        let line = diagnostic_line diag in
+        Printf.printf "  diag line %d: %s\n    source: %s\n%!" line
+          (diagnostic_message diag) (line_at ~text line))
+      (parse.diags @ parse.recovery_diags);
+    List.iter
+      (fun taint ->
+        Printf.printf "  taint line %d penalty=%.2f semantic=%b: %s\n%!"
+          taint.Lib.Parser.taint_loc.start_pos.line
+          taint.taint_confidence_penalty taint.taint_allows_semantic
+          taint.taint_reason)
+      parse.tainted_ranges);
+  (parse.parse_health, parse.parse_confidence, syntax_count + recovery_count)
+
+let workspace_report_diagnostics root =
+  let files = collect_jovial_files root |> List.sort String.compare in
+  let asm_files = collect_assembly_files root |> List.sort String.compare in
+  let ws = Lib.Workspace_state.create () in
+  Lib.Workspace_state.set_root_path ws (Some root);
+  ignore (Lib.Workspace_state.set_source_files ws files);
+  ignore (Lib.Workspace_state.set_assembly_files ws asm_files);
+  List.iter
+    (fun path ->
+      let text = read_file path in
+      match Lib.Uri_path.docuri_of_path path with
+      | None -> Printf.printf "bad-uri\t%s\n%!" path
+      | Some uri ->
+          Lib.Workspace_doc_lifecycle.open_doc ws ~uri ~file:(Some path) ~text)
+    files;
+  ignore (Lib.Workspace_doc_lifecycle.revalidate_all ws);
+  List.iter
+    (fun path ->
+      match Lib.Uri_path.docuri_of_path path with
+      | None -> ()
+      | Some uri ->
+          let diags = Lib.Workspace_state.diagnostics_for ws ~uri in
+          Printf.printf "== %s diagnostics=%d ==\n%!" path (List.length diags);
+          List.iter
+            (fun diag ->
+              Printf.printf "line %d:%d [%s] %s\n%!"
+                (diag.T.Diagnostic.range.start.line + 1)
+                (diag.T.Diagnostic.range.start.character + 1)
+                (Option.value diag.T.Diagnostic.source ~default:"")
+                (diagnostic_message diag))
+            diags)
+    files
+
+let run_corpus root =
+  let files = collect_jovial_files root |> List.sort String.compare in
+  Printf.printf "== corpus: %s ==\nfiles: %d\n%!" root (List.length files);
+  let totals =
+    List.fold_left
+      (fun (clean, recovered, low_conf, diag_files) path ->
+        let health, confidence, diag_count =
+          report_corpus_file ~verbose:(has_arg "--verbose") path
+        in
+        let clean =
+          match health with Lib.Parser.ParseClean -> clean + 1 | _ -> clean
+        in
+        let recovered =
+          match health with
+          | Lib.Parser.ParseRecovered -> recovered + 1
+          | _ -> recovered
+        in
+        let low_conf = if confidence < 0.80 then low_conf + 1 else low_conf in
+        let diag_files = if diag_count > 0 then diag_files + 1 else diag_files in
+        (clean, recovered, low_conf, diag_files))
+      (0, 0, 0, 0) files
+  in
+  let clean, recovered, low_conf, diag_files = totals in
+  Printf.printf
+    "summary\tclean=%d\trecovered=%d\tlow_confidence=%d\tdiagnostic_files=%d\n%!"
+    clean recovered low_conf diag_files
+
+let () =
+  if has_arg "--menhir-codegen" then
+    run_menhir_codegen_probe ();
+  match arg_value "--workspace-diags" with
+  | Some root -> workspace_report_diagnostics root
+  | None -> (
+  match arg_value "--corpus" with
+  | Some root -> run_corpus root
+  | None ->
+      let sizes =
+        if has_arg "--quick" then [ 200 ]
+        else if has_arg "--large" then [ 10_000; 100_000; 1_000_000 ]
+        else [ 10_000 ]
+      in
+      List.iter run_one sizes)

@@ -1,6 +1,6 @@
 (* Module overview: Maintains searchable symbol definitions and names across the workspace. *)
 
-type symbol_id = string
+type symbol_id = Symbol_id.t
 
 type type_info = { display : string }
 
@@ -50,9 +50,12 @@ let add (t : t) (record : symbol_record) : unit =
   add_to t.by_scope_tbl record.container_scope record;
   if record.exported then add_to t.exports_by_module_tbl file_key record
 
-let symbol_id ~(uri : string) (sym : Skeleton_index.symbol_decl) =
-  Printf.sprintf "%s:%s:%d:%d" uri sym.normalized_name
+let stable_symbol_key ~(uri : string) (sym : Skeleton_index.symbol_decl) =
+  Printf.sprintf "snapshot-symbol|%s|%s|%d|%d" uri sym.normalized_name
     sym.loc.Ast.Loc.start_pos.offset sym.loc.Ast.Loc.end_pos.offset
+
+let symbol_id_of_skeleton ~(uri : string) (sym : Skeleton_index.symbol_decl) =
+  Symbol_id.of_stable_string (stable_symbol_key ~uri sym)
 
 let external_kind (sym : Skeleton_index.symbol_decl) =
   if sym.exported then `Def else if sym.imported then `Ref else `Local
@@ -60,7 +63,7 @@ let external_kind (sym : Skeleton_index.symbol_decl) =
 let add_skeleton_symbol t ~uri (sym : Skeleton_index.symbol_decl) =
   add t
     {
-      id = symbol_id ~uri sym;
+      id = symbol_id_of_skeleton ~uri sym;
       name = sym.name;
       normalized_name = sym.normalized_name;
       kind = sym.kind;

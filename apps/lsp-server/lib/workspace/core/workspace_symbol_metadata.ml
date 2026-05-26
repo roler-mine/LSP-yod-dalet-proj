@@ -231,9 +231,11 @@ let jovial_kind_of_data_kind ~is_constant = function
 let literal_to_display = function
   | Ast.LInt s -> s
   | Ast.LFloat s -> s
+  | Ast.LBit { raw; _ } -> raw
   | Ast.LString s -> "'" ^ s ^ "'"
   | Ast.LChar c -> Printf.sprintf "'%c'" c
   | Ast.LBool b -> if b then "TRUE" else "FALSE"
+  | Ast.LNull -> "NULL"
 
 let binop_display = function
   | Ast.BAdd -> "+"
@@ -285,13 +287,44 @@ let rec expr_display (e : Ast.expr Ast.node) =
       expr_display base ^ "("
       ^ (items |> List.map expr_display |> String.concat ", ")
       ^ ")"
+  | Ast.EOmitted -> ""
+  | Ast.ERepeat { count; items } ->
+      expr_display count ^ "*("
+      ^ (items |> List.map expr_display |> String.concat ", ")
+      ^ ")"
+  | Ast.EPositioned { indexes; values } ->
+      "POS("
+      ^ (indexes |> List.map expr_display |> String.concat ", ")
+      ^ "):"
+      ^ (values |> List.map expr_display |> String.concat ", ")
   | Ast.ERange { lo; hi } -> expr_display lo ^ ":" ^ expr_display hi
   | Ast.EAt { field; ptr } -> expr_display field ^ " @ " ^ expr_display ptr
   | Ast.EDeref { ptr } -> "@ " ^ expr_display ptr
+  | Ast.EError _ | Ast.EMissing _ -> "?"
+
+and scalar_base_name = function
+  | Ast.ScalarUnsigned -> "U"
+  | Ast.ScalarSigned -> "S"
+  | Ast.ScalarFloat -> "F"
+  | Ast.ScalarFixed -> "A"
+  | Ast.ScalarBit -> "B"
+  | Ast.ScalarChar -> "C"
+
+and round_mode_name = function Ast.Round -> "R" | Ast.Truncate -> "T"
 
 and type_display (t : Ast.type_expr Ast.node) =
   match t.v with
   | Ast.TName id -> id.v
+  | Ast.TScalar { base; round; sizes } ->
+      let base_text = scalar_base_name base in
+      let head =
+        match round with
+        | None -> base_text
+        | Some mode -> base_text ^ "," ^ round_mode_name mode
+      in
+      let sep = match base with Ast.ScalarFixed -> "," | _ -> " " in
+      let size_text = sizes |> List.map expr_display |> String.concat sep in
+      if size_text = "" then head else head ^ " " ^ size_text
   | Ast.TPointer inner -> "P " ^ type_display inner
   | Ast.TSpecifiedTable { elem; dims; kind } ->
       let dim_text =
@@ -347,6 +380,8 @@ let builtin_size_name name =
 
 let rec has_non_integer_builtin_size (t : Ast.type_expr Ast.node) =
   match t.v with
+  | Ast.TScalar { sizes; _ } ->
+      List.exists (fun dim -> not (int_literal_expr dim)) sizes
   | Ast.TArray { elem = { v = Ast.TName id; _ }; dims }
     when builtin_size_name id.v ->
       List.exists (fun dim -> not (int_literal_expr dim)) dims
@@ -464,6 +499,18 @@ let type_info_of_type_expr ?implementation_config
   in
   let display = rich_type_display ?implementation_config t in
   match t.v with
+  | Ast.TScalar { base; sizes; _ } ->
+      let _, explanation =
+        builtin_type_details ?implementation_config (scalar_base_name base) sizes
+      in
+      {
+        display;
+        origin = BuiltinType;
+        resolved_display = None;
+        type_decl_uri = None;
+        type_decl_loc = None;
+        explanation;
+      }
   | Ast.TName id when is_builtin_type_name id.v ->
       let cls, explanation =
         builtin_type_details ?implementation_config id.v []

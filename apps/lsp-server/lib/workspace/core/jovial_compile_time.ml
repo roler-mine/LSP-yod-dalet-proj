@@ -12,6 +12,7 @@ type ctf_value =
 type ctf_error_kind =
   | UnknownIdentifier of string
   | NonConstantReference of string
+  | ParseDamage of Ast.parse_error
   | UnsupportedConstruct of string
   | UnsupportedBuiltin of string
   | TypeMismatch of string
@@ -85,6 +86,7 @@ let err_of_kind (loc : Ast.Loc.t) (kind : ctf_error_kind) : ctf_result =
         Printf.sprintf "unknown identifier %S" name
     | NonConstantReference name ->
         Printf.sprintf "%S is not a compile-time constant" name
+    | ParseDamage damage -> damage.message
     | UnsupportedConstruct what ->
         Printf.sprintf "%s is not supported in compile-time formulas yet" what
     | UnsupportedBuiltin name ->
@@ -130,9 +132,12 @@ let literal_value (loc : Ast.Loc.t) (lit : Ast.literal) : ctf_result =
       | Some n -> Known (CtfInt n)
       | None -> err_of_kind loc (UnsupportedConstruct ("integer literal " ^ s)))
   | Ast.LFloat s -> Known (CtfFloat s)
+  | Ast.LBit { raw; _ } ->
+      err_of_kind loc (UnsupportedConstruct ("bit literal " ^ raw))
   | Ast.LString s -> Known (CtfString s)
   | Ast.LChar c -> Known (CtfChar c)
   | Ast.LBool b -> Known (CtfBool b)
+  | Ast.LNull -> err_of_kind loc (UnsupportedConstruct "NULL literal")
 
 let type_name_of_value = function
   | CtfInt _ -> "integer"
@@ -339,6 +344,16 @@ let rec eval ?env (expr : Ast.expr Ast.node) ~(stack : string list) : ctf_result
         (eval_child base
         :: unknown_construct expr.loc "preset"
         :: List.map eval_child items)
+  | Ast.EOmitted -> unknown_construct expr.loc "omitted value"
+  | Ast.ERepeat { count; items } ->
+      combine_unknowns
+        (eval_child count
+        :: unknown_construct expr.loc "repeated preset"
+        :: List.map eval_child items)
+  | Ast.EPositioned { indexes; values } ->
+      combine_unknowns
+        (unknown_construct expr.loc "positioned preset"
+        :: List.map eval_child (indexes @ values))
   | Ast.ERange { lo; hi } ->
       combine_unknowns
         [ eval_child lo; eval_child hi; unknown_construct expr.loc "range" ]
@@ -348,6 +363,7 @@ let rec eval ?env (expr : Ast.expr Ast.node) ~(stack : string list) : ctf_result
   | Ast.EDeref { ptr } ->
       combine_unknowns
         [ eval_child ptr; unknown_construct expr.loc "pointer dereference" ]
+  | Ast.EError damage | Ast.EMissing damage -> err_of_kind expr.loc (ParseDamage damage)
 
 let eval_expr ?env expr = eval ?env expr ~stack:[]
 
@@ -360,6 +376,7 @@ let is_diagnostic_worthy_error ?(diagnose_unknown_identifiers = false)
   | UnsafeFloatComparison ->
       true
   | UnknownIdentifier _ -> diagnose_unknown_identifiers
+  | ParseDamage _ -> false
   | UnsupportedConstruct _ -> diagnose_unsupported_constructs
   | UnsupportedBuiltin _ -> false
 

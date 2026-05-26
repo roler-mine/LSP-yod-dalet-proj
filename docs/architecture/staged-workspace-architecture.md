@@ -40,6 +40,14 @@ include `quickNavIndexReady`, `quickNavIndexed`, `quickNavTotal`,
 `openDocsConverged`, `openDocsAuthoritative`, `backgroundDrainRequired`, and
 `fullyNavigable`.
 
+Readiness targets are scheduling goals recorded in reports. They are useful for
+regression detection on the same machine and workspace shape, but extreme mixed
+pressure runs on lower-spec machines can legitimately report
+`readyWithinTarget=false` while the editor path remains usable through
+provisional results. In those cases, compare startup timings, command
+latencies, diagnostics behavior, memory pressure, and readiness components
+against the local benchmark artifact.
+
 ## Query Facade
 
 Feature endpoints still live in focused modules such as
@@ -98,9 +106,10 @@ Useful counters:
 Persistent cache files are lightweight and safe to ignore. They live under the
 workspace root, mainly:
 
-- `.jovial-lsp-cache/source-index.json`
-- `.jovial-lsp-cache/skeleton-index.json`
-- `.jovial-lsp-cache/module-summaries.json`
+- `.jovial_ls/cache/source-index.json`
+- `.jovial_ls/cache/skeleton-index.json`
+- `.jovial_ls/cache/module-summaries.json`
+- `.jovial_ls/index/files.json` and related workspace index snapshots
 
 The cache stores source index metadata, quick-nav skeleton entries, module
 summaries, public signature hashes, imported COMPOOL lists, exported

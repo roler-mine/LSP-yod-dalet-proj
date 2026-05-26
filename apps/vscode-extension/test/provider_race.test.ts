@@ -83,6 +83,40 @@ async function testFallbackWinsAfterBudget(): Promise<void> {
   assert.equal(token.listenerCount(), 0);
 }
 
+async function testLateServerCanBeatFallbackWhenPreferred(): Promise<void> {
+  const token = new TestCancellationToken();
+
+  const result = await raceServerWithFallback<string | undefined>({
+    budgetMs: 1,
+    fallbackServerBudgetMs: 40,
+    preferLateServerResult: true,
+    token,
+    server: () => delay(10, "server"),
+    fallback: () => "fallback",
+    hasResult,
+  });
+
+  assert.equal(result, "server");
+  assert.equal(token.listenerCount(), 0);
+}
+
+async function testFallbackWinsAfterServerGrace(): Promise<void> {
+  const token = new TestCancellationToken();
+
+  const result = await raceServerWithFallback<string | undefined>({
+    budgetMs: 1,
+    fallbackServerBudgetMs: 5,
+    preferLateServerResult: true,
+    token,
+    server: () => delay(50, "server"),
+    fallback: () => "fallback",
+    hasResult,
+  });
+
+  assert.equal(result, "fallback");
+  assert.equal(token.listenerCount(), 0);
+}
+
 async function testQuickEmptyServerFallsBack(): Promise<void> {
   const token = new TestCancellationToken();
 
@@ -142,7 +176,7 @@ async function testMissingFallbackStopsAtLateBudget(): Promise<void> {
   assert.ok(Date.now() - started < 45);
 }
 
-async function testCancellationPreventsFallback(): Promise<void> {
+async function testCancellationUsesFallback(): Promise<void> {
   const token = new TestCancellationToken();
   let fallbackCalls = 0;
 
@@ -159,8 +193,27 @@ async function testCancellationPreventsFallback(): Promise<void> {
   setTimeout(() => token.cancel(), 1);
 
   const result = await resultPromise;
-  assert.equal(result, undefined);
-  assert.equal(fallbackCalls, 0);
+  assert.equal(result, "fallback");
+  assert.equal(fallbackCalls, 1);
+  assert.equal(token.listenerCount(), 0);
+}
+
+async function testLateCancellationKeepsFallback(): Promise<void> {
+  const token = new TestCancellationToken();
+
+  const resultPromise = raceServerWithFallback<string | undefined>({
+    budgetMs: 1,
+    fallbackServerBudgetMs: 50,
+    preferLateServerResult: true,
+    token,
+    server: () => never(),
+    fallback: () => "fallback",
+    hasResult,
+  });
+  setTimeout(() => token.cancel(), 5);
+
+  const result = await resultPromise;
+  assert.equal(result, "fallback");
   assert.equal(token.listenerCount(), 0);
 }
 
@@ -187,9 +240,12 @@ async function testServerFailureFallsBack(): Promise<void> {
 export async function run(): Promise<void> {
   await testServerWinsBeforeBudget();
   await testFallbackWinsAfterBudget();
+  await testLateServerCanBeatFallbackWhenPreferred();
+  await testFallbackWinsAfterServerGrace();
   await testQuickEmptyServerFallsBack();
   await testMissingFallbackWaitsForServer();
   await testMissingFallbackStopsAtLateBudget();
-  await testCancellationPreventsFallback();
+  await testCancellationUsesFallback();
+  await testLateCancellationKeepsFallback();
   await testServerFailureFallsBack();
 }

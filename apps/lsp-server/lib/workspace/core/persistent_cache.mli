@@ -29,8 +29,11 @@ val indexer_version : string
 val cache_dir : root:string -> string
 val cache_version_json_path : root:string -> string
 val source_index_json_path : root:string -> string
+val source_index_bin_path : root:string -> string
 val skeleton_index_json_path : root:string -> string
+val skeleton_index_bin_path : root:string -> string
 val module_summary_json_path : root:string -> string
+val module_summary_bin_path : root:string -> string
 val fingerprint_path : string -> file_metadata option
 
 val load_or_build_source_index :

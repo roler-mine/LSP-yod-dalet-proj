@@ -45,18 +45,51 @@ type module_summary_payload = {
   module_summaries : (string, file_metadata * Module_summary.t) Hashtbl.t;
 }
 
-let schema_version = 2
+type source_binary_payload = {
+  source_index : Workspace_index.t;
+  source_metadata : file_metadata list;
+}
+
+type skeleton_binary_payload = {
+  skeleton_max_bytes : int;
+  skeleton_items : (file_metadata * quick_nav_entry list) list;
+}
+
+type module_summary_binary_payload = {
+  module_summary_items : (file_metadata * Module_summary.t) list;
+}
+
+type 'a binary_envelope = {
+  be_schema_version : int;
+  be_parser_version : string;
+  be_indexer_version : string;
+  be_implementation_config_version : string;
+  be_source_extensions : string list;
+  be_payload : 'a;
+}
+
+let schema_version = 3
 let parser_version = Workspace_persistent_index.parser_version
 let indexer_version = Workspace_persistent_index.indexer_version
-let implementation_config_version = "jovial-persistent-cache-v1"
+let implementation_config_version = "jovial-persistent-cache-v2-binary"
 
-let cache_dir ~(root : string) = Filename.concat root ".jovial-lsp-cache"
+let cache_dir ~(root : string) = Workspace_storage_layout.cache_dir ~root
 let json_path ~(root : string) name = Filename.concat (cache_dir ~root) name
+let bin_path ~(root : string) name = Filename.concat (cache_dir ~root) name
 let cache_version_json_path ~(root : string) = json_path ~root "cache-version.json"
 let source_index_json_path ~(root : string) = json_path ~root "source-index.json"
+let source_index_bin_path ~(root : string) = bin_path ~root "source-index.bin"
 let skeleton_index_json_path ~(root : string) = json_path ~root "skeleton-index.json"
+let skeleton_index_bin_path ~(root : string) = bin_path ~root "skeleton-index.bin"
 let module_summary_json_path ~(root : string) =
   json_path ~root "module-summaries.json"
+let module_summary_bin_path ~(root : string) =
+  bin_path ~root "module-summaries.bin"
+
+let binary_magic = "JOVIAL_LSP_CACHE_BIN_V2\n"
+
+let normalized_source_extensions (source_extensions : string list) =
+  Source_file.normalize_extensions source_extensions |> List.sort_uniq String.compare
 
 let ensure_dir path =
   let rec loop path =
@@ -68,6 +101,63 @@ let ensure_dir path =
   loop path
 
 let read_json path = try Some (Yojson.Safe.from_file path) with _ -> None
+
+let header_matches_values ~(source_extensions : string list) ~schema ~parser
+    ~indexer ~implementation ~extensions =
+  schema = schema_version
+  && parser = parser_version
+  && indexer = indexer_version
+  && implementation = implementation_config_version
+  && List.sort_uniq String.compare extensions
+     = normalized_source_extensions source_extensions
+
+let binary_header_matches ~(source_extensions : string list)
+    (envelope : 'a binary_envelope) : bool =
+  header_matches_values ~source_extensions ~schema:envelope.be_schema_version
+    ~parser:envelope.be_parser_version ~indexer:envelope.be_indexer_version
+    ~implementation:envelope.be_implementation_config_version
+    ~extensions:envelope.be_source_extensions
+
+let read_binary_payload ~(source_extensions : string list) path : 'a option =
+  try
+    let ic = open_in_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+        let magic = really_input_string ic (String.length binary_magic) in
+        if magic <> binary_magic then None
+        else
+          let envelope : 'a binary_envelope = Marshal.from_channel ic in
+          if binary_header_matches ~source_extensions envelope then
+            Some envelope.be_payload
+          else None)
+  with _ -> None
+
+let save_binary_payload ~(source_extensions : string list) path payload =
+  ensure_dir (Filename.dirname path);
+  let tmp = path ^ ".tmp" in
+  let oc = open_out_bin tmp in
+  try
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () ->
+        output_string oc binary_magic;
+        Marshal.to_channel oc
+          {
+            be_schema_version = schema_version;
+            be_parser_version = parser_version;
+            be_indexer_version = indexer_version;
+            be_implementation_config_version = implementation_config_version;
+            be_source_extensions =
+              normalized_source_extensions source_extensions;
+            be_payload = payload;
+          }
+          [ Marshal.No_sharing ]);
+    Sys.rename tmp path
+  with exn ->
+    close_out_noerr oc;
+    (try Sys.remove tmp with _ -> ());
+    raise exn
 
 let content_hash_of_path path : string option =
   try
@@ -92,9 +182,6 @@ let save_json path json =
     close_out_noerr oc;
     (try Sys.remove tmp with _ -> ());
     raise exn
-
-let normalized_source_extensions (source_extensions : string list) =
-  Source_file.normalize_extensions source_extensions |> List.sort_uniq String.compare
 
 let json_of_string_list values =
   `List (List.map (fun value -> `String value) values)
@@ -296,8 +383,17 @@ let save_cache_version ~(root : string) ~(source_extensions : string list) :
   try save_json (cache_version_json_path ~root) (cache_header ~source_extensions [])
   with _ -> Perf_stats.tick "persistent_cache.write_failed"
 
-let read_source_payload ~(source_extensions : string list) ~(root : string) :
-    source_payload option =
+let source_payload_of_binary (payload : source_binary_payload) : source_payload =
+  let metadata_by_path = Hashtbl.create 512 in
+  List.iter
+    (fun meta ->
+      if meta.path_key <> "" then
+        Hashtbl.replace metadata_by_path meta.path_key meta)
+    payload.source_metadata;
+  { index = payload.source_index; metadata_by_path }
+
+let read_source_json_payload ~(source_extensions : string list) ~(root : string)
+    : source_payload option =
   match read_json (source_index_json_path ~root) with
   | None -> None
   | Some (`Assoc fields) when header_matches ~source_extensions fields -> (
@@ -320,6 +416,19 @@ let read_source_payload ~(source_extensions : string list) ~(root : string) :
   | Some _ ->
       Perf_stats.tick "persistent_cache.source_ignored";
       None
+
+let read_source_payload ~(source_extensions : string list) ~(root : string) :
+    source_payload option =
+  let bin = source_index_bin_path ~root in
+  if Sys.file_exists bin then
+    match read_binary_payload ~source_extensions bin with
+    | Some payload ->
+        Perf_stats.tick "persistent_cache.source_binary_hit";
+        Some (source_payload_of_binary payload)
+    | None ->
+        Perf_stats.tick "persistent_cache.source_binary_ignored";
+        None
+  else read_source_json_payload ~source_extensions ~root
 
 let index_source_extensions_match ~(source_extensions : string list)
     (idx : Workspace_index.t) =
@@ -439,17 +548,10 @@ let save_source_index ~(root : string) ~(source_extensions : string list)
       Workspace_index.all_source_paths idx
       |> List.filter_map (metadata_for_path ~source_extensions)
       |> List.sort (fun a b -> String.compare a.path_key b.path_key)
-      |> List.map json_of_file_metadata
-    in
-    let json =
-      cache_header ~source_extensions
-        [
-          ("files", `List files);
-          ("index", Workspace_index.to_yojson idx);
-        ]
     in
     save_cache_version ~root ~source_extensions;
-    save_json (source_index_json_path ~root) json
+    save_binary_payload ~source_extensions (source_index_bin_path ~root)
+      { source_index = idx; source_metadata = files }
   with _ -> Perf_stats.tick "persistent_cache.write_failed"
 
 let json_of_pos (p : Ast.Loc.pos) =
@@ -690,8 +792,20 @@ let quick_nav_entry_of_json = function
       | _ -> None)
   | _ -> None
 
-let read_skeleton_payload ~(source_extensions : string list) ~(max_bytes : int)
-    ~(root : string) : skeleton_payload option =
+let skeleton_payload_of_binary (payload : skeleton_binary_payload) :
+    skeleton_payload option =
+  if payload.skeleton_max_bytes < 0 then None
+  else
+    let skeleton_entries = Hashtbl.create 512 in
+    List.iter
+      (fun (meta, entries) ->
+        if meta.path_key <> "" then
+          Hashtbl.replace skeleton_entries meta.path_key (meta, entries))
+      payload.skeleton_items;
+    Some { skeleton_entries }
+
+let read_skeleton_json_payload ~(source_extensions : string list)
+    ~(max_bytes : int) ~(root : string) : skeleton_payload option =
   match read_json (skeleton_index_json_path ~root) with
   | None -> None
   | Some (`Assoc fields)
@@ -724,6 +838,27 @@ let read_skeleton_payload ~(source_extensions : string list) ~(max_bytes : int)
       Perf_stats.tick "persistent_cache.skeleton_ignored";
       None
 
+let read_skeleton_payload ~(source_extensions : string list) ~(max_bytes : int)
+    ~(root : string) : skeleton_payload option =
+  let bin = skeleton_index_bin_path ~root in
+  if Sys.file_exists bin then
+    match read_binary_payload ~source_extensions bin with
+    | Some payload when payload.skeleton_max_bytes = max_bytes -> (
+        match skeleton_payload_of_binary payload with
+        | Some payload ->
+            Perf_stats.tick "persistent_cache.skeleton_binary_hit";
+            Some payload
+        | None ->
+            Perf_stats.tick "persistent_cache.skeleton_binary_ignored";
+            None)
+    | Some _ ->
+        Perf_stats.tick "persistent_cache.skeleton_binary_ignored";
+        None
+    | None ->
+        Perf_stats.tick "persistent_cache.skeleton_binary_ignored";
+        None
+  else read_skeleton_json_payload ~source_extensions ~max_bytes ~root
+
 let skeleton_entries (cache : skeleton_cache) ~(path : string) :
     quick_nav_entry list option =
   Hashtbl.find_opt cache.entries_by_path (Uri_path.normalize_path_key path)
@@ -748,7 +883,7 @@ let load_skeleton_cache ~(root : string) ~(source_extensions : string list)
         payload.skeleton_entries);
   { entries_by_path }
 
-let json_of_skeleton_payload ~(source_extensions : string list)
+let _json_of_skeleton_payload ~(source_extensions : string list)
     ~(max_bytes : int) (payload : skeleton_payload) =
   let entries =
     Hashtbl.fold
@@ -802,9 +937,15 @@ let apply_skeleton_entries ~(source_extensions : string list)
 
 let write_skeleton_payload ~(root : string) ~(source_extensions : string list)
     ~(max_bytes : int) (payload : skeleton_payload) : unit =
+  let entries =
+    Hashtbl.fold
+      (fun _ (meta, entries) acc -> (meta, entries) :: acc)
+      payload.skeleton_entries []
+    |> List.sort (fun (a, _) (b, _) -> String.compare a.path_key b.path_key)
+  in
   save_cache_version ~root ~source_extensions;
-  save_json (skeleton_index_json_path ~root)
-    (json_of_skeleton_payload ~source_extensions ~max_bytes payload)
+  save_binary_payload ~source_extensions (skeleton_index_bin_path ~root)
+    { skeleton_max_bytes = max_bytes; skeleton_items = entries }
 
 type skeleton_write_buffer = {
   swb_root : string;
@@ -898,8 +1039,18 @@ let flush_skeleton_entries ~(root : string) ~(source_extensions : string list)
     | Some buffer -> flush_skeleton_buffer buffer
   with _ -> Perf_stats.tick "persistent_cache.write_failed"
 
-let read_module_summary_payload ~(source_extensions : string list) ~(root : string)
-    : module_summary_payload option =
+let module_summary_payload_of_binary
+    (payload : module_summary_binary_payload) : module_summary_payload =
+  let module_summaries = Hashtbl.create 512 in
+  List.iter
+    (fun (meta, summary) ->
+      if meta.path_key <> "" then
+        Hashtbl.replace module_summaries meta.path_key (meta, summary))
+    payload.module_summary_items;
+  { module_summaries }
+
+let read_module_summary_json_payload ~(source_extensions : string list)
+    ~(root : string) : module_summary_payload option =
   match read_json (module_summary_json_path ~root) with
   | None -> None
   | Some (`Assoc fields) when header_matches ~source_extensions fields ->
@@ -925,7 +1076,20 @@ let read_module_summary_payload ~(source_extensions : string list) ~(root : stri
       Perf_stats.tick "persistent_cache.summary_ignored";
       None
 
-let reverse_importers_json_of_entries
+let read_module_summary_payload ~(source_extensions : string list)
+    ~(root : string) : module_summary_payload option =
+  let bin = module_summary_bin_path ~root in
+  if Sys.file_exists bin then
+    match read_binary_payload ~source_extensions bin with
+    | Some payload ->
+        Perf_stats.tick "persistent_cache.summary_binary_hit";
+        Some (module_summary_payload_of_binary payload)
+    | None ->
+        Perf_stats.tick "persistent_cache.summary_binary_ignored";
+        None
+  else read_module_summary_json_payload ~source_extensions ~root
+
+let _reverse_importers_json_of_entries
     (entries : (string, file_metadata * Module_summary.t) Hashtbl.t) :
     Yojson.Safe.t =
   let reverse = Hashtbl.create 128 in
@@ -968,7 +1132,7 @@ let reverse_importers_json_of_entries
   in
   `List items
 
-let json_of_module_summary_payload ~(source_extensions : string list)
+let _json_of_module_summary_payload ~(source_extensions : string list)
     (payload : module_summary_payload) =
   let entries =
     Hashtbl.fold
@@ -993,7 +1157,7 @@ let json_of_module_summary_payload ~(source_extensions : string list)
   cache_header ~source_extensions
     [
       ("entries", `List entries);
-      ("reverseImporters", reverse_importers_json_of_entries payload.module_summaries);
+      ("reverseImporters", _reverse_importers_json_of_entries payload.module_summaries);
     ]
 
 let load_module_summary_cache ~(root : string)
@@ -1052,7 +1216,13 @@ let save_module_summary_entry ~(root : string)
     | None -> Hashtbl.remove retained (Uri_path.normalize_path_key path)
     | Some meta -> Hashtbl.replace retained meta.path_key (meta, summary));
     let payload = { module_summaries = retained } in
+    let entries =
+      Hashtbl.fold
+        (fun _ (meta, summary) acc -> (meta, summary) :: acc)
+        payload.module_summaries []
+      |> List.sort (fun (a, _) (b, _) -> String.compare a.path_key b.path_key)
+    in
     save_cache_version ~root ~source_extensions;
-    save_json (module_summary_json_path ~root)
-      (json_of_module_summary_payload ~source_extensions payload)
+    save_binary_payload ~source_extensions (module_summary_bin_path ~root)
+      { module_summary_items = entries }
   with _ -> Perf_stats.tick "persistent_cache.write_failed"

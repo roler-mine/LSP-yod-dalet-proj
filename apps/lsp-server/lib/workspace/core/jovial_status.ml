@@ -84,7 +84,9 @@ let rec owner_of_type_expr ?owner_name ?owner_loc (t : Ast.type_expr Ast.node) :
       legacy_owner_of_status_array ?owner_name ?owner_loc elem dims
   | Ast.TSpecifiedTable { elem; _ } ->
       owner_of_type_expr ?owner_name ?owner_loc elem
-  | Ast.TName _ | Ast.TPointer _ | Ast.TRecord _ | Ast.TFunc _ -> None
+  | Ast.TName _ | Ast.TScalar _ | Ast.TPointer _ | Ast.TRecord _ | Ast.TFunc _
+    ->
+      None
 
 let rec owners_of_type_expr ?owner_name ?owner_loc
     (t : Ast.type_expr Ast.node) : owner list =
@@ -99,6 +101,7 @@ let rec owners_of_type_expr ?owner_name ?owner_loc
       | None -> owners_of_type_expr ?owner_name ?owner_loc elem)
   | Ast.TSpecifiedTable { elem; _ } ->
       owners_of_type_expr ?owner_name ?owner_loc elem
+  | Ast.TScalar _ -> []
   | Ast.TPointer inner -> owners_of_type_expr ?owner_name ?owner_loc inner
   | Ast.TRecord fields ->
       List.concat_map
@@ -131,6 +134,7 @@ let rec owners_of_decl (d : Ast.decl Ast.node) : owner list =
   | Ast.DConst { name; dtype = Some dtype; _ } ->
       owners_of_type_expr ~owner_name:name.v ~owner_loc:name.loc dtype
   | Ast.DConst { dtype = None; _ } | Ast.DOverlay _ | Ast.DDirective _ -> []
+  | Ast.DError _ -> []
   | Ast.DProc p ->
       List.concat_map owners_of_decl p.v.locals @ owners_of_stmt p.v.body
 
@@ -146,14 +150,23 @@ and owners_of_stmt (s : Ast.stmt Ast.node) : owner list =
       (match init with None -> [] | Some i -> owners_of_stmt i)
       @ (match step with None -> [] | Some s -> owners_of_stmt s)
       @ owners_of_stmt body
+  | Ast.SCase { options; _ } ->
+      List.concat_map
+        (fun (opt : Ast.case_option Ast.node) -> owners_of_stmt opt.v.case_body)
+        options
   | Ast.SLabel { body; _ } -> owners_of_stmt body
   | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _
     ->
       []
+  | Ast.SError _ -> []
 
-let owners_of_program (prog : Ast.program) : owner list =
+let rec owners_of_program (prog : Ast.program) : owner list =
   List.concat_map
-    (function Ast.TopDecl d -> owners_of_decl d | Ast.TopStmt s -> owners_of_stmt s)
+    (function
+      | Ast.TopDecl d -> owners_of_decl d
+      | Ast.TopStmt s -> owners_of_stmt s
+      | Ast.TopModule m -> owners_of_program m.v.module_items
+      | Ast.TopError _ -> [])
     prog
 
 let duplicate_values (owner : owner) : (value * value) list =

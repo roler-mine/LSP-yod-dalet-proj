@@ -12,6 +12,7 @@ type dim_bound =
   | BoundInt of int
   | BoundStatus of string
   | BoundExpr of Ast.expr Ast.node
+  | BoundDamaged of Ast.parse_error
   | BoundUnknown
 
 type dim = {

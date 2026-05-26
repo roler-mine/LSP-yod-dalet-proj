@@ -1,4 +1,8 @@
-(* Module overview: Filesystem-backed workspace index for source discovery and dependency lookup. *)
+(* Module overview: Filesystem-backed source locator.
+
+   Keep this file path first. Cross-file semantic ownership belongs to
+   Cross_file_index/Workspace_query; this legacy index only feeds startup,
+   file-set health checks, scheduling, and coarse compool/source hints. *)
 
 type file_change_kind = Created | Changed | Deleted
 
@@ -82,25 +86,42 @@ let unique_keys (items : string list) : string list =
     items;
   List.rev !out
 
-let import_hints_from_prefix (text : string) : string list =
+let import_hints_from_words (words : string list) : string list =
   let rec collect acc = function
-    | ("COMPOOL" | "ICOMPOOL") :: name :: tl -> collect (name :: acc) tl
+    | marker :: name :: tl
+      when Preprocess.canonical_directive_name marker = "COMPOOL" ->
+        collect (name :: acc) tl
     | _ :: tl -> collect acc tl
     | [] -> List.rev acc
   in
-  collect [] (tokenize_upper_hint_words text) |> unique_keys
+  collect [] words |> unique_keys
 
-let entry_hint_from_prefix (text : string) : bool =
-  tokenize_upper_hint_words text |> List.exists (( = ) "PROGRAM")
+let entry_hint_from_words (words : string list) : bool =
+  List.exists (( = ) "PROGRAM") words
 
-let proc_hints_from_prefix (text : string) : string list =
+let proc_hints_from_words (words : string list) : string list =
   let rec collect acc = function
     | "DEF" :: "PROC" :: name :: tl -> collect (name :: acc) tl
     | "PROC" :: name :: tl -> collect (name :: acc) tl
     | _ :: tl -> collect acc tl
     | [] -> List.rev acc
   in
-  collect [] (tokenize_upper_hint_words text) |> unique_keys
+  collect [] words |> unique_keys
+
+let compool_def_hint_from_prefix (text : string) : string option =
+  let rec loop = function
+    | [] -> None
+    | raw :: tl ->
+        let line = String.trim raw in
+        if line = "" || line.[0] = '!' then loop tl
+        else
+          match tokenize_upper_hint_words line with
+          | "START" :: "COMPOOL" :: name :: _ | "COMPOOL" :: name :: _ ->
+              let key = normalize_key name in
+              if key = "" then loop tl else Some key
+          | _ -> loop tl
+  in
+  loop (String.split_on_char '\n' text)
 
 let file_stem_key (path : string) : string =
   let base = Filename.basename path in
@@ -211,24 +232,25 @@ let index_source_file (t : t) (path : string) : bool =
         Hashtbl.remove t.source_entry_hints path_key;
         (compool_removed, import_changed || entry_changed || proc_changed)
     | Some text ->
+        let words = tokenize_upper_hint_words text in
         let compool_changed =
-          match Preprocess.scan_compool_def ~text with
-          | Some name when normalize_key name = file_stem_key path ->
+          match compool_def_hint_from_prefix text with
+          | Some name when name = file_stem_key path ->
               set_compool_for_path t ~path ~path_key
-                ~compool_key:(normalize_key name)
+                ~compool_key:name
           | _ -> remove_compool_for_path t ~path_key
         in
         let import_changed =
           update_list_hint t.source_import_hints ~path_key
-            ~value:(import_hints_from_prefix text)
+            ~value:(import_hints_from_words words)
         in
         let entry_changed =
           update_bool_hint t.source_entry_hints ~path_key
-            ~value:(entry_hint_from_prefix text)
+            ~value:(entry_hint_from_words words)
         in
         let proc_changed =
           set_proc_hints_for_path t ~path_key
-            ~proc_hints:(proc_hints_from_prefix text)
+            ~proc_hints:(proc_hints_from_words words)
         in
         (compool_changed, import_changed || entry_changed || proc_changed)
   in

@@ -342,9 +342,8 @@ function validateBinaryArchitecture(sourcePath, target, allowArchMismatch) {
 
 function applyBundledBinaryMode(destinationPath, target) {
   const { platform } = splitTarget(target);
-  if (platform !== "linux") return;
   try {
-    fs.chmodSync(destinationPath, 0o755);
+    fs.chmodSync(destinationPath, platform === "linux" ? 0o755 : 0o666);
   } catch (err) {
     process.stderr.write(
       `[build-server] warning: failed to set execute permissions on ${destinationPath}: ${String(
@@ -354,8 +353,19 @@ function applyBundledBinaryMode(destinationPath, target) {
   }
 }
 
+function makeDestinationReplaceable(destinationPath) {
+  try {
+    if (fs.existsSync(destinationPath)) {
+      fs.chmodSync(destinationPath, 0o666);
+    }
+  } catch (_) {
+    // copyFileSync below will report a useful locked/permission error path.
+  }
+}
+
 function bundleBinary(sourcePath, destinationPath, target) {
   fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+  makeDestinationReplaceable(destinationPath);
   try {
     fs.copyFileSync(sourcePath, destinationPath);
     applyBundledBinaryMode(destinationPath, target);

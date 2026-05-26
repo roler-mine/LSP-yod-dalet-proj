@@ -1,0 +1,340 @@
+{
+  "tool": "jovial-vscode-e2e-perf",
+  "generatedAt": "2026-05-19T23:22:52.284Z",
+  "note": "Measures VS Code extension-host UX path: extension activation, LanguageClient processing, stdio JSON-RPC, real OCaml LSP server processing, provider command results, and unsaved edit-to-diagnostics latency.",
+  "workspacePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2",
+  "workspaceFolders": [
+    {
+      "name": "jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2",
+      "uri": "file:///c%3A/Users/miran/AppData/Local/Temp/jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2",
+      "fsPath": "c:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2"
+    }
+  ],
+  "workspaceInventory": {
+    "sourceFileCount": 5,
+    "sourceBytes": 261662,
+    "files": [
+      {
+        "name": "MAINCOMP.j73",
+        "bytes": 940
+      },
+      {
+        "name": "MAINMODULE (1).j73",
+        "bytes": 459
+      },
+      {
+        "name": "MAINSYSCOMP.j73",
+        "bytes": 204
+      },
+      {
+        "name": "TINYCOMP2.j73",
+        "bytes": 258860
+      },
+      {
+        "name": "UTIL.j73",
+        "bytes": 1199
+      }
+    ],
+    "featureCounts": {
+      "compoolImports": 4,
+      "compoolDeclarations": 3,
+      "icopyIncludes": 0,
+      "defines": 3,
+      "defProcedures": 4,
+      "refProcedures": 2,
+      "types": 10,
+      "tables": 6
+    },
+    "featureScanBytesPerFile": 262144
+  },
+  "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2\\UTIL.j73",
+  "serverPath": "C:\\Users\\miran\\OneDrive\\מסמכים\\GitHub\\LSP-yod-dalet-proj\\apps\\lsp-server\\_build-win32-x64\\install\\default\\bin\\jovial-lsp.exe",
+  "profile": "mixed",
+  "sampleBytes": 1199,
+  "hugeThresholdBytes": 15728640,
+  "fullParseMaxBytes": 15728640,
+  "commandSamples": 3,
+  "hoverSamples": 3,
+  "navigationSamples": 3,
+  "providerRange": {
+    "start": {
+      "line": 0,
+      "character": 0
+    },
+    "end": {
+      "line": 68,
+      "character": 4
+    }
+  },
+  "activation": {
+    "name": "openDocument.extensionActivate.serverInitialize",
+    "durationMs": 2140.963,
+    "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2\\UTIL.j73"
+  },
+  "sampleOpen": {
+    "name": "sample.openedDuringActivation",
+    "durationMs": 0,
+    "samplePath": "C:\\Users\\miran\\AppData\\Local\\Temp\\jovial-j73-examples-e2e-c7dfa0d740b94e9a800cdec6bbeb0fb2\\UTIL.j73"
+  },
+  "commands": [
+    {
+      "name": "documentSymbols",
+      "iterations": 3,
+      "durationsMs": [
+        22.318,
+        1.518,
+        1.512
+      ],
+      "stats": {
+        "minMs": 1.512,
+        "p50Ms": 1.518,
+        "p95Ms": 22.318,
+        "p99Ms": 22.318,
+        "maxMs": 22.318,
+        "avgMs": 8.449
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 13
+      },
+      "errors": []
+    },
+    {
+      "name": "hover",
+      "iterations": 3,
+      "durationsMs": [
+        39.691,
+        19.259,
+        10.758
+      ],
+      "stats": {
+        "minMs": 10.758,
+        "p50Ms": 19.259,
+        "p95Ms": 39.691,
+        "p99Ms": 39.691,
+        "maxMs": 39.691,
+        "avgMs": 23.236
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "definition",
+      "iterations": 3,
+      "durationsMs": [
+        25.611,
+        21.6,
+        16.245
+      ],
+      "stats": {
+        "minMs": 16.245,
+        "p50Ms": 21.6,
+        "p95Ms": 25.611,
+        "p99Ms": 25.611,
+        "maxMs": 25.611,
+        "avgMs": 21.152
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "references",
+      "iterations": 3,
+      "durationsMs": [
+        15.018,
+        14.199,
+        15.87
+      ],
+      "stats": {
+        "minMs": 14.199,
+        "p50Ms": 15.018,
+        "p95Ms": 15.87,
+        "p99Ms": 15.87,
+        "maxMs": 15.87,
+        "avgMs": 15.029
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 1
+      },
+      "errors": []
+    },
+    {
+      "name": "inlayHints",
+      "iterations": 3,
+      "durationsMs": [
+        87.398,
+        19.755,
+        15.924
+      ],
+      "stats": {
+        "minMs": 15.924,
+        "p50Ms": 19.755,
+        "p95Ms": 87.398,
+        "p99Ms": 87.398,
+        "maxMs": 87.398,
+        "avgMs": 41.026
+      },
+      "resultSummary": {
+        "kind": "array",
+        "length": 5
+      },
+      "errors": []
+    },
+    {
+      "name": "semanticTokens.range",
+      "iterations": 3,
+      "durationsMs": [
+        17.105,
+        15.413,
+        16.207
+      ],
+      "stats": {
+        "minMs": 15.413,
+        "p50Ms": 16.207,
+        "p95Ms": 17.105,
+        "p99Ms": 17.105,
+        "maxMs": 17.105,
+        "avgMs": 16.242
+      },
+      "resultSummary": {
+        "kind": "semanticTokens",
+        "dataLength": 635
+      },
+      "errors": []
+    },
+    {
+      "name": "completion",
+      "iterations": 3,
+      "durationsMs": [
+        24.249,
+        11.716,
+        12.415
+      ],
+      "stats": {
+        "minMs": 11.716,
+        "p50Ms": 12.415,
+        "p95Ms": 24.249,
+        "p99Ms": 24.249,
+        "maxMs": 24.249,
+        "avgMs": 16.127
+      },
+      "resultSummary": {
+        "kind": "objectWithItems",
+        "length": 39
+      },
+      "errors": []
+    }
+  ],
+  "diagnostics": {
+    "baseline": {
+      "name": "diagnostics.skippedNavigationProfile",
+      "durationMs": 0,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "brokenEdit": {
+      "name": "diagnostics.skippedNavigationProfile",
+      "durationMs": 0,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "restoredEdit": {
+      "name": "diagnostics.skippedNavigationProfile",
+      "durationMs": 0,
+      "count": 0,
+      "fingerprint": "",
+      "messages": []
+    },
+    "restoredMatchesBaseline": true,
+    "errors": []
+  },
+  "workspaceReadiness": {
+    "name": "workspace.deepSemanticReady",
+    "durationMs": 45.73,
+    "ready": true,
+    "elapsedMs": 26,
+    "targetMs": 1500,
+    "startup": {
+      "startedMs": 1779232971825.4775,
+      "readyMs": 1779232971851.5447,
+      "elapsedMs": 26,
+      "targetMs": 1500,
+      "readyWithinTarget": true,
+      "isReady": true,
+      "phase": "ready",
+      "aggressiveWindowMs": 500,
+      "aggressiveBudgetMs": 20,
+      "missNotified": false,
+      "stages": {
+        "diagHoverReady": {
+          "targetMs": 1500,
+          "elapsedMs": 26,
+          "isReady": false,
+          "readyWithinTarget": true
+        },
+        "interactiveNavReady": {
+          "targetMs": 1500,
+          "elapsedMs": 26,
+          "isReady": true,
+          "readyWithinTarget": true
+        },
+        "deepSemanticComplete": {
+          "targetMs": 1500,
+          "elapsedMs": 26,
+          "isReady": true,
+          "readyWithinTarget": true
+        }
+      },
+      "components": {
+        "indexComplete": true,
+        "indexReconcilePending": false,
+        "seedComplete": false,
+        "seedReady": true,
+        "highQueuesEmpty": false,
+        "interactiveQueuesEmpty": false,
+        "queuesEmpty": false,
+        "backgroundDrainRequired": false,
+        "hintsReady": true,
+        "rootClosureReady": true,
+        "navPrereqsReady": true,
+        "interactiveNavReady": true,
+        "quickNavComplete": true,
+        "deepSemanticComplete": true,
+        "fullyNavigable": true,
+        "quickNavIndexReady": true,
+        "quickNavIndexComplete": true,
+        "quickNavIndexed": 6,
+        "quickNavTotal": 6,
+        "quickNavPending": 0,
+        "quickNavPendingSet": 0,
+        "parseWorkerJobs": 0,
+        "parseWorkerResults": 0,
+        "parseWorkerInflight": 0,
+        "openDocsConverged": true,
+        "openDocsAuthoritative": true,
+        "openDocsPendingParse": 0,
+        "xmoduleDiagReady": true,
+        "openDiagRevalidateQueueEmpty": false,
+        "openDiagRevalidatePending": 1
+      }
+    },
+    "errors": []
+  },
+  "summary": {
+    "commandErrors": [],
+    "emptyProviderResults": [],
+    "diagnosticsRestoredToBaseline": true,
+    "diagnosticErrors": [],
+    "seededDiagnosticErrors": [],
+    "workspaceReadinessErrors": []
+  }
+}

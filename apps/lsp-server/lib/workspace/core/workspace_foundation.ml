@@ -216,6 +216,9 @@ type parse_job_payload =
       path_key : string;
       uri : T.DocumentUri.t;
       generation : int;
+      text_hash : string;
+      parse_profile : string;
+      started_ms : float;
       doc : Document.t;
     }
   | ParseJobPath of { path : string; path_key : string }
@@ -233,6 +236,9 @@ type parse_result =
       path_key : string;
       uri : T.DocumentUri.t;
       generation : int;
+      text_hash : string;
+      parse_profile : string;
+      started_ms : float;
       doc : Document.t;
     }
   | ParseResultPath of {
@@ -263,6 +269,25 @@ type module_summary_cache_entry = {
   msc_path_key : string;
   msc_summary : Module_summary.t;
   mutable msc_authority : module_summary_authority;
+}
+
+type asm_label_source = AsmConcreteLabel | AsmExportDirective
+
+type asm_label_hit = {
+  label_name : string;
+  label_key : string;
+  label_path : string;
+  label_loc : Ast.Loc.t;
+  label_source : asm_label_source;
+}
+
+type asm_file_index = {
+  asm_path : string;
+  asm_path_key : string;
+  asm_import_keys : string list;
+  asm_labels : asm_label_hit list;
+  asm_export_directives : asm_label_hit list;
+  asm_content_hash : string;
 }
 
 module Lsif_delta = struct
@@ -364,11 +389,13 @@ type t = {
   files : (string, Document.t) Hashtbl.t;
   mutable root_path : string option;
   mutable source_file_paths : string list;
+  mutable assembly_file_paths : string list;
   mutable index : Workspace_index.t option;
   mutable index_checkpoint_loaded : bool;
   mutable symbol_hints :
     ((string, string list) Hashtbl.t * (string, string list) Hashtbl.t) option;
   semantic_store : Semantic_store.t;
+  cross_file_index : Cross_file_index.t;
   semantic_tokens_cache : (string, int array) Hashtbl.t;
   sem_store_enabled : bool;
   lsif_delta_enabled : bool;
@@ -455,6 +482,10 @@ type t = {
   mutable xmodule_diag_ready_prev : bool;
   mutable source_bytes_estimate : int option;
   mutable source_bytes_estimate_count : int;
+  asm_index_by_path : (string, asm_file_index) Hashtbl.t;
+  asm_label_hits_by_key : (string, asm_label_hit list) Hashtbl.t;
+  mutable asm_index_paths_key : string list;
+  mutable asm_index_dirty : bool;
   workspace_profile_mode : workspace_profile_mode;
   root_model : root_model;
   root_heuristic_fallback : bool;
@@ -478,8 +509,10 @@ type t = {
   nav_quick_scan_offset_by_path : (string, int) Hashtbl.t;
   mutable quick_nav_index_done : int;
   mutable quick_nav_index_total : int;
-  parse_worker_jobs : parse_job Queue.t;
-  parse_worker_results : parse_result Queue.t;
+  parse_worker_jobs : bytes Queue.t;
+  parse_worker_results : bytes Queue.t;
+  parse_worker_doc_slots : (int, Document.t) Hashtbl.t;
+  mutable parse_worker_next_doc_slot : int;
   parse_worker_mtx : Mutex.t;
   parse_worker_cv : Condition.t;
   parse_worker_inflight : (string, parse_job_kind) Hashtbl.t;

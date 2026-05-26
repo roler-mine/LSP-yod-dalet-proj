@@ -44,7 +44,25 @@ let include_targets_of_tokens ~(file : string option)
     if i < 0 || i >= len then None
     else
       match tokens.(i).Parser.tok with
-      | Parser.ID raw | Parser.STRINGLIT raw -> Some (raw, tokens.(i))
+      | Parser.ID raw | Parser.FIXED_A raw | Parser.STRINGLIT raw ->
+          Some (raw, tokens.(i))
+      | _ -> None
+  in
+  let legacy_copy_marker raw =
+    String.uppercase_ascii (String.trim raw) = "ICOPY"
+  in
+  let copy_marker_at i =
+    if i < 0 || i >= len then None
+    else
+      match tokens.(i).Parser.tok with
+      | Parser.BANG when i + 1 < len -> (
+          match tokens.(i + 1).Parser.tok with
+          | Parser.ID raw | Parser.FIXED_A raw
+            when Preprocess.canonical_directive_name raw = "COPY" ->
+              Some (i, i + 1)
+          | _ -> None)
+      | Parser.ID raw | Parser.FIXED_A raw when legacy_copy_marker raw ->
+          Some (i, i)
       | _ -> None
   in
   let rec find_target i steps =
@@ -62,9 +80,9 @@ let include_targets_of_tokens ~(file : string option)
   let seen = Hashtbl.create 8 in
   let out = ref [] in
   for i = 0 to len - 1 do
-    match tokens.(i).Parser.tok with
-    | Parser.ID raw when String.uppercase_ascii (String.trim raw) = "ICOPY" -> (
-        match find_target (i + 1) 0 with
+    match copy_marker_at i with
+    | Some (directive_i, marker_i) -> (
+        match find_target (marker_i + 1) 0 with
         | None -> ()
         | Some (target, target_tok) ->
             let normalized_target = normalize_key target in
@@ -75,13 +93,13 @@ let include_targets_of_tokens ~(file : string option)
                 {
                   target = normalize_target target;
                   normalized_target;
-                  directive_loc = loc_of_token ~file tokens.(i);
+                  directive_loc = loc_of_token ~file tokens.(directive_i);
                   target_loc = loc_of_token ~file target_tok;
                   resolved_path = None;
                   source_map = [];
                 }
                 :: !out))
-    | _ -> ()
+    | None -> ()
   done;
   List.rev !out
 

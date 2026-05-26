@@ -6,7 +6,11 @@ import * as vscode from "vscode";
 import type { LanguageClient } from "vscode-languageclient/node";
 import { asFiniteInt, asRecord } from "./unknown_utils";
 
-export type StatusKind = "starting" | "running" | "stopped" | "error";
+export type StatusKind =
+  | "starting"
+  | "running"
+  | "stopped"
+  | "error";
 
 type StartupStage =
   | "ServerReady"
@@ -27,8 +31,8 @@ type RootStartupStatus = {
   navMissTargetMs?: number;
 };
 
-export const STARTUP_DIAG_TARGET_DEFAULT_MS = 1500;
-export const STARTUP_NAV_TARGET_DEFAULT_MS = 1500;
+export const STARTUP_DIAG_TARGET_DEFAULT_MS = 15000;
+export const STARTUP_NAV_TARGET_DEFAULT_MS = 15000;
 
 const startupStatusByRoot = new Map<string, RootStartupStatus>();
 
@@ -147,7 +151,9 @@ export function setStatus(
     case "error":
       status.text = `$(error) Jovial LSP: error`;
       status.color = "#ff4d4d";
-      status.tooltip = detail ?? "Jovial LSP error (click to restart)";
+      status.tooltip =
+        detail ??
+        "Jovial LSP server error or connection failure (click to restart)";
       break;
   }
 }
@@ -176,14 +182,8 @@ export function refreshStartupStatusBar(status: vscode.StatusBarItem): void {
     state.navMissElapsedMs !== undefined ||
     state.navMissTargetMs !== undefined
   ) {
-    const elapsed = state.navMissElapsedMs ?? 0;
-    const target = state.navMissTargetMs ?? STARTUP_NAV_TARGET_DEFAULT_MS;
-    setStatus(
-      status,
-      "error",
-      `Startup miss (${startupStageLabel("WorkspaceSemanticReady")}): ${elapsed}ms > ${target}ms (${label})`,
-    );
-    return;
+    state.navMissElapsedMs = undefined;
+    state.navMissTargetMs = undefined;
   }
   if (state.diagReadyElapsedMs !== undefined) {
     const target = state.diagReadyTargetMs ?? STARTUP_DIAG_TARGET_DEFAULT_MS;
@@ -198,14 +198,8 @@ export function refreshStartupStatusBar(status: vscode.StatusBarItem): void {
     state.diagMissElapsedMs !== undefined ||
     state.diagMissTargetMs !== undefined
   ) {
-    const elapsed = state.diagMissElapsedMs ?? 0;
-    const target = state.diagMissTargetMs ?? STARTUP_DIAG_TARGET_DEFAULT_MS;
-    setStatus(
-      status,
-      "error",
-      `Startup miss (${startupStageLabel("InteractiveReady")}): ${elapsed}ms > ${target}ms (${label})`,
-    );
-    return;
+    state.diagMissElapsedMs = undefined;
+    state.diagMissTargetMs = undefined;
   }
 
   const phaseLabel = startupPhaseLabel(state.phase);

@@ -5,3 +5,30 @@
 (executable
  (name parse_pipeline_bench)
  (libraries jovial_lsp_lib unix yojson str))
+
+(rule
+ (alias runtest-smoke)
+ (action
+  (run
+   ./workspace_core_suite_test.exe
+   source_set_index
+   bad_lexer_tokens_are_structured_diagnostics
+   nested_define_numeric_paste_parses_cleanly
+   call_statement_without_terminator_parses_cleanly
+   cross_file_index_ref_decl_is_import_ref
+   recursive_proc_call_requires_rec
+   workspace_query_asm_ref_proc_implementation_falls_through
+   asm_extdef_directive_is_fallback_implementation
+   worker_ipc_binary_roundtrip
+   parse_damage_suppresses_semantic_cascade
+   workspace_query_facade_preserves_feature_results
+   jovial_hover_nav_fixtures_parse_cleanly
+   startup_target_is_reporting_only)))
+
+(rule
+ (alias runtest-stability)
+ (action (run ./workspace_core_suite_test.exe)))
+
+(rule
+ (alias runtest-perf)
+ (action (run ./parse_pipeline_bench.exe --quick)))

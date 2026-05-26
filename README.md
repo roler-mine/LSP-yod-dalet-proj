@@ -139,6 +139,7 @@ Startup behavior:
 - `balanced`: diagnostics and navigation warm together.
 - `infoFirst`: hover, goto, references, and other navigation features are prioritized first; diagnostics publish after navigation readiness is reached.
 - Open-file hover and navigation readiness targets are 1500 ms by default. Files over 15 MB use the huge-file path and a 10000 ms readiness target while full background indexing continues.
+- Treat readiness targets as recorded service goals, not universal pass/fail guarantees for every machine and workspace shape. Full 20 GiB mixed-stress runs on lower-spec laptops can miss the 1500 ms target while still producing responsive provisional hover, navigation, semantic-token, and visible-diagnostic results; compare those runs against machine-local benchmark baselines.
 
 Architecture and performance docs:
 

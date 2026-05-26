@@ -1,6 +1,6 @@
 (** Module overview: Maintains searchable symbol definitions and names across the workspace. *)
 
-type symbol_id = string
+type symbol_id = Symbol_id.t
 
 type type_info = { display : string }
 
@@ -22,6 +22,7 @@ type symbol_record = {
 type t
 
 val empty : unit -> t
+val symbol_id_of_skeleton : uri:string -> Skeleton_index.symbol_decl -> symbol_id
 val add : t -> symbol_record -> unit
 val of_skeleton : Skeleton_index.skeleton_file -> t
 val by_id : t -> symbol_id -> symbol_record option

@@ -102,6 +102,35 @@ let diagnostics_through_source_map ~(generated_text : string) source_map diags =
 let uppercase = String.uppercase_ascii
 let known_exts = Source_file.with_defaults [ ".j" ]
 
+let canonical_directive_name (s : string) : string =
+  let u = uppercase (String.trim s) in
+  let u =
+    if String.length u > 0 && u.[0] = '!' then
+      String.sub u 1 (String.length u - 1)
+    else u
+  in
+  match u with
+  | "ICOMPOOL" -> "COMPOOL"
+  | "ICOPY" -> "COPY"
+  | "ISKIP" -> "SKIP"
+  | "IBEGIN" -> "BEGIN"
+  | "IEND" -> "END"
+  | "ILIST" -> "LIST"
+  | "INOLIST" -> "NOLIST"
+  | "IEJECT" -> "EJECT"
+  | "IINITIALIZE" -> "INITIALIZE"
+  | "IORDER" -> "ORDER"
+  | "ILEFTRIGHT" -> "LEFTRIGHT"
+  | "IREARRANGE" -> "REARRANGE"
+  | "IINTERFERENCE" -> "INTERFERENCE"
+  | "IREDUCIBLE" -> "REDUCIBLE"
+  | "IBASE" -> "BASE"
+  | "IISBASE" -> "ISBASE"
+  | "IDROP" -> "DROP"
+  | "ILINKAGE" -> "LINKAGE"
+  | "ITRACE" -> "TRACE"
+  | _ -> u
+
 type lex_tok = Parser.token_span
 
 type define_macro = {
@@ -137,6 +166,10 @@ let mk_loc_of_lex ~(file : string option) (sp : Lexing.position)
 
 let diag_error (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
   Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"preprocess"
+    ~message:msg loc
+
+let diag_lexer (loc : Ast.Loc.t) (msg : string) : T.Diagnostic.t =
+  Lsp_conv.diagnostic ~severity:T.DiagnosticSeverity.Error ~source:"lexer"
     ~message:msg loc
 
 let pos_of_offset ~(text : string) (off : int) : Ast.Loc.pos =
@@ -195,6 +228,21 @@ let token_builder_add (b : token_builder) (tok : lex_tok) : unit =
 let token_builder_finish (b : token_builder) : lex_tok array =
   Array.sub b.buf 0 b.len
 
+let token_builder_last (b : token_builder) : lex_tok option =
+  if b.len <= 0 then None else Some b.buf.(b.len - 1)
+
+let token_builder_finish_with_eof (b : token_builder)
+    ~(pos : Lexing.position) : lex_tok array =
+  let has_eof =
+    match token_builder_last b with
+    | Some { Parser.tok = Parser.EOF; _ } -> true
+    | _ -> false
+  in
+  if not has_eof then
+    Parser.token_span_of_lexing_positions Parser.EOF pos pos
+    |> token_builder_add b;
+  token_builder_finish b
+
 let lex_all_tokens_impl ~(debug_lexemes : bool) ~(file : string option)
     ~(text : string) ~(start_off : int) ~(start_line : int)
     ~(start_col : int) : lex_tok array =
@@ -220,6 +268,10 @@ let lex_all_tokens_impl ~(debug_lexemes : bool) ~(file : string option)
       lexbuf.lex_start_p <- start_pos;
       lexbuf.lex_curr_p <- start_pos;
       let builder = token_builder_create () in
+      let last_error_off = ref (-1) in
+      let finish_with_eof pos =
+        token_builder_finish_with_eof builder ~pos
+      in
       let rec gather () =
         try
           let tok = Lexer.token lexer lexbuf in
@@ -229,7 +281,14 @@ let lex_all_tokens_impl ~(debug_lexemes : bool) ~(file : string option)
           Parser.token_span_of_lexing_positions ?lexeme tok sp ep
           |> token_builder_add builder;
           match tok with Parser.EOF -> token_builder_finish builder | _ -> gather ()
-        with _ -> token_builder_finish builder
+        with
+        | Lexer.Lex_error (_msg, _sp, ep) ->
+            let pos = lexbuf.lex_curr_p in
+            if pos.pos_cnum > !last_error_off && pos.pos_cnum < text_len then (
+              last_error_off := pos.pos_cnum;
+              gather ())
+            else finish_with_eof ep
+        | _ -> finish_with_eof lexbuf.lex_curr_p
       in
       gather ())
 
@@ -271,6 +330,17 @@ let scan_from_token_array ~(file : string option) (arr : lex_tok array) :
   let prev_is_bang i =
     i > 0 && match tok_at arr (i - 1) with Parser.BANG -> true | _ -> false
   in
+  let directive_name_at i =
+    if i < 0 || i >= len then None
+    else
+      match tok_at arr i with
+      | Parser.COMPOOL -> Some "COMPOOL"
+      | Parser.ICOMPOOL -> Some "COMPOOL"
+      | Parser.ILINKAGE | Parser.LINKAGE -> Some "LINKAGE"
+      | Parser.ID raw | Parser.FIXED_A raw ->
+          Some (canonical_directive_name raw)
+      | _ -> None
+  in
   let find_name_after start : scanned_name option =
     let rec go j steps =
       if j >= len || steps > 12 then None
@@ -278,7 +348,7 @@ let scan_from_token_array ~(file : string option) (arr : lex_tok array) :
         match tok_at arr j with
         | Parser.LPAREN | Parser.RPAREN | Parser.COMMA ->
             go (j + 1) (steps + 1)
-        | Parser.ID raw | Parser.STRINGLIT raw ->
+        | Parser.ID raw | Parser.FIXED_A raw | Parser.STRINGLIT raw ->
             let norm = normalize_compool_name raw in
             if norm = "" then go (j + 1) (steps + 1)
             else
@@ -294,20 +364,19 @@ let scan_from_token_array ~(file : string option) (arr : lex_tok array) :
   for i = 0 to len - 1 do
     match tok_at arr i with
     | Parser.BANG -> (
-        if i + 1 < len then
-          match tok_at arr (i + 1) with
-          | Parser.COMPOOL | Parser.ICOMPOOL -> (
-              match find_name_after (i + 2) with
-              | None -> ()
-              | Some nm ->
-                  imports_rev :=
-                    {
-                      kind = Compool;
-                      name = nm.norm;
-                      loc = mk_loc_of_lex ~file nm.sp nm.ep;
-                    }
-                    :: !imports_rev)
-          | _ -> ())
+        match directive_name_at (i + 1) with
+        | Some "COMPOOL" -> (
+            match find_name_after (i + 2) with
+            | None -> ()
+            | Some nm ->
+                imports_rev :=
+                  {
+                    kind = Compool;
+                    name = nm.norm;
+                    loc = mk_loc_of_lex ~file nm.sp nm.ep;
+                  }
+                  :: !imports_rev)
+        | _ -> ())
     | Parser.ICOMPOOL when not (prev_is_bang i) -> (
         match find_name_after (i + 1) with
         | None -> ()
@@ -357,7 +426,7 @@ let parse_formals_list (arr : lex_tok array) ~(start : int) :
           if j >= len then None
           else
             match tok_at arr j with
-            | Parser.ID raw -> (
+            | Parser.ID raw | Parser.FIXED_A raw -> (
                 let acc_rev = uppercase raw :: acc_rev in
                 let j = j + 1 in
                 if j >= len then None
@@ -382,7 +451,7 @@ let parse_define_at ~(file : string option) (arr : lex_tok array) (i : int) :
           if !j >= len then None
           else
             match tok_at arr !j with
-            | Parser.ID raw ->
+            | Parser.ID raw | Parser.FIXED_A raw ->
                 incr j;
                 let sp = sp_at ~file arr (!j - 1) in
                 let ep = ep_at ~file arr (!j - 1) in
@@ -407,7 +476,9 @@ let parse_define_at ~(file : string option) (arr : lex_tok array) (i : int) :
                | _ -> ());
             (if (not !malformed) && !j < len then
                match tok_at arr !j with
-               | Parser.ID raw when is_define_list_option raw -> incr j
+               | (Parser.ID raw | Parser.FIXED_A raw)
+                 when is_define_list_option raw ->
+                   incr j
                | _ -> ());
             if !malformed || !j >= len then None
             else
@@ -586,6 +657,17 @@ let is_macro_ident_char = function
 let left_boundary (s : string) (pos : int) : bool =
   pos <= 0 || not (is_macro_ident_char s.[pos - 1])
 
+let left_boundary_for_function_macro (s : string) (pos : int) : bool =
+  if left_boundary s pos then true
+  else if pos <= 0 || not (match s.[pos - 1] with '0' .. '9' -> true | _ -> false)
+  then false
+  else
+    let j = ref (pos - 1) in
+    while !j >= 0 && match s.[!j] with '0' .. '9' -> true | _ -> false do
+      decr j
+    done;
+    !j < 0 || not (is_macro_ident_char s.[!j])
+
 let right_boundary (s : string) (pos : int) : bool =
   pos >= String.length s || not (is_macro_ident_char s.[pos])
 
@@ -627,7 +709,7 @@ let find_macro_match ~(file : string option) ~(raw_text : string)
     | [] -> None
     | m :: tl ->
         if
-          left_boundary s pos && starts_with_ci s ~pos m.name
+          left_boundary_for_function_macro s pos && starts_with_ci s ~pos m.name
           && right_boundary s (pos + String.length m.name)
         then
           let after_name = pos + String.length m.name in
@@ -966,6 +1048,28 @@ let scan_compool_def ~(text : string) : string option =
 
 let run_from_tokens ~(file : string option) ~(text : string)
     ~(tokens : lex_tok array) : result * bool =
+  let lexer_diags =
+    tokens
+    |> Array.to_list
+    |> List.filter_map (fun (span : lex_tok) ->
+           let loc =
+             mk_loc_of_lex ~file
+               (Parser.token_span_start_p ~file span)
+               (Parser.token_span_end_p ~file span)
+           in
+           match span.Parser.tok with
+           | Parser.BAD_CHAR raw ->
+               Some (diag_lexer loc ("Invalid character: " ^ raw))
+           | Parser.BAD_STRING reason ->
+               Some (diag_lexer loc ("Bad string literal: " ^ reason))
+           | Parser.BAD_COMMENT reason ->
+               Some (diag_lexer loc ("Bad comment: " ^ reason))
+           | Parser.BAD_DIRECTIVE reason ->
+               Some (diag_lexer loc ("Bad directive: " ^ reason))
+           | Parser.BAD_LITERAL reason ->
+               Some (diag_lexer loc ("Bad literal: " ^ reason))
+           | _ -> None)
+  in
   let all_macros, define_spans = collect_define_macros ~file tokens in
   let macros = latest_define_macros all_macros in
   let raw_text = text in
@@ -1025,7 +1129,7 @@ let run_from_tokens ~(file : string option) ~(text : string)
       compool_def;
       defines;
       source_map;
-      diags = mismatch_diags @ expansion_diags;
+      diags = lexer_diags @ mismatch_diags @ expansion_diags;
     },
     expanded_changed )
 

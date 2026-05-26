@@ -6,7 +6,9 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 $dirsToRemove = @(
   (Join-Path $repoRoot "_build"),
+  (Join-Path $repoRoot ".jovial_ls"),
   (Join-Path $repoRoot ".jovial-lsp"),
+  (Join-Path $repoRoot "apps\\.jovial_ls"),
   (Join-Path $repoRoot "apps\\.jovial-lsp"),
   (Join-Path $repoRoot "apps\\lsp-server\\_build"),
   (Join-Path $repoRoot "apps\\lsp-server\\_build-linux-x64"),

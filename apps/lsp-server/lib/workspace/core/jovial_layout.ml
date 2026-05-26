@@ -199,6 +199,17 @@ let rec logical_size_of_type (config : implementation_config)
     (env : Jovial_compile_time.env) (ty : Ast.type_expr Ast.node) : size_bits =
   match ty.v with
   | Ast.TName id -> builtin_logical_size config env id.v []
+  | Ast.TScalar { base; sizes; _ } ->
+      let name =
+        match base with
+        | Ast.ScalarUnsigned -> "U"
+        | Ast.ScalarSigned -> "S"
+        | Ast.ScalarFloat -> "F"
+        | Ast.ScalarFixed -> "A"
+        | Ast.ScalarBit -> "B"
+        | Ast.ScalarChar -> "C"
+      in
+      builtin_logical_size config env name sizes
   | Ast.TPointer _ -> unknown "pointer size is target-specific"
   | Ast.TStatus _ -> unknown "status representation is target-specific"
   | Ast.TFunc _ -> unknown "procedure layout is not data layout"

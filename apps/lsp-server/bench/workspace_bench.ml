@@ -782,6 +782,7 @@ let rec collect_sources root =
     |> List.sort String.compare
 
 let clear_persistent_caches root =
+  remove_tree (Lib.Workspace_storage_layout.workspace_dir ~root);
   remove_tree (Filename.concat root ".jovial-lsp-cache");
   remove_tree (Filename.concat root ".jovial-lsp")
 

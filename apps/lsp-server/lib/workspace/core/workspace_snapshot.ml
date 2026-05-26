@@ -132,6 +132,7 @@ let ensure_system_scope scopes =
          name = None;
          loc = Ast.Loc.none;
          symbols = [];
+         symbol_bindings = [];
          imports = [];
        })
 

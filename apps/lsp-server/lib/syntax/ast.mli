@@ -74,12 +74,31 @@ val is_recovered : 'a node -> bool
 
 type ident = string node
 
+type parse_error = {
+  message : string;
+  expected : string list;
+  actual : string option;
+  recovery_kind : string;
+}
+
 type literal =
   | LInt of string
   | LFloat of string
+  | LBit of { bead_size : int; beads : string; raw : string }
   | LString of string
   | LChar of char
   | LBool of bool
+  | LNull
+
+type round_mode = Round | Truncate
+
+type scalar_base =
+  | ScalarUnsigned
+  | ScalarSigned
+  | ScalarFloat
+  | ScalarFixed
+  | ScalarBit
+  | ScalarChar
 
 type unop = UPlus | UMinus | UNot | UBitNot
 
@@ -107,6 +126,11 @@ type binop =
 
 type type_expr =
   | TName of ident
+  | TScalar of {
+      base : scalar_base;
+      round : round_mode option;
+      sizes : expr node list;
+    }
   | TArray of { elem : type_expr node; dims : expr node list }
   | TSpecifiedTable of {
       elem : type_expr node;
@@ -154,6 +178,8 @@ and overlay_decl = {
 and expr =
   | EName of ident
   | ELit of literal
+  | EError of parse_error
+  | EMissing of parse_error
   | EUnop of { op : unop; rhs : expr node }
   | EBinop of { op : binop; lhs : expr node; rhs : expr node }
   | ECall of { callee : ident; args : expr node list }
@@ -161,13 +187,28 @@ and expr =
   | EField of { base : expr node; field : ident }
   | EConvert of { ty : type_expr node; expr : expr node }
   | EPreset of { base : expr node; items : expr node list }
+  | EOmitted
+  | ERepeat of { count : expr node; items : expr node list }
+  | EPositioned of { indexes : expr node list; values : expr node list }
   | ERange of { lo : expr node; hi : expr node }
   | EAt of { field : expr node; ptr : expr node }
   | EDeref of { ptr : expr node }
   | EParen of expr node
 
+and case_index =
+  | CaseDefault
+  | CaseValue of expr node
+  | CaseRange of expr node * expr node
+
+and case_option = {
+  case_indexes : case_index node list;
+  case_body : stmt node;
+  case_fallthru : bool;
+}
+
 and stmt =
   | SEmpty
+  | SError of parse_error
   | SBlock of stmt node list
   | SDecl of decl node
   | SAssign of { lhs : expr node; rhs : expr node }
@@ -184,6 +225,7 @@ and stmt =
       step : stmt node option;
       body : stmt node;
     }
+  | SCase of { selector : expr node; options : case_option node list }
   | SReturn of expr node option
   | SLabel of { label : ident; body : stmt node }
   | SGoto of ident
@@ -193,6 +235,7 @@ and proc_use = UseNormal | UseRec | UseRent
 and external_modifier = LocalDecl | DefDecl | RefDecl
 and data_decl_kind = DataItem | DataTable | DataBlock | DataUnknown
 and decl =
+  | DError of parse_error
   | DVar of {
       name : ident;
       dtype : type_expr node;
@@ -223,6 +266,7 @@ and proc = {
   params : param node list;
   returns : type_expr node option;
   use_attr : proc_use;
+  linkage : ident option;
   locals : decl node list;
   body : stmt node;
   external_modifier : external_modifier;
@@ -230,7 +274,23 @@ and proc = {
   is_inline : bool;
 }
 
-type toplevel = TopDecl of decl node | TopStmt of stmt node
+type module_kind =
+  | MainProgram of ident option
+  | CompoolModule of ident option
+  | ProcedureModule
+  | UnknownModule
+
+type toplevel =
+  | TopDecl of decl node
+  | TopStmt of stmt node
+  | TopModule of jovial_module node
+  | TopError of parse_error node
+
+and jovial_module = {
+  module_kind : module_kind;
+  module_items : toplevel list;
+}
+
 type program = toplevel list
 
 module Debug : sig

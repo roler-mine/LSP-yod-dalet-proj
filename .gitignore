@@ -56,7 +56,9 @@ extension_proj/pnpm-debug.log*
 **/.ocamlinit
 
 # Workspace index + scratch files
+**/.jovial_ls/
 **/.jovial-lsp/
+**/.jovial-lsp-cache/
 .jovial-lsp-index-checkpoint.json
 .jovial-lsp-index-resume.txt
 apps/lsp-server/_tmp_*.txt

@@ -8,8 +8,12 @@ type query_context = {
   pos : T.Position.t;
 }
 
+type symbol_ref_id =
+  | LegacySymbolId of string
+  | CrossFileSymbolId of Cross_file_index.symbol_id
+
 type symbol_ref = {
-  symbol_id : string option;
+  symbol_id : symbol_ref_id option;
   name : string;
   key : string;
   loc : Ast.Loc.t;
@@ -35,11 +39,41 @@ val readiness_for_doc :
 val symbol_at_position : query_context -> symbol_ref option query_result
 val hover_target_at_position : query_context -> symbol_ref option query_result
 val definition_at_position : query_context -> definition_result
+val implementation_at_position : query_context -> definition_result
+val type_definition_at_position : query_context -> definition_result
 val references_at_position :
   include_declaration:bool -> query_context -> references_result
 val hover_at_position : query_context -> hover_result
+val completions_at_position :
+  query_context -> T.CompletionItem.t list query_result
+
+val diagnostics_for_file :
+  Workspace_state.t -> uri:T.DocumentUri.t -> T.Diagnostic.t list
+
+val document_symbols_for_file :
+  Workspace_state.t ->
+  uri:T.DocumentUri.t ->
+  [ `DocumentSymbol of T.DocumentSymbol.t
+  | `SymbolInformation of T.SymbolInformation.t ]
+  list
+  option
+
+val workspace_symbols_for :
+  Workspace_state.t -> query:string -> T.SymbolInformation.t list
+
+val workspace_symbols_stream :
+  Workspace_state.t ->
+  query:string ->
+  emit:(T.SymbolInformation.t list -> unit) ->
+  T.SymbolInformation.t list
 
 val definition_locations_for :
+  Workspace_state.t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
+
+val type_definition_locations_for :
+  Workspace_state.t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
+
+val implementation_locations_for :
   Workspace_state.t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Location.t list
 
 val references_locations_for :
@@ -51,6 +85,25 @@ val references_locations_for :
 
 val hover_for :
   Workspace_state.t -> uri:T.DocumentUri.t -> pos:T.Position.t -> T.Hover.t option
+
+val completion_items_for :
+  Workspace_state.t ->
+  uri:T.DocumentUri.t ->
+  pos:T.Position.t ->
+  T.CompletionItem.t list
+
+val prepare_rename_for :
+  Workspace_state.t ->
+  uri:T.DocumentUri.t ->
+  pos:T.Position.t ->
+  [ `Range of T.Range.t | `RangeWithPlaceholder of T.Range.t * string ] option
+
+val rename_for :
+  Workspace_state.t ->
+  uri:T.DocumentUri.t ->
+  pos:T.Position.t ->
+  new_name:string ->
+  T.WorkspaceEdit.t option
 
 val explain_symbol_resolution_json :
   Workspace_state.t ->

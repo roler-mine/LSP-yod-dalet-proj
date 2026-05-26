@@ -68,6 +68,7 @@ const serverRestartConfigKeys = [
   "jovial.workspace.manualRootFiles",
   "jovial.workspace.maxStartupFiles",
   "jovial.workspace.extraSourceFileExtensions",
+  "jovial.workspace.extraAssemblyFileExtensions",
   "jovial.background",
   "jovial.background.indexBudgetMs",
   "jovial.background.diagBatchSize",
@@ -231,7 +232,7 @@ export function registerExtensionHooks({
         await startClient(context, output, status);
       } catch (e) {
         output.appendLine(`restart failed: ${String(e)}`);
-        setStatus(status, "error", `restart failed: ${String(e)}`);
+        setStatus(status, "stopped", `restart failed: ${String(e)}`);
       }
     }),
   );

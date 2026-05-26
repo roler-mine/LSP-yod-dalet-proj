@@ -59,25 +59,24 @@ let completion_keywords : (string * int * string option) list =
     ("CASE", 14, None);
     ("DEFAULT", 14, None);
     ("COMPOOL", 14, Some "compool directive");
-    ("ICOMPOOL", 14, Some "import compool directive");
-    ("ICOPY", 14, Some "copy directive");
-    ("ISKIP", 14, Some "skip directive");
-    ("IBEGIN", 14, Some "directive scope begin");
-    ("IEND", 14, Some "directive scope end");
-    ("ILINKAGE", 14, Some "linkage directive");
-    ("ITRACE", 14, Some "trace directive");
-    ("IINTERFERENCE", 14, Some "interference directive");
-    ("IREDUCIBLE", 14, Some "reducible directive");
-    ("ILIST", 14, Some "listing directive");
-    ("INOLIST", 14, Some "listing directive");
-    ("IEJECT", 14, Some "listing directive");
-    ("IBASE", 14, Some "base directive");
-    ("IISBASE", 14, Some "base directive");
-    ("IDROP", 14, Some "drop directive");
-    ("ILEFTRIGHT", 14, Some "layout directive");
-    ("IREARRANGE", 14, Some "rearrange directive");
-    ("IINITIALIZE", 14, Some "initialize directive");
-    ("IORDER", 14, Some "order directive");
+    ("COPY", 14, Some "copy directive");
+    ("SKIP", 14, Some "skip directive");
+    ("BEGIN", 14, Some "directive scope begin");
+    ("END", 14, Some "directive scope end");
+    ("LINKAGE", 14, Some "linkage directive");
+    ("TRACE", 14, Some "trace directive");
+    ("INTERFERENCE", 14, Some "interference directive");
+    ("REDUCIBLE", 14, Some "reducible directive");
+    ("LIST", 14, Some "listing directive");
+    ("NOLIST", 14, Some "listing directive");
+    ("EJECT", 14, Some "listing directive");
+    ("BASE", 14, Some "base directive");
+    ("ISBASE", 14, Some "base directive");
+    ("DROP", 14, Some "drop directive");
+    ("LEFTRIGHT", 14, Some "layout directive");
+    ("REARRANGE", 14, Some "rearrange directive");
+    ("INITIALIZE", 14, Some "initialize directive");
+    ("ORDER", 14, Some "order directive");
     ("DEFINE", 14, Some "macro directive");
     ("PROGRAM", 14, Some "program directive");
     ("BLOCK", 14, Some "block directive");
@@ -143,7 +142,8 @@ let completion_functions_builtin : (string * int * string option) list =
 let completion_snippets : (string * string * int * string option) list =
   [
     ("!COMPOOL", "!COMPOOL(\"COMP\");", 15, Some "import compool");
-    ("!ICOMPOOL", "!ICOMPOOL(\"COMP\");", 15, Some "import compool");
+    ("!COPY", "!COPY(\"INC.j73\");", 15, Some "copy include");
+    ("!LINKAGE", "!LINKAGE BIF;", 15, Some "linkage directive");
   ]
 
 let completion_item_kind_of_lsp_int (kind : int) : T.CompletionItemKind.t =

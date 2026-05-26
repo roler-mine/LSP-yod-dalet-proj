@@ -1,7 +1,12 @@
 (* Module overview: Models lexical and module scopes for symbol lookup across Jovial files. *)
 
-type symbol_id = string
+type symbol_id = Symbol_id.t
 type import_id = int
+
+type symbol_binding = {
+  symbol_id : symbol_id;
+  normalized_name : string;
+}
 
 type scope_kind =
   | SystemScope
@@ -23,6 +28,7 @@ type scope = {
   name : string option;
   loc : Ast.Loc.t;
   symbols : symbol_id list;
+  symbol_bindings : symbol_binding list;
   imports : import_id list;
 }
 
@@ -75,23 +81,11 @@ let kind_of_symbol (sym : Skeleton_index.symbol_decl) : scope_kind option =
   | Skeleton_index.Define -> Some MacroScope
   | _ -> None
 
-let symbol_id ~(uri : string) (sym : Skeleton_index.symbol_decl) =
-  Printf.sprintf "%s:%s:%d:%d" uri sym.normalized_name
-    sym.loc.Ast.Loc.start_pos.offset sym.loc.Ast.Loc.end_pos.offset
-
-let string_contains_substring haystack needle =
-  let h = String.length haystack in
-  let n = String.length needle in
-  if n = 0 then true
-  else
-    let rec loop i =
-      i + n <= h
-      && (String.sub haystack i n = needle || loop (i + 1))
-    in
-    loop 0
-
-let symbol_id_matches_name ~(normalized_name : string) (id : symbol_id) : bool =
-  string_contains_substring id (":" ^ normalized_name ^ ":")
+let symbol_binding ~(uri : string) (sym : Skeleton_index.symbol_decl) =
+  {
+    symbol_id = Symbol_index.symbol_id_of_skeleton ~uri sym;
+    normalized_name = sym.normalized_name;
+  }
 
 let lookup_symbol_id t ~(scope_id : int) ~(normalized_name : string) :
     symbol_id option =
@@ -100,8 +94,11 @@ let lookup_symbol_id t ~(scope_id : int) ~(normalized_name : string) :
          match by_id t id with
          | None -> None
          | Some scope ->
-             scope.symbols
-             |> List.find_opt (symbol_id_matches_name ~normalized_name))
+             scope.symbol_bindings
+             |> List.find_map (fun binding ->
+                    if binding.normalized_name = normalized_name then
+                      Some binding.symbol_id
+                    else None))
 
 let module_scope_kind = function
   | Skeleton_index.CompoolModule -> CompoolScope
@@ -133,6 +130,7 @@ let of_skeleton (sk : Skeleton_index.skeleton_file) : t =
       name = None;
       loc = Ast.Loc.none;
       symbols = [];
+      symbol_bindings = [];
       imports = [];
     }
   in
@@ -147,12 +145,17 @@ let of_skeleton (sk : Skeleton_index.skeleton_file) : t =
       name = sk.module_name;
       loc = module_loc sk;
       symbols = [];
+      symbol_bindings = [];
       imports = [];
     }
   in
   ignore (add_scope t module_scope);
   let body_symbols =
-    Skeleton_index.symbols sk |> List.map (symbol_id ~uri:sk.uri)
+    Skeleton_index.symbols sk
+    |> List.map (Symbol_index.symbol_id_of_skeleton ~uri:sk.uri)
+  in
+  let body_symbol_bindings =
+    Skeleton_index.symbols sk |> List.map (symbol_binding ~uri:sk.uri)
   in
   ignore
     (add_scope t
@@ -163,6 +166,7 @@ let of_skeleton (sk : Skeleton_index.skeleton_file) : t =
          name = sk.module_name;
          loc = Ast.Loc.none;
          symbols = body_symbols;
+         symbol_bindings = body_symbol_bindings;
          imports = List.mapi (fun i _ -> i) sk.imports;
        });
   let next = ref 3 in
@@ -173,6 +177,7 @@ let of_skeleton (sk : Skeleton_index.skeleton_file) : t =
          | Some kind ->
              let id = !next in
              incr next;
+             let binding = symbol_binding ~uri:sk.uri sym in
              ignore
                (add_scope t
                   {
@@ -181,7 +186,8 @@ let of_skeleton (sk : Skeleton_index.skeleton_file) : t =
                     kind;
                     name = Some sym.name;
                     loc = sym.loc;
-                    symbols = [ symbol_id ~uri:sk.uri sym ];
+                    symbols = [ binding.symbol_id ];
+                    symbol_bindings = [ binding ];
                     imports = [];
                   }));
   t

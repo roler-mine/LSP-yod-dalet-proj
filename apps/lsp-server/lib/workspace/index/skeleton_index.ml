@@ -157,7 +157,23 @@ let icopy_imports ~(file : string option) (tokens : Preprocess.lex_tok array) :
     if i < 0 || i >= len then None
     else
       match tokens.(i).Parser.tok with
-      | Parser.ID s | Parser.STRINGLIT s -> Some (s, tokens.(i))
+      | Parser.ID s | Parser.FIXED_A s | Parser.STRINGLIT s ->
+          Some (s, tokens.(i))
+      | _ -> None
+  in
+  let copy_marker_at i =
+    if i < 0 || i >= len then None
+    else
+      match tokens.(i).Parser.tok with
+      | Parser.BANG when i + 1 < len -> (
+          match tokens.(i + 1).Parser.tok with
+          | Parser.ID raw | Parser.FIXED_A raw
+            when Preprocess.canonical_directive_name raw = "COPY" ->
+              Some (i + 1)
+          | _ -> None)
+      | Parser.ID raw | Parser.FIXED_A raw
+        when normalize_name raw = "ICOPY" ->
+          Some i
       | _ -> None
   in
   let rec find_target i steps =
@@ -174,13 +190,13 @@ let icopy_imports ~(file : string option) (tokens : Preprocess.lex_tok array) :
   in
   let out = ref [] in
   for i = 0 to len - 1 do
-    match tokens.(i).Parser.tok with
-    | Parser.ID raw when normalize_name raw = "ICOPY" -> (
-        match find_target (i + 1) 0 with
+    match copy_marker_at i with
+    | Some marker_i -> (
+        match find_target (marker_i + 1) 0 with
         | None -> ()
         | Some (name, tok) ->
             out := { kind = Icopy; name; loc = loc_of_token ~file tok } :: !out)
-    | _ -> ()
+    | None -> ()
   done;
   List.rev !out
 
@@ -245,7 +261,8 @@ let of_syntax_cache ~(uri : string) ~(rev : int) ~(size_bytes : int)
     locals;
     defines;
     labels;
-    diagnostics = syntax.preprocess.diags @ syntax.parse.diags;
+    diagnostics =
+      syntax.preprocess.diags @ syntax.parse.diags @ syntax.parse.recovery_diags;
   }
 
 let of_document (doc : Document.t) : skeleton_file option =

@@ -145,6 +145,16 @@ let warmup_suppress_crossmodule_unresolved =
 let bg_seed_paths_per_tick =
   max 1 (Env_utils.nonneg_int "JOVIAL_BG_SEED_PATHS_PER_TICK" ~default:128)
 
+let startup_foreground_nav_index_budget_ms =
+  max 0
+    (Env_utils.nonneg_int "JOVIAL_STARTUP_FOREGROUND_NAV_INDEX_BUDGET_MS"
+       ~default:350)
+
+let post_startup_large_parse_idle_quiet_ms =
+  max 0
+    (Env_utils.nonneg_int "JOVIAL_POST_STARTUP_LARGE_PARSE_IDLE_QUIET_MS"
+       ~default:30000)
+
 let nav_soft_budget_ms =
   max 1 (Env_utils.nonneg_int "JOVIAL_NAV_SOFT_BUDGET_MS" ~default:1800)
 

@@ -46,6 +46,79 @@ let macro_reference_locations (budget : nav_budget) (ws : t) (doc : Document.t)
   in
   locations_with_budget budget occs
 
+let macro_key_in_doc (doc : Document.t) (key : string) : bool =
+  key <> ""
+  && List.exists
+       (fun (d : Preprocess.define) -> d.Preprocess.key = key)
+       doc.Document.defines
+
+let macro_target_def_at_position_if_candidate (doc : Document.t)
+    (pos : T.Position.t) : Workspace_nav_model.def option =
+  match define_under_cursor doc pos with
+  | Some (dm, _) when position_in_loc pos dm.Preprocess.loc ->
+      Some (def_of_preprocess_define doc dm)
+  | Some _ | None -> (
+      match nav_word_at_position doc pos with
+      | None -> None
+      | Some (nm, _) ->
+          let key = normalize_name nm in
+          if not (macro_key_in_doc doc key) then None
+          else
+            Workspace_foundation.Perf_stats.time "query.macro_graph_ms"
+              (fun () -> macro_target_def_at_position doc pos))
+
+let startup_fast_references_active (ws : t) (doc : Document.t) : bool =
+  let text_len = String.length doc.Document.text in
+  let large_for_interactive =
+    text_len >= min ws.bg_large_file_bytes ws.full_semantic_tokens_max_bytes
+  in
+  (doc.Document.parse_rev <> doc.Document.rev && large_for_interactive)
+  || (ws.startup_fully_nav_ready_ms = None
+     &&
+     (large_for_interactive
+     ||
+     match Workspace_runtime.workspace_profile_for_budget ws with
+     | Workspace_foundation.ProfileLarge -> true
+     | Workspace_foundation.ProfileSmall | Workspace_foundation.ProfileMedium ->
+         false))
+
+let startup_reference_defs_for_key (ws : t) (doc : Document.t) ~(key : string) :
+    def list =
+  if
+    key = ""
+    || String.length doc.Document.text
+       > max 2_097_152 ws.full_semantic_tokens_max_bytes
+  then
+    []
+  else
+    fallback_line_defs doc
+    |> List.filter (fun d -> d.key = key && same_uri d.uri doc.Document.uri)
+
+let startup_fast_reference_locations (budget : nav_budget) (ws : t)
+    (doc : Document.t) ~(pos : T.Position.t) ~(include_decl : bool) :
+    T.Location.t list =
+  let pos = adjust_nav_position doc pos in
+  match nav_word_at_position doc pos with
+  | None -> []
+  | Some (nm, word_loc) ->
+      let key = normalize_name nm in
+      if key = "" then []
+      else
+        let defs =
+          if include_decl then [] else startup_reference_defs_for_key ws doc ~key
+        in
+        let def_keys = def_keys_for_defs defs in
+        let occs =
+          Workspace_foundation.Perf_stats.time
+            "query.references_startup_current_doc_ms" (fun () ->
+              occurrences_in_doc_fallback ~budget doc ~key)
+        in
+        let occs =
+          (doc.Document.uri, word_loc) :: occs
+          |> filter_declarations ~include_decl ~def_keys
+        in
+        locations_with_budget budget occs
+
 let references_locations_for ?budget (ws : t) ~(uri : T.DocumentUri.t)
     ~(pos : T.Position.t) ~(include_decl : bool) : T.Location.t list =
   match doc_of_uri ws uri with
@@ -54,6 +127,8 @@ let references_locations_for ?budget (ws : t) ~(uri : T.DocumentUri.t)
       let budget = match budget with Some b -> b | None -> nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then []
+        else if startup_fast_references_active ws doc then
+          startup_fast_reference_locations budget ws doc ~pos ~include_decl
         else
           match import_under_cursor doc pos with
           | Some imp ->
@@ -78,7 +153,7 @@ let references_locations_for ?budget (ws : t) ~(uri : T.DocumentUri.t)
                 in
                 locations_with_budget budget occs
           | None -> (
-              match macro_target_def_at_position doc pos with
+              match macro_target_def_at_position_if_candidate doc pos with
               | Some target ->
                   macro_reference_locations budget ws doc target ~include_decl
               | None ->
@@ -223,6 +298,12 @@ let references_locations_stream ?budget (ws : t) ~(uri : T.DocumentUri.t)
       let budget = match budget with Some b -> b | None -> nav_budget_start ws in
       let compute () =
         if nav_budget_check budget then []
+        else if startup_fast_references_active ws doc then
+          let locations =
+            startup_fast_reference_locations budget ws doc ~pos ~include_decl
+          in
+          if locations <> [] then emit locations;
+          locations
         else
           let current, imported, workspace = reference_doc_stages ws doc in
           match import_under_cursor doc pos with
@@ -240,7 +321,7 @@ let references_locations_stream ?budget (ws : t) ~(uri : T.DocumentUri.t)
                   ~def_keys:(def_keys_for_defs defs) ~key current imported
                   workspace
           | None -> (
-              match macro_target_def_at_position doc pos with
+              match macro_target_def_at_position_if_candidate doc pos with
               | Some target ->
                   let locations =
                     macro_reference_locations budget ws doc target ~include_decl

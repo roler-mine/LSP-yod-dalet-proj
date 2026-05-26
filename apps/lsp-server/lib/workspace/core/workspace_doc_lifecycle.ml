@@ -253,8 +253,9 @@ let diagnostic_at_line ~line ~character ~message : T.Diagnostic.t =
     data = None;
   }
 
-(* Large-file didChange can intentionally defer full parsing; this bounded
-   check catches obvious source-shape breakage so diagnostics still move. *)
+(* Large-file didChange can intentionally defer full parsing. Keep parser
+   diagnostics quiet until the current revision has an authoritative parse, so
+   the Problems pane does not fill with speculative parser noise. *)
 let provisional_live_edit_parse_diags (doc : Document.t) : T.Diagnostic.t list =
   match first_significant_line doc.Document.text with
   | Some (line, character, text) when first_word_upper text <> "START" ->
@@ -270,8 +271,9 @@ let with_provisional_live_edit_diags (doc : Document.t) : Document.t =
   match provisional_live_edit_parse_diags doc with
   | [] -> doc
   | diags ->
-      Perf_stats.tick "diag.open.provisional_live_edit";
-      Document.with_parse_diags diags doc
+      let _ = diags in
+      Perf_stats.tick "diag.open.provisional_live_edit_suppressed";
+      doc
 
 let doc_has_compool_import (doc : Document.t) : bool =
   Document.imports doc
@@ -363,8 +365,13 @@ let open_doc_install ?lsp_version ?(force_provisional : bool = false)
       let path_key = normalize_path_key p in
       if should_defer_parse then (
         Hashtbl.remove ws.bg_parsed path_key;
-        enqueue_bg_path ws ~lane:LaneOpen ~reason_group:"did_open_deferred"
-          ~high:true p)
+        if
+          String.length text >= ws.bg_large_file_bytes
+          && quick_nav_index_complete ws
+        then Perf_stats.tick "didopen.large_parse_deferred_nav_ready"
+        else
+          enqueue_bg_path ws ~lane:LaneOpen ~reason_group:"did_open_deferred"
+            ~high:true p)
       else Hashtbl.replace ws.bg_parsed path_key true
   | None -> ());
   if not should_defer_parse then (
@@ -493,7 +500,7 @@ let change_doc ?lsp_version (ws : t) ~(uri : T.DocumentUri.t)
               Perf_stats.tick "change.parse_deferred";
               store_doc_fast ws uri (with_provisional_live_edit_diags doc_fast);
               pump_index_background ws)
-            else
+            else (
               let doc' =
                 try
                   Perf_stats.time "parse.change_doc" (fun () ->
@@ -505,6 +512,7 @@ let change_doc ?lsp_version (ws : t) ~(uri : T.DocumentUri.t)
               let semantic_mode = semantic_mode_for_rev doc'.rev in
               store_doc ~import_lookup_pump:false ~semantic_mode ws uri doc';
               pump_index_background ws);
+        );
         (match Hashtbl.find_opt ws.docs uri with
         | Some latest ->
             ignore
@@ -552,7 +560,8 @@ let close_doc (ws : t) ~(uri : T.DocumentUri.t) : unit =
      | Some snap when snap.Semantic_store.Snapshot.path_key <> None -> ()
      | _ ->
          Perf_stats.tick "query.cache.invalidate_uri";
-         Semantic_store.remove_uri ws.semantic_store ~uri);
+         Semantic_store.remove_uri ws.semantic_store ~uri;
+         Cross_file_index.remove_uri ws.cross_file_index ~uri);
   pump_index_background ws;
   update_startup_ready_state ws
 
@@ -666,10 +675,17 @@ let apply_watched_file_changes (ws : t)
             Semantic_store.invalidate_path_and_dependents ws.semantic_store
               ~path_key
           in
+          let cross_removed =
+            Cross_file_index.invalidate_path_and_dependents ws.cross_file_index
+              ~path_key
+          in
           if removed <> [] then
             Perf_stats.observe_ms "query.cache.invalidate_path_removed"
               (float_of_int (List.length removed));
-          if removed <> [] then sem_dirty := true))
+          if cross_removed <> [] then
+            Perf_stats.observe_ms "query.cross_file.invalidate_path_removed"
+              (float_of_int (List.length cross_removed));
+          if removed <> [] || cross_removed <> [] then sem_dirty := true))
       changes;
   ws.bg_seed_cursor <- 0;
   if changes <> [] || source_set_changed then ws.bg_seed_needs_refresh <- true;

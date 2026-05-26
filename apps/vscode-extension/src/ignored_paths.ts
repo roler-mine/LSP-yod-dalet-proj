@@ -14,11 +14,13 @@ export const IGNORED_DIR_SEGMENTS = [
   "node_modules",
   ".vscode-test",
   ".vscode",
+  ".jovial_ls",
   ".jovial-lsp",
+  ".jovial-lsp-cache",
 ] as const;
 
 export function sourceDiscoveryExcludeGlob(): string {
-  return "{**/.git/**,**/_build*/**,**/build/**,**/dist/**,**/out/**,**/node_modules/**,**/.vscode-test/**,**/.vscode/**,**/.jovial-lsp/**}";
+  return "{**/.git/**,**/_build*/**,**/build/**,**/dist/**,**/out/**,**/node_modules/**,**/.vscode-test/**,**/.vscode/**,**/.jovial_ls/**,**/.jovial-lsp/**,**/.jovial-lsp-cache/**}";
 }
 
 export function shouldIgnoreSourcePath(

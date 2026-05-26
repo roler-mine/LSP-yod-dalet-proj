@@ -1,4 +1,11 @@
-(** Module overview: Filesystem-backed workspace index for source discovery and dependency lookup. *)
+(** Module overview: Filesystem-backed source locator.
+
+    This is intentionally not the semantic authority for LSP requests. Hover,
+    goto, references, rename, completion, and diagnostics should go through
+    Workspace_query/Cross_file_index. This legacy index remains as a compact
+    source-file discovery layer for startup scheduling, source-set changes,
+    and coarse compool path hints while the centralized cross-file index owns
+    symbols, scopes, references, types, and visibility. *)
 
 type t
 type file_change_kind = Created | Changed | Deleted

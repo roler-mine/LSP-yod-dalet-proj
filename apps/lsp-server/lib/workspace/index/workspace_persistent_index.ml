@@ -9,20 +9,37 @@ type file_fingerprint = {
   indexer_version : string;
 }
 
+type 'a binary_envelope = {
+  be_parser_version : string;
+  be_indexer_version : string;
+  be_source_extensions : string list;
+  be_payload : 'a;
+}
+
 let parser_version = "jovial-menhir-v1"
 let indexer_version = "jovial-indexer-v1"
 
-let cache_dir ~(root : string) =
-  Filename.concat (Filename.concat root ".jovial-lsp") "index"
+let cache_dir ~(root : string) = Workspace_storage_layout.index_dir ~root
 
 let json_path ~(root : string) name = Filename.concat (cache_dir ~root) name
+let bin_path ~(root : string) name = Filename.concat (cache_dir ~root) name
 let files_json_path ~(root : string) = json_path ~root "files.json"
+let files_bin_path ~(root : string) = bin_path ~root "files.bin"
 let symbols_json_path ~(root : string) = json_path ~root "symbols.json"
+let symbols_bin_path ~(root : string) = bin_path ~root "symbols.bin"
 let refs_json_path ~(root : string) = json_path ~root "refs.json"
+let refs_bin_path ~(root : string) = bin_path ~root "refs.bin"
 let scopes_json_path ~(root : string) = json_path ~root "scopes.json"
+let scopes_bin_path ~(root : string) = bin_path ~root "scopes.bin"
 let deps_json_path ~(root : string) = json_path ~root "deps.json"
+let deps_bin_path ~(root : string) = bin_path ~root "deps.bin"
 let macros_json_path ~(root : string) = json_path ~root "macros.json"
+let macros_bin_path ~(root : string) = bin_path ~root "macros.bin"
 let diagnostics_json_path ~(root : string) = json_path ~root "diagnostics.json"
+let diagnostics_bin_path ~(root : string) = bin_path ~root "diagnostics.bin"
+let snapshot_bin_path ~(root : string) = bin_path ~root "snapshot.bin"
+
+let binary_magic = "JOVIAL_LSP_INDEX_BIN_V2\n"
 
 let ensure_dir path =
   let rec loop path =
@@ -35,6 +52,84 @@ let ensure_dir path =
 
 let read_json path =
   try Some (Yojson.Safe.from_file path) with _ -> None
+
+let normalized_source_extensions (source_extensions : string list) =
+  Source_file.normalize_extensions source_extensions |> List.sort_uniq String.compare
+
+let source_extensions_of_index (idx : Workspace_index.t) : string list =
+  match Workspace_index.to_yojson idx with
+  | `Assoc fields -> (
+      match List.assoc_opt "sourceExtensions" fields with
+      | Some (`List values) ->
+          values
+          |> List.filter_map (function `String s -> Some s | _ -> None)
+          |> normalized_source_extensions
+      | _ -> [])
+  | _ -> []
+
+let read_binary_payload ~(source_extensions : string list) path : 'a option =
+  try
+    let ic = open_in_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+        let magic = really_input_string ic (String.length binary_magic) in
+        if magic <> binary_magic then None
+        else
+          let envelope : 'a binary_envelope = Marshal.from_channel ic in
+          if
+            envelope.be_parser_version = parser_version
+            && envelope.be_indexer_version = indexer_version
+            && envelope.be_source_extensions
+               = normalized_source_extensions source_extensions
+          then Some envelope.be_payload
+          else None)
+  with _ -> None
+
+let save_binary_payload ~(source_extensions : string list) path payload =
+  ensure_dir (Filename.dirname path);
+  let tmp = path ^ ".tmp" in
+  let oc = open_out_bin tmp in
+  try
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () ->
+        output_string oc binary_magic;
+        Marshal.to_channel oc
+          {
+            be_parser_version = parser_version;
+            be_indexer_version = indexer_version;
+            be_source_extensions =
+              normalized_source_extensions source_extensions;
+            be_payload = payload;
+          }
+          [ Marshal.No_sharing ]);
+    Sys.rename tmp path
+  with exn ->
+    close_out_noerr oc;
+    (try Sys.remove tmp with _ -> ());
+    raise exn
+
+let raw_binary_magic = "JOVIAL_LSP_INDEX_RAW_V1\n"
+
+let save_raw_binary path payload =
+  ensure_dir (Filename.dirname path);
+  let tmp = path ^ ".tmp" in
+  let oc = open_out_bin tmp in
+  try
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () ->
+        output_string oc raw_binary_magic;
+        Marshal.to_channel oc payload [ Marshal.No_sharing ]);
+    Sys.rename tmp path
+  with exn ->
+    close_out_noerr oc;
+    (try Sys.remove tmp with _ -> ());
+    raise exn
+
+let debug_json_enabled () =
+  Env_utils.flag "JOVIAL_PERSISTENT_INDEX_DEBUG_JSON" ~default:false
 
 let save_json path json =
   ensure_dir (Filename.dirname path);
@@ -66,17 +161,22 @@ let fingerprint_path path : file_fingerprint option =
 
 let load_workspace_index ~(source_extensions : string list) ~(root : string) :
     Workspace_index.t option =
-  match read_json (files_json_path ~root) with
-  | None -> None
-  | Some json -> (
-      match Workspace_index.of_yojson json with
-      | None -> None
-      | Some idx ->
-          ignore source_extensions;
-          Some idx)
+  let bin = files_bin_path ~root in
+  if Sys.file_exists bin then read_binary_payload ~source_extensions bin
+  else
+    match read_json (files_json_path ~root) with
+    | None -> None
+    | Some json -> (
+        match Workspace_index.of_yojson json with
+        | None -> None
+        | Some idx ->
+            ignore source_extensions;
+            Some idx)
 
 let save_workspace_index ~(root : string) (idx : Workspace_index.t) : unit =
-  try save_json (files_json_path ~root) (Workspace_index.to_yojson idx)
+  try
+    let source_extensions = source_extensions_of_index idx in
+    save_binary_payload ~source_extensions (files_bin_path ~root) idx
   with _ -> ()
 
 let json_of_option f = function None -> `Null | Some v -> f v
@@ -121,7 +221,7 @@ let string_of_external_kind = function
 let json_of_symbol_record (s : Symbol_index.symbol_record) =
   `Assoc
     [
-      ("id", `String s.id);
+      ("id", `Int (Symbol_id.to_int s.id));
       ("name", `String s.name);
       ("normalizedName", `String s.normalized_name);
       ("kind", `String (string_of_symbol_kind s.kind));
@@ -164,7 +264,7 @@ let string_of_confidence = function
 let json_of_occurrence (o : Reference_index.occurrence) =
   `Assoc
     [
-      ("symbolId", json_of_option (fun id -> `String id) o.symbol_id);
+      ("symbolId", json_of_option (fun id -> `Int (Symbol_id.to_int id)) o.symbol_id);
       ("name", `String o.name);
       ("normalizedName", `String o.normalized_name);
       ("loc", json_of_loc o.loc);
@@ -187,6 +287,13 @@ let string_of_scope_kind = function
   | Scope_graph.MacroScope -> "MacroScope"
 
 let json_of_scope (s : Scope_graph.scope) =
+  let json_of_symbol_binding (binding : Scope_graph.symbol_binding) =
+    `Assoc
+      [
+        ("symbolId", `Int (Symbol_id.to_int binding.symbol_id));
+        ("normalizedName", `String binding.normalized_name);
+      ]
+  in
   `Assoc
     [
       ("id", `Int s.id);
@@ -194,7 +301,8 @@ let json_of_scope (s : Scope_graph.scope) =
       ("kind", `String (string_of_scope_kind s.kind));
       ("name", json_of_option (fun name -> `String name) s.name);
       ("loc", json_of_loc s.loc);
-      ("symbols", `List (List.map (fun id -> `String id) s.symbols));
+      ("symbols", `List (List.map (fun id -> `Int (Symbol_id.to_int id)) s.symbols));
+      ("symbolBindings", `List (List.map json_of_symbol_binding s.symbol_bindings));
       ("imports", `List (List.map (fun id -> `Int id) s.imports));
     ]
 
@@ -243,6 +351,10 @@ let save_snapshot_index ~(root : string) (snap : Workspace_snapshot.snapshot) :
     unit =
   try
     let files = Workspace_snapshot.UriMap.bindings snap.files in
+    let symbols = Symbol_index.all snap.symbols in
+    let refs = Reference_index.all snap.refs in
+    let scopes = Scope_graph.scopes snap.scopes in
+    let deps = Dependency_graph.edges snap.deps in
     let macro_entries =
       files
       |> List.concat_map (fun (uri, state) ->
@@ -250,46 +362,45 @@ let save_snapshot_index ~(root : string) (snap : Workspace_snapshot.snapshot) :
              | None -> []
              | Some sk -> List.map (json_of_define ~uri) sk.defines)
     in
-    save_json (symbols_json_path ~root)
-      (`Assoc
-        [
-          ("generation", `Int snap.generation);
-          ( "symbols",
-            `List
-              (List.map json_of_symbol_record
-                 (Symbol_index.all snap.symbols)) );
-        ]);
-    save_json (refs_json_path ~root)
-      (`Assoc
-        [
-          ("generation", `Int snap.generation);
-          ( "refs",
-            `List
-              (List.map json_of_occurrence
-                 (Reference_index.all snap.refs)) );
-        ]);
-    save_json (scopes_json_path ~root)
-      (`Assoc
-        [
-          ("generation", `Int snap.generation);
-          ( "scopes",
-            `List (List.map json_of_scope (Scope_graph.scopes snap.scopes)) );
-        ]);
-    save_json (deps_json_path ~root)
-      (`Assoc
-        [
-          ("generation", `Int snap.generation);
-          ( "deps",
-            `List
-              (List.map json_of_edge (Dependency_graph.edges snap.deps)) );
-        ]);
-    save_json (macros_json_path ~root)
-      (`Assoc [ ("generation", `Int snap.generation); ("macros", `List macro_entries) ]);
-    save_json (diagnostics_json_path ~root)
-      (`Assoc
-        [
-          ("generation", `Int snap.generation);
-          ( "files",
-            `List (List.map json_of_file_diagnostics files) );
-        ])
+    save_raw_binary (snapshot_bin_path ~root) snap;
+    save_raw_binary (symbols_bin_path ~root) (snap.generation, symbols);
+    save_raw_binary (refs_bin_path ~root) (snap.generation, refs);
+    save_raw_binary (scopes_bin_path ~root) (snap.generation, scopes);
+    save_raw_binary (deps_bin_path ~root) (snap.generation, deps);
+    save_raw_binary (macros_bin_path ~root) (snap.generation, macro_entries);
+    save_raw_binary (diagnostics_bin_path ~root) (snap.generation, files);
+    if debug_json_enabled () then (
+      save_json (symbols_json_path ~root)
+        (`Assoc
+          [
+            ("generation", `Int snap.generation);
+            ("symbols", `List (List.map json_of_symbol_record symbols));
+          ]);
+      save_json (refs_json_path ~root)
+        (`Assoc
+          [
+            ("generation", `Int snap.generation);
+            ("refs", `List (List.map json_of_occurrence refs));
+          ]);
+      save_json (scopes_json_path ~root)
+        (`Assoc
+          [
+            ("generation", `Int snap.generation);
+            ("scopes", `List (List.map json_of_scope scopes));
+          ]);
+      save_json (deps_json_path ~root)
+        (`Assoc
+          [
+            ("generation", `Int snap.generation);
+            ("deps", `List (List.map json_of_edge deps));
+          ]);
+      save_json (macros_json_path ~root)
+        (`Assoc
+          [ ("generation", `Int snap.generation); ("macros", `List macro_entries) ]);
+      save_json (diagnostics_json_path ~root)
+        (`Assoc
+          [
+            ("generation", `Int snap.generation);
+            ("files", `List (List.map json_of_file_diagnostics files));
+          ]))
   with _ -> ()

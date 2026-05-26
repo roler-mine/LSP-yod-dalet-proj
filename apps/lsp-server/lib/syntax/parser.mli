@@ -32,24 +32,29 @@ type token =
   | PLUS
   | OVERLAY
   | OR
+  | NULL
   | NOT
   | NE
   | MOD
   | MINUS
   | LT
   | LPAREN
+  | LINKAGE
   | LE
   | ITEM
   | INTLIT of string
   | INLINE
+  | ILINKAGE
   | IF
   | ID of string
   | ICOMPOOL
+  | ICODE
   | GT
   | GOTO
   | GE
   | FOR
   | FLOATLIT of string
+  | FIXED_A of string
   | FALSE
   | FALLTHRU
   | EXIT
@@ -68,11 +73,18 @@ type token =
   | COMPOOL
   | COMMA
   | COLON
+  | CODE
   | CASE
   | BY
   | BLOCK
+  | BITLIT of (int * string * string)
   | BEGIN
   | BANG
+  | BAD_STRING of string
+  | BAD_LITERAL of string
+  | BAD_DIRECTIVE of string
+  | BAD_COMMENT of string
+  | BAD_CHAR of string
   | AT
   | AND
   | ABORT
@@ -80,7 +92,37 @@ type token =
 type output = {
   ast : Ast.program option;
   diags : Lsp.Types.Diagnostic.t list;
+  recovery_diags : Lsp.Types.Diagnostic.t list;
+  tainted_ranges : tainted_range list;
+  parse_health : parse_health;
+  parse_confidence : float;
   ast_dump : string option;
+}
+
+and parse_health =
+  | ParseClean
+  | ParseRecovered
+  | ParsePartial
+  | ParseSkeletonOnly
+  | ParseLexicalOnly
+  | ParseFailedInternal
+
+and recovery_kind =
+  | RecoverTokenInsertion
+  | RecoverTokenDeletion
+  | RecoverBlockCloseInsertion
+  | RecoverSyncSkip
+  | RecoverIslandFallback
+  | RecoverSkeletonFallback
+  | RecoverGrammarError
+  | RecoverInternalFailure
+
+and tainted_range = {
+  taint_loc : Ast.Loc.t;
+  taint_reason : string;
+  taint_recovery_kind : recovery_kind;
+  taint_confidence_penalty : float;
+  taint_allows_semantic : bool;
 }
 
 type profile = Interactive | Background | Batch | Debug

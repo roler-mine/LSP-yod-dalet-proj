@@ -22,10 +22,12 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     files = Hashtbl.create 64;
     root_path = None;
     source_file_paths = [];
+    assembly_file_paths = [];
     index = None;
     index_checkpoint_loaded = false;
     symbol_hints = None;
     semantic_store = Semantic_store.create ();
+    cross_file_index = Cross_file_index.create ();
     semantic_tokens_cache = Hashtbl.create 32;
     sem_store_enabled = settings.sem_store_enabled;
     lsif_delta_enabled = settings.lsif_delta_enabled;
@@ -111,6 +113,10 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     xmodule_diag_ready_prev = false;
     source_bytes_estimate = None;
     source_bytes_estimate_count = -1;
+    asm_index_by_path = Hashtbl.create 128;
+    asm_label_hits_by_key = Hashtbl.create 512;
+    asm_index_paths_key = [];
+    asm_index_dirty = true;
     workspace_profile_mode = settings.workspace_profile_mode;
     root_model = settings.root_model;
     root_heuristic_fallback = settings.root_heuristic_fallback;
@@ -136,6 +142,8 @@ let create ?(settings = Workspace_settings.from_env ()) () : t =
     quick_nav_index_total = 0;
     parse_worker_jobs = Queue.create ();
     parse_worker_results = Queue.create ();
+    parse_worker_doc_slots = Hashtbl.create 1024;
+    parse_worker_next_doc_slot = 1;
     parse_worker_mtx = Mutex.create ();
     parse_worker_cv = Condition.create ();
     parse_worker_inflight = Hashtbl.create 4096;
@@ -252,7 +260,8 @@ let invalidate_importer_nav_state_for_compool_key (ws : t)
       Semantic_store.uris_importing_compool ws.semantic_store ~compool_key:key
       |> List.iter (fun uri ->
           Perf_stats.tick "query.cache.invalidate_uri";
-          Semantic_store.remove_uri ws.semantic_store ~uri)
+          Semantic_store.remove_uri ws.semantic_store ~uri;
+          Cross_file_index.remove_uri ws.cross_file_index ~uri)
 
 let importer_uris_for_compool_key (ws : t) ~(compool_key : string) :
     T.DocumentUri.t list =
@@ -358,7 +367,7 @@ let open_doc_parse_pending_for_path_key (ws : t) ~(path_key : string) : bool =
          acc
          ||
          (doc.Document.parse_rev <> doc.Document.rev
-         && not (is_huge_doc doc ws)
+          && not (is_large_doc doc ws)
          &&
          match doc.Document.file with
          | Some p ->
@@ -372,7 +381,7 @@ let has_pending_open_parse_work (ws : t) : bool =
       acc
       ||
       (doc.Document.parse_rev <> doc.Document.rev
-      && not (is_huge_doc doc ws)
+       && not (is_large_doc doc ws)
       &&
       match doc.Document.file with
       | Some p ->
@@ -425,7 +434,9 @@ let evict_closed_docs_if_needed (ws : t) : unit =
             Hashtbl.remove ws.closed_doc_last_touch path_key;
             if ws.sem_store_enabled then (
               Perf_stats.tick "query.cache.invalidate_uri";
-              Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri);
+              Semantic_store.remove_uri ws.semantic_store ~uri:doc.Document.uri;
+              Cross_file_index.remove_uri ws.cross_file_index
+                ~uri:doc.Document.uri);
             Perf_stats.tick "mem.closed_doc_evict";
             drop (n - 1) tl
     in
@@ -519,6 +530,15 @@ let enqueue_bg_path ?(lane : schedule_lane = LaneSweep)
 let enqueue_open_doc_parse_if_pending ?(reason_group : string = "open_doc")
     (ws : t) (doc : Document.t) : bool =
   if doc.Document.parse_rev = doc.Document.rev then false
+  else if
+    String.length doc.Document.text >= ws.bg_large_file_bytes
+    && Queue.is_empty ws.quick_nav_pending_paths
+    && Hashtbl.length ws.quick_nav_pending_set = 0
+    && ws.quick_nav_index_total > 0
+    && ws.quick_nav_index_done >= ws.quick_nav_index_total
+  then (
+    Perf_stats.tick "open_doc.large_parse_deferred_nav_ready";
+    false)
   else
     match doc.Document.file with
     | None -> false
@@ -797,6 +817,7 @@ let set_root_path (ws : t) (root : string option) : unit =
   if ws.root_path <> root then (
     mark_graph_dirty ws;
     clear_module_summary_cache ws;
+    Cross_file_index.reset ws.cross_file_index;
     ws.root_path <- root;
     ws.startup_started_ms <- Perf_stats.now_ms ();
     ws.startup_diag_hover_target_ms <-
@@ -849,12 +870,43 @@ let set_source_files (ws : t) (paths : string list) : bool =
     ws.source_bytes_estimate_count <- List.length source_paths;
     ws.index <- None;
     clear_module_summary_cache ws;
+    Cross_file_index.reset ws.cross_file_index;
     mark_graph_dirty ws;
     ws.bg_seed_needs_refresh <- true;
     true)
   else (
     if ws.source_bytes_estimate_count < 0 then
       ws.source_bytes_estimate_count <- List.length source_paths;
+    false)
+
+let invalidate_assembly_index (ws : t) : unit =
+  Hashtbl.clear ws.asm_index_by_path;
+  Hashtbl.clear ws.asm_label_hits_by_key;
+  ws.asm_index_paths_key <- [];
+  ws.asm_index_dirty <- true;
+  invalidate_lsif_snapshot ws
+
+let set_assembly_files (ws : t) (paths : string list) : bool =
+  let seen = Hashtbl.create (max 16 (List.length paths)) in
+  let assembly_paths =
+    paths
+    |> List.filter_map (fun path ->
+           let key = normalize_path_key path in
+           if key = "" || Hashtbl.mem seen key then None
+           else (
+             Hashtbl.replace seen key true;
+             Some path))
+    |> List.sort (fun a b -> compare (normalize_path_key a) (normalize_path_key b))
+  in
+  if assembly_paths <> ws.assembly_file_paths then (
+    ws.assembly_file_paths <- assembly_paths;
+    invalidate_assembly_index ws;
+    true)
+  else (
+    (* A source-file-set refresh can be triggered by an ASM content change while
+       the path list is unchanged. Keep the path-set return value stable for
+       callers, but force the lightweight ASM symbol cache to rebuild. *)
+    invalidate_assembly_index ws;
     false)
 
 let is_import_word_char = function
@@ -899,7 +951,8 @@ let quick_imports_from_deferred_doc_text (doc : Document.t) :
       out := { Preprocess.kind = Preprocess.Compool; name; loc } :: !out)
   in
   let rec collect = function
-    | ("COMPOOL" | "ICOMPOOL") :: name :: tl ->
+    | marker :: name :: tl
+      when Preprocess.canonical_directive_name marker = "COMPOOL" ->
         push_name name;
         collect tl
     | _ :: tl -> collect tl

@@ -192,6 +192,7 @@ let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
   in
   let rec walk_decl (d : Ast.decl Ast.node) : unit =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DDirective { name; args } ->
         if normalize_name name.v = "DEFINE" then add_define_args args
     | Ast.DProc p ->
@@ -200,8 +201,8 @@ let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
     | Ast.DVar _ | Ast.DConst _ | Ast.DType _ | Ast.DOverlay _ -> ()
   and walk_stmt (s : Ast.stmt Ast.node) : unit =
     match s.v with
-    | Ast.SEmpty | Ast.SAssign _ | Ast.SCallStmt _ | Ast.SReturn _ | Ast.SGoto _
-      ->
+    | Ast.SEmpty | Ast.SError _ | Ast.SAssign _ | Ast.SCallStmt _
+    | Ast.SReturn _ | Ast.SGoto _ ->
         ()
     | Ast.SDecl d -> walk_decl d
     | Ast.SBlock xs -> List.iter walk_stmt xs
@@ -213,13 +214,21 @@ let collect_define_macro_keys (doc : Document.t) : (string, bool) Hashtbl.t =
         (match init with None -> () | Some i -> walk_stmt i);
         (match step with None -> () | Some st -> walk_stmt st);
         walk_stmt body
+    | Ast.SCase { options; _ } ->
+        List.iter
+          (fun (opt : Ast.case_option Ast.node) -> walk_stmt opt.v.case_body)
+          options
     | Ast.SLabel { body; _ } -> walk_stmt body
   in
   (match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } ->
-      List.iter
-        (function Ast.TopDecl d -> walk_decl d | Ast.TopStmt s -> walk_stmt s)
-        prog
+      let rec walk_top = function
+        | Ast.TopDecl d -> walk_decl d
+        | Ast.TopStmt s -> walk_stmt s
+        | Ast.TopModule m -> List.iter walk_top m.v.module_items
+        | Ast.TopError _ -> ()
+      in
+      List.iter walk_top prog
   | _ -> ());
   out
 
@@ -269,7 +278,7 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
     ~(builtin_type_context : string -> bool)
     (tok : Parser.token) : (int * int) option =
   match tok with
-  | Parser.ID s ->
+  | Parser.ID s | Parser.FIXED_A s ->
       let k = normalize_name s in
       if k = "" then None
       else if Hashtbl.mem macro_keys k then Some (sem_tt_macro, 0)
@@ -278,7 +287,8 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
       else if is_builtin_function_name k then Some (sem_tt_function, 0)
       else if is_reserved_keyword k then Some (sem_tt_keyword, 0)
       else Some (sem_tt_variable, 0)
-  | Parser.INTLIT _ | Parser.FLOATLIT _ -> Some (sem_tt_number, 0)
+  | Parser.INTLIT _ | Parser.FLOATLIT _ | Parser.BITLIT _ ->
+      Some (sem_tt_number, 0)
   | Parser.STRINGLIT _ -> Some (sem_tt_string, 0)
   | Parser.START | Parser.TERM | Parser.BEGIN | Parser.END | Parser.DEF
   | Parser.REF | Parser.PROC | Parser.ITEM | Parser.TABLE | Parser.STATIC
@@ -288,8 +298,10 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
   | Parser.FALLTHRU | Parser.EXIT | Parser.GOTO | Parser.RETURN
   | Parser.ABORT | Parser.STOP | Parser.NOT | Parser.AND | Parser.OR
   | Parser.XOR | Parser.EQV | Parser.MOD | Parser.TRUE | Parser.FALSE
-  | Parser.PROGRAM | Parser.COMPOOL
-  | Parser.ICOMPOOL | Parser.DEFINE | Parser.TYPE | Parser.BLOCK | Parser.POS ->
+  | Parser.NULL
+  | Parser.PROGRAM | Parser.COMPOOL | Parser.ICOMPOOL | Parser.LINKAGE
+  | Parser.ILINKAGE | Parser.CODE | Parser.ICODE
+  | Parser.DEFINE | Parser.TYPE | Parser.BLOCK | Parser.POS ->
       Some (sem_tt_keyword, 0)
   | Parser.EQ | Parser.NE | Parser.LT | Parser.LE | Parser.GT | Parser.GE
   | Parser.PLUS | Parser.MINUS | Parser.STAR | Parser.SLASH | Parser.POW
@@ -297,6 +309,9 @@ let semantic_class_of_lex_token ~(macro_keys : (string, bool) Hashtbl.t)
       Some (sem_tt_operator, 0)
   | Parser.LPAREN | Parser.RPAREN | Parser.COMMA | Parser.SEMI | Parser.COLON
   | Parser.DOT | Parser.EOF ->
+      None
+  | Parser.BAD_CHAR _ | Parser.BAD_STRING _ | Parser.BAD_COMMENT _
+  | Parser.BAD_DIRECTIVE _ | Parser.BAD_LITERAL _ ->
       None
 
 let semantic_lex_tokens_for_doc ?budget (doc : Document.t)
@@ -445,12 +460,22 @@ let semantic_tokens_for_doc ?budget (ws : t) (doc : Document.t)
     | _ -> None
   in
   if not doc_current then
-    schedule_open_doc_parse_fallback ws doc
-      ~reason_group:"semantic_range_fallback";
+    if
+      String.length doc.Document.text >= ws.bg_large_file_bytes
+      && quick_nav_index_complete ws
+    then Perf_stats.tick "semantic_tokens.large_parse_deferred_nav_ready"
+    else
+      schedule_open_doc_parse_fallback ws doc
+        ~reason_group:"semantic_range_fallback";
   if range = None && doc_large then (
     Perf_stats.tick "semantic_tokens.full_skipped_large";
-    schedule_open_doc_parse_fallback ws doc
-      ~reason_group:"semantic_full_large";
+    if
+      String.length doc.Document.text >= ws.bg_large_file_bytes
+      && quick_nav_index_complete ws
+    then Perf_stats.tick "semantic_tokens.full_large_parse_deferred_nav_ready"
+    else
+      schedule_open_doc_parse_fallback ws doc
+        ~reason_group:"semantic_full_large";
     [])
   else if budget_should_stop ~phase:"semantic_tokens" budget then []
   else
@@ -595,7 +620,12 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
       | Ast.UseRent -> " RENT"
     in
     let inline = if p.v.is_inline then " INLINE" else "" in
-    "(" ^ params ^ ")" ^ ret ^ attr ^ inline
+    let linkage =
+      match p.v.linkage with
+      | None -> ""
+      | Some id -> " !LINKAGE " ^ id.v
+    in
+    "(" ^ params ^ ")" ^ ret ^ attr ^ inline ^ linkage
   in
   let overlay_target_names (items : Ast.overlay_item Ast.node list) :
       string list =
@@ -609,6 +639,7 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
   in
   let rec of_decl (d : Ast.decl Ast.node) : doc_symbol list =
     match d.v with
+    | Ast.DError _ -> []
     | Ast.DVar { name; dtype; data_decl_kind; _ } ->
         let kind =
           match data_decl_kind with
@@ -680,7 +711,7 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
             ~selection:overlay.overlay_name.loc ~detail ~children;
         ]
     | Ast.DDirective { name; args } -> (
-        let key = normalize_name name.v in
+        let key = Preprocess.canonical_directive_name name.v in
         match (key, args) with
         | "PROGRAM", first :: _ ->
             [
@@ -692,7 +723,7 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
               mk_symbol ~name:name.v ~kind:sym_kind_module ~range:d.loc
                 ~selection:name.loc ~detail:None ~children:[];
             ]
-        | ("COMPOOL" | "ICOMPOOL"), first :: _ ->
+        | "COMPOOL", first :: _ ->
             let fk = normalize_name first.v in
             let is_file_compool =
               match current_compool_key with
@@ -705,16 +736,19 @@ let document_symbols_from_ast (doc : Document.t) : doc_symbol list =
                 mk_symbol ~name:first.v ~kind:sym_kind_module ~range:d.loc
                   ~selection:first.loc ~detail:(Some "COMPOOL") ~children:[];
               ]
-        | ("COMPOOL" | "ICOMPOOL"), [] -> []
+        | "COMPOOL", [] -> []
         | "BLOCK", _ -> []
         | _ -> [])
   in
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } ->
-      prog
-      |> List.concat_map (function
+      let rec of_top = function
         | Ast.TopDecl d -> of_decl d
-        | Ast.TopStmt _ -> [])
+        | Ast.TopStmt _ -> []
+        | Ast.TopModule m -> List.concat_map of_top m.v.module_items
+        | Ast.TopError _ -> []
+      in
+      prog |> List.concat_map of_top
   | _ -> []
 
 let startup_priority_mode_to_string = function
@@ -751,22 +785,9 @@ let bg_queue_kind_to_string = function
   | BgQueueRootLarge -> "rootLarge"
   | BgQueueNormalLarge -> "normalLarge"
 
-let parse_job_kind_to_string = function
-  | ParseJobHighLarge -> "highLarge"
-  | ParseJobRootLarge -> "rootLarge"
-  | ParseJobNormalLarge -> "normalLarge"
-
 let size_class_of_queue_kind = function
   | BgQueueHighSmall | BgQueueRootSmall | BgQueueNormalSmall -> "small"
   | BgQueueHighLarge | BgQueueRootLarge | BgQueueNormalLarge -> "large"
-
-let size_class_of_parse_job_kind = function
-  | ParseJobHighLarge | ParseJobRootLarge | ParseJobNormalLarge -> "large"
-
-let lane_of_parse_job_kind = function
-  | ParseJobHighLarge -> "open"
-  | ParseJobRootLarge -> "root"
-  | ParseJobNormalLarge -> "sweep"
 
 let path_debug_json path =
   `Assoc
@@ -798,41 +819,53 @@ let scheduler_queue_candidate_json (ws : t) ~(queue_name : string)
     ]
 
 let parse_job_path_json = function
-  | ParseJobOpen { doc; uri; generation; _ } ->
+  | Worker_ipc.JobOpen { file; uri; generation; _ } ->
       `Assoc
         [
           ( "path",
-            match doc.Document.file with
+            match file with
             | Some path -> path_debug_json path
             | None -> `Null );
-          ("uri", `String (Uri_path.docuri_to_string uri));
+          ("uri", `String uri);
           ("generation", `Int generation);
         ]
-  | ParseJobPath { path; _ } ->
+  | Worker_ipc.JobPath { path; _ } ->
       `Assoc [ ("path", path_debug_json path); ("uri", `Null) ]
 
-let scheduler_parse_job_candidate_json (job : parse_job) : Yojson.Safe.t =
+let scheduler_parse_job_candidate_json (job : Worker_ipc.parse_job) :
+    Yojson.Safe.t =
+  let kind = Worker_ipc.parse_job_kind job in
   `Assoc
     [
       ("source", `String "parseWorkerQueue");
       ("queue", `String "parseWorkerJobs");
-      ("kind", `String (parse_job_kind_to_string job.pj_kind));
-      ("target", parse_job_path_json job.pj_payload);
-      ("lane", `String (lane_of_parse_job_kind job.pj_kind));
-      ("sizeClass", `String (size_class_of_parse_job_kind job.pj_kind));
+      ("protocol", `String Worker_ipc.protocol_name);
+      ("kind", `String (Worker_ipc.job_kind_to_string kind));
+      ("target", parse_job_path_json job);
+      ("lane", `String (Worker_ipc.lane_of_job_kind kind));
+      ("sizeClass", `String (Worker_ipc.size_class_of_job_kind kind));
       ("ageMs", `Null);
-      ("score", `Int job.pj_epoch);
+      ("score", `Int (Worker_ipc.parse_job_epoch job));
       ("reason", `Null);
     ]
 
-let parse_worker_queue_lengths (ws : t) : int * int * parse_job option =
+let parse_worker_queue_lengths (ws : t) :
+    int * int * Worker_ipc.parse_job option =
   Mutex.lock ws.parse_worker_mtx;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock ws.parse_worker_mtx)
     (fun () ->
+      let head =
+        match queue_peek_opt ws.parse_worker_jobs with
+        | None -> None
+        | Some frame -> (
+            match Worker_ipc.decode_parse_job frame with
+            | Ok job -> Some job
+            | Error _ -> None)
+      in
       ( Queue.length ws.parse_worker_jobs,
         Queue.length ws.parse_worker_results,
-        queue_peek_opt ws.parse_worker_jobs ))
+        head ))
 
 let debug_scheduler_json (ws : t) : Yojson.Safe.t =
   let parse_jobs_len, parse_results_len, parse_job_head =
@@ -992,6 +1025,7 @@ let layout_debug_json (doc : Document.t) : Yojson.Safe.t =
   let env = Jovial_compile_time.empty_env () in
   let register_decl (d : Ast.decl Ast.node) =
     match d.v with
+    | Ast.DError _ -> ()
     | Ast.DConst { name; data_decl_kind = Ast.DataTable; _ }
     | Ast.DVar { name; _ }
     | Ast.DType { name; _ } ->
@@ -1016,6 +1050,7 @@ let layout_debug_json (doc : Document.t) : Yojson.Safe.t =
           :: acc
     in
     match d.v with
+    | Ast.DError _ -> acc
     | Ast.DVar { name; dtype; _ } -> add_layout acc name.v dtype
     | Ast.DConst { name; dtype = Some dtype; _ } -> add_layout acc name.v dtype
     | Ast.DType { name; defn; _ } -> add_layout acc name.v defn
@@ -1024,18 +1059,22 @@ let layout_debug_json (doc : Document.t) : Yojson.Safe.t =
   in
   match Document.current_parse doc with
   | Some { Document.parsed_ast = Some prog; _ } ->
-      List.iter
-        (function
-          | Ast.TopDecl d -> register_decl d
-          | Ast.TopStmt _ -> ())
-        prog;
+      let rec register_top = function
+        | Ast.TopDecl d -> register_decl d
+        | Ast.TopStmt _ -> ()
+        | Ast.TopModule m -> List.iter register_top m.v.module_items
+        | Ast.TopError _ -> ()
+      in
+      List.iter register_top prog;
       let layouts =
+        let rec collect_top acc = function
+          | Ast.TopDecl d -> collect_decl acc d
+          | Ast.TopStmt _ -> acc
+          | Ast.TopModule m -> List.fold_left collect_top acc m.v.module_items
+          | Ast.TopError _ -> acc
+        in
         prog
-        |> List.fold_left
-             (fun acc -> function
-               | Ast.TopDecl d -> collect_decl acc d
-               | Ast.TopStmt _ -> acc)
-             []
+        |> List.fold_left collect_top []
         |> List.rev
       in
       `Assoc [ ("tables", `List layouts) ]
@@ -1262,6 +1301,21 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
           ]
       in
 
+      let semantic_graph =
+        if
+          doc.Document.parse_rev <> doc.Document.rev
+          || String.length doc.Document.text
+             >= min ws.bg_large_file_bytes ws.large_file_threshold_bytes
+          || large_workspace_startup_quiet_active ws
+        then
+          `Assoc
+            [
+              ("skipped", `Bool true);
+              ("reason", `String "startupLargeOrProvisional");
+            ]
+        else Semantic_graph.debug_json (Semantic_graph.of_doc_defs doc)
+      in
+
       `Assoc
         [
           ("uri", `String (Uri_path.docuri_to_string uri));
@@ -1285,8 +1339,7 @@ let debug_report_for (ws : t) ~(uri : T.DocumentUri.t) ~(max_tokens : int) :
           ("layout", layout_debug_json doc);
           ( "query",
             Workspace_query.debug_report_json ws doc );
-          ( "semanticGraph",
-            Semantic_graph.debug_json (Semantic_graph.of_doc_defs doc) );
+          ("semanticGraph", semantic_graph);
           ("tokens", `List tokens);
         ]
 

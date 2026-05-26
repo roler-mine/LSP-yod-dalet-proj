@@ -222,8 +222,10 @@ let assoc_field (name : string) (json : Yojson.Safe.t) : Yojson.Safe.t option =
   match get_assoc json with None -> None | Some xs -> find_field name xs
 
 type source_file_set = {
+  workspace_uri : T.DocumentUri.t option;
   source_root_uri : T.DocumentUri.t;
   source_file_uris : T.DocumentUri.t list;
+  assembly_file_uris : T.DocumentUri.t list;
   source_search_truncated : bool;
 }
 
@@ -249,8 +251,19 @@ let parse_source_file_sets_json = function
                 match Uri_path.docuri_of_string root_s with
                 | None -> None
                 | Some source_root_uri ->
+                    let workspace_uri =
+                      match List.assoc_opt "workspaceUri" fields with
+                      | Some (`String s) when s <> "" ->
+                          Uri_path.docuri_of_string s
+                      | _ -> None
+                    in
                     let source_file_uris =
                       match List.assoc_opt "fileUris" fields with
+                      | Some uris -> parse_uri_list uris
+                      | None -> []
+                    in
+                    let assembly_file_uris =
+                      match List.assoc_opt "assemblyFileUris" fields with
                       | Some uris -> parse_uri_list uris
                       | None -> []
                     in
@@ -260,8 +273,10 @@ let parse_source_file_sets_json = function
                     in
                     Some
                       {
+                        workspace_uri;
                         source_root_uri;
                         source_file_uris;
+                        assembly_file_uris;
                         source_search_truncated;
                       })
             | _ -> None)
@@ -300,6 +315,14 @@ let source_paths_for_root (sets : source_file_set list) (root_uri : T.DocumentUr
   sets
   |> List.find_opt (fun s -> same_uri_path s.source_root_uri root_uri)
   |> Option.map (fun s -> s.source_file_uris |> List.filter_map Uri_path.file_path_of_uri)
+  |> Option.value ~default:[]
+
+let assembly_paths_for_root (sets : source_file_set list)
+    (root_uri : T.DocumentUri.t) : string list =
+  sets
+  |> List.find_opt (fun s -> same_uri_path s.source_root_uri root_uri)
+  |> Option.map (fun s ->
+         s.assembly_file_uris |> List.filter_map Uri_path.file_path_of_uri)
   |> Option.value ~default:[]
 
 let parse_client_overrides (params : Yojson.Safe.t) :

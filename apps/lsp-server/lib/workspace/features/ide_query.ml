@@ -68,6 +68,11 @@ let definition snap ~uri ~pos =
   | None -> []
   | Some sym ->
       Symbol_index.by_name snap.Workspace_snapshot.symbols sym.normalized_name
+      |> List.filter (fun hit ->
+             hit.Symbol_index.external_kind <> `Ref
+             && not
+                  (Workspace_symbol_metadata.is_external_ref
+                     hit.Symbol_index.metadata))
       |> List.filter_map (fun hit ->
              location_of_symbol ~uri
                (Option.value hit.Symbol_index.definition
@@ -115,7 +120,7 @@ let workspace_symbols snap ~query =
                   ~location ()))
 
 let semantic_token_type_of_parser_token = function
-  | Parser.ID _ -> Some 3
+  | Parser.ID _ | Parser.FIXED_A _ -> Some 3
   | Parser.STRINGLIT _ -> Some 6
   | Parser.INTLIT _ | Parser.FLOATLIT _ -> Some 7
   | Parser.PLUS

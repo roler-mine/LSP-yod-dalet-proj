@@ -183,7 +183,8 @@ let quick_imports_from_deferred_doc_text (doc : Document.t) :
       out := { Preprocess.kind = Preprocess.Compool; name; loc } :: !out)
   in
   let rec collect = function
-    | ("COMPOOL" | "ICOMPOOL") :: name :: tl ->
+    | marker :: name :: tl
+      when Preprocess.canonical_directive_name marker = "COMPOOL" ->
         push_name name;
         collect tl
     | _ :: tl -> collect tl
@@ -949,6 +950,8 @@ let rescan (ws : t) : unit =
   ws.quick_nav_index_done <- 0;
   ws.quick_nav_index_total <- 0;
   Hashtbl.clear ws.parse_worker_inflight;
+  Hashtbl.clear ws.parse_worker_doc_slots;
+  ws.parse_worker_next_doc_slot <- 1;
   while not (Queue.is_empty ws.bg_high_small_queue) do
     ignore (Queue.pop ws.bg_high_small_queue)
   done;
@@ -978,6 +981,7 @@ let rescan (ws : t) : unit =
   ws.bg_seed_needs_refresh <- true;
   invalidate_symbol_hints ws;
   if ws.sem_store_enabled then Semantic_store.reset ws.semantic_store;
+  Cross_file_index.reset ws.cross_file_index;
   if ws.lsif_delta_enabled then Lsif_delta.reset ws.lsif_delta_state;
   match ws.root_path with
   | None ->

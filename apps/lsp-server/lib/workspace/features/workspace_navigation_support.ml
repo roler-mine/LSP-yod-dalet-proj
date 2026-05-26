@@ -146,7 +146,7 @@ let occurrences_in_doc ?budget (doc : Document.t) ~(key : string) :
           let ep = Lexing.lexeme_end_p lexbuf in
           match tok with
           | Parser.EOF -> List.rev acc
-          | Parser.ID s when normalize_name s = key ->
+          | (Parser.ID s | Parser.FIXED_A s) when normalize_name s = key ->
               let loc =
                 Ast.Loc.of_lexing_positions sp ep ~file:doc.Document.file
               in
